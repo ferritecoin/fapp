@@ -30,7 +30,7 @@ version = 3.0.0
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy
 # NOTE: sqlite3 ships with python3-for-android automatically.
-requirements = python3,kivy==2.3.0,pillow,requests,urllib3,charset-normalizer,idna,certifi,websocket-client,cryptography,qrcode,pyjnius,android
+requirements = python3,kivy,pillow,requests,urllib3,charset-normalizer,idna,certifi,websocket-client,cryptography,qrcode,pyjnius,android
 
 # (str) Presplash of the application
 #presplash.filename = %(source.dir)s/data/presplash.png
@@ -88,6 +88,14 @@ android.allow_backup = True
 
 # (str) The name of the bootstrap to use
 p4a.bootstrap = sdl2
+
+# (str) python-for-android branch/tag to use.
+# Pinned to a stable release: p4a's default (master) now targets CPython 3.14,
+# whose removed private C-API (_PyUnicode_FastCopyCharacters,
+# _PyInterpreterState_GetConfig) makes Kivy 2.3.x fail to compile. v2024.01.21
+# targets Python 3.11.5 + Kivy 2.3.0 + OpenSSL-based cryptography 2.8 (no Rust),
+# a known-good, widely-used combination.
+p4a.branch = v2024.01.21
 
 #
 # Buildozer
