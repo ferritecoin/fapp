@@ -1,0 +1,22 @@
+# Buildozer / python-for-android
+.buildozer/
+bin/
+*.apk
+*.aab
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# FEXT runtime data (keys + local chat DBs must NEVER be committed)
+.fext/
+
+# OS / editor
+.DS_Store
+*.swp
+
+# Local tooling config
+.claude/settings.local.json

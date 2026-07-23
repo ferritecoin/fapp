@@ -1,0 +1,35 @@
+name: Build Android APK
+
+# Builds the FEXT client into an installable debug .apk with Buildozer.
+# The finished APK is uploaded as a workflow artifact you can download from
+# the run's "Summary" page. Runs on every push and can be triggered manually.
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    name: Buildozer (debug APK)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build the APK with Buildozer
+        uses: ArtemSBulgakov/buildozer-action@v1
+        id: buildozer
+        with:
+          command: buildozer android debug
+          buildozer_version: stable
+
+      - name: Upload the debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: fext-debug-apk
+          path: ${{ steps.buildozer.outputs.filename }}
+          if-no-files-found: error
