@@ -36,8 +36,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential ccache git zip unzip autoconf libtool \
-            pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev
+            build-essential ccache git zip unzip autoconf automake libtool \
+            libltdl-dev pkg-config zlib1g-dev libncurses-dev cmake \
+            libffi-dev libssl-dev
+          # autoconf + automake (aclocal) + libltdl-dev (LT_SYS_SYMBOL_USCORE)
+          # are all required to autoreconf libffi (a cffi/cryptography dep).
 
       - name: Install Rust (required by the cryptography recipe)
         run: |
