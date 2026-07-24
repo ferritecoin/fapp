@@ -62,9 +62,14 @@ android.permissions = INTERNET,ACCESS_NETWORK_STATE
 # to a blanket android:usesCleartextTraffic="true".
 android.add_resources = src/android/res/xml/network_security_config.xml:xml/network_security_config.xml
 
-# (str) Extra xml written inside the <manifest><application> tag: points the
-# application at the network security config added above.
-android.extra_manifest_application_arguments = src/android/extra_manifest_application_arguments.xml
+# NOTE: the <application> attribute that points at the config above is set via
+# p4a.extra_args at the bottom of this file, NOT via
+# android.extra_manifest_application_arguments. Buildozer 1.5.0 escapes the
+# quotes in that option's file (" -> \") and then wraps the whole value in
+# another pair of quotes, and because p4a is invoked without a shell those
+# characters land verbatim in AndroidManifest.xml — which then fails to parse
+# ("ManifestMerger2$MergeFailureException: Error parsing AndroidManifest.xml").
+# p4a.extra_args is shlex-split, so the attribute survives intact.
 
 # (int) Target Android API, should be as high as possible.
 android.api = 34
@@ -116,6 +121,15 @@ p4a.bootstrap = sdl2
 # targets Python 3.11.5 + Kivy 2.3.0 + OpenSSL-based cryptography 2.8 (no Rust),
 # a known-good, widely-used combination.
 p4a.branch = v2024.01.21
+
+# (str) extra command line arguments to pass when invoking p4a.
+# Points <application> at res/xml/network_security_config.xml (shipped via
+# android.add_resources), which permits cleartext for the relay host only so
+# the v7.1 https->http fallback is not blocked by the platform. This is set
+# here rather than through android.extra_manifest_application_arguments
+# because that option mangles the quotes (see the note above); p4a.extra_args
+# is shlex-split, so the single quotes below keep the inner double quotes.
+p4a.extra_args = --extra-manifest-application-arguments='android:networkSecurityConfig="@xml/network_security_config"'
 
 #
 # Buildozer
