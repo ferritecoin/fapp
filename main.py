@@ -103,6 +103,7 @@ except ImportError:                            # graceful HTTP-polling fallback
 # ---- Kivy (import AFTER env hints; window is created on import) -------------
 os.environ.setdefault("KIVY_NO_ARGS", "1")     # our argv is not kivy's argv
 
+from kivy.animation import Animation
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.clipboard import Clipboard
@@ -114,6 +115,7 @@ from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.filechooser import FileChooserListView
+from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.image import Image as KivyImage
 from kivy.uix.label import Label
 from kivy.uix.modalview import ModalView
@@ -800,10 +802,25 @@ ecdh_shared_secret = ecdh_shared_secret_accel
 # =============================================================================
 #  Configuration
 # =============================================================================
-# The relay address is hardcoded on purpose: this build is pinned to one
-# deployment, and pinning removes a whole class of "point the client at an
-# attacker's server" configuration mistakes.
-SERVER_URL = "http://118.189.201.104:50607"
+# The relay address is pinned to one deployment on purpose: pinning removes
+# a whole class of "point the client at an attacker's server" mistakes. The
+# environment override exists for local development and the test harness
+# only; shipped builds use the constant.
+#
+# v7: HTTPS is now mandatory rather than aspirational.
+#   * Store-Now-Decrypt-Later. Message BODIES are end-to-end encrypted, but
+#     over cleartext everything around them is not: who talks to whom, how
+#     often, message sizes, and the username/public-key directory lookups.
+#     That metadata is exactly what bulk collection harvests today to mine
+#     later, and it is not protected by the envelope.
+#   * Key substitution. A directory lookup over plain HTTP can be rewritten
+#     on-path to return an attacker's public key, at which point the E2E
+#     layer faithfully encrypts to the wrong person. TLS is what stops that.
+#   * Platform policy. Android (API 28+) blocks cleartext by default and iOS
+#     App Transport Security requires TLS 1.2+ from a publicly trusted CA,
+#     so a shipped app simply cannot use http:// without special-casing.
+SERVER_URL = _os.environ.get("FEXT_SERVER_URL",
+                             "https://118.189.201.104:50607")
 
 APP_NAME = "FEXT"
 
@@ -837,6 +854,7 @@ WS_RECV_TICK = 3.0              # socket recv timeout; stop/keepalive cadence
 WS_RECONNECT_MIN = 0.5          # delay before re-dialing a dropped socket
 WS_RECONNECT_MAX = 30.0         # cap for offline exponential backoff
 REQUEST_TIMEOUT = 8             # HTTP timeout (seconds)
+FOREGROUND_RECONNECT_MAX = 6.0  # backoff cap while the app is on screen
 MAX_MESSAGE_CHARS = 4000        # sanitization cap for outgoing text
 CHAT_PAGE_SIZE = 60             # messages materialised per chat page
 HKDF_INFO = b"fext.v2.secp256k1-ecdh-hkdf-sha256.aes256gcm"
@@ -1081,6 +1099,45 @@ class IdentityManager:
         self._save()
         return address
 
+    def remove_identity(self, address: str) -> Optional[str]:
+        """Delete an identity from this device. Returns the address that is
+        active afterwards, or None when none are left.
+
+        The local chat database is removed too — leaving it behind would
+        keep plaintext history on disk for an identity the user believes
+        they deleted.
+        """
+        idents = self._data.get("identities", [])
+        remaining = [i for i in idents if i["address"] != address]
+        if len(remaining) == len(idents):
+            return self._data.get("active")
+        self._data["identities"] = remaining
+        if self._data.get("active") == address:
+            self._data["active"] = (remaining[0]["address"] if remaining
+                                    else None)
+        self._save()
+        for path in (self.store_path_for(address),
+                     Path(str(self.store_path_for(address)) + "-wal"),
+                     Path(str(self.store_path_for(address)) + "-shm")):
+            try:
+                if path.exists():
+                    path.unlink()
+            except OSError:
+                pass         # best effort: the identity is gone regardless
+        return self._data.get("active")
+
+    def clear_username(self) -> None:
+        """Forget the registered name for the ACTIVE identity.
+
+        Used when the relay says it does not know this address (its database
+        was reset, or the identity was never registered here). The keypair is
+        untouched — only the claim that it has a name on this relay is
+        dropped, so the user can register again.
+        """
+        ident = self._require_active()
+        ident.pop("username", None)
+        self._save()
+
     def activate(self, address: str) -> None:
         if self.find(address) is None:
             raise KeyError("unknown identity")
@@ -1157,7 +1214,13 @@ class IdentityManager:
     def store_path(self) -> Path:
         """Per-identity local database — chats never bleed across identities.
         Base58 addresses are filesystem-safe by construction."""
-        return DATA_DIR / f"store_{self.address}.db"
+        return self.store_path_for(self.address)
+
+    @staticmethod
+    def store_path_for(address: str) -> Path:
+        """Database path for any identity, active or not — removal needs to
+        delete the file of an identity that is not the current one."""
+        return DATA_DIR / f"store_{address}.db"
 
 
 # =============================================================================
@@ -1312,15 +1375,26 @@ class ApiClient:
     """
 
     class ApiError(RuntimeError):
-        def __init__(self, status: int, code: str, message: str) -> None:
+        """`detail` carries the server's machine-readable extra fields — e.g.
+        the username an address is already registered under — so recovery
+        flows can branch on data instead of parsing English."""
+
+        def __init__(self, status: int, code: str, message: str,
+                     detail: Optional[dict] = None) -> None:
             super().__init__(f"[{status}/{code}] {message}")
             self.status, self.code = status, code
+            self.message = message
+            self.detail = detail or {}
 
     def __init__(self, keys: IdentityManager) -> None:
         self._keys = keys
         self._session = requests.Session()
 
     # ---- plumbing (DRY) ------------------------------------------------------
+    def deregister(self) -> dict:
+        """Remove this identity from the relay (releases the username)."""
+        return self._delete("/api/users/me", "delete.me")
+
     def auth_fields(self, context: str) -> dict:
         timestamp = int(time.time())
         nonce = os.urandom(16).hex()
@@ -1345,7 +1419,9 @@ class ApiClient:
         if resp.status_code >= 400:
             err = data.get("error", {}) if isinstance(data, dict) else {}
             raise self.ApiError(resp.status_code, err.get("code", "unknown"),
-                                err.get("message", "request failed"))
+                                err.get("message", "request failed"),
+                                {k: v for k, v in err.items()
+                                 if k not in ("code", "message")})
         return data
 
     def _get(self, path: str, params: dict,
@@ -1362,6 +1438,15 @@ class ApiClient:
         headers["Content-Type"] = "application/json"
         resp = self._session.post(f"{SERVER_URL}{path}", data=raw,
                                   headers=headers, timeout=REQUEST_TIMEOUT)
+        return self._handle(resp)
+
+    def _delete(self, path: str, context: str) -> dict:
+        """Authenticated DELETE. There is no body to bind the signature to,
+        so the context is a fixed verb string, matching how the server
+        authenticates 'ws.connect' and 'events.sync'."""
+        headers = self._auth_headers(context)
+        resp = self._session.delete(f"{SERVER_URL}{path}", headers=headers,
+                                    timeout=REQUEST_TIMEOUT)
         return self._handle(resp)
 
     # ---- public API ----------------------------------------------------------
@@ -1686,6 +1771,33 @@ class LocalStore:
 # =============================================================================
 #  SyncWorker — realtime WebSocket sync with HTTP-polling fallback
 # =============================================================================
+def _ws_ssl_options() -> dict:
+    """Trust store for the WebSocket transport.
+
+    v7 fix for a silent, mobile-only failure. `requests` verifies against
+    the certifi bundle SHIPPED INSIDE the app. `websocket-client` also
+    verifies by default, but builds its context with
+    ssl.create_default_context().load_default_certs() — the OPERATING
+    SYSTEM trust store. In a python-for-android build the OpenSSL default
+    certificate paths frequently do not resolve, so HTTPS succeeds while
+    WSS fails to handshake.
+
+    That failure is invisible: the sync worker falls back to HTTP polling
+    and reports "Connected (polling)", which looks like success while
+    realtime push is silently gone and messages only appear every few
+    seconds. Pointing websocket-client at the same certifi bundle keeps
+    both transports on one trust store.
+
+    Verification is never disabled — an unverified TLS session would defeat
+    the entire reason for moving off cleartext.
+    """
+    try:
+        import certifi
+        return {"ca_certs": certifi.where()}
+    except ImportError:
+        return {}          # fall back to the OS store rather than skip TLS
+
+
 class SyncWorker(threading.Thread):
     """Background thread that keeps this identity synchronized.
 
@@ -1706,8 +1818,22 @@ class SyncWorker(threading.Thread):
         super().__init__(daemon=True)
         self.app = app
         self.stop_event = threading.Event()
+        self.wake_event = threading.Event()     # "retry right now"
         self._ws = None
         self._ws_lock = threading.Lock()
+
+    def nudge(self) -> None:
+        """Cut any pending backoff short and re-dial immediately."""
+        self.wake_event.set()
+
+    def _sleep(self, seconds: float) -> None:
+        """Interruptible wait: returns early on stop OR on a manual retry."""
+        self.wake_event.clear()
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            if self.stop_event.is_set() or self.wake_event.is_set():
+                return
+            time.sleep(min(0.1, end - time.monotonic()))
 
     # ---- outbound frames (called from UI thread too) -------------------------
     def send_ws(self, payload: dict) -> bool:
@@ -1783,8 +1909,16 @@ class SyncWorker(threading.Thread):
         url = SERVER_URL.replace("http://", "ws://") \
                         .replace("https://", "wss://") + "/ws"
         try:
-            ws = _websocket_mod.create_connection(url, timeout=10)
-        except Exception:
+            ws = _websocket_mod.create_connection(
+                url, timeout=10, sslopt=_ws_ssl_options())
+        except Exception as exc:
+            # Distinguish "cannot reach the relay" from "TLS refused it".
+            # A certificate failure is a deployment problem the user cannot
+            # fix by waiting, so it must not masquerade as being offline.
+            if url.startswith("wss://") and "certificate" in str(exc).lower():
+                self.app.ui_queue.put(
+                    ("status", "Secure connection rejected — check the "
+                     "relay's certificate", COL_DANGER))
             return False
         try:
             fields = self.app.api.auth_fields("ws.connect")
@@ -1792,10 +1926,21 @@ class SyncWorker(threading.Thread):
             hello = json.loads(ws.recv())
             if hello.get("type") != "auth_ok":
                 if hello.get("type") == "auth_error":
-                    self.app.ui_queue.put(
-                        ("status", f"Realtime auth failed: "
-                         f"{hello.get('message', 'unknown error')}",
-                         COL_DANGER))
+                    code = hello.get("code", "")
+                    if code == "unknown_address":
+                        # The relay has no record of this identity — its
+                        # database was reset, or this key was never
+                        # registered here. Recoverable: ask for a name.
+                        # Stop the worker so it does not spin re-dialing
+                        # against an identity the relay will keep rejecting.
+                        self.stop_event.set()
+                        self.app.ui_queue.put(("needs_registration",
+                                               hello.get("message", "")))
+                    else:
+                        self.app.ui_queue.put(
+                            ("status", f"Realtime auth failed: "
+                             f"{hello.get('message', 'unknown error')}",
+                             COL_DANGER))
                 return False
             with self._ws_lock:
                 self._ws = ws
@@ -1886,7 +2031,7 @@ class SyncWorker(threading.Thread):
                 backoff = WS_RECONNECT_MIN
                 self.app.ui_queue.put(("status", "Reconnecting…",
                                        COL_TEXT_DIM))
-                self.stop_event.wait(WS_RECONNECT_MIN)
+                self._sleep(WS_RECONNECT_MIN)
                 continue
             reachable = False
             try:
@@ -1903,17 +2048,35 @@ class SyncWorker(threading.Thread):
                         self.app.ui_queue.put(
                             ("status", "Connected (polling) · end-to-end "
                              "encrypted", COL_OK))
-            except (requests.RequestException, ApiClient.ApiError):
+            except ApiClient.ApiError as exc:
+                if exc.code == "unknown_address":
+                    self.stop_event.set()
+                    self.app.ui_queue.put(("needs_registration", exc.message))
+                    break
+                if online is not False:
+                    online = False
+                    self.app.ui_queue.put(("status", f"Sync error: "
+                                           f"{exc.message}", COL_DANGER))
+            except requests.RequestException:
                 if online is not False:
                     online = False
                     self.app.ui_queue.put(("status", "Offline — retrying…",
                                            COL_DANGER))
             if reachable:
                 backoff = WS_RECONNECT_MIN
-                self.stop_event.wait(POLL_INTERVAL_SECONDS)
+                self._sleep(POLL_INTERVAL_SECONDS)
             else:
-                self.stop_event.wait(backoff)
-                backoff = min(backoff * 2, WS_RECONNECT_MAX)
+                self._sleep(backoff)
+                # While the app is on screen the user is WATCHING for their
+                # messages, so a 30s blind window reads as "the app is
+                # broken". QA saw exactly that after a relay restart or a
+                # network transition: sync recovered, but only after a long
+                # unexplained gap with no way to hurry it along. Cap the
+                # backoff much lower in the foreground and let the user
+                # force an immediate retry (see FextApp.retry_now).
+                cap = (FOREGROUND_RECONNECT_MAX if self.app.foreground
+                       else WS_RECONNECT_MAX)
+                backoff = min(backoff * 2, cap)
 
 
 
@@ -2023,6 +2186,61 @@ class IconButton(ButtonBehavior, Widget):
                                  cx + r * 1.2, cy])
                 Line(points=[cx - r, cy, cx - r * 0.1, cy], width=dp(1.2),
                      cap="round")
+
+
+class TickMarks(Widget):
+    """Delivery ticks drawn as vector paths instead of text glyphs.
+
+    v7 fix: these used to be U+2713 CHECK MARK printed through a Label, and
+    Kivy's bundled Roboto has no glyph for that codepoint — so the ticks
+    rendered as empty rectangles ("tofu") on desktop Linux and on any device
+    whose font fallback chain lacks it. Drawing the strokes removes the font
+    dependency completely, the same approach IconButton already uses for the
+    app-bar icons, and it renders identically on every platform.
+
+    Ticks overlap slightly so 2 and 3 read as a group rather than a row of
+    separate marks, which is the visual language people already know.
+    """
+
+    def __init__(self, count: int = 0, tint: str = COL_TICK_GOLD,
+                 mark: float = None, **kw):
+        kw.setdefault("size_hint", (None, None))
+        self._mark = mark or dp(9.0)         # height of one checkmark
+        self._step = self._mark * 0.52       # horizontal overlap between marks
+        self._count, self._tint = max(0, min(int(count), 3)), tint
+        kw.setdefault("size", (self._width_for(self._count), self._mark))
+        super().__init__(**kw)
+        self.bind(pos=self._redraw, size=self._redraw)
+        self._redraw()
+
+    def _width_for(self, count: int) -> float:
+        if count <= 0:
+            return 0.0
+        return self._mark * 0.92 + self._step * (count - 1)
+
+    def set_state(self, count: int, tint: str) -> None:
+        count = max(0, min(int(count), 3))
+        if count == self._count and tint == self._tint:
+            return
+        self._count, self._tint = count, tint
+        self.width = self._width_for(count)
+        self._redraw()
+
+    def _redraw(self, *_a):
+        self.canvas.clear()
+        if self._count <= 0:
+            return
+        h = self._mark
+        with self.canvas:
+            Color(*C(self._tint))
+            for i in range(self._count):
+                x = self.x + i * self._step
+                y = self.y
+                # A checkmark: short down-stroke into a long up-stroke.
+                Line(points=[x, y + h * 0.45,
+                             x + h * 0.34, y + h * 0.06,
+                             x + h * 0.92, y + h * 0.82],
+                     width=dp(1.15), cap="round", joint="round")
 
 
 class Avatar(AnchorLayout):
@@ -2147,13 +2365,33 @@ class CozyModal(ModalView):
 #  Dialogs
 # =============================================================================
 class RegisterModal(CozyModal):
-    """Pick a username for the ACTIVE identity. Registration sends only
-    public values (username + public key + ownership signature); the server
-    recomputes the address and enforces the 'Fec' proof-of-work."""
+    """Pick a username for the ACTIVE identity.
 
-    def __init__(self, app: "FextApp") -> None:
+    Registration sends only public values (username + public key + ownership
+    signature); the server recomputes the address and enforces the 'Fec'
+    proof-of-work.
+
+    v7: this dialog is also the RECOVERY path. It is reopened when the relay
+    reports that it does not know this address — which happens when the
+    relay's database is reset, or when the app was restored onto a device
+    whose identity was never registered here. Previously that state showed
+    "Realtime auth failed" in the status ribbon forever, with no way to pick
+    a new name and no way out except deleting app data.
+
+    It now handles all three server answers distinctly:
+      * username_taken      -> keep the dialog open, ask for another name
+      * address_registered  -> this key already has a name here; offer to
+                               adopt it in one tap rather than dead-ending
+      * success             -> register and start syncing
+    """
+
+    def __init__(self, app: "FextApp", reason: str = "") -> None:
         super().__init__("Pick your name", dismissable=False)
         self.app = app
+        self._suggested: Optional[str] = None
+        if reason:
+            self.add(InfoLabel(reason, color=COL_TICK_GOLD,
+                               font_size=sp(13)))
         self.add(InfoLabel(f"for identity {short_addr(app.keys.address, 16)}"
                            "\n3–32 characters: letters, digits, underscore",
                            color=COL_TEXT_DIM, font_size=sp(13)))
@@ -2162,6 +2400,12 @@ class RegisterModal(CozyModal):
         self.status = self.status_label()
         self.button = self.add(CozyButton("Register", on_release=lambda
                                           _w: self._submit()))
+        # Shown only when the relay tells us this key already has a name.
+        self.adopt_button = CozyButton(
+            "", bg=COL_BG_LIST, fg=COL_ACCENT_DARK, outline=COL_ACCENT,
+            on_release=lambda _w: self._adopt())
+        self.check_label = self.add(InfoLabel("", color=COL_TEXT_DIM,
+                                              font_size=sp(12.5)))
 
     def _submit(self) -> None:
         username = self.entry.text.strip()
@@ -2178,11 +2422,38 @@ class RegisterModal(CozyModal):
         try:
             self.app.api.register(username)
         except ApiClient.ApiError as exc:
-            run_on_ui(self._fail, str(exc))
+            if exc.code == "username_taken":
+                run_on_ui(self._fail,
+                          f"'{username}' is already taken — try another name.")
+            elif exc.code == "address_registered":
+                run_on_ui(self._offer_adopt,
+                          exc.detail.get("username") or "")
+            else:
+                run_on_ui(self._fail, exc.message)
         except requests.RequestException:
-            run_on_ui(self._fail, "Network error — is the server reachable?")
+            run_on_ui(self._fail, "Network error — is the relay reachable?")
         else:
             run_on_ui(self._succeed, username)
+
+    def _offer_adopt(self, existing: str) -> None:
+        """This key is already registered under `existing`. Let the user take
+        that name back instead of leaving them stuck."""
+        self.button.disabled = False
+        if not existing:
+            self.set_status(self.status, "This identity is already "
+                            "registered on the relay.", COL_DANGER)
+            return
+        self._suggested = existing
+        self.set_status(self.status,
+                        f"This identity is already registered as "
+                        f"'{existing}'.", COL_TICK_GOLD)
+        self.adopt_button.text = f"Continue as {existing}"
+        if self.adopt_button.parent is None:
+            self.add(self.adopt_button)
+
+    def _adopt(self) -> None:
+        if self._suggested:
+            self._succeed(self._suggested)
 
     def _fail(self, message: str) -> None:
         self.set_status(self.status, message, COL_DANGER)
@@ -2426,12 +2697,13 @@ class ContactSettingsModal(CozyModal):
         seg.add_widget(self.seg_on)
         seg.add_widget(self.seg_off)
         card.add_widget(seg)
+        # Described in words, not glyphs: the check-mark codepoint has no
+        # glyph in the bundled font and rendered as an empty box here too.
         card.add_widget(InfoLabel(
-            "Ticks on: [color=%s]\u2713\u2713 / \u2713\u2713\u2713[/color] "
-            "receipts flow both ways when you both enable them.\nNo ticks: "
-            "either side choosing this caps both chats at \u2713 1/3." %
-            COL_TICK_GOLD.lstrip("#"), color=COL_TEXT_DIM,
-            font_size=sp(12.5)))
+            "Ticks on: delivered and read receipts flow both ways when you "
+            "both enable them, so messages can reach two and three ticks.\n"
+            "No ticks: either side choosing this caps both chats at a "
+            "single tick.", color=COL_TEXT_DIM, font_size=sp(12.5)))
         self.ticks_status = InfoLabel("", color=COL_TEXT_DIM,
                                       font_size=sp(12.5))
         card.add_widget(self.ticks_status)
@@ -2445,8 +2717,8 @@ class ContactSettingsModal(CozyModal):
                                       self._on_auto_change())
         card.add_widget(self.auto_button)
         card.add_widget(InfoLabel(
-            "When off, messages stay unread (their sender sees \u2713\u2713 "
-            "at most) until you press \u201cMark all as read\u201d or tap a "
+            "When off, messages stay unread (their sender sees two ticks at "
+            "most) until you press \u201cMark all as read\u201d or tap a "
             "message.", color=COL_TEXT_DIM, font_size=sp(12.5)))
         body.add_widget(card)
 
@@ -2717,6 +2989,135 @@ class SettingsModal(CozyModal):
         Clipboard.copy(data["private_key_wif"])
 
 
+class RemoveIdentityModal(CozyModal):
+    """Confirm removal of an identity from this device.
+
+    This is irreversible in the way that matters: the private key IS the
+    identity, so once it is gone the address, its message history and any
+    coins attached to it are unrecoverable. The dialog therefore puts the
+    key export in front of the user BEFORE the destructive button, rather
+    than warning about it afterwards.
+
+    Releasing the name on the relay is offered separately, because the two
+    are genuinely different decisions: you may want the identity off a
+    shared device while keeping the username reserved for another device
+    that holds the same key.
+    """
+
+    def __init__(self, app: "FextApp", address: str) -> None:
+        ident = app.keys.find(address) or {}
+        label = ident.get("label") or short_addr(address, 12)
+        super().__init__(f"Remove “{label}”?")
+        self.app = app
+        self.address = address
+        self.username = ident.get("username")
+        self._release = bool(self.username)
+
+        self.add(InfoLabel(
+            "Removing this identity deletes its private key and its chat "
+            "history from this device. The key cannot be recovered "
+            "afterwards — if you might want this identity back, copy the "
+            "key first.", color=COL_TEXT_DIM, font_size=sp(13)))
+        self.add(InfoLabel(address, color=COL_TICK_GOLD, font_size=sp(11.5)))
+
+        self.add(CozyButton("Copy private key (WIF) first", height=dp(42),
+                            bg=COL_BG_LIST, fg=COL_DANGER,
+                            outline=COL_DANGER, font_size=sp(13),
+                            on_release=lambda _w: self._copy_key()))
+
+        if self.username:
+            self.release_button = self.add(CozyButton(
+                "", height=dp(42), font_size=sp(13),
+                on_release=lambda _w: self._toggle_release()))
+            self.add(InfoLabel(
+                f"Releasing “{self.username}” removes it from the relay's "
+                f"directory so nobody can look you up, and frees the name "
+                f"for reuse. Leave it on if another device still uses this "
+                f"same key.", color=COL_TEXT_DIM, font_size=sp(12)))
+            self._style_release()
+
+        self.status = self.status_label()
+        row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(10))
+        row.add_widget(CozyButton("Cancel", bg=COL_BG_LIST, fg=COL_TEXT_DIM,
+                                  outline=COL_CARD_EDGE,
+                                  on_release=lambda _w: self.dismiss()))
+        self.confirm = CozyButton("Remove identity", bg=COL_DANGER,
+                                  pressed=COL_DANGER,
+                                  on_release=lambda _w: self._confirm())
+        row.add_widget(self.confirm)
+        self.add(row)
+
+    def _copy_key(self) -> None:
+        """Export the key of the identity being removed.
+
+        private_export() reads the ACTIVE identity, so this switches, reads,
+        and switches back — in a finally, because leaving the app pointed at
+        a different identity after an error would be far worse than the
+        failed copy itself.
+        """
+        active = self.app.keys.address
+        try:
+            self.app.keys.activate(self.address)
+            data = json.loads(self.app.keys.private_export())
+            Clipboard.copy(data["private_key_wif"])
+            self.set_status(self.status, "Private key copied to the "
+                            "clipboard — paste it somewhere safe now.",
+                            COL_TICK_GOLD)
+        except Exception as exc:
+            self.set_status(self.status, f"Could not export the key: {exc}",
+                            COL_DANGER)
+        finally:
+            try:
+                self.app.keys.activate(active)
+            except Exception:
+                pass
+
+    def _toggle_release(self) -> None:
+        self._release = not self._release
+        self._style_release()
+
+    def _style_release(self) -> None:
+        self.release_button.text = (
+            f"Release “{self.username}” on the relay:  "
+            f"{'YES' if self._release else 'NO'}")
+        self.release_button._bg_hex = (COL_ACCENT if self._release
+                                       else COL_BG_LIST)
+        self.release_button.color = C("#FFFFFF" if self._release
+                                      else COL_TEXT_DIM)
+        self.release_button._on_state(self.release_button,
+                                      self.release_button.state)
+
+    def _confirm(self) -> None:
+        self.confirm.disabled = True
+        self.set_status(self.status, "Removing…")
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self) -> None:
+        note = ""
+        if self._release and self.username:
+            # Deregistration must be signed by the identity being removed,
+            # so switch to it for the call and restore in a finally.
+            previous = self.app.keys.address
+            try:
+                self.app.keys.activate(self.address)
+                ApiClient(self.app.keys).deregister()
+            except (requests.RequestException, ApiClient.ApiError):
+                # Removal is still correct locally; the name simply stays
+                # claimed on the relay until the identity is deleted there.
+                note = (" (the relay could not be reached, so the name is "
+                        "still registered)")
+            finally:
+                try:
+                    self.app.keys.activate(previous)
+                except Exception:
+                    pass
+        run_on_ui(self._finish, note)
+
+    def _finish(self, note: str) -> None:
+        self.dismiss()
+        self.app.on_identity_removed(self.address, note)
+
+
 class ProfileMenuModal(CozyModal):
     """Tap your avatar in the chat list: identity switcher + settings —
     the whole multi-identity story, one warm sheet."""
@@ -2739,7 +3140,11 @@ class ProfileMenuModal(CozyModal):
         card = SectionCard("Identities on this device")
         for ident in keys.identities:
             active = ident["address"] == keys.address
-            marker = "\u25CF  " if active else "\u25CB  "
+            # U+25CF/U+25CB (black/white circle) are ALSO missing from the
+            # bundled font and rendered as boxes. U+2022 BULLET does render;
+            # inactive rows are distinguished by colour and weight instead.
+            marker = "\u2022  " if active else "     "
+            line = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(6))
             row = CozyButton(
                 f"{marker}{ident.get('label') or '?'}   "
                 f"{short_addr(ident['address'], 10)}",
@@ -2749,7 +3154,15 @@ class ProfileMenuModal(CozyModal):
                 pressed=COL_PRESSED)
             row.bind(on_release=lambda _w, a=ident["address"]:
                      self._switch(a))
-            card.add_widget(row)
+            line.add_widget(row)
+            remove = CozyButton("Remove", size_hint_x=None, width=dp(78),
+                                height=dp(42), font_size=sp(12),
+                                bg=COL_BG_LIST, fg=COL_DANGER,
+                                outline=COL_DANGER)
+            remove.bind(on_release=lambda _w, a=ident["address"]:
+                        self._remove(a))
+            line.add_widget(remove)
+            card.add_widget(line)
         card.add_widget(CozyButton("New identity…", height=dp(42),
                                    bg=COL_BG_LIST, fg=COL_ACCENT_DARK,
                                    outline=COL_ACCENT, font_size=sp(13.5),
@@ -2762,6 +3175,10 @@ class ProfileMenuModal(CozyModal):
         self.dismiss()
         if address != self.app.keys.address:
             self.app._activate_identity(address)
+
+    def _remove(self, address: str) -> None:
+        self.dismiss()
+        RemoveIdentityModal(self.app, address).open()
 
     def _new(self) -> None:
         self.dismiss()
@@ -2776,8 +3193,11 @@ class ProfileMenuModal(CozyModal):
 # =============================================================================
 #  Chat list — the "home" screen
 # =============================================================================
-TICK = "\u2713"          # kept as a constant: no backslash escapes inside
-BULLET = "\u25CF"        # f-string expressions (that needs Python 3.12+)
+# Ticks are DRAWN (see TickMarks), so no check-mark codepoint is needed.
+# U+2022 BULLET is used rather than U+25CF BLACK CIRCLE because only the
+# former has a glyph in Kivy's bundled Roboto — the latter renders as an
+# empty box, which is what the tick marks used to do.
+BULLET = "\u2022"
 
 
 class TappableBox(ButtonBehavior, BoxLayout):
@@ -2883,14 +3303,25 @@ class ChatsScreen(Screen):
         root.add_widget(bar)
 
         # ---- status ribbon ---------------------------------------------------
-        ribbon = BoxLayout(size_hint_y=None, height=dp(28),
-                           padding=[dp(14), 0, dp(14), 0])
+        # Tapping the ribbon forces an immediate reconnect. Without this the
+        # only cure for a stalled sync was to wait out the backoff or
+        # restart the app — which is what "sometimes messages don't arrive"
+        # felt like from the outside.
+        ribbon = TappableBox(on_tap=lambda: self.app.retry_now(),
+                             orientation="horizontal", size_hint_y=None,
+                             height=dp(28), padding=[dp(14), 0, dp(14), 0])
         paint_round(ribbon, COL_BG, radius=dp(0))
         self.status_label = Label(text="Starting…", font_size=sp(11.5),
                                   color=C(COL_TEXT_DIM), halign="left",
                                   valign="middle")
         self.status_label.bind(size=lambda w, v: setattr(w, "text_size", v))
         ribbon.add_widget(self.status_label)
+        self.retry_hint = Label(text="tap to retry", font_size=sp(10.5),
+                                color=C(COL_TEXT_DIM), halign="right",
+                                valign="middle", size_hint_x=None,
+                                width=dp(72), opacity=0)
+        self.retry_hint.bind(size=lambda w, v: setattr(w, "text_size", v))
+        ribbon.add_widget(self.retry_hint)
         root.add_widget(ribbon)
 
         # ---- conversation list ----------------------------------------------
@@ -2917,6 +3348,10 @@ class ChatsScreen(Screen):
     def set_status(self, text: str, color: str) -> None:
         self.status_label.text = text
         self.status_label.color = C(color)
+        # Offer the retry affordance only when it would actually do
+        # something — a permanent "tap to retry" next to "Connected" is
+        # noise that trains people to ignore the ribbon.
+        self.retry_hint.opacity = 0 if color == COL_OK else 1
 
     def refresh_list(self, conversations: list) -> None:
         self.list.clear_widgets()
@@ -2976,35 +3411,66 @@ class MessageBubble(ButtonBehavior, BoxLayout):
                           size_hint=(None, None))
         self.add_widget(self.body)
 
-        self.meta = Label(text=self._meta_text(msg, outgoing, ticks_enabled),
-                          markup=True, font_size=sp(10.5),
-                          color=C(COL_TEXT_DIM), halign="right",
-                          valign="middle", size_hint=(None, None),
-                          height=dp(14))
+        # Meta line = timestamp + vector ticks. Kept as two widgets rather
+        # than one markup Label so the ticks can be DRAWN (see TickMarks).
+        self.meta = Label(text=self._stamp_text(msg), markup=True,
+                          font_size=sp(10.5), color=C(COL_TEXT_DIM),
+                          halign="right", valign="middle",
+                          size_hint=(None, None), height=dp(14))
+        count, tint = self._tick_state(msg, outgoing, ticks_enabled)
+        self.ticks = TickMarks(count=count, tint=tint)
+        self.meta_box = BoxLayout(orientation="horizontal", spacing=dp(4),
+                                  size_hint=(None, None), height=dp(14))
+        self.meta_box.add_widget(self.meta)
+        self.meta_box.add_widget(self.ticks)
         meta_row = AnchorLayout(anchor_x="right", size_hint_y=None,
                                 height=dp(14))
-        meta_row.add_widget(self.meta)
+        meta_row.add_widget(self.meta_box)
         self.add_widget(meta_row)
 
         if on_tap is not None:
             self.bind(on_release=lambda _w: on_tap())
 
     @staticmethod
-    def _meta_text(msg: dict, outgoing: bool, ticks_enabled: bool) -> str:
+    def _stamp_text(msg: dict) -> str:
+        """Timestamp, plus an unread nudge on incoming messages that still
+        need a tap (only shown when auto-read is off, otherwise nothing is
+        ever left unread and the hint would be noise)."""
         stamp = pretty_time(msg["created_at"])
-        accent = COL_ACCENT.lstrip("#")
-        if not outgoing:
-            if not msg["read"]:
-                return "%s   [color=%s]%s unread — tap[/color]" % (
-                    stamp, accent, BULLET)
-            return stamp
-        # Display caps at 1 tick when this contact's ticks are off locally.
-        status = msg["status"] if ticks_enabled else min(msg["status"], 1)
+        if msg["direction"] == "in" and not msg["read"]:
+            return "%s   [color=%s]tap to mark read[/color]" % (
+                stamp, COL_ACCENT.lstrip("#"))
+        return stamp
+
+    @staticmethod
+    def _tick_state(msg: dict, outgoing: bool, ticks_enabled: bool) -> tuple:
+        """(tick count, colour) for this message.
+
+        v7: BOTH SIDES now show ticks. Previously only the sender saw them,
+        so the same message displayed three ticks on one device and a bare
+        timestamp on the other, and the recipient had no way to tell whether
+        a read receipt had actually gone back.
+
+        Outgoing ticks come from the relay's receipts:
+            0 = queued on this device (grey)   1 = accepted by the relay
+            2 = delivered to their device      3 = read by them
+        Incoming ticks are derived LOCALLY from facts this device already
+        knows — it holds the message (2), and it knows whether the user has
+        read it (3) — so the same message reads the same on both screens
+        without the relay having to send anything extra.
+
+        Either side disabling ticks caps the display at one, matching the
+        privacy rule the relay already enforces for receipts.
+        """
+        if outgoing:
+            status = msg["status"]
+        else:
+            status = 3 if msg["read"] else 2
+        if not ticks_enabled:
+            status = min(status, 1)
         if status <= 0:
-            return "%s   [color=%s]%s[/color]" % (
-                stamp, COL_TICK_GREY.lstrip("#"), TICK)
-        return "%s   [color=%s]%s[/color]" % (
-            stamp, COL_TICK_GOLD.lstrip("#"), TICK * min(status, 3))
+            return 1, COL_TICK_GREY          # queued: one grey tick
+        return min(status, 3), COL_TICK_GOLD
 
     def update(self, msg: dict, ticks_enabled: bool) -> None:
         """Repaint in place after a status/read/body change.
@@ -3014,7 +3480,8 @@ class MessageBubble(ButtonBehavior, BoxLayout):
         text itself changes does the bubble need re-wrapping.
         """
         outgoing = msg["direction"] == "out"
-        self.meta.text = self._meta_text(msg, outgoing, ticks_enabled)
+        self.meta.text = self._stamp_text(msg)
+        self.ticks.set_state(*self._tick_state(msg, outgoing, ticks_enabled))
         if self.body.text != msg["body"]:
             self.body.text = msg["body"]
         if self._last_width:
@@ -3022,6 +3489,8 @@ class MessageBubble(ButtonBehavior, BoxLayout):
         else:
             self.meta.texture_update()
             self.meta.size = (self.meta.texture_size[0], dp(14))
+            self.meta_box.width = (self.meta.width + self.ticks.width
+                                   + (dp(4) if self.ticks.width else 0))
 
     def layout_for(self, available: float) -> None:
         """Wrap to at most 76% of the viewport, then size to content."""
@@ -3032,9 +3501,14 @@ class MessageBubble(ButtonBehavior, BoxLayout):
         self.body.size = self.body.texture_size
         self.meta.texture_update()
         self.meta.size = (self.meta.texture_size[0], dp(14))
-        content = max(self.body.width, self.meta.width)
+        # Composite meta row: timestamp + drawn ticks + the gap between them.
+        meta_w = self.meta.width + self.ticks.width
+        if self.ticks.width:
+            meta_w += dp(4)
+        self.meta_box.width = meta_w
+        content = max(self.body.width, meta_w)
         self.width = content + dp(24)
-        self.height = self.body.height + self.meta.height + dp(20)
+        self.height = self.body.height + dp(14) + dp(20)
 
 
 class BubbleRow(AnchorLayout):
@@ -3072,6 +3546,76 @@ class DayDivider(AnchorLayout):
         self.add_widget(pill)
 
 
+class JumpToBottomButton(ButtonBehavior, Widget):
+    """Floating "back to the latest message" pill.
+
+    Appears whenever the view is scrolled away from the bottom. When
+    messages arrived while the user was reading history it carries a count,
+    so a new message is announced WITHOUT yanking the scroll position — the
+    old behaviour snapped every reader to the bottom mid-sentence.
+    """
+
+    def __init__(self, on_tap=None, **kw):
+        kw.setdefault("size_hint", (None, None))
+        kw.setdefault("size", (dp(40), dp(40)))
+        super().__init__(**kw)
+        self._count = 0
+        self.opacity = 0
+        self.disabled = True
+        with self.canvas.before:
+            self._shadow_col = Color(*C(COL_CARD_EDGE))
+            self._shadow = Ellipse()
+            self._bg_col = Color(*C(COL_CARD))
+            self._bg = Ellipse()
+        self.bind(pos=self._sync, size=self._sync, state=self._on_state)
+        if on_tap is not None:
+            self.bind(on_release=lambda _w: on_tap())
+        self._badge = Label(text="", bold=True, font_size=sp(10),
+                            color=C("#FFFFFF"), size_hint=(None, None),
+                            size=(dp(18), dp(18)), opacity=0)
+        self.add_widget(self._badge)
+        self._sync()
+
+    def _on_state(self, _w, state):
+        self._bg_col.rgba = C(COL_PRESSED if state == "down" else COL_CARD)
+
+    def _sync(self, *_a):
+        self._shadow.pos = (self.x - dp(1), self.y - dp(1.5))
+        self._shadow.size = (self.width + dp(2), self.height + dp(2))
+        self._bg.pos, self._bg.size = self.pos, self.size
+        self._badge.center = (self.center_x + dp(13), self.center_y + dp(13))
+        self.canvas.after.clear()
+        cx, cy = self.center_x, self.center_y
+        r = self.width * 0.19
+        with self.canvas.after:
+            Color(*C(COL_ACCENT_DARK))
+            # downward chevron
+            Line(points=[cx - r, cy + r * 0.55, cx, cy - r * 0.5,
+                         cx + r, cy + r * 0.55],
+                 width=dp(1.6), cap="round", joint="round")
+            if self._count > 0:
+                Color(*C(COL_ACCENT))
+                Ellipse(pos=(self.center_x + dp(4), self.center_y + dp(4)),
+                        size=(dp(18), dp(18)))
+
+    def set_visible(self, visible: bool) -> None:
+        target = 1.0 if visible else 0.0
+        self.disabled = not visible
+        if abs(self.opacity - target) < 0.01:
+            return
+        Animation.cancel_all(self, "opacity")
+        Animation(opacity=target, d=0.15).start(self)
+
+    def set_count(self, count: int) -> None:
+        count = max(0, int(count))
+        if count == self._count:
+            return
+        self._count = count
+        self._badge.text = str(min(count, 99)) if count else ""
+        self._badge.opacity = 1 if count else 0
+        self._sync()
+
+
 class ConversationScreen(Screen):
     """The chat itself: the app bar with the peer, the chat background,
     bubbles, and a rounded composer pinned to the bottom."""
@@ -3086,6 +3630,10 @@ class ConversationScreen(Screen):
         self._rendered_peer: Optional[str] = None
         self._rendered_ticks: Optional[bool] = None
         self._last_day: Optional[str] = None
+        self._unseen = 0                  # arrived while reading history
+        self._scroll_trigger = None       # pending deferred scroll, if any
+        self._stick_to_bottom = True      # follow new content?
+        self._last_content_h = 0.0        # for preserving the read position
         self.has_older = False            # more history available to page in
         self._more_button = CozyButton(
             "Load earlier messages", bg=COL_CARD, fg=COL_ACCENT_DARK,
@@ -3127,13 +3675,22 @@ class ConversationScreen(Screen):
         root.add_widget(self.bar)
 
         # ---- messages --------------------------------------------------------
-        self.scroll = ScrollView(bar_width=dp(3))
+        stack = FloatLayout()
+        self.scroll = ScrollView(bar_width=dp(3), size_hint=(1, 1),
+                                 pos_hint={"x": 0, "y": 0})
         self.messages = BoxLayout(orientation="vertical", size_hint_y=None,
                                   padding=[0, dp(10), 0, dp(10)],
                                   spacing=dp(2))
         self.messages.bind(minimum_height=self.messages.setter("height"))
+        self.messages.bind(height=lambda *_a: self._on_content_height())
         self.scroll.add_widget(self.messages)
-        root.add_widget(self.scroll)
+        stack.add_widget(self.scroll)
+        self.jump_button = JumpToBottomButton(on_tap=self.jump_to_latest,
+                                              pos_hint={"right": 0.965,
+                                                        "y": 0.02})
+        stack.add_widget(self.jump_button)
+        self.scroll.bind(scroll_y=lambda *_a: self._on_scrolled())
+        root.add_widget(stack)
 
         # ---- composer --------------------------------------------------------
         composer = BoxLayout(size_hint_y=None, height=dp(66),
@@ -3208,16 +3765,29 @@ class ConversationScreen(Screen):
             if bubble is not None:
                 bubble.update(msg, ticks_enabled)
 
-        # 2) append whatever is genuinely new
+        # 2) append whatever is genuinely new.
+        #    Capture the scroll position BEFORE adding widgets: appending
+        #    changes the content height, which changes what "at the bottom"
+        #    means.
+        was_at_bottom = self.at_bottom()
         appended = 0
+        sent_by_me = False
         for msg in messages[len(self._rendered_ids):]:
             self._append_bubble(msg, ticks_enabled, on_tap_unread)
             appended += 1
+            if msg["direction"] == "out":
+                sent_by_me = True
 
         self._rendered_ids = ids
         self._rendered_sigs = signatures
         if appended:
-            self.scroll_to_bottom()
+            if sent_by_me or was_at_bottom:
+                # Following your own message down is expected; so is staying
+                # pinned to the bottom if that is where you already were.
+                self.scroll_to_bottom()
+            else:
+                # You were reading history — say so, do NOT drag the view.
+                self.note_new_messages(appended)
 
     def _full_render(self, messages: list, ticks_enabled: bool,
                      on_tap_unread: Callable, peer: Optional[str]) -> None:
@@ -3237,7 +3807,8 @@ class ConversationScreen(Screen):
                                for m in messages}
         self._rendered_peer = peer
         self._rendered_ticks = ticks_enabled
-        self.scroll_to_bottom()
+        self._unseen = 0
+        self.scroll_to_bottom(animate=False)
 
     def _append_bubble(self, msg: dict, ticks_enabled: bool,
                        on_tap_unread: Callable) -> None:
@@ -3253,13 +3824,123 @@ class ConversationScreen(Screen):
         self._bubbles[msg["id"]] = bubble
         self.messages.add_widget(BubbleRow(bubble, outgoing))
 
-    def scroll_to_bottom(self) -> None:
-        # Two passes: once after layout settles, once after wrapping resizes
-        # the bubbles (scroll_y == 0 is the bottom of a ScrollView).
-        Clock.schedule_once(lambda _dt: setattr(self.scroll, "scroll_y", 0),
-                            0.03)
-        Clock.schedule_once(lambda _dt: setattr(self.scroll, "scroll_y", 0),
-                            0.12)
+    # ---- scroll position -----------------------------------------------------
+    BOTTOM_EPSILON = 0.02        # within 2% of the end counts as "at bottom"
+
+    def at_bottom(self) -> bool:
+        """True when the latest message is already on screen.
+
+        A ScrollView whose content is shorter than the viewport reports
+        scroll_y == 1, which is simultaneously the top AND the bottom; treat
+        that as at-bottom or short chats would show a pointless jump pill.
+        """
+        if self.messages.height <= self.scroll.height:
+            return True
+        return self.scroll.scroll_y <= self.BOTTOM_EPSILON
+
+    def scroll_to_bottom(self, animate: bool = True) -> None:
+        """Bring the newest message into view.
+
+        v7: this used to fire two hard `scroll_y = 0` assignments 30ms and
+        120ms apart. Because bubbles wrap (and therefore resize) after the
+        first assignment, the list visibly jumped twice — the "everything
+        shoots to the top" effect. Now the position settles once, on the
+        frame after layout, and eases instead of snapping.
+        """
+        self._stick_to_bottom = True
+
+        def _apply(_dt):
+            self._scroll_trigger = None
+            Animation.cancel_all(self.scroll, "scroll_y")
+            if not animate or self.messages.height <= self.scroll.height:
+                self.scroll.scroll_y = 0
+            else:
+                Animation(scroll_y=0, d=0.22, t="out_quad").start(self.scroll)
+            self._unseen = 0
+            self._sync_jump_button()
+
+        # One pending settle at a time. A single user action can trigger
+        # several refreshes (mark-read, chat repaint, list repaint), and
+        # each used to queue its own deferred scroll — so the view could be
+        # dragged back to the bottom a beat AFTER the user had scrolled away.
+        if self._scroll_trigger is not None:
+            self._scroll_trigger.cancel()
+        self._scroll_trigger = Clock.schedule_once(_apply, 0.02)
+
+    def jump_to_latest(self) -> None:
+        self._unseen = 0
+        self.scroll_to_bottom(animate=True)
+
+    def _on_content_height(self) -> None:
+        """Keep the view stable while the content height changes.
+
+        Bubbles wrap AFTER they are added, so the list grows over the frames
+        following a render — the original code papered over this by slamming
+        scroll_y to 0 twice, 30ms and 120ms apart, which is what made the
+        whole conversation visibly jump. Reacting to the height itself is
+        both exact and cheap:
+
+          * following the conversation -> stay pinned to the newest message
+          * reading history            -> hold the CURRENT reading position
+            by converting the old pixel offset into the new proportion, so
+            appending a message below does not shove the text you are
+            reading up the screen
+        """
+        old_h, new_h = self._last_content_h, self.messages.height
+        self._last_content_h = new_h
+        view = self.scroll.height
+        if self._stick_to_bottom:
+            if self.scroll.scroll_y != 0:
+                self.scroll.scroll_y = 0
+            return
+        old_span, new_span = old_h - view, new_h - view
+        if old_span > 0 and new_span > 0 and abs(new_h - old_h) > 0.5:
+            offset_px = self.scroll.scroll_y * old_span
+            self.scroll.scroll_y = max(0.0, min(1.0, offset_px / new_span))
+
+    def _on_scrolled(self) -> None:
+        """Reaching the bottom by hand clears the unseen counter, and moving
+        away from it means the user is reading — stop following."""
+        if self.at_bottom():
+            self._unseen = 0
+            self._stick_to_bottom = True
+        else:
+            self._stick_to_bottom = False
+        self._sync_jump_button()
+
+    def cancel_pending_scroll(self) -> None:
+        """Hand scroll control back to the user.
+
+        Cancels the queued settle, any in-flight easing, AND the residual
+        momentum of Kivy's damped overscroll effect — without that last part
+        a fling can keep dragging the view for several frames after the user
+        has grabbed it, which reads as the app fighting them.
+        """
+        if self._scroll_trigger is not None:
+            self._scroll_trigger.cancel()
+            self._scroll_trigger = None
+        Animation.cancel_all(self.scroll, "scroll_y")
+        self._stick_to_bottom = False
+        effect = getattr(self.scroll, "effect_y", None)
+        if effect is not None:
+            try:
+                effect.velocity = 0
+                effect.stop(effect.value)
+            except Exception:
+                pass          # effect internals vary; momentum is cosmetic
+
+    def _sync_jump_button(self) -> None:
+        self.jump_button.set_count(self._unseen)
+        self.jump_button.set_visible(not self.at_bottom() or
+                                     self._unseen > 0)
+
+    def note_new_messages(self, count: int) -> None:
+        """Announce arrivals that landed while the user was reading history.
+        Deliberately does NOT move the view — that is the whole point."""
+        if count > 0:
+            self._unseen += count
+        self._stick_to_bottom = False
+        self._sync_jump_button()
 
     @staticmethod
     def _day_text(day: str) -> str:
@@ -3311,6 +3992,8 @@ class FextApp(App):
         self._chat_anchor: Optional[int] = None  # oldest id shown in the chat
         self._dirty_chat = False               # coalesced refresh flags
         self._dirty_list = False
+        self.foreground = True                 # drives reconnect aggressiveness
+        self._register_modal: Optional[RegisterModal] = None
 
     # ---- lifecycle -----------------------------------------------------------
     def build(self):
@@ -3395,6 +4078,37 @@ class FextApp(App):
 
     def on_identity_created(self, address: str) -> None:
         self._activate_identity(address)
+
+    def on_identity_removed(self, address: str, note: str = "") -> None:
+        """Finish removing an identity and land somewhere sensible.
+
+        If the identity being removed is the ACTIVE one its worker and store
+        must be torn down before the files are deleted, or the sync thread
+        keeps writing to a database that is being unlinked.
+        """
+        if address == self.keys.address:
+            if self.worker is not None:
+                self.worker.stop_event.set()
+                self.worker = None
+            if self.store is not None:
+                self.store.close()
+                self.store = None
+        remaining = self.keys.remove_identity(address)
+        if remaining:
+            self._activate_identity(remaining)
+            self._set_status(f"Identity removed{note}", COL_TEXT_DIM)
+        else:
+            # Nothing left: return to the first-run experience rather than
+            # leaving a half-live UI pointing at an identity that is gone.
+            self.current_peer = None
+            self.chats_screen.refresh_header()
+            self.chats_screen.refresh_list([])
+            self.manager.transition = NoTransition()
+            self.manager.current = "chats"
+            self.manager.transition = SlideTransition(duration=0.18)
+            self._set_status(f"No identities on this device{note}",
+                             COL_TICK_GOLD)
+            NewIdentityModal(self, first_run=True).open()
 
     def on_identity_dialog_closed(self) -> None:
         self.chats_screen.refresh_header()
@@ -3554,6 +4268,8 @@ class FextApp(App):
                 kind = event[0]
                 if kind == "status":
                     self._set_status(event[1], event[2])
+                elif kind == "needs_registration":
+                    self._handle_needs_registration(event[1])
                 elif kind == "message_stored":
                     peer = event[1]
                     if peer == self.current_peer:
@@ -3570,6 +4286,57 @@ class FextApp(App):
         if self._dirty_list:
             self._dirty_list = False
             self.refresh_sidebar()
+
+    def _handle_needs_registration(self, message: str) -> None:
+        """The relay does not recognise this identity — offer to register.
+
+        Reached when the relay's database has been reset, or when this key
+        was never registered here. The keypair is intact, so recovery is
+        just picking a name again; only the local claim of having a name is
+        dropped.
+        """
+        if self._register_modal is not None:
+            return                       # already asking
+        if self.worker is not None:
+            self.worker.stop_event.set()
+            self.worker = None
+        self.keys.clear_username()
+        self.chats_screen.refresh_header()
+        self._set_status("This relay doesn't recognise your identity — "
+                         "pick a username to reconnect", COL_TICK_GOLD)
+        reason = ("The relay no longer has a record of this identity "
+                  "(its database may have been reset). Your keys are "
+                  "safe — choose a name to register again.")
+        self._register_modal = RegisterModal(self, reason=reason)
+        self._register_modal.bind(
+            on_dismiss=lambda *_a: setattr(self, "_register_modal", None))
+        self._register_modal.open()
+
+    def retry_now(self) -> None:
+        """User-initiated reconnect: skip whatever backoff is pending."""
+        if self.worker is not None and self.worker.is_alive():
+            self.worker.nudge()
+            self._set_status("Reconnecting…", COL_TEXT_DIM)
+        elif self.keys.has_identity and self.keys.username:
+            self._start_worker()
+
+    def on_pause(self) -> bool:
+        self.foreground = False          # background: back off politely
+        return True
+
+    def on_resume(self) -> None:
+        """Returning to the app must feel instant, not 'wait out the timer'.
+
+        Android suspends sockets in the background, so the worker is very
+        often sitting in a long backoff at the moment the user looks at the
+        screen again. Nudging here is what turns a 30-second blank stare
+        into an immediate reconnect.
+        """
+        self.foreground = True
+        if self.worker is not None and self.worker.is_alive():
+            self.worker.nudge()
+        elif self.keys.has_identity and self.keys.username:
+            self._start_worker()
 
     def _set_status(self, text: str, color: str = COL_TEXT_DIM) -> None:
         self._pending_status = (text, color)
