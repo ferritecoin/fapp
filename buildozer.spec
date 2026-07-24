@@ -82,6 +82,13 @@ android.archs = arm64-v8a, armeabi-v7a
 # (bool) enables Android auto backup feature (Android API >=23)
 android.allow_backup = True
 
+# (str) The format used to package the app for release mode (aab or apk or aar).
+# We ship a directly-installable APK, not a Play-Store bundle.
+android.release_artifact = apk
+
+# (str) The format used to package the app for debug mode (apk).
+android.debug_artifact = apk
+
 #
 # Python for android (p4a) specific
 #

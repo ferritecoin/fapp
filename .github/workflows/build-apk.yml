@@ -1,9 +1,18 @@
 name: Build Android APK
 
-# Builds the FEXT client into an installable debug .apk with Buildozer, running
-# directly on an ubuntu-latest runner (GitHub runners can reach the Android SDK
-# host dl.google.com that Buildozer downloads from). The finished APK is
-# uploaded as a workflow artifact you can download from the run's Summary page.
+# Builds the FEXT client into an installable, release-signed .apk with Buildozer
+# on an ubuntu-latest runner (GitHub runners can reach the Android SDK host
+# dl.google.com that Buildozer downloads from), then publishes it to a GitHub
+# Release so it can be downloaded directly from github.com.
+#
+# Signing:
+#   * If you set the repo secrets FEXT_KEYSTORE_B64 / FEXT_KEYSTORE_PASSWORD /
+#     FEXT_KEY_ALIAS / FEXT_KEY_PASSWORD, the release is signed with THAT
+#     keystore (a persistent key you own — required so future updates install
+#     over this one; this is the proper production setup).
+#   * Otherwise the workflow generates an ephemeral keystore just for the build,
+#     so you still get a properly release-signed, installable APK. No key
+#     material is ever committed to the repo.
 
 on:
   push:
@@ -11,9 +20,12 @@ on:
       - "**"
   workflow_dispatch:
 
+permissions:
+  contents: write        # needed to create/update the GitHub Release
+
 jobs:
   build-android:
-    name: Buildozer (debug APK)
+    name: Buildozer (release APK)
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -42,11 +54,6 @@ jobs:
           # autoconf + automake (aclocal) + libltdl-dev (LT_SYS_SYMBOL_USCORE)
           # are all required to autoreconf libffi (a cffi/cryptography dep).
 
-      - name: Install Rust (required by the cryptography recipe)
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
       - name: Install Buildozer and Cython
         run: |
           python -m pip install --upgrade pip
@@ -60,12 +67,58 @@ jobs:
           restore-keys: |
             buildozer-${{ runner.os }}-
 
-      - name: Build the debug APK
-        run: buildozer android debug
+      - name: Build & sign the release APK
+        env:
+          FEXT_KEYSTORE_B64: ${{ secrets.FEXT_KEYSTORE_B64 }}
+          FEXT_KEYSTORE_PASSWORD: ${{ secrets.FEXT_KEYSTORE_PASSWORD }}
+          FEXT_KEY_ALIAS: ${{ secrets.FEXT_KEY_ALIAS }}
+          FEXT_KEY_PASSWORD: ${{ secrets.FEXT_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KS="$RUNNER_TEMP/fext-release.keystore"
+          if [ -n "${FEXT_KEYSTORE_B64:-}" ]; then
+            echo "::notice::Signing with the keystore from repository secrets (persistent key)."
+            printf '%s' "$FEXT_KEYSTORE_B64" | base64 -d > "$KS"
+            STOREPASS="$FEXT_KEYSTORE_PASSWORD"
+            KEYPASS="${FEXT_KEY_PASSWORD:-$FEXT_KEYSTORE_PASSWORD}"
+            ALIAS="${FEXT_KEY_ALIAS:-fext}"
+          else
+            echo "::warning::No signing secrets set - generating an ephemeral keystore for this build. Add FEXT_KEYSTORE_B64/PASSWORD/ALIAS secrets for a persistent key so future updates install over this release."
+            STOREPASS="$(openssl rand -hex 24)"
+            KEYPASS="$STOREPASS"
+            ALIAS="fext"
+            keytool -genkeypair -v -keystore "$KS" -alias "$ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$STOREPASS" -keypass "$KEYPASS" \
+              -dname "CN=FEXT Client, OU=FEXT, O=FEXT, C=SG"
+          fi
+          export P4A_RELEASE_KEYSTORE="$KS"
+          export P4A_RELEASE_KEYSTORE_PASSWD="$STOREPASS"
+          export P4A_RELEASE_KEYALIAS="$ALIAS"
+          export P4A_RELEASE_KEYALIAS_PASSWD="$KEYPASS"
+          buildozer android release
+          echo "Built:"; ls -la bin/
 
-      - name: Upload the debug APK
+      - name: Upload the signed APK as a workflow artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: fext-debug-apk
-          path: bin/*.apk
+          name: fext-release-apk
+          path: bin/*-release.apk
           if-no-files-found: error
+
+      - name: Publish the signed APK to a GitHub Release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          APK="$(ls bin/*-release.apk | head -1)"
+          VER="$(grep -E '^version' buildozer.spec | head -1 | sed -E 's/.*=[[:space:]]*//')"
+          TAG="v${VER}"
+          NOTES="Signed release build of the FEXT client (CI run #${{ github.run_number }}, commit ${GITHUB_SHA:0:7}). Download the .apk below and sideload it via Android 'Install unknown apps'."
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+                 --target "$GITHUB_SHA" --title "FEXT $TAG" --notes "$NOTES"
+          gh release upload "$TAG" "$APK" --repo "$GITHUB_REPOSITORY" --clobber
+          echo "Published $(basename "$APK") to release $TAG"

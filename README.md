@@ -16,23 +16,27 @@ is transmitted.
 | --- | --- |
 | `main.py` | The complete FEXT client (Buildozer's entry point **must** be `main.py`). |
 | `buildozer.spec` | Android packaging configuration (requirements, permissions, ABIs, API levels). |
-| `.github/workflows/build-apk.yml` | CI that builds the APK and uploads it as a downloadable artifact. |
+| `.github/workflows/build-apk.yml` | CI that builds a signed release APK and publishes it to a GitHub Release. |
 
 ## Getting the APK
 
-### Option A — download it from CI (no local setup)
+### Option A — download the release from GitHub (no local setup)
 
-Every push builds the APK on GitHub Actions:
+Every push builds a **signed release APK** on GitHub Actions and publishes it to
+a GitHub Release:
 
-1. Open the **Actions** tab → the latest **Build Android APK** run.
-2. Download the **`fext-debug-apk`** artifact from the run summary.
-3. Unzip it — inside is `fext-3.0.0-*-debug.apk`.
+1. Open the repository's **Releases** page (or the **`v3.0.0`** tag).
+2. Download `fext-3.0.0-*-release.apk` from the release assets.
+
+The same APK is also attached to each Actions run as the **`fext-release-apk`**
+artifact (Actions tab → latest run → Artifacts).
 
 ### Option B — build it locally
 
 Requirements: Linux (or WSL) with Python 3, a JDK, and the usual build
-toolchain (`git`, `zip`, `unzip`, `gcc`, `make`, `autoconf`, `libtool`).
-Buildozer downloads the Android SDK/NDK automatically on first run.
+toolchain (`git`, `zip`, `unzip`, `gcc`, `make`, `autoconf`, `automake`,
+`libtool`, `libltdl-dev`). Buildozer downloads the Android SDK/NDK automatically
+on first run.
 
 ```bash
 python3 -m pip install --user buildozer cython
@@ -43,8 +47,33 @@ The first build takes a while (it downloads the SDK/NDK and compiles the
 native requirements such as `cryptography` and `pillow`). Subsequent builds are
 much faster.
 
-For a signed release build, configure signing and run `buildozer android
-release` — see the [Buildozer docs](https://buildozer.readthedocs.io/en/latest/).
+## Release signing
+
+The CI publishes a properly release-signed, installable APK. How it's signed
+depends on whether you've provided a keystore:
+
+- **Persistent key (recommended for real distribution).** Generate a keystore
+  once and add it as repository secrets so every build is signed with the *same*
+  key — this is what lets future versions install as an update over an existing
+  install (and is required if you ever move to the Play Store):
+
+  ```bash
+  keytool -genkeypair -v -keystore fext-release.keystore -alias fext \
+    -keyalg RSA -keysize 2048 -validity 10000
+  base64 -w0 fext-release.keystore    # value for the FEXT_KEYSTORE_B64 secret
+  ```
+
+  Then, under **Settings → Secrets and variables → Actions**, add:
+  `FEXT_KEYSTORE_B64`, `FEXT_KEYSTORE_PASSWORD`, `FEXT_KEY_ALIAS`,
+  `FEXT_KEY_PASSWORD`. Keep the keystore file itself somewhere safe and private
+  — losing it means you can never ship an update that installs over this one.
+
+- **No secrets set.** The workflow generates a throwaway keystore per build, so
+  you still get a valid, installable release APK — but each build's signature
+  differs, so a later build won't update-install over an earlier one. Fine for
+  first tests; switch to a persistent key before distributing widely.
+
+A signing key is **never committed to this repository.**
 
 ## Installing on a phone
 
@@ -55,7 +84,7 @@ release` — see the [Buildozer docs](https://buildozer.readthedocs.io/en/latest
 Or install over ADB from a computer:
 
 ```bash
-adb install -r bin/fext-3.0.0-*-debug.apk
+adb install -r fext-3.0.0-*-release.apk
 ```
 
 ## Configuration notes
