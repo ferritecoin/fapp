@@ -25,8 +25,8 @@ is transmitted.
 Every push builds a **signed release APK** on GitHub Actions and publishes it to
 a GitHub Release:
 
-1. Open the repository's **Releases** page (or the **`v7.0.0`** tag).
-2. Download `fext-7.0.0-*-release.apk` from the release assets.
+1. Open the repository's **Releases** page (or the **`v7.1.0`** tag).
+2. Download `fext-7.1.0-*-release.apk` from the release assets.
 
 The same APK is also attached to each Actions run as the **`fext-release-apk`**
 artifact (Actions tab → latest run → Artifacts).
@@ -40,7 +40,7 @@ on first run.
 
 ```bash
 python3 -m pip install --user buildozer cython
-buildozer android debug          # produces bin/fext-7.0.0-*-debug.apk
+buildozer android debug          # produces bin/fext-7.1.0-*-debug.apk
 ```
 
 The first build takes a while (it downloads the SDK/NDK and compiles the
@@ -84,7 +84,7 @@ A signing key is **never committed to this repository.**
 Or install over ADB from a computer:
 
 ```bash
-adb install -r fext-7.0.0-*-release.apk
+adb install -r fext-7.1.0-*-release.apk
 ```
 
 ## Configuration notes
@@ -95,4 +95,14 @@ adb install -r fext-7.0.0-*-release.apk
 - **Permissions**: `INTERNET` and `ACCESS_NETWORK_STATE` — the app is a
   networked messenger and shows an online/offline status ribbon.
 - **ABIs**: `arm64-v8a` (all modern phones) and `armeabi-v7a` (older/32-bit).
-- The relay server address is pinned in `main.py` (`SERVER_URL`).
+- The relay host is pinned in `main.py` (`SERVER_HOST`). Since v7.1 the client
+  *discovers* the scheme: it probes `https://` first and falls back to `http://`,
+  caching the winner in `transport.json` and re-probing when it stops working.
+- **Cleartext is scoped, not blanket.** Android blocks cleartext by default
+  (API 28+), which would defeat that fallback before any Python runs, so the
+  build ships `src/android/res/xml/network_security_config.xml` permitting
+  cleartext for the **relay host only** — every other destination stays blocked.
+  It is wired up via `android.add_resources` plus
+  `android.extra_manifest_application_arguments` in `buildozer.spec`.
+  Once every relay serves HTTPS: delete that file, remove those two spec keys,
+  and set `FEXT_REQUIRE_TLS=1` to fail closed.

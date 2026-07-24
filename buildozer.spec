@@ -25,7 +25,7 @@ source.exclude_exts = spec
 source.exclude_dirs = tests, bin, venv, .git, .github, .buildozer, __pycache__
 
 # (str) Application versioning (method 1)
-version = 7.0.0
+version = 7.1.0
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy
@@ -52,6 +52,19 @@ fullscreen = 0
 # The app is a networked E2E messenger: it needs the internet, and it checks
 # connectivity state to drive its online/offline status ribbon.
 android.permissions = INTERNET,ACCESS_NETWORK_STATE
+
+# (list) Put these files or directories in the apk res directory.
+# Ships res/xml/network_security_config.xml, which permits cleartext for the
+# relay host ONLY. The v7.1 client probes https:// and falls back to http://
+# for relays without TLS; Android (API 28+) blocks cleartext by default, so
+# without this the platform refuses the connection before any Python runs and
+# the client-side fallback cannot help. Scoped to the one host in preference
+# to a blanket android:usesCleartextTraffic="true".
+android.add_resources = src/android/res/xml/network_security_config.xml:xml/network_security_config.xml
+
+# (str) Extra xml written inside the <manifest><application> tag: points the
+# application at the network security config added above.
+android.extra_manifest_application_arguments = src/android/extra_manifest_application_arguments.xml
 
 # (int) Target Android API, should be as high as possible.
 android.api = 34

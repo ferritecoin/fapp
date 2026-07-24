@@ -802,25 +802,33 @@ ecdh_shared_secret = ecdh_shared_secret_accel
 # =============================================================================
 #  Configuration
 # =============================================================================
-# The relay address is pinned to one deployment on purpose: pinning removes
-# a whole class of "point the client at an attacker's server" mistakes. The
-# environment override exists for local development and the test harness
-# only; shipped builds use the constant.
+# ---- relay endpoint ---------------------------------------------------------
+# The relay is pinned to one deployment on purpose: pinning removes a whole
+# class of "point the client at an attacker's server" mistakes.
 #
-# v7: HTTPS is now mandatory rather than aspirational.
-#   * Store-Now-Decrypt-Later. Message BODIES are end-to-end encrypted, but
-#     over cleartext everything around them is not: who talks to whom, how
-#     often, message sizes, and the username/public-key directory lookups.
-#     That metadata is exactly what bulk collection harvests today to mine
-#     later, and it is not protected by the envelope.
-#   * Key substitution. A directory lookup over plain HTTP can be rewritten
-#     on-path to return an attacker's public key, at which point the E2E
-#     layer faithfully encrypts to the wrong person. TLS is what stops that.
-#   * Platform policy. Android (API 28+) blocks cleartext by default and iOS
-#     App Transport Security requires TLS 1.2+ from a publicly trusted CA,
-#     so a shipped app simply cannot use http:// without special-casing.
-SERVER_URL = _os.environ.get("FEXT_SERVER_URL",
-                             "https://118.189.201.104:50607")
+# v7.1 CHANGE OF POLICY. v7 hardcoded an https:// URL and made TLS mandatory.
+# That was the right security posture and the wrong engineering call: relays
+# that speak plain HTTP became UNREACHABLE, and the app failed at first-run
+# registration with "Network error — is the relay reachable?". An app that
+# cannot be used protects nobody.
+#
+# The scheme is now DISCOVERED rather than assumed. HTTPS is tried first and
+# preferred; if the relay does not speak it, the client falls back to HTTP
+# and says so plainly in the status ribbon. Message bodies are end-to-end
+# encrypted either way — what TLS adds is protection for the metadata around
+# them, so losing it is a real downgrade the user deserves to be told about,
+# but not a reason to refuse to run.
+#
+# Set FEXT_REQUIRE_TLS=1 (or REQUIRE_TLS = True) for deployments that would
+# rather fail closed than fall back.
+SERVER_HOST = _os.environ.get("FEXT_SERVER_HOST", "118.189.201.104:50607")
+
+# A full URL still overrides everything, for development and the tests. If it
+# carries an explicit scheme, that scheme is TRIED FIRST but does not disable
+# the fallback unless REQUIRE_TLS is set.
+SERVER_URL_OVERRIDE = _os.environ.get("FEXT_SERVER_URL", "")
+
+REQUIRE_TLS = _os.environ.get("FEXT_REQUIRE_TLS", "") not in ("", "0", "false")
 
 APP_NAME = "FEXT"
 
@@ -853,7 +861,10 @@ WS_IDLE_TIMEOUT = 30            # max seconds between outbound WS frames
 WS_RECV_TICK = 3.0              # socket recv timeout; stop/keepalive cadence
 WS_RECONNECT_MIN = 0.5          # delay before re-dialing a dropped socket
 WS_RECONNECT_MAX = 30.0         # cap for offline exponential backoff
-REQUEST_TIMEOUT = 8             # HTTP timeout (seconds)
+# Mobile radios take seconds to wake from idle, and a relay doing a
+# pure-Python ECDSA verify can hold a request for tens of milliseconds more.
+# 8s was tight enough that ordinary latency looked like failure on a phone.
+REQUEST_TIMEOUT = 20 if IS_MOBILE else 12
 FOREGROUND_RECONNECT_MAX = 6.0  # backoff cap while the app is on screen
 MAX_MESSAGE_CHARS = 4000        # sanitization cap for outgoing text
 CHAT_PAGE_SIZE = 60             # messages materialised per chat page
@@ -1388,7 +1399,45 @@ class ApiClient:
 
     def __init__(self, keys: IdentityManager) -> None:
         self._keys = keys
-        self._session = requests.Session()
+        self._session = self._build_session()
+
+    @staticmethod
+    def _build_session() -> "requests.Session":
+        """A session that survives the ordinary flakiness of mobile networks.
+
+        v7.1: a single dropped TCP connection used to surface as a hard
+        "Network error" straight to the user. Handing a walking commuter a
+        modal error because one packet went missing is not a network
+        problem, it is a design problem. urllib3 now retries connection-level
+        failures with a short backoff before we ever report anything.
+
+        Only CONNECTION and READ failures are retried, and reads only for
+        idempotent verbs — replaying a POST that the relay already processed
+        could duplicate a message.
+
+        `total` MUST be finite. With total=None urllib3 consults only the
+        per-category counters, and a category it does not decrement — a TLS
+        handshake failure, for instance — never exhausts the retry, so the
+        request loops forever and the app hangs instead of reporting an
+        error. That is not hypothetical: it happened in testing, where a
+        wrong-scheme guess ran past nine connection attempts and never
+        returned.
+        """
+        session = requests.Session()
+        try:
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.retry import Retry
+            retry = Retry(
+                total=3, connect=2, read=2, status=0, redirect=2,
+                backoff_factor=0.4,
+                allowed_methods=frozenset(["GET", "DELETE"]),
+                raise_on_status=False)
+            adapter = HTTPAdapter(max_retries=retry, pool_maxsize=8)
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+        except Exception:
+            pass          # a plain session still works, just less patiently
+        return session
 
     # ---- plumbing (DRY) ------------------------------------------------------
     def deregister(self) -> dict:
@@ -1424,30 +1473,50 @@ class ApiClient:
                                  if k not in ("code", "message")})
         return data
 
+    def _attempt(self, call) -> dict:
+        """Run `call(base_url)`, re-resolving the transport once on failure.
+
+        This is what makes a scheme change survivable at runtime: if the
+        relay gains TLS, or loses it, or the cached choice is simply stale,
+        the first failure triggers a re-probe and the request is retried
+        against whatever actually answers. Only then is an error reported.
+        """
+        base = ENDPOINT.base if ENDPOINT.resolved else ENDPOINT.resolve()
+        try:
+            return call(base or ENDPOINT.base)
+        except requests.RequestException as first:
+            ENDPOINT.invalidate()
+            retry_base = ENDPOINT.resolve(force=True)
+            if not retry_base or retry_base == base:
+                raise first
+            return call(retry_base)
+
     def _get(self, path: str, params: dict,
              headers: Optional[dict] = None) -> dict:
-        resp = self._session.get(f"{SERVER_URL}{path}", params=params,
-                                 headers=headers, timeout=REQUEST_TIMEOUT)
-        return self._handle(resp)
+        return self._attempt(lambda base: self._handle(
+            self._session.get(f"{base}{path}", params=params,
+                              headers=headers, timeout=REQUEST_TIMEOUT)))
 
     def _post_signed(self, path: str, body: dict, context_prefix: str) -> dict:
         # Serialize ONCE, hash those exact bytes, sign, send those exact
-        # bytes — so the server-side body hash always matches.
+        # bytes — so the server-side body hash always matches. The signature
+        # is over the body only, never the URL, so re-resolving the
+        # transport and retrying is safe.
         raw = json.dumps(body, separators=(",", ":")).encode("utf-8")
         headers = self._auth_headers(f"{context_prefix}.{sha256_hex(raw)}")
         headers["Content-Type"] = "application/json"
-        resp = self._session.post(f"{SERVER_URL}{path}", data=raw,
-                                  headers=headers, timeout=REQUEST_TIMEOUT)
-        return self._handle(resp)
+        return self._attempt(lambda base: self._handle(
+            self._session.post(f"{base}{path}", data=raw, headers=headers,
+                               timeout=REQUEST_TIMEOUT)))
 
     def _delete(self, path: str, context: str) -> dict:
         """Authenticated DELETE. There is no body to bind the signature to,
         so the context is a fixed verb string, matching how the server
         authenticates 'ws.connect' and 'events.sync'."""
         headers = self._auth_headers(context)
-        resp = self._session.delete(f"{SERVER_URL}{path}", headers=headers,
-                                    timeout=REQUEST_TIMEOUT)
-        return self._handle(resp)
+        return self._attempt(lambda base: self._handle(
+            self._session.delete(f"{base}{path}", headers=headers,
+                                 timeout=REQUEST_TIMEOUT)))
 
     # ---- public API ----------------------------------------------------------
     def health(self) -> bool:
@@ -1465,13 +1534,16 @@ class ApiClient:
         """Registration proves key ownership by signing 'register.<name>';
         the server then recomputes the address and enforces the 'Fec' PoW."""
         signature = self._keys.sign(f"register.{username}".encode("utf-8"))
-        resp = self._session.post(
-            f"{SERVER_URL}/api/register",
-            json={"username": username,
-                  "public_key": self._keys.public_key_hex,
-                  "signature": b64e(signature)},
-            timeout=REQUEST_TIMEOUT)
-        return self._handle(resp)
+        payload = {"username": username,
+                   "public_key": self._keys.public_key_hex,
+                   "signature": b64e(signature)}
+        # Registration is the FIRST call a new install makes, so it is where
+        # a wrong transport guess used to dead-end the whole app. Going
+        # through _attempt() means a bad guess re-probes and recovers here
+        # rather than showing "Network error" on the very first screen.
+        return self._attempt(lambda base: self._handle(
+            self._session.post(f"{base}/api/register", json=payload,
+                               timeout=REQUEST_TIMEOUT)))
 
     def lookup(self, *, username: Optional[str] = None,
                address: Optional[str] = None) -> dict:
@@ -1771,6 +1843,167 @@ class LocalStore:
 # =============================================================================
 #  SyncWorker — realtime WebSocket sync with HTTP-polling fallback
 # =============================================================================
+def describe_network_error(exc: Exception) -> str:
+    """Turn a transport exception into something a user can act on.
+
+    v7.1: every failure used to surface as the single string "Network error
+    — is the relay reachable?", which is the least useful thing we could
+    have said. It cannot distinguish a relay that is switched off from a
+    phone with no signal from a TLS mismatch — and on Android the real
+    cause was almost always the last one, invisibly.
+    """
+    text = str(exc).lower()
+    if isinstance(exc, requests.exceptions.SSLError):
+        return ("Secure connection failed — the relay's certificate was "
+                "rejected")
+    if isinstance(exc, (requests.exceptions.ConnectTimeout,
+                        requests.exceptions.ReadTimeout)):
+        return "The relay didn't respond in time — the network may be slow"
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        if "name or service not known" in text or "nodename nor servname" \
+                in text or "getaddrinfo" in text:
+            return "Couldn't look up the relay's address — check your network"
+        if "connection refused" in text:
+            return "The relay refused the connection — it may be offline"
+        if "network is unreachable" in text:
+            return "No route to the relay — are you online?"
+        return "Couldn't reach the relay — check your connection"
+    return f"Network problem: {type(exc).__name__}"
+
+
+class Endpoint:
+    """Works out which transport the relay actually speaks, and remembers.
+
+    HTTPS is preferred but not required. The resolved choice is cached on
+    disk so later launches skip probing, and it is invalidated the moment a
+    request fails so a relay that gains (or loses) TLS is picked up without
+    a reinstall.
+
+    On a TLS failure the client falls back to plain HTTP rather than
+    accepting an untrusted certificate. That is deliberate: falling back is
+    visible and we tell the user their transport is unencrypted, whereas
+    quietly trusting a bad certificate would show a padlock the user has no
+    reason to believe. Never trade an honest downgrade for a dishonest
+    upgrade.
+    """
+
+    PROBE_TIMEOUT = 6         # generous: mobile networks are slow to answer
+    CACHE_NAME = "transport.json"
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._base: Optional[str] = None
+        self._secure = False
+        self._cache = DATA_DIR / self.CACHE_NAME
+        self._load_cache()
+
+    # ---- candidates ---------------------------------------------------------
+    def _candidates(self) -> list:
+        if SERVER_URL_OVERRIDE:
+            base = SERVER_URL_OVERRIDE.rstrip("/")
+            if REQUIRE_TLS and base.startswith("http://"):
+                return ["https://" + base[len("http://"):]]
+            # An explicit scheme is tried first; the sibling scheme remains a
+            # fallback so a misconfigured build still connects.
+            other = ("http://" + base[len("https://"):]
+                     if base.startswith("https://")
+                     else "https://" + base[len("http://"):])
+            return [base] if REQUIRE_TLS else [base, other]
+        host = SERVER_HOST.strip().rstrip("/")
+        for prefix in ("https://", "http://"):
+            if host.startswith(prefix):
+                host = host[len(prefix):]
+        secure = f"https://{host}"
+        return [secure] if REQUIRE_TLS else [secure, f"http://{host}"]
+
+    # ---- cache --------------------------------------------------------------
+    def _load_cache(self) -> None:
+        try:
+            data = json.loads(self._cache.read_text("utf-8"))
+            base = data.get("base")
+            if isinstance(base, str) and base in self._candidates():
+                self._base = base
+                self._secure = base.startswith("https://")
+        except (OSError, ValueError):
+            pass
+
+    def _save_cache(self) -> None:
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            self._cache.write_text(json.dumps({"base": self._base}), "utf-8")
+        except OSError:
+            pass
+
+    # ---- resolution ---------------------------------------------------------
+    def _probe(self, base: str) -> bool:
+        try:
+            resp = requests.get(f"{base}/api/health",
+                                timeout=self.PROBE_TIMEOUT)
+            return resp.status_code < 500
+        except requests.RequestException:
+            return False
+
+    def resolve(self, force: bool = False) -> Optional[str]:
+        """Return a usable base URL, probing if we do not have one."""
+        with self._lock:
+            if self._base is not None and not force:
+                return self._base
+        chosen, errors = None, []
+        for candidate in self._candidates():
+            if self._probe(candidate):
+                chosen = candidate
+                break
+            errors.append(candidate)
+        with self._lock:
+            if chosen is not None:
+                changed = chosen != self._base
+                self._base = chosen
+                self._secure = chosen.startswith("https://")
+                if changed:
+                    self._save_cache()
+                    log_transport(chosen, self._secure)
+            return self._base if chosen is None else chosen
+
+    def invalidate(self) -> None:
+        """Forget the current choice so the next call re-probes."""
+        with self._lock:
+            self._base = None
+
+    # ---- accessors ----------------------------------------------------------
+    @property
+    def base(self) -> str:
+        """Best known base URL. Falls back to the first candidate so callers
+        always have something to try rather than crashing on None."""
+        with self._lock:
+            if self._base is not None:
+                return self._base
+        return self._candidates()[0]
+
+    @property
+    def secure(self) -> bool:
+        with self._lock:
+            return self._secure
+
+    @property
+    def resolved(self) -> bool:
+        with self._lock:
+            return self._base is not None
+
+    def ws_url(self) -> str:
+        base = self.base
+        return (base.replace("https://", "wss://")
+                    .replace("http://", "ws://")) + "/ws"
+
+
+def log_transport(base: str, secure: bool) -> None:
+    print(f"[FEXT] transport: {base} "
+          f"({'TLS' if secure else 'CLEARTEXT — metadata is exposed'})",
+          file=sys.stderr)
+
+
+ENDPOINT = Endpoint()
+
+
 def _ws_ssl_options() -> dict:
     """Trust store for the WebSocket transport.
 
@@ -1906,19 +2139,21 @@ class SyncWorker(threading.Thread):
         (used to decide whether to bother with the HTTP fallback)."""
         if _websocket_mod is None:
             return False
-        url = SERVER_URL.replace("http://", "ws://") \
-                        .replace("https://", "wss://") + "/ws"
+        url = ENDPOINT.ws_url()
         try:
             ws = _websocket_mod.create_connection(
                 url, timeout=10, sslopt=_ws_ssl_options())
         except Exception as exc:
-            # Distinguish "cannot reach the relay" from "TLS refused it".
-            # A certificate failure is a deployment problem the user cannot
-            # fix by waiting, so it must not masquerade as being offline.
-            if url.startswith("wss://") and "certificate" in str(exc).lower():
-                self.app.ui_queue.put(
-                    ("status", "Secure connection rejected — check the "
-                     "relay's certificate", COL_DANGER))
+            # A wss:// failure against a relay that only speaks ws:// is not
+            # an outage, it is a wrong guess. Drop the cached choice so the
+            # next cycle re-probes and settles on whatever the relay really
+            # offers, instead of retrying the same broken scheme forever.
+            if url.startswith("wss://"):
+                text = str(exc).lower()
+                if ("certificate" in text or "wrong_version_number" in text
+                        or "sslv3" in text or "ssl" in text):
+                    ENDPOINT.invalidate()
+                    ENDPOINT.resolve(force=True)
             return False
         try:
             fields = self.app.api.auth_fields("ws.connect")
@@ -1944,8 +2179,18 @@ class SyncWorker(threading.Thread):
                 return False
             with self._ws_lock:
                 self._ws = ws
-            self.app.ui_queue.put(("status",
-                                   "Connected · end-to-end encrypted", COL_OK))
+            # Say what is actually true. Message bodies are end-to-end
+            # encrypted on every transport, but on cleartext the metadata
+            # around them is not — and the user is entitled to know which
+            # they have rather than seeing one reassuring string regardless.
+            if ENDPOINT.secure:
+                self.app.ui_queue.put(
+                    ("status", "Connected · encrypted end-to-end and in "
+                     "transit", COL_OK))
+            else:
+                self.app.ui_queue.put(
+                    ("status", "Connected · end-to-end encrypted "
+                     "(transport not secured)", COL_TICK_GOLD))
             # Short recv tick -> the loop wakes every few seconds to honour
             # stop_event and the keepalive schedule even while idle. The
             # keepalive is wall-clock based (not recv-timeout based) so a
@@ -2047,7 +2292,9 @@ class SyncWorker(threading.Thread):
                     else:
                         self.app.ui_queue.put(
                             ("status", "Connected (polling) · end-to-end "
-                             "encrypted", COL_OK))
+                             "encrypted" + ("" if ENDPOINT.secure
+                                            else " (transport not secured)"),
+                             COL_OK if ENDPOINT.secure else COL_TICK_GOLD))
             except ApiClient.ApiError as exc:
                 if exc.code == "unknown_address":
                     self.stop_event.set()
@@ -2057,11 +2304,12 @@ class SyncWorker(threading.Thread):
                     online = False
                     self.app.ui_queue.put(("status", f"Sync error: "
                                            f"{exc.message}", COL_DANGER))
-            except requests.RequestException:
+            except requests.RequestException as exc:
                 if online is not False:
                     online = False
-                    self.app.ui_queue.put(("status", "Offline — retrying…",
-                                           COL_DANGER))
+                    self.app.ui_queue.put(
+                        ("status", f"{describe_network_error(exc)} — "
+                         f"retrying…", COL_DANGER))
             if reachable:
                 backoff = WS_RECONNECT_MIN
                 self._sleep(POLL_INTERVAL_SECONDS)
@@ -2430,8 +2678,8 @@ class RegisterModal(CozyModal):
                           exc.detail.get("username") or "")
             else:
                 run_on_ui(self._fail, exc.message)
-        except requests.RequestException:
-            run_on_ui(self._fail, "Network error — is the relay reachable?")
+        except requests.RequestException as exc:
+            run_on_ui(self._fail, describe_network_error(exc))
         else:
             run_on_ui(self._succeed, username)
 
@@ -2506,8 +2754,8 @@ class AddContactModal(CozyModal):
         except ApiClient.ApiError as exc:
             run_on_ui(self._fail,
                       "No such user." if exc.status == 404 else str(exc))
-        except requests.RequestException:
-            run_on_ui(self._fail, "Network error — is the server reachable?")
+        except requests.RequestException as exc:
+            run_on_ui(self._fail, describe_network_error(exc))
         else:
             run_on_ui(self._succeed, user["address"])
 
@@ -4018,7 +4266,28 @@ class FextApp(App):
         Clock.schedule_once(self._post_build, 0.05)
         return self.manager
 
+    def _probe_transport(self) -> None:
+        """Work out the relay's transport in the background at startup.
+
+        Doing it here rather than lazily on the first API call means the
+        probe overlaps with identity mining and the first-run dialog, so by
+        the time anyone presses Register the scheme is already known and
+        that call goes straight through.
+        """
+        def worker():
+            base = ENDPOINT.resolve(force=not ENDPOINT.resolved)
+            if base is None:
+                self.ui_queue.put(
+                    ("status", "Can't reach the relay — tap to retry",
+                     COL_DANGER))
+            elif not ENDPOINT.secure:
+                self.ui_queue.put(
+                    ("status", "Relay reachable (transport not secured)",
+                     COL_TICK_GOLD))
+        threading.Thread(target=worker, daemon=True).start()
+
     def _post_build(self, _dt) -> None:
+        self._probe_transport()
         if self.keys.has_identity:
             self._activate_identity(self.keys.active["address"])
         else:
@@ -4313,7 +4582,12 @@ class FextApp(App):
         self._register_modal.open()
 
     def retry_now(self) -> None:
-        """User-initiated reconnect: skip whatever backoff is pending."""
+        """User-initiated reconnect: re-probe the transport AND skip whatever
+        backoff is pending. Re-probing matters because the most common cause
+        of a stuck connection is a stale transport choice — the relay gained
+        or lost TLS since the choice was cached."""
+        ENDPOINT.invalidate()
+        self._probe_transport()
         if self.worker is not None and self.worker.is_alive():
             self.worker.nudge()
             self._set_status("Reconnecting…", COL_TEXT_DIM)

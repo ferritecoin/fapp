@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android has blocked cleartext traffic by default since API 28. The v7.1
+  client probes https:// first and falls back to http:// when a relay has no
+  TLS (see Endpoint in main.py) — but without this file the platform refuses
+  the cleartext connection before any Python runs, and the fallback cannot
+  help.
+
+  This permits cleartext for the RELAY HOST ONLY, rather than a blanket
+  android:usesCleartextTraffic="true" over the whole app: every other
+  destination stays cleartext-blocked.
+
+  When the relay serves HTTPS everywhere: delete this file, remove
+  android.add_resources / android.extra_manifest_application_arguments from
+  buildozer.spec, and set FEXT_REQUIRE_TLS=1 to fail closed.
+-->
+<network-security-config>
+    <!-- The pinned FEXT relay. cleartextTrafficPermitted applies to this
+         host only; HTTPS is still attempted first by the client. -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">118.189.201.104</domain>
+    </domain-config>
+
+    <!-- Everything else: cleartext stays blocked, system CAs only. -->
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
