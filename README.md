@@ -25,8 +25,8 @@ is transmitted.
 Every push builds a **signed release APK** on GitHub Actions and publishes it to
 a GitHub Release:
 
-1. Open the repository's **Releases** page (or the **`v7.1.0`** tag).
-2. Download `fext-7.1.0-*-release.apk` from the release assets.
+1. Open the repository's **Releases** page (or the **`v7.2.0`** tag).
+2. Download `fext-7.2.0-*-release.apk` from the release assets.
 
 The same APK is also attached to each Actions run as the **`fext-release-apk`**
 artifact (Actions tab → latest run → Artifacts).
@@ -40,7 +40,7 @@ on first run.
 
 ```bash
 python3 -m pip install --user buildozer cython
-buildozer android debug          # produces bin/fext-7.1.0-*-debug.apk
+buildozer android debug          # produces bin/fext-7.2.0-*-debug.apk
 ```
 
 The first build takes a while (it downloads the SDK/NDK and compiles the
@@ -84,7 +84,7 @@ A signing key is **never committed to this repository.**
 Or install over ADB from a computer:
 
 ```bash
-adb install -r fext-7.1.0-*-release.apk
+adb install -r fext-7.2.0-*-release.apk
 ```
 
 ## Configuration notes
@@ -102,7 +102,9 @@ adb install -r fext-7.1.0-*-release.apk
   (API 28+), which would defeat that fallback before any Python runs, so the
   build ships `src/android/res/xml/network_security_config.xml` permitting
   cleartext for the **relay host only** — every other destination stays blocked.
-  It is wired up via `android.add_resources` plus
-  `android.extra_manifest_application_arguments` in `buildozer.spec`.
+  It is wired up via `android.add_resources` plus a `p4a.extra_args` entry in
+  `buildozer.spec` (**not** `android.extra_manifest_application_arguments` —
+  buildozer 1.5.0 mangles the quotes in that option, producing an
+  AndroidManifest.xml that fails to parse; see the note in the spec).
   Once every relay serves HTTPS: delete that file, remove those two spec keys,
   and set `FEXT_REQUIRE_TLS=1` to fail closed.

@@ -70,6 +70,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import logging
 import os
 import platform
 import queue
@@ -81,7 +82,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -99,6 +100,18 @@ except ImportError:                            # graceful HTTP-polling fallback
           "DISABLED and the client will fall back to HTTP polling.\n"
           "[fext] Install it for instant delivery:  pip install "
           "websocket-client", file=sys.stderr)
+
+# ---- logging ----------------------------------------------------------------
+# The client keeps its own message-flow log, in the SAME format the relay
+# writes, so the two can be read side by side. That is the point: when a
+# message goes missing, the question is always "which of the two of us thinks
+# it happened?", and answering it used to mean guessing.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("fext.client")
+flow_log = logging.getLogger("fext.flow")
 
 # ---- Kivy (import AFTER env hints; window is created on import) -------------
 os.environ.setdefault("KIVY_NO_ARGS", "1")     # our argv is not kivy's argv
@@ -868,6 +881,9 @@ REQUEST_TIMEOUT = 20 if IS_MOBILE else 12
 FOREGROUND_RECONNECT_MAX = 6.0  # backoff cap while the app is on screen
 MAX_MESSAGE_CHARS = 4000        # sanitization cap for outgoing text
 CHAT_PAGE_SIZE = 60             # messages materialised per chat page
+# Mirrors the relay's LEDGER_RETENTION_SECONDS. A read receipt older than
+# this can never be confirmed, because the routing row it needs is gone.
+RECEIPT_RETRY_WINDOW_SECONDS = 7 * 86400
 HKDF_INFO = b"fext.v2.secp256k1-ecdh-hkdf-sha256.aes256gcm"
 
 # ---- Palette -----------------------------------------------------------------
@@ -953,6 +969,84 @@ def valid_address(value: str) -> bool:
         return False
 
 
+# =============================================================================
+#  MessageFlowLog — the client half of the golden-tick audit trail
+# =============================================================================
+class MessageFlowLog:
+    """Mirrors the relay's flow log, line for line and format for format, so
+    the two can be diffed when a message goes missing.
+
+        ✓    1/3   the relay accepted our ciphertext (or: we accepted theirs)
+        ✓✓   2/3   the recipient holds it
+        ✓✓✓  3/3   the recipient read it
+
+    Every line carries who -> whom and a fragment of the ciphertext. The
+    fragment is the join key: it is the one value that exists identically on
+    both sides of the wire, so `grep` on it lines a client's story up against
+    the relay's without either side having to log anything sensitive.
+
+    PRIVACY NOTE. Unlike the relay, this process legitimately holds
+    plaintext — and it stays out of the log regardless. What lands here is
+    what the relay could already see: addresses, sizes, timings. Message
+    bodies never appear.
+    """
+
+    _TIERS = {0: "·  ", 1: "✓  ", 2: "✓✓ ", 3: "✓✓✓"}
+    _LABELS = {0: "queued locally (not yet on the relay)",
+               1: "accepted by relay",
+               2: "delivered to recipient",
+               3: "read by recipient"}
+
+    #: How much base64 ciphertext to echo. Matches the relay's default.
+    FRAGMENT_CHARS = 24
+
+    @classmethod
+    def fragment(cls, envelope: Optional[dict]) -> str:
+        """The head of the base64 ciphertext plus its true byte length —
+        opaque, but unique enough to identify one message anywhere."""
+        if not isinstance(envelope, dict):
+            return "ct=?"
+        ct = envelope.get("ciphertext", "")
+        if not isinstance(ct, str):
+            return "ct=?"
+        try:
+            size = len(b64d(ct))
+        except (ValueError, TypeError):
+            size = 0
+        head = ct[:cls.FRAGMENT_CHARS] + ("…" if len(ct) > cls.FRAGMENT_CHARS
+                                          else "")
+        return f"ct={head} ({size}B)"
+
+    @staticmethod
+    def who(address: str, username: Optional[str] = None) -> str:
+        short = (address if len(address) <= 14
+                 else f"{address[:6]}…{address[-4:]}")
+        return f"{username}({short})" if username else short
+
+    @classmethod
+    def tick(cls, tier: int, server_id, sender: str, recipient: str,
+             extra: str = "") -> None:
+        flow_log.info("%s %d/3  #%s  %s -> %s  %s%s",
+                      cls._TIERS.get(tier, "?"), tier,
+                      server_id if server_id else "-", sender, recipient,
+                      cls._LABELS.get(tier, ""),
+                      f"  {extra}" if extra else "")
+
+    @classmethod
+    def failed(cls, sender: str, recipient: str, reason: str,
+               extra: str = "") -> None:
+        flow_log.warning("✗   0/3  %s -> %s  NOT SENT: %s%s",
+                         sender, recipient, reason,
+                         f"  {extra}" if extra else "")
+
+    @classmethod
+    def dropped(cls, server_id, sender: str, reason: str) -> None:
+        """An INBOUND message we could not take custody of. Loud on purpose:
+        this is the exact moment at which a message is at risk of being lost,
+        and the whole 2/3-tick bug was this path failing quietly."""
+        flow_log.error("✗   in   #%s  from %s  NOT STORED: %s "
+                       "(withholding ack so the relay keeps its copy)",
+                       server_id if server_id else "-", sender, reason)
 
 
 def open_folder_in_explorer(path: Path) -> bool:
@@ -1609,10 +1703,33 @@ class LocalStore:
         body          TEXT NOT NULL,
         status        INTEGER NOT NULL DEFAULT 0,  -- out: 0..3 tick tier
         read          INTEGER NOT NULL DEFAULT 1,  -- in: 0 until marked read
-        created_at    TEXT NOT NULL
+        created_at    TEXT NOT NULL,
+        -- in: 0 until the relay has CONFIRMED our read receipt. A receipt
+        -- written to a socket is not a receipt the relay received, so the
+        -- send is retried until something acknowledges it. Without this the
+        -- sender's 3rd tick simply never arrived and nobody could say why.
+        receipt_sent  INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_local_msgs_peer ON messages (peer, id);
+    CREATE INDEX IF NOT EXISTS idx_local_msgs_cmid ON messages (client_msg_id);
     """
+
+    #: Columns added after v7.1 shipped, applied to databases that predate
+    #: them. SQLite has no "ADD COLUMN IF NOT EXISTS", so this is done by
+    #: inspection rather than by catching the error — an OperationalError is
+    #: too blunt an instrument to distinguish "already there" from "broken".
+    _MIGRATIONS = (
+        ("receipt_sent", (
+            "ALTER TABLE messages "
+            "ADD COLUMN receipt_sent INTEGER NOT NULL DEFAULT 0",
+            # Backfill: history predates the column, so treat it as settled.
+            # Without this, upgrading replays a read receipt for every
+            # message ever received — and the relay's routing ledger is
+            # purged after 7 days, so almost none of them can be confirmed
+            # and they would be retried on every sync cycle forever.
+            "UPDATE messages SET receipt_sent = 1",
+        )),
+    )
 
     def __init__(self, path: Path) -> None:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -1621,7 +1738,20 @@ class LocalStore:
         self._db.row_factory = sqlite3.Row
         with self._lock:
             self._db.executescript(self._SCHEMA)
+            self._migrate()
             self._db.commit()
+
+    def _migrate(self) -> None:
+        """Bring an older database up to the current schema. Called with the
+        lock held."""
+        have = {r["name"] for r in
+                self._db.execute("PRAGMA table_info(messages)").fetchall()}
+        for column, statements in self._MIGRATIONS:
+            if column in have:
+                continue
+            log.info("local store: adding messages.%s", column)
+            for statement in statements:
+                self._db.execute(statement)
 
     def close(self) -> None:
         with self._lock:
@@ -1670,6 +1800,43 @@ class LocalStore:
             self._db.commit()
 
     # ---- messages ------------------------------------------------------------
+    def _claim_server_id(self, server_id: int, keep_local_id: int = -1) -> bool:
+        """Make `server_id` available to one row, freeing any stale claim.
+
+        `server_id` is UNIQUE locally, but relay ids are only unique WITHIN
+        ONE RELAY GENERATION: reset the relay's database, or point the app at
+        a different relay, and ids restart at 1 while local rows still hold
+        1, 2, 3… Every consequence of that collision was bad. `add_in` threw
+        the incoming message away, `mark_sent` raised IntegrityError inside a
+        worker thread with no handler for it, and the delivery receipt for
+        the NEW message landed on whichever OLD row happened to own that id —
+        which is how a message that was never delivered ended up wearing two
+        golden ticks.
+
+        The resolution is unambiguous once stated: the relay has just told us
+        this id now refers to a different message, so any local row still
+        claiming it is stale BY DEFINITION. Clear the old claim. That row
+        keeps the tick tier it had already earned — the relay has long since
+        forgotten it, so there were no further receipts coming for it anyway.
+
+        Called with the lock held. Returns True if anything was displaced.
+        """
+        row = self._db.execute(
+            "SELECT id, direction, status FROM messages "
+            "WHERE server_id = ? AND id != ?",
+            (server_id, keep_local_id)).fetchone()
+        if row is None:
+            return False
+        log.warning(
+            "local store: relay id %s was still claimed by local row %s "
+            "(%s, %s tick[s]) — releasing it; that row can no longer be "
+            "correlated with relay receipts. This normally means the relay's "
+            "database was reset or you are talking to a different relay.",
+            server_id, row["id"], row["direction"], row["status"])
+        self._db.execute("UPDATE messages SET server_id = NULL WHERE id = ?",
+                         (row["id"],))
+        return True
+
     def add_out(self, peer: str, body: str, created_at: str,
                 client_msg_id: str) -> int:
         """Insert an outgoing message at 0/3 (grey tick). Returns local id."""
@@ -1682,13 +1849,25 @@ class LocalStore:
             self._db.commit()
             return cur.lastrowid
 
-    def mark_sent(self, local_id: int, server_id: int) -> None:
-        """Server stored the ciphertext -> 1/3 (first golden tick)."""
-        with self._lock:
-            self._db.execute(
-                "UPDATE messages SET server_id = ?, status = MAX(status, 1) "
-                "WHERE id = ?", (server_id, local_id))
-            self._db.commit()
+    def mark_sent(self, local_id: int, server_id: int) -> bool:
+        """Server stored the ciphertext -> 1/3 (first golden tick).
+
+        Returns False instead of raising: this runs on a send worker whose
+        death would leave the message stuck at 0/3 with nothing on screen to
+        say so.
+        """
+        try:
+            with self._lock:
+                self._claim_server_id(server_id, keep_local_id=local_id)
+                self._db.execute(
+                    "UPDATE messages SET server_id = ?, status = MAX(status, 1) "
+                    "WHERE id = ?", (server_id, local_id))
+                self._db.commit()
+            return True
+        except sqlite3.Error:
+            log.exception("local store: could not record relay id %s for "
+                          "local message %s", server_id, local_id)
+            return False
 
     def apply_receipt(self, server_id: int, status: str) -> Optional[str]:
         """delivered -> 2/3, read -> 3/3. Status only ever ratchets upward.
@@ -1698,31 +1877,74 @@ class LocalStore:
             return None
         with self._lock:
             row = self._db.execute(
-                "SELECT id, peer FROM messages WHERE server_id = ? "
+                "SELECT id, peer, status FROM messages WHERE server_id = ? "
                 "AND direction = 'out'", (server_id,)).fetchone()
             if row is None:
+                # Not an error: receipts for a conversation this identity no
+                # longer holds, or for a stale id we have already released.
+                log.debug("receipt '%s' for relay id %s matched no local "
+                          "outgoing message", status, server_id)
                 return None
+            if row["status"] >= tier:
+                return None                  # already at or above this tier
             self._db.execute(
                 "UPDATE messages SET status = MAX(status, ?) WHERE id = ?",
                 (tier, row["id"]))
             self._db.commit()
             return row["peer"]
 
+    # Outcomes of add_in(). The caller must be able to tell these apart,
+    # because only two of the three make it safe to acknowledge delivery.
+    STORED = "stored"          # plaintext is now durably ours
+    DUPLICATE = "duplicate"    # we already hold this exact message
+    FAILED = "failed"          # NOT stored — do not ack, do not lose it
+
     def add_in(self, peer: str, body: str, created_at: str,
-               server_id: Optional[int], client_msg_id: Optional[str]) -> bool:
-        """Insert an incoming message (unread). False on duplicate server_id."""
-        with self._lock:
-            try:
+               server_id: Optional[int], client_msg_id: Optional[str],
+               unread: bool = True) -> str:
+        """Insert an incoming message (unread).
+
+        Returns STORED, DUPLICATE or FAILED. The old boolean collapsed
+        DUPLICATE and FAILED into one value, and the sync worker acked on
+        both — which meant a message that could not be stored was reported to
+        the sender as delivered and then deleted from the relay. Never again:
+        the three cases are now distinct and only the first two are ackable.
+
+        Duplicate detection prefers `client_msg_id`, a uuid4 minted by the
+        SENDER, because it is globally unique and survives a relay database
+        reset. `server_id` is only a fallback for messages sent by clients
+        old enough not to set one.
+        """
+        try:
+            with self._lock:
+                if client_msg_id:
+                    dup = self._db.execute(
+                        """SELECT 1 FROM messages WHERE client_msg_id = ?
+                           AND peer = ? AND direction = 'in'""",
+                        (client_msg_id, peer)).fetchone()
+                elif server_id:
+                    dup = self._db.execute(
+                        """SELECT 1 FROM messages WHERE server_id = ?
+                           AND direction = 'in'""", (server_id,)).fetchone()
+                else:
+                    dup = None
+                if dup is not None:
+                    return self.DUPLICATE
+                if server_id:
+                    self._claim_server_id(server_id)
                 self._db.execute(
                     """INSERT INTO messages (server_id, client_msg_id, peer,
                                              direction, body, status, read,
-                                             created_at)
-                       VALUES (?, ?, ?, 'in', ?, 0, 0, ?)""",
-                    (server_id, client_msg_id, peer, body, created_at))
+                                             created_at, receipt_sent)
+                       VALUES (?, ?, ?, 'in', ?, 0, ?, ?, ?)""",
+                    (server_id, client_msg_id, peer, body,
+                     0 if unread else 1, created_at, 0 if unread else 1))
                 self._db.commit()
-                return True
-            except sqlite3.IntegrityError:
-                return False       # duplicate server_id — already synced
+                return self.STORED
+        except sqlite3.Error:
+            log.exception("local store: could not store incoming message "
+                          "(relay id %s) from %s", server_id, peer)
+            return self.FAILED
 
     def unread_for(self, peer: str) -> list:
         """[(local_id, server_id), …] for unread incoming messages."""
@@ -1740,6 +1962,51 @@ class LocalStore:
             self._db.executemany(
                 "UPDATE messages SET read = 1 WHERE id = ?",
                 [(i,) for i in local_ids])
+            self._db.commit()
+
+    def pending_read_receipts(self, limit: int = 200) -> list:
+        """[(relay id, peer), …] for messages we have READ but whose receipt
+        the relay has not confirmed. Retried every sync cycle until it does,
+        or until the message is older than the relay's ledger retention —
+        past that the relay has forgotten the routing row, no confirmation
+        can ever arrive, and retrying would be a permanent slow leak.
+
+        This exists because `ws.send()` succeeding proves only that bytes
+        entered a socket buffer, which a dead peer will happily accept. The
+        old code took that as delivery and returned, so a receipt sent into a
+        half-open connection vanished and the sender's third tick never came.
+        """
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(seconds=RECEIPT_RETRY_WINDOW_SECONDS)).isoformat()
+        with self._lock:
+            rows = self._db.execute(
+                """SELECT server_id, peer FROM messages
+                   WHERE direction = 'in' AND read = 1 AND receipt_sent = 0
+                     AND server_id IS NOT NULL AND created_at >= ?
+                   ORDER BY id ASC LIMIT ?""", (cutoff, limit)).fetchall()
+        return [(r["server_id"], r["peer"]) for r in rows]
+
+    def peers_for_server_ids(self, server_ids: list) -> list:
+        """[(relay id, peer), …] for incoming rows, so a receipt can be
+        logged with both ends named rather than as a bare number."""
+        if not server_ids:
+            return []
+        marks = ",".join("?" * len(server_ids))
+        with self._lock:
+            rows = self._db.execute(
+                f"""SELECT server_id, peer FROM messages
+                    WHERE direction = 'in' AND server_id IN ({marks})""",
+                list(server_ids)).fetchall()
+        return [(r["server_id"], r["peer"]) for r in rows]
+
+    def confirm_read_receipts(self, server_ids: list) -> None:
+        """Called only once the relay has ACKNOWLEDGED the receipt."""
+        if not server_ids:
+            return
+        with self._lock:
+            self._db.executemany(
+                "UPDATE messages SET receipt_sent = 1 WHERE server_id = ?",
+                [(i,) for i in server_ids])
             self._db.commit()
 
     def messages_for(self, peer: str, limit: Optional[int] = None,
@@ -2054,6 +2321,10 @@ class SyncWorker(threading.Thread):
         self.wake_event = threading.Event()     # "retry right now"
         self._ws = None
         self._ws_lock = threading.Lock()
+        # relay id -> consecutive failed decryption attempts. In memory on
+        # purpose: a restart is exactly when a key problem may have been
+        # fixed, so the count should start again.
+        self._decrypt_failures: dict = {}
 
     def nudge(self) -> None:
         """Cut any pending backoff short and re-dial immediately."""
@@ -2070,7 +2341,13 @@ class SyncWorker(threading.Thread):
 
     # ---- outbound frames (called from UI thread too) -------------------------
     def send_ws(self, payload: dict) -> bool:
-        """Best-effort frame over the live socket. False when offline."""
+        """Best-effort frame over the live socket. False when offline.
+
+        CAUTION at every call site: True here means "the bytes entered a
+        socket buffer", NOT "the relay received them". A half-open TCP
+        connection accepts writes for a long time before anything notices.
+        Anything that must not be lost needs a transport that answers.
+        """
         with self._ws_lock:
             ws = self._ws
             if ws is None:
@@ -2082,42 +2359,160 @@ class SyncWorker(threading.Thread):
                 return False
 
     def send_read_receipts(self, server_ids: list) -> None:
-        """3/3 tick: prefer the socket, fall back to the HTTP endpoint."""
+        """3/3 tick.
+
+        The socket is tried first because it makes the sender's third tick
+        appear instantly. It is NOT trusted, because it cannot answer: the
+        HTTP endpoint returns a count, so that is what actually clears the
+        receipt from the retry queue. Sending both is harmless — the relay's
+        read confirmation is idempotent and emits at most one receipt per
+        message — and it is the difference between a third tick that usually
+        arrives and one that always does.
+        """
         ids = [i for i in server_ids if i]
         if not ids:
             return
-        if self.send_ws({"type": "read", "ids": ids}):
+        self.send_ws({"type": "read", "ids": ids})      # fast path
+        self._flush_read_receipts(ids)                  # confirming path
+
+    def _flush_read_receipts(self, ids: Optional[list] = None) -> None:
+        """Confirm outstanding read receipts over HTTP, retrying forever
+        until the relay acknowledges. Called with explicit ids on a fresh
+        read, and with none from the sync loop to drain the backlog."""
+        if ids is None:
+            pairs = self.app.store.pending_read_receipts()
+        else:
+            pairs = self.app.store.peers_for_server_ids(
+                [i for i in ids if i])
+        if not pairs:
             return
+        server_ids = [sid for sid, _ in pairs]
         try:
-            self.app.api.read(ids)
-        except (requests.RequestException, ApiClient.ApiError):
-            pass   # receipts are best-effort; ticks simply stay at 2/3
+            self.app.api.read(server_ids)
+        except (requests.RequestException, ApiClient.ApiError) as exc:
+            log.debug("read receipts for %s not confirmed yet (%s) — "
+                      "will retry", server_ids, exc)
+            return
+        self.app.store.confirm_read_receipts(server_ids)
+        me = MessageFlowLog.who(self.app.keys.address, self.app.keys.username)
+        for server_id, peer in pairs:
+            contact = self.app.store.get_contact(peer) or {}
+            MessageFlowLog.tick(
+                3, server_id, MessageFlowLog.who(peer, contact.get("username")),
+                me, "[our read receipt confirmed by the relay]")
 
     # ---- inbound handling ----------------------------------------------------
+    #: How many times an undecryptable envelope is refused before it is
+    #: acked away. Bounded so one poison row cannot wedge the mailbox
+    #: forever, but not 1, because the usual cause — a contact key that is
+    #: momentarily stale — fixes itself on the next directory refresh.
+    MAX_DECRYPT_ATTEMPTS = 3
+
     def _ingest_message(self, msg: dict) -> Optional[int]:
-        """Decrypt + verify + store one envelope. Returns the server id to
-        ack, or None when the row was skipped/duplicate."""
+        """Decrypt + verify + store one envelope.
+
+        Returns the relay id to ACKNOWLEDGE, or None to leave the message on
+        the relay for another attempt.
+
+        This function is where the two-golden-ticks bug lived. It used to
+        `return msg.get("id")` on EVERY path, including the two where it had
+        stored nothing: an envelope that would not decrypt, and an insert
+        that came back False. Acknowledging is what makes the relay DELETE
+        its only copy and tell the sender "delivered", so those two paths
+        destroyed the message and lit a second golden tick on a screen far
+        away. An acknowledgement now costs custody: it is returned only once
+        the plaintext is durably in this device's database.
+        """
+        server_id = msg.get("id")
         sender = msg.get("sender", "")
+        who = MessageFlowLog.who(sender)
+        fragment = MessageFlowLog.fragment(msg.get("envelope"))
+
         try:
             payload = self.app.crypto.open_envelope(msg.get("envelope", {}),
                                                     sender)
-        except CryptoEngine.EnvelopeError:
-            # Undecryptable/forged rows are acked-away (never rendered) so a
-            # single bad row cannot wedge the mailbox forever.
-            return msg.get("id")
+        except CryptoEngine.EnvelopeError as exc:
+            return self._handle_undecryptable(server_id, sender, who,
+                                              fragment, exc)
+
         inner = payload["sender"]
         # Verified sender keys come from INSIDE the authenticated ciphertext
         # — trust them over anything the directory says.
-        self.app.store.upsert_contact(sender, inner.get("username"),
-                                      inner["public_key"])
-        stored = self.app.store.add_in(
+        try:
+            self.app.store.upsert_contact(sender, inner.get("username"),
+                                          inner["public_key"])
+        except sqlite3.Error:
+            log.exception("could not update contact record for %s", sender)
+            MessageFlowLog.dropped(server_id, who, "contact upsert failed")
+            return None
+
+        outcome = self.app.store.add_in(
             peer=sender, body=sanitize_text(str(payload.get("body", ""))),
             created_at=payload.get("sent_at",
                                    msg.get("created_at", now_iso())),
-            server_id=msg.get("id"), client_msg_id=msg.get("client_msg_id"))
-        if stored:
-            self.app.ui_queue.put(("message_stored", sender))
-        return msg.get("id")
+            server_id=server_id, client_msg_id=msg.get("client_msg_id"))
+
+        if outcome == LocalStore.FAILED:
+            # Not ours yet. Withhold the ack; the relay keeps its copy and
+            # re-pushes on the next connect.
+            MessageFlowLog.dropped(server_id, who, "local database write failed")
+            return None
+
+        if outcome == LocalStore.DUPLICATE:
+            # We genuinely already hold this one — a re-push after a
+            # reconnect. Acking is correct and stops it coming back.
+            flow_log.debug("·   in   #%s  from %s  already held  %s",
+                           server_id, who, fragment)
+            self._decrypt_failures.pop(server_id, None)
+            return server_id
+
+        self._decrypt_failures.pop(server_id, None)
+        MessageFlowLog.tick(2, server_id,
+                            MessageFlowLog.who(sender, inner.get("username")),
+                            MessageFlowLog.who(self.app.keys.address,
+                                               self.app.keys.username),
+                            f"{fragment}  [stored locally — acking]")
+        self.app.ui_queue.put(("message_stored", sender))
+        return server_id
+
+    def _handle_undecryptable(self, server_id, sender: str, who: str,
+                              fragment: str, exc: Exception) -> Optional[int]:
+        """An envelope that will not open.
+
+        Usually a stale contact key — the sender encrypted to an identity
+        this device has since replaced. Refusing to ack keeps the relay's
+        copy alive so a later attempt can succeed, but refusing FOREVER
+        would wedge the mailbox behind one bad row, so after a few attempts
+        the message is recorded locally as unreadable and acked away. Either
+        way the user is told; the one outcome that is not acceptable is the
+        old one, where it disappeared and the sender was told 'delivered'.
+        """
+        attempts = self._decrypt_failures.get(server_id, 0) + 1
+        self._decrypt_failures[server_id] = attempts
+        if attempts < self.MAX_DECRYPT_ATTEMPTS:
+            MessageFlowLog.dropped(
+                server_id, who,
+                f"{exc} (attempt {attempts}/{self.MAX_DECRYPT_ATTEMPTS})")
+            return None
+
+        log.error("giving up on relay message %s from %s after %d attempts: "
+                  "%s — recording it as unreadable", server_id, sender,
+                  attempts, exc)
+        placeholder = ("⚠ A message arrived that this device could not "
+                       "decrypt. It was most likely encrypted to an older "
+                       "identity key. Ask the sender to try again.")
+        # Stored as ALREADY READ so no read receipt is ever emitted for it:
+        # the sender is entitled to know it arrived (2/3), and entitled NOT
+        # to be told it was read, because it never was.
+        self.app.store.add_in(
+            peer=sender, body=placeholder, created_at=now_iso(),
+            server_id=server_id, client_msg_id=None, unread=False)
+        flow_log.warning("✗   in   #%s  from %s  UNREADABLE after %d "
+                         "attempts  %s  [placeholder stored — acking]",
+                         server_id, who, attempts, fragment)
+        self._decrypt_failures.pop(server_id, None)
+        self.app.ui_queue.put(("message_stored", sender))
+        return server_id
 
     def _handle_frame(self, frame: dict) -> Optional[dict]:
         """Process one pushed frame; returns an ack frame to send, if any."""
@@ -2127,9 +2522,17 @@ class SyncWorker(threading.Thread):
             if server_id:
                 return {"type": "ack", "ids": [server_id]}
         elif kind == "receipt":
-            peer = self.app.store.apply_receipt(frame.get("server_id", 0),
-                                                frame.get("status", ""))
+            server_id = frame.get("server_id", 0)
+            status = frame.get("status", "")
+            peer = self.app.store.apply_receipt(server_id, status)
             if peer:
+                contact = self.app.store.get_contact(peer) or {}
+                MessageFlowLog.tick(
+                    {"delivered": 2, "read": 3}.get(status, 0), server_id,
+                    MessageFlowLog.who(self.app.keys.address,
+                                       self.app.keys.username),
+                    MessageFlowLog.who(peer, contact.get("username")),
+                    "[receipt from relay]")
                 self.app.ui_queue.put(("message_stored", peer))
         return None
 
@@ -2179,6 +2582,10 @@ class SyncWorker(threading.Thread):
                 return False
             with self._ws_lock:
                 self._ws = ws
+            # A reconnect is the first honest chance to discover that
+            # receipts written to the PREVIOUS socket never landed.
+            threading.Thread(target=self._flush_read_receipts,
+                             daemon=True).start()
             # Say what is actually true. Message bodies are end-to-end
             # encrypted on every transport, but on cleartext the metadata
             # around them is not — and the user is entitled to know which
@@ -2239,15 +2646,25 @@ class SyncWorker(threading.Thread):
         for event in self.app.api.events_sync().get("events", []):
             if isinstance(event, dict):
                 self._handle_frame(event)
+        self._flush_read_receipts()          # retry anything unconfirmed
         while True:
             data = self.app.api.sync(0)
             ack_ids = []
+            skipped = 0
             for msg in data.get("messages", []):
                 server_id = self._ingest_message(msg)
                 if server_id:
                     ack_ids.append(server_id)
+                else:
+                    skipped += 1        # left on the relay deliberately
             if ack_ids:
                 self.app.api.ack(ack_ids)
+            if skipped:
+                # Do not spin: the rows we refused are still pending, so
+                # has_more/refetch would loop straight back onto them.
+                log.info("%d message(s) left on the relay for another "
+                         "attempt", skipped)
+                break
             if not data.get("has_more"):
                 break
 
@@ -4501,6 +4918,10 @@ class FextApp(App):
         # 0/3 immediately: the grey tick means "not yet on the server".
         local_id = self.store.add_out(self.current_peer, body, now_iso(),
                                       client_msg_id)
+        MessageFlowLog.tick(
+            0, None, MessageFlowLog.who(self.keys.address, self.keys.username),
+            MessageFlowLog.who(self.current_peer, contact.get("username")),
+            f"[local id {local_id}, client_msg_id {client_msg_id[:8]}…]")
         self.refresh_chat(self.current_peer)
         threading.Thread(
             target=self._send_worker,
@@ -4510,15 +4931,53 @@ class FextApp(App):
 
     def _send_worker(self, local_id: int, peer: str, peer_pub: str,
                      body: str, client_msg_id: str) -> None:
-        """SIGN → ENCRYPT → SEND, then record the server receipt (1/3)."""
+        """SIGN → ENCRYPT → SEND, then record the server receipt (1/3).
+
+        Every failure here has to end at the UI. The previous version caught
+        three exception types and let everything else kill the thread — and
+        one of the things it let through, sqlite3.IntegrityError from
+        mark_sent, was reachable in ordinary use. When it fired the message
+        sat at 0/3 forever with no error anywhere, which is precisely the
+        class of silent failure this release exists to remove.
+        """
+        me = MessageFlowLog.who(self.keys.address, self.keys.username)
+        contact = self.store.get_contact(peer) or {}
+        them = MessageFlowLog.who(peer, contact.get("username"))
         try:
             envelope, _sent_at = self.crypto.build_envelope(body, peer_pub)
+        except Exception as exc:
+            log.exception("could not build envelope for %s", peer)
+            MessageFlowLog.failed(me, them, f"encryption failed: {exc}")
+            self.ui_queue.put(("status", f"Could not encrypt: {exc}",
+                               COL_DANGER))
+            return
+
+        fragment = MessageFlowLog.fragment(envelope)
+        try:
             result = self.api.send_message(peer, envelope, client_msg_id)
         except (requests.RequestException, ApiClient.ApiError,
                 ValueError) as exc:
+            MessageFlowLog.failed(me, them, str(exc), fragment)
             self.ui_queue.put(("status", f"Send failed: {exc}", COL_DANGER))
             return
-        self.store.mark_sent(local_id, result["server_id"])
+        except Exception as exc:                     # never lose the thread
+            log.exception("unexpected error sending to %s", peer)
+            MessageFlowLog.failed(me, them, f"unexpected: {exc}", fragment)
+            self.ui_queue.put(("status", f"Send failed: {exc}", COL_DANGER))
+            return
+
+        server_id = result.get("server_id")
+        if not self.store.mark_sent(local_id, server_id):
+            # The relay HAS the message; we merely failed to write that
+            # down. Say so rather than leaving a grey tick and no reason.
+            MessageFlowLog.failed(
+                me, them, f"relay accepted it as #{server_id} but the local "
+                          f"store could not record that", fragment)
+            self.ui_queue.put(
+                ("status", "Sent, but this device could not record it — "
+                 "the tick may be wrong", COL_DANGER))
+            return
+        MessageFlowLog.tick(1, server_id, me, them, fragment)
         self.ui_queue.put(("message_stored", peer))
 
     # =========================================================================
