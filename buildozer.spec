@@ -25,7 +25,7 @@ source.exclude_exts = spec
 source.exclude_dirs = tests, bin, venv, .git, .github, .buildozer, __pycache__
 
 # (str) Application versioning (method 1)
-version = 7.2.0
+version = 8.0.0
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy

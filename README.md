@@ -25,8 +25,8 @@ is transmitted.
 Every push builds a **signed release APK** on GitHub Actions and publishes it to
 a GitHub Release:
 
-1. Open the repository's **Releases** page (or the **`v7.2.0`** tag).
-2. Download `fext-7.2.0-*-release.apk` from the release assets.
+1. Open the repository's **Releases** page (or the **`v8.0.0`** tag).
+2. Download `fext-8.0.0-*-release.apk` from the release assets.
 
 The same APK is also attached to each Actions run as the **`fext-release-apk`**
 artifact (Actions tab → latest run → Artifacts).
@@ -40,7 +40,7 @@ on first run.
 
 ```bash
 python3 -m pip install --user buildozer cython
-buildozer android debug          # produces bin/fext-7.2.0-*-debug.apk
+buildozer android debug          # produces bin/fext-8.0.0-*-debug.apk
 ```
 
 The first build takes a while (it downloads the SDK/NDK and compiles the
@@ -84,7 +84,7 @@ A signing key is **never committed to this repository.**
 Or install over ADB from a computer:
 
 ```bash
-adb install -r fext-7.2.0-*-release.apk
+adb install -r fext-8.0.0-*-release.apk
 ```
 
 ## Configuration notes
