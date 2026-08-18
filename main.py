@@ -88,6 +88,7 @@ from typing import Callable, Optional
 
 import qrcode
 import requests
+from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -1368,8 +1369,19 @@ class CryptoEngine:
     # ---- internal helpers ----------------------------------------------------
     @staticmethod
     def _derive_key(shared_secret: bytes) -> bytes:
+        """HKDF-SHA256 over the ECDH secret.
+
+        `backend` is passed EXPLICITLY and must stay. The Android build
+        bundles cryptography 2.8, where HKDF.__init__ takes `backend` as a
+        REQUIRED positional argument; it only became optional in 3.1. Omitting
+        it raises TypeError inside every seal and every open — the app installs
+        and registers fine and then fails on the first message, in both
+        directions. Desktop testing hides this completely, because a modern
+        cryptography accepts the call either way.
+        """
         return HKDF(algorithm=SHA256(), length=32, salt=None,
-                    info=HKDF_INFO).derive(shared_secret)
+                    info=HKDF_INFO,
+                    backend=default_backend()).derive(shared_secret)
 
     @staticmethod
     def _canonical(version: int, msg_type: str, body: str,
