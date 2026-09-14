@@ -1,6 +1,6 @@
 name: Build Android APK
 
-# Builds the FEXT client into an installable, release-signed .apk with Buildozer
+# Builds the Ferritext client into an installable, release-signed .apk with Buildozer
 # on an ubuntu-latest runner (GitHub runners can reach the Android SDK host
 # dl.google.com that Buildozer downloads from), then publishes it to a GitHub
 # Release so it can be downloaded directly from github.com.
@@ -116,9 +116,17 @@ jobs:
           APK="$(ls bin/*-release.apk | head -1)"
           VER="$(grep -E '^version' buildozer.spec | head -1 | sed -E 's/.*=[[:space:]]*//')"
           TAG="v${VER}"
-          NOTES="Signed release build of the FEXT client (CI run #${{ github.run_number }}, commit ${GITHUB_SHA:0:7}). Download the .apk below and sideload it via Android 'Install unknown apps'."
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
-            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
-                 --target "$GITHUB_SHA" --title "FEXT $TAG" --notes "$NOTES"
+          TITLE="$(grep -E '^title' buildozer.spec | head -1 | sed -E 's/.*=[[:space:]]*//')"
+          NOTES="Signed release build of the $TITLE client (CI run #${{ github.run_number }}, commit ${GITHUB_SHA:0:7}). Download the .apk below and sideload it via Android 'Install unknown apps'."
+          # Create the release if this tag is new; otherwise keep it and just
+          # refresh the title/notes, so a rebuild of the same version does not
+          # leave stale text (or a stale app name) on the downloads page.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "$TITLE $TAG" --notes "$NOTES"
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "$TITLE $TAG" --notes "$NOTES"
+          fi
           gh release upload "$TAG" "$APK" --repo "$GITHUB_REPOSITORY" --clobber
           echo "Published $(basename "$APK") to release $TAG"
