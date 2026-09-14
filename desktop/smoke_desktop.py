@@ -63,14 +63,36 @@ try:
     app = mod.FextApp()
     root = app.build()
     state["built"] = root is not None
-    check("App.build() constructs the UI (ScreenManager + screens)",
-          root is not None and hasattr(root, "current"))
+    # Since v8.0.2 the root is a FloatLayout holding the ScreenManager and
+    # the loading screen stacked over it; the app itself talks to .manager.
+    check("App.build() constructs the UI (root + ScreenManager)",
+          root is not None and hasattr(app.manager, "current"))
     check("both screens registered",
-          {s.name for s in root.screens} >= {"chats", "conversation"},
-          str([s.name for s in root.screens]))
-    # drive the post-build step that opens the first-run dialog
-    app._post_build(0)
+          {s.name for s in app.manager.screens} >= {"chats", "conversation"},
+          str([s.name for s in app.manager.screens]))
+    check("loading screen is stacked over the app",
+          isinstance(app.splash, mod.SplashOverlay)
+          and app.splash in root.children,
+          f"splash={app.splash}")
+    check("loading screen fades out in 100ms",
+          abs(mod.SplashOverlay.FADE - 0.1) < 1e-9,
+          str(mod.SplashOverlay.FADE))
+    check("loading screen carries the wordmark",
+          any("by koh-gt" in getattr(w, "text", "")
+              for w in app.splash.walk()),
+          "wordmark not found")
+    # the loading screen hands over to the first-run dialog when it goes
+    app._splash_gone()
+    check("loading screen is removed once it has faded",
+          app.splash is None and len(root.children) == 1,
+          f"children={len(root.children)}")
     check("first-run path runs without error (welcome dialog opens)", True)
+    check("app is branded Ferritext", mod.APP_NAME == "Ferritext",
+          mod.APP_NAME)
+    check("identity payload still carries the original wire tag",
+          mod.WIRE_APP_TAG == "FEXT", mod.WIRE_APP_TAG)
+    check("the mark ships with the client", mod.LOGO_FILE.exists(),
+          str(mod.LOGO_FILE))
 except Exception as e:
     state["error"] = e
     check("App.build() constructs the UI", False, f"{type(e).__name__}: {e}")

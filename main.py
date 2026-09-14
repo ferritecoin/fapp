@@ -844,7 +844,17 @@ SERVER_URL_OVERRIDE = _os.environ.get("FEXT_SERVER_URL", "")
 
 REQUIRE_TLS = _os.environ.get("FEXT_REQUIRE_TLS", "") not in ("", "0", "false")
 
-APP_NAME = "FEXT"
+APP_NAME = "Ferritext"
+
+# The identity/QR payload keeps carrying the ORIGINAL tag. It is wire data
+# that older clients already produce and consume, so renaming the app must
+# not rename it — the brand changed, the protocol did not.
+WIRE_APP_TAG = "FEXT"
+
+# Bundled artwork. Absent on a stripped-down checkout, so every use is
+# guarded: the loading screen simply drops the mark rather than failing.
+ASSET_DIR = Path(__file__).resolve().parent / "data"
+LOGO_FILE = ASSET_DIR / "ferritext_logo.png"
 
 IS_ANDROID = kivy_platform == "android"
 IS_IOS = kivy_platform == "ios"
@@ -1313,7 +1323,7 @@ class IdentityManager:
     def public_bundle(self) -> dict:
         """Everything safe to share (this is what the QR code encodes)."""
         ident = self._require_active()
-        return {"v": 2, "app": APP_NAME, "username": ident.get("username"),
+        return {"v": 2, "app": WIRE_APP_TAG, "username": ident.get("username"),
                 "address": ident["address"],
                 "public_key": ident["public_key_hex"]}
 
@@ -3205,7 +3215,7 @@ class NewIdentityModal(CozyModal):
     with a clear explanation, because the server would reject them anyway."""
 
     def __init__(self, app: "FextApp", first_run: bool = False) -> None:
-        super().__init__("Welcome to FEXT" if first_run else
+        super().__init__(f"Welcome to {APP_NAME}" if first_run else
                          "Create an identity", dismissable=False)
         self.app = app
         self.first_run = first_run
@@ -3310,7 +3320,7 @@ class NewIdentityModal(CozyModal):
 
 
 class ImportChooserModal(CozyModal):
-    """Pick a FEXT .json chat export to import (cross-platform file picker)."""
+    """Pick a .json chat export to import (cross-platform file picker)."""
 
     def __init__(self, on_pick: Callable[[str], None]) -> None:
         super().__init__("Choose a chat export (.json)")
@@ -3490,7 +3500,7 @@ class ContactSettingsModal(CozyModal):
                 }, indent=2, ensure_ascii=False), "utf-8")
             else:
                 me = self.app.keys.username or "Me"
-                lines = [f"FEXT chat with {name} ({self.peer})",
+                lines = [f"{APP_NAME} chat with {name} ({self.peer})",
                          f"Exported {now_iso()}", ""]
                 for m in messages:
                     who = me if m["direction"] == "out" else name
@@ -3514,7 +3524,7 @@ class ContactSettingsModal(CozyModal):
             data = json.loads(Path(path).read_text("utf-8"))
             if data.get("fext_chat_export") != 2 or \
                     not isinstance(data.get("messages"), list):
-                raise ValueError("not a FEXT chat export")
+                raise ValueError(f"not a {APP_NAME} chat export")
             added = 0
             for m in data["messages"]:
                 if not isinstance(m, dict):
@@ -4061,6 +4071,91 @@ class ChatsScreen(Screen):
 # =============================================================================
 #  Conversation screen
 # =============================================================================
+_METRIC_LABEL = None
+
+
+def measure_text(text: str, font_size: float, wrap_width: float) -> tuple:
+    """Pixel (width, height) of `text` wrapped at `wrap_width`.
+
+    One shared, never-displayed Label measures for every bubble. The widget
+    that now DISPLAYS message text is a TextInput (so it can be selected and
+    copied), and a TextInput cannot report the size it wants until the frame
+    after it is given one — useless for laying a bubble out. Measuring with
+    the same Label the bubbles used in v8.0.1 keeps the geometry pixel-for-
+    pixel identical to the previous release, so making text selectable
+    changes nothing about how a conversation looks.
+    """
+    global _METRIC_LABEL
+    if _METRIC_LABEL is None:
+        _METRIC_LABEL = Label(halign="left", valign="top",
+                              size_hint=(None, None))
+    metric = _METRIC_LABEL
+    metric.font_size = font_size
+    metric.text_size = (wrap_width, None)
+    metric.text = text
+    metric.texture_update()
+    return metric.texture_size
+
+
+class SelectableText(TextInput):
+    """Message text you can highlight and copy — on a phone and on a PC.
+
+    A Kivy Label cannot be selected at all, so until now the only way to get
+    a message back out of the app was to retype it. A READ-ONLY TextInput
+    gives the behaviour people already expect from every other app, for
+    free: drag to select plus Ctrl+A/Ctrl+C on desktop, and on Android a
+    long press raises the selection handles and a context bubble which —
+    because the field is readonly — offers exactly one action, Copy. Kivy
+    enables the handles and the bubble by itself off `_is_desktop`, so
+    neither needs configuring here.
+
+    Scrolling still works over it: a ScrollView holds each touch for
+    scroll_timeout (55ms) and only hands it to the child if the finger has
+    not travelled scroll_distance, so a flick scrolls and a press selects.
+
+    It is painted to look precisely like the Label it replaces — no
+    background, no border, no cursor, the same espresso text at the same
+    size.
+    """
+
+    def __init__(self, on_tap: Optional[Callable] = None, **kw):
+        kw.setdefault("readonly", True)
+        kw.setdefault("multiline", True)
+        kw.setdefault("background_color", (0, 0, 0, 0))
+        kw.setdefault("background_normal", "")
+        kw.setdefault("background_active", "")
+        kw.setdefault("background_disabled_normal", "")
+        kw.setdefault("foreground_color", C(COL_TEXT))
+        kw.setdefault("selection_color", C(COL_ACCENT)[:3] + [0.35])
+        kw.setdefault("cursor_color", (0, 0, 0, 0))
+        kw.setdefault("cursor_width", 0)
+        kw.setdefault("padding", [0, 0, 0, 0])
+        kw.setdefault("size_hint", (None, None))
+        super().__init__(**kw)
+        self._on_tap = on_tap
+
+    # ---- tap-to-mark-read ----------------------------------------------------
+    # The bubble is a ButtonBehavior, but Kivy offers every touch to the
+    # children first, so the TextInput now swallows it and the bubble's
+    # on_release never fires. Tapping a message is exactly the gesture that
+    # marks it read, so re-dispatch it from here — but only when the press
+    # AND the release happened on this bubble, or merely scrolling past an
+    # unread message would mark it read.
+    def on_touch_down(self, touch):
+        handled = super().on_touch_down(touch)
+        if handled:
+            touch.ud["fext_tap_origin"] = self
+        return handled
+
+    def on_touch_up(self, touch):
+        handled = super().on_touch_up(touch)
+        if (self._on_tap is not None
+                and touch.ud.pop("fext_tap_origin", None) is self
+                and self.collide_point(*touch.pos)):
+            self._on_tap()
+        return handled
+
+
 class MessageBubble(ButtonBehavior, BoxLayout):
     """One message. Outgoing = gold, right-aligned, carrying the tick tier.
     Incoming = white, left-aligned; tapping an unread one marks it read."""
@@ -4083,9 +4178,9 @@ class MessageBubble(ButtonBehavior, BoxLayout):
         if not outgoing:
             paint_border(self, COL_CARD_EDGE, radius=dp(16))
 
-        self.body = Label(text=msg["body"], color=C(COL_TEXT),
-                          font_size=sp(14.5), halign="left", valign="top",
-                          size_hint=(None, None))
+        self.body = SelectableText(text=msg["body"], font_size=sp(14.5),
+                                   on_tap=on_tap)
+        self.body.bind(minimum_height=self._body_min_height)
         self.add_widget(self.body)
 
         # Meta line = timestamp + vector ticks. Kept as two widgets rather
@@ -4169,13 +4264,29 @@ class MessageBubble(ButtonBehavior, BoxLayout):
             self.meta_box.width = (self.meta.width + self.ticks.width
                                    + (dp(4) if self.ticks.width else 0))
 
+    def _body_min_height(self, _w, value: float) -> None:
+        """Safety net for the measured height.
+
+        The TextInput re-wraps a frame after it is given a width. If it ends
+        up wanting more room than measure_text predicted — a font metric
+        rounding apart — grow the bubble rather than clip the message.
+        """
+        if value > self.body.height + 0.5:
+            self.body.height = value
+            self.height = self.body.height + dp(14) + dp(20)
+
     def layout_for(self, available: float) -> None:
         """Wrap to at most 76% of the viewport, then size to content."""
         self._last_width = available
         max_text = max(dp(120), available * 0.76 - dp(24))
-        self.body.text_size = (max_text, None)
-        self.body.texture_update()
-        self.body.size = self.body.texture_size
+        text_w, text_h = measure_text(self.body.text, self.body.font_size,
+                                      max_text)
+        # +2px of slack: the TextInput re-wraps at whatever width it is
+        # given, and handing it the exact width of the widest measured line
+        # can tip that line over by a rounding error. Invisible, and it
+        # keeps a one-line message on one line.
+        self.body.width = text_w + dp(2)
+        self.body.height = text_h
         self.meta.texture_update()
         self.meta.size = (self.meta.texture_size[0], dp(14))
         # Composite meta row: timestamp + drawn ticks + the gap between them.
@@ -4358,8 +4469,16 @@ class ConversationScreen(Screen):
         self.messages = BoxLayout(orientation="vertical", size_hint_y=None,
                                   padding=[0, dp(10), 0, dp(10)],
                                   spacing=dp(2))
+        # Keeps short conversations sitting on the composer instead of flying
+        # up under the app bar — see _sync_filler. Always the FIRST child, so
+        # it pads above every bubble.
+        self._filler = Widget(size_hint_y=None, height=0)
+        self._syncing_filler = False
+        self.messages.add_widget(self._filler)
         self.messages.bind(minimum_height=self.messages.setter("height"))
         self.messages.bind(height=lambda *_a: self._on_content_height())
+        self.messages.bind(minimum_height=lambda *_a: self._sync_filler())
+        self.scroll.bind(height=lambda *_a: self._sync_filler())
         self.scroll.add_widget(self.messages)
         stack.add_widget(self.scroll)
         self.jump_button = JumpToBottomButton(on_tap=self.jump_to_latest,
@@ -4469,6 +4588,7 @@ class ConversationScreen(Screen):
     def _full_render(self, messages: list, ticks_enabled: bool,
                      on_tap_unread: Callable, peer: Optional[str]) -> None:
         self.messages.clear_widgets()
+        self.messages.add_widget(self._filler)     # stays the topmost child
         self._bubbles.clear()
         self._last_day = None
         if not messages:
@@ -4501,17 +4621,55 @@ class ConversationScreen(Screen):
         self._bubbles[msg["id"]] = bubble
         self.messages.add_widget(BubbleRow(bubble, outgoing))
 
+    # ---- bottom alignment ----------------------------------------------------
+    def content_height(self) -> float:
+        """Height of the real messages, with the bottom-align filler removed."""
+        return self.messages.minimum_height - self._filler.height
+
+    def _sync_filler(self) -> None:
+        """Pin a short conversation to the BOTTOM of the viewport.
+
+        Kivy lays a ScrollView's content out from the TOP whenever it is
+        shorter than the viewport (scrollview.py: `y = self.top - vp.height`),
+        and because always_overscroll defaults to True the very same branch
+        runs for ANY scroll_y above zero. So one stray touch was enough to
+        lift a two-message chat up under the app bar and leave a screenful of
+        background beneath it — the reported "messages scroll all the way to the
+        top". It was never a scroll: it was the layout Kivy falls back to,
+        which is also why nothing pulled the view back down. at_bottom() read
+        True the entire time, quite correctly, since the newest message WAS
+        on screen.
+
+        Instead of fighting the ScrollView we make the short case impossible:
+        pad the TOP until the content is at least viewport-tall. Every render
+        then takes the ordinary scrolling branch, scroll_y == 0 means "newest
+        message resting on the composer" in both states, and a conversation
+        that genuinely overflows is untouched — the filler collapses to zero
+        and this method stops mattering.
+        """
+        if self._syncing_filler:
+            return          # setting the height below re-enters us via bind
+        self._syncing_filler = True
+        try:
+            want = max(0.0, self.scroll.height - self.content_height())
+            if abs(self._filler.height - want) > 0.5:
+                self._filler.height = want
+        finally:
+            self._syncing_filler = False
+
     # ---- scroll position -----------------------------------------------------
     BOTTOM_EPSILON = 0.02        # within 2% of the end counts as "at bottom"
 
     def at_bottom(self) -> bool:
         """True when the latest message is already on screen.
 
-        A ScrollView whose content is shorter than the viewport reports
-        scroll_y == 1, which is simultaneously the top AND the bottom; treat
-        that as at-bottom or short chats would show a pointless jump pill.
+        A conversation that does not fill the viewport is always showing its
+        newest message, whatever scroll_y happens to say; treating that as
+        at-bottom keeps the jump pill from appearing over a two-line chat.
+        The comparison uses content_height(), NOT messages.height, because
+        the filler pads the latter up to the viewport by design.
         """
-        if self.messages.height <= self.scroll.height:
+        if self.content_height() <= self.scroll.height:
             return True
         return self.scroll.scroll_y <= self.BOTTOM_EPSILON
 
@@ -4529,7 +4687,7 @@ class ConversationScreen(Screen):
         def _apply(_dt):
             self._scroll_trigger = None
             Animation.cancel_all(self.scroll, "scroll_y")
-            if not animate or self.messages.height <= self.scroll.height:
+            if not animate or self.content_height() <= self.scroll.height:
                 self.scroll.scroll_y = 0
             else:
                 Animation(scroll_y=0, d=0.22, t="out_quad").start(self.scroll)
@@ -4646,6 +4804,45 @@ class ConversationScreen(Screen):
 # =============================================================================
 #  FextApp — the Kivy application controller
 # =============================================================================
+class SplashOverlay(FloatLayout):
+    """The loading screen: the mark above the wordmark, on the app's cream.
+
+    It covers the first paint — the ScreenManager building its two screens,
+    the identity being read off disk, the transport probe going out — and
+    then fades so the chat list does not simply snap into existence.
+
+    It is a widget in the tree rather than a ModalView on purpose. The
+    first-run dialog IS a ModalView, and a ModalView attaches to the Window
+    above everything, so raising it while this was still up would show it
+    through the loading screen. _post_build therefore waits for the fade.
+    """
+
+    FADE = 0.1          # seconds of fade-out
+    HOLD = 0.9          # minimum time on screen, so it never merely blinks
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        paint_round(self, COL_BG_LIST, radius=dp(0))
+        column = BoxLayout(orientation="vertical", spacing=dp(22),
+                           size_hint=(None, None), width=dp(280),
+                           height=dp(300),
+                           pos_hint={"center_x": 0.5, "center_y": 0.5})
+        if LOGO_FILE.exists():
+            column.add_widget(KivyImage(source=str(LOGO_FILE),
+                                        allow_stretch=True, keep_ratio=True,
+                                        size_hint_y=None, height=dp(190)))
+        wordmark = Label(
+            text=("[b]Ferrite Text[/b]\n[b]Messenger[/b]\n"
+                  "[size=%d][color=%s]by koh-gt[/color][/size]"
+                  % (int(sp(12.5)), COL_TEXT_DIM.lstrip("#"))),
+            markup=True, halign="center", valign="top", font_size=sp(21),
+            color=C(COL_TEXT), line_height=1.25,
+            size_hint_y=None, height=dp(100))
+        wordmark.bind(size=lambda w, v: setattr(w, "text_size", v))
+        column.add_widget(wordmark)
+        self.add_widget(column)
+
+
 class FextApp(App):
     """Owns the identity lifecycle, the two screens and the UI-queue pump.
 
@@ -4671,6 +4868,7 @@ class FextApp(App):
         self._dirty_list = False
         self.foreground = True                 # drives reconnect aggressiveness
         self._register_modal: Optional[RegisterModal] = None
+        self.splash: Optional["SplashOverlay"] = None
 
     # ---- lifecycle -----------------------------------------------------------
     def build(self):
@@ -4692,8 +4890,19 @@ class FextApp(App):
         self.manager.add_widget(self.conversation_screen)
         Window.bind(on_keyboard=self._on_keyboard)     # Android back button
         Clock.schedule_interval(self._drain_ui_queue, 0.15)
-        Clock.schedule_once(self._post_build, 0.05)
-        return self.manager
+        # The loading screen sits over the whole app until it fades, so the
+        # root has to be something that can stack widgets. Nothing else
+        # reaches for App.root; the rest of the app talks to self.manager.
+        root = FloatLayout()
+        root.add_widget(self.manager)
+        self.splash = SplashOverlay()
+        root.add_widget(self.splash)
+        # The probe still goes out immediately — it is a background thread,
+        # and starting it behind the loading screen is exactly the overlap
+        # _probe_transport was written for.
+        Clock.schedule_once(lambda _dt: self._probe_transport(), 0.05)
+        Clock.schedule_once(self._dismiss_splash, SplashOverlay.HOLD)
+        return root
 
     def _probe_transport(self) -> None:
         """Work out the relay's transport in the background at startup.
@@ -4715,8 +4924,20 @@ class FextApp(App):
                      COL_TICK_GOLD))
         threading.Thread(target=worker, daemon=True).start()
 
+    def _dismiss_splash(self, _dt) -> None:
+        """Fade the loading screen out, then start the app proper."""
+        fade = Animation(opacity=0, d=SplashOverlay.FADE)
+        fade.bind(on_complete=lambda *_a: self._splash_gone())
+        fade.start(self.splash)
+
+    def _splash_gone(self) -> None:
+        if self.splash is not None and self.splash.parent is not None:
+            self.splash.parent.remove_widget(self.splash)
+        self.splash = None
+        self._post_build(0)
+
     def _post_build(self, _dt) -> None:
-        self._probe_transport()
+        """Deferred until the loading screen has gone — see SplashOverlay."""
         if self.keys.has_identity:
             self._activate_identity(self.keys.active["address"])
         else:

@@ -42,6 +42,11 @@ exec "$PY" -m nuitka \
   `# builds fine and then cannot open a secure connection at runtime.` \
   --include-package-data=certifi \
   \
+  `# The Ferritext mark, loaded by the in-app loading screen from` \
+  `# ASSET_DIR (main.py resolves it next to __file__). Nuitka cannot see` \
+  `# a path built at runtime, so the folder has to be named explicitly.` \
+  --include-data-dir="$ROOT/data=data" \
+  \
   `# qrcode picks its image backend by dynamic import at call time, so` \
   `# Nuitka cannot see it from static analysis. The Settings screen renders` \
   `# QR codes; miss this and that screen raises instead of drawing.` \
