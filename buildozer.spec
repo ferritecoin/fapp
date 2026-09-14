@@ -26,7 +26,10 @@ source.include_exts = py,png,jpg,kv,atlas,ttf
 source.exclude_exts = spec
 
 # (list) List of directory to exclude (let empty to not exclude anything)
-source.exclude_dirs = tests, bin, venv, .git, .github, .buildozer, __pycache__
+source.exclude_dirs = tests, bin, venv, .git, .github, .buildozer, __pycache__, desktop, tools
+# desktop/ (Nuitka packaging + the headless test suites) and tools/ (the
+# logo generator) are build-time only. data/ is NOT excluded: the app
+# loads data/ferritext_logo.png at runtime for the loading screen.
 
 # (str) Application versioning (method 1)
 version = 8.0.2
