@@ -4149,8 +4149,10 @@ class SelectableText(TextInput):
 
     def on_touch_up(self, touch):
         handled = super().on_touch_up(touch)
+        # .get, not .pop: every bubble under the touch sees this event, and
+        # popping it in one would rob the bubble that actually started it.
         if (self._on_tap is not None
-                and touch.ud.pop("fext_tap_origin", None) is self
+                and touch.ud.get("fext_tap_origin") is self
                 and self.collide_point(*touch.pos)):
             self._on_tap()
         return handled
