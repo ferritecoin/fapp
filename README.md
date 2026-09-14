@@ -17,6 +17,7 @@ is transmitted.
 | `main.py` | The complete FEXT client (Buildozer's entry point **must** be `main.py`). |
 | `buildozer.spec` | Android packaging configuration (requirements, permissions, ABIs, API levels). |
 | `.github/workflows/build-apk.yml` | CI that builds a signed release APK and publishes it to a GitHub Release. |
+| `desktop/` | Nuitka packaging for the **desktop** build of the same `main.py` (see `desktop/README.md`). |
 
 ## Getting the APK
 
@@ -108,3 +109,17 @@ adb install -r fext-8.0.1-*-release.apk
   AndroidManifest.xml that fails to parse; see the note in the spec).
   Once every relay serves HTTPS: delete that file, remove those two spec keys,
   and set `FEXT_REQUIRE_TLS=1` to fail closed.
+
+## Desktop build
+
+The same `main.py` also runs on desktop — it detects the platform at import
+time, so there is no separate desktop source. `desktop/build_desktop.sh`
+compiles it into a distributable executable with Nuitka:
+
+```bash
+cd desktop && ./build_desktop.sh            # standalone folder
+cd desktop && ONEFILE=1 ./build_desktop.sh  # single executable
+```
+
+See `desktop/README.md` for prerequisites, why each Nuitka flag is required,
+and the verification results.

@@ -20,3 +20,8 @@ venv/
 
 # Local tooling config
 .claude/settings.local.json
+
+# Desktop (Nuitka) build output
+desktop/build/
+desktop/dist/
+desktop/env/
