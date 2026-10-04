@@ -1,21 +1,27 @@
-# FEXT desktop client (Nuitka)
+# Ferritext desktop client (Nuitka)
 
 The desktop client is **`../main.py` — the exact same file the APK ships.**
 There is no desktop fork. The client detects its platform at import time
-(`IS_MOBILE`) and adjusts the three things that actually differ:
+(`IS_MOBILE`) and adapts where the platforms genuinely differ:
 
 | | Android (APK) | Desktop |
 | --- | --- | --- |
 | Data directory | app-private storage (via `pyjnius`) | `~/.fext` |
 | Request timeout | 20 s (mobile radios) | 12 s |
 | Keyboard / window | Android IME, fullscreen | desktop window |
+| Selecting messages | long-press | right-click (or long-press); drag inside a message to highlight part of it |
+| Sharing | Android share sheet | copied to the clipboard |
+| Photos | system photo picker | file chooser |
+| Voice notes | record and play | play (opens in the system's audio player); recording needs a phone |
+| Notifications | system notifications, plus a background service | status line while the app is open |
 
 Everything else — the crypto core, the wire protocol, the relay discovery, the
 local SQLite store — is byte-for-byte the same code, which is the point: a
 desktop build can never drift from the phone build.
 
-For distribution, `fext_client_v8.0.1.py` is simply this file under a versioned
-name (`sha256 a44b295f…d241e`, identical to `main.py` at the `v8.0.1` tag).
+For distribution, every GitHub Release carries `Ferritext-<version>-desktop.py`:
+simply this file under a versioned name, byte-identical to `main.py` at that
+release's tag.
 
 ## Building
 
@@ -23,7 +29,7 @@ name (`sha256 a44b295f…d241e`, identical to `main.py` at the `v8.0.1` tag).
 python3 -m venv env && . env/bin/activate
 pip install nuitka kivy requests urllib3 charset-normalizer idna certifi \
             websocket-client cryptography qrcode pillow
-./build_desktop.sh              # -> desktop/dist/fext_client_8.0.1.dist/fext
+./build_desktop.sh              # -> desktop/dist/fext_client_v<version>.dist/fext
 ONEFILE=1 ./build_desktop.sh    # -> desktop/dist/fext   (single file)
 ```
 
@@ -56,7 +62,7 @@ cleanly and then misbehaves at runtime, which is the worst failure mode to ship:
 
 Against real Kivy 2.3.1 / cryptography 50.0.1, Nuitka 4.2.1, Python 3.11:
 
-- `smoke_desktop.py main.py` — **8/8**: imports under real Kivy; desktop
+- `smoke_desktop.py main.py` — imports under real Kivy; desktop
   platform detected; `~/.fext` data dir; 12 s timeout; `seal()` round-trips on
   modern cryptography (the v8.0.1 HKDF-backend fix is version-agnostic —
   it works on both 2.8 and 50.x); `App.build()` constructs the UI; both screens

@@ -1,9 +1,9 @@
 name: Build Android APK
 
-# Builds the Ferritext client into an installable, release-signed .apk with Buildozer
-# on an ubuntu-latest runner (GitHub runners can reach the Android SDK host
-# dl.google.com that Buildozer downloads from), then publishes it to a GitHub
-# Release so it can be downloaded directly from github.com.
+# Tests first, then a release-signed .apk built with Buildozer on an
+# ubuntu-latest runner (GitHub runners can reach the Android SDK host
+# dl.google.com that Buildozer downloads from), then a GitHub Release that
+# carries both deliverables: the Android APK and the desktop Python client.
 #
 # Signing:
 #   * If you set the repo secrets FEXT_KEYSTORE_B64 / FEXT_KEYSTORE_PASSWORD /
@@ -24,8 +24,58 @@ permissions:
   contents: write        # needed to create/update the GitHub Release
 
 jobs:
+  tests:
+    name: Client test suites (headless)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout (with tags, for the previous-release compatibility tests)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install a virtual display and the client's dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb libgl1 libgl1-mesa-dri libmtdev1 xclip
+          python -m pip install --upgrade pip
+          pip install "kivy[base]==2.3.1" requests urllib3 charset-normalizer \
+            idna certifi websocket-client cryptography qrcode pillow
+
+      - name: Version in main.py matches buildozer.spec
+        run: |
+          SPEC=$(grep -E '^version' buildozer.spec | head -1 | sed -E 's/.*=[[:space:]]*//')
+          CODE=$(grep -E '^APP_VERSION = ' main.py | sed -E 's/.*"(.*)".*/\1/')
+          echo "spec=$SPEC main.py=$CODE"
+          test "$SPEC" = "$CODE"
+
+      - name: Run the suites
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          set -euo pipefail
+          # The newest release tag before this version: compatibility is
+          # checked against that release's REAL code, in both directions.
+          OLD=""
+          PREV=$(git tag --list 'v*' --sort=-v:refname | head -1 || true)
+          if [ -n "$PREV" ] && git show "$PREV:main.py" > "$RUNNER_TEMP/old_main.py" 2>/dev/null; then
+            OLD="$RUNNER_TEMP/old_main.py"; echo "compatibility baseline: $PREV"
+          fi
+          python desktop/test_service.py main.py
+          xvfb-run -a python desktop/test_core.py main.py $OLD
+          xvfb-run -a python desktop/test_flows.py main.py
+          xvfb-run -a python desktop/smoke_desktop.py main.py
+          xvfb-run -a python desktop/smoke_chat.py main.py
+
   build-android:
     name: Buildozer (release APK)
+    needs: tests
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -99,25 +149,39 @@ jobs:
           buildozer android release
           echo "Built:"; ls -la bin/
 
-      - name: Upload the signed APK as a workflow artifact
+      - name: Name the deliverables
+        id: assets
+        run: |
+          set -euo pipefail
+          VER="$(grep -E '^version' buildozer.spec | head -1 | sed -E 's/.*=[[:space:]]*//')"
+          TITLE="$(grep -E '^title' buildozer.spec | head -1 | sed -E 's/.*=[[:space:]]*//')"
+          mkdir -p release
+          cp "$(ls bin/*-release.apk | head -1)" "release/${TITLE}-${VER}.apk"
+          # The desktop client IS main.py; shipped under a versioned name for
+          # people who run it with Python or package it (desktop/README.md).
+          cp main.py "release/${TITLE}-${VER}-desktop.py"
+          ls -la release/
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the deliverables as a workflow artifact
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: fext-release-apk
-          path: bin/*-release.apk
+          name: ferritext-release
+          path: release/*
           if-no-files-found: error
 
-      - name: Publish the signed APK to a GitHub Release
+      - name: Publish to a GitHub Release
         if: success()
         env:
           GH_TOKEN: ${{ github.token }}
+          VER: ${{ steps.assets.outputs.ver }}
+          TITLE: ${{ steps.assets.outputs.title }}
         run: |
           set -euo pipefail
-          APK="$(ls bin/*-release.apk | head -1)"
-          VER="$(grep -E '^version' buildozer.spec | head -1 | sed -E 's/.*=[[:space:]]*//')"
           TAG="v${VER}"
-          TITLE="$(grep -E '^title' buildozer.spec | head -1 | sed -E 's/.*=[[:space:]]*//')"
-          NOTES="Signed release build of the $TITLE client (CI run #${{ github.run_number }}, commit ${GITHUB_SHA:0:7}). Download the .apk below and sideload it via Android 'Install unknown apps'."
+          NOTES="${TITLE} ${VER} (CI run #${{ github.run_number }}, commit ${GITHUB_SHA:0:7}). ${TITLE}-${VER}.apk: Android — sideload via 'Install unknown apps'. ${TITLE}-${VER}-desktop.py: the same client for Windows/macOS/Linux — run it with Python 3.11+, or package it with desktop/build_desktop.sh."
           # Create the release if this tag is new; otherwise keep it and just
           # refresh the title/notes, so a rebuild of the same version does not
           # leave stale text (or a stale app name) on the downloads page.
@@ -128,5 +192,5 @@ jobs:
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" --title "$TITLE $TAG" --notes "$NOTES"
           fi
-          gh release upload "$TAG" "$APK" --repo "$GITHUB_REPOSITORY" --clobber
-          echo "Published $(basename "$APK") to release $TAG"
+          gh release upload "$TAG" release/* --repo "$GITHUB_REPOSITORY" --clobber
+          echo "Published to release $TAG:"; ls release/

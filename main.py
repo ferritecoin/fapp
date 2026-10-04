@@ -71,12 +71,14 @@ import base64
 import io
 import json
 import logging
+import math
 import os
 import platform
 import queue
 import re
 import sqlite3
 import stat
+import shutil
 import subprocess
 import sys
 import threading
@@ -123,7 +125,8 @@ from kivy.clock import Clock
 from kivy.core.clipboard import Clipboard
 from kivy.core.image import Image as CoreImage
 from kivy.core.window import Window
-from kivy.graphics import Color, Ellipse, Line, RoundedRectangle, Triangle
+from kivy.graphics import Color, Ellipse, Line, Mesh, Rectangle, \
+    RoundedRectangle, Triangle
 from kivy.metrics import dp, sp
 from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.behaviors import ButtonBehavior
@@ -845,6 +848,8 @@ SERVER_URL_OVERRIDE = _os.environ.get("FEXT_SERVER_URL", "")
 REQUIRE_TLS = _os.environ.get("FEXT_REQUIRE_TLS", "") not in ("", "0", "false")
 
 APP_NAME = "Ferritext"
+#: Must equal `version` in buildozer.spec — CI refuses to build if not.
+APP_VERSION = "9.0.0"
 
 # The identity/QR payload keeps carrying the ORIGINAL tag. It is wire data
 # that older clients already produce and consume, so renaming the app must
@@ -897,6 +902,26 @@ CHAT_PAGE_SIZE = 60             # messages materialised per chat page
 RECEIPT_RETRY_WINDOW_SECONDS = 7 * 86400
 HKDF_INFO = b"fext.v2.secp256k1-ecdh-hkdf-sha256.aes256gcm"
 
+# ---- v9 media ---------------------------------------------------------------
+# Photos and voice notes are sealed with a fresh per-file AES-256-GCM key,
+# uploaded to the relay as an opaque blob, and referenced from a normal
+# end-to-end message that carries the key. The relay keeps blobs only for a
+# while; past that the recipient asks the sender to upload again, and the
+# sender's device — which still holds the file — does it (see the 'resend'
+# control). Long-term storage is the phones', never the relay's.
+MEDIA_DIR = DATA_DIR / "media"
+MAX_MEDIA_BYTES = 8 * 1024 * 1024    # hard cap for one sealed blob
+IMAGE_MAX_EDGE = 1280                # photos are resized to fit this box…
+IMAGE_JPEG_QUALITY = 60              # …and re-encoded: ~100-200 KB typical
+THUMB_EDGE = 40                      # inline preview, travels in the message
+THUMB_QUALITY = 40
+VOICE_SAMPLE_RATE = 16000            # wideband speech
+VOICE_BITRATE = 24000                # AAC-LC: ~3 KB per second of speech
+MAX_VOICE_SECONDS = 300
+MEDIA_MIME = {"image": ("image/jpeg", "image/png", "image/webp"),
+              "voice": ("audio/mp4", "audio/aac", "audio/ogg",
+                        "audio/3gpp", "audio/amr", "audio/wav")}
+
 # ---- Palette -----------------------------------------------------------------
 # A beige chat background, a dark brown app bar, gold bubbles for your own
 # messages and cream cards everywhere else. The one non-negotiable brand
@@ -919,6 +944,10 @@ COL_OK           = "#69945F"    # sage
 COL_TICK_GOLD    = "#C9871B"    # the golden ticks
 COL_TICK_GREY    = "#B3A48F"    # 0/3 — not yet on the server
 COL_PRESSED      = "#F1E5CF"    # row press feedback
+COL_DIVIDER      = "#EFE4D2"    # hairlines between list rows
+COL_QUOTE_ME     = "#F7CF86"    # reply-quote ground inside an outgoing bubble
+COL_QUOTE_PEER   = "#F7EFE2"    # ... and inside an incoming one
+COL_SELECT_RGBA  = (0.851, 0.557, 0.169, 0.18)   # gold wash on selected rows
 
 # Avatar hues, assigned by address hash — every contact gets a stable, warm
 # colour of their own.
@@ -964,6 +993,177 @@ def sanitize_text(text: str) -> str:
     text = _CONTROL_CHARS.sub("", text)
     text = text.strip()
     return text[:MAX_MESSAGE_CHARS]
+
+
+_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _str(value, limit: int) -> Optional[str]:
+    return value[:limit] if isinstance(value, str) else None
+
+
+def _int(value, low: int, high: int) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if low <= value <= high else None
+
+
+def sanitize_media(media) -> Optional[dict]:
+    """Validate a peer-supplied media reference field by field.
+
+    The block it came in is authenticated, but authenticated is not the same
+    as well-formed: a buggy or hostile client can sign anything. Every field
+    is type-checked and bounded before it reaches the database or the
+    screen, and anything unrecognised is dropped rather than passed through.
+    """
+    if not isinstance(media, dict):
+        return None
+    kind = media.get("kind")
+    if kind not in MEDIA_MIME:
+        return None
+    blob, sha = _str(media.get("blob"), 64), _str(media.get("sha"), 64)
+    mime = _str(media.get("mime"), 40)
+    size = _int(media.get("size"), 1, MAX_MEDIA_BYTES)
+    try:
+        key_ok = len(b64d(media.get("key", ""))) == 32
+    except (TypeError, ValueError):
+        key_ok = False
+    if not (blob and _TOKEN_RE.match(blob) and sha and _HEX64_RE.match(sha)
+            and mime in MEDIA_MIME[kind] and size and key_ok):
+        return None
+    out = {"kind": kind, "blob": blob, "sha": sha, "mime": mime,
+           "size": size, "key": media["key"]}
+    for field, low, high in (("w", 1, 20000), ("h", 1, 20000),
+                             ("dur", 0, MAX_VOICE_SECONDS * 1000 + 999)):
+        value = _int(media.get(field), low, high)
+        if value is not None:
+            out[field] = value
+    for field, limit in (("thumb", 24000), ("wave", 400)):
+        value = _str(media.get(field), limit + 1)
+        if value is not None and len(value) <= limit:
+            try:
+                b64d(value)
+                out[field] = value
+            except (TypeError, ValueError):
+                pass
+    caption = _str(media.get("cap"), 1000)
+    if caption:
+        out["cap"] = sanitize_text(caption)
+    return out
+
+
+def sanitize_ext(x) -> dict:
+    """The parts of a peer's extension block we keep: reply quote, forwarded
+    mark, media reference. Routing fields (to/cid/xv/k) are consumed by the
+    sync layer and never stored."""
+    out = {}
+    if not isinstance(x, dict):
+        return out
+    reply = x.get("reply")
+    if isinstance(reply, dict):
+        quoted = {}
+        cid = _str(reply.get("cid"), 64)
+        if cid and _TOKEN_RE.match(cid):
+            quoted["cid"] = cid
+        snip = _str(reply.get("snip"), 300)
+        if snip:
+            quoted["snip"] = sanitize_text(snip)[:300]
+        author = _str(reply.get("from"), 64)
+        if author and valid_address(author):
+            quoted["from"] = author
+        if reply.get("kind") in ("text", "image", "voice"):
+            quoted["kind"] = reply["kind"]
+        if quoted:
+            out["reply"] = quoted
+    if x.get("fwd") in (1, True):
+        out["fwd"] = 1
+    media = sanitize_media(x.get("media"))
+    if media:
+        out["media"] = media
+    return out
+
+
+MEDIA_AAD = b"fext.media.v1"
+
+
+def compress_image(path: str) -> tuple:
+    """Shrink a photo for sending: (jpeg_bytes, width, height, thumb_b64).
+
+    Fits it inside IMAGE_MAX_EDGE, re-encodes it as a progressive JPEG and,
+    by not passing them on, drops EXIF and every other metadata block —
+    which is where phones keep the GPS position a photo was taken at. The
+    camera's rotation flag is applied to the pixels first, because dropping
+    it would otherwise turn portrait photos on their side.
+    """
+    from PIL import Image, ImageOps
+    import io as _io
+    with Image.open(path) as source:
+        source.load()
+        try:
+            image = ImageOps.exif_transpose(source)
+        except Exception:                        # malformed EXIF: ignore it
+            image = source.copy()
+    if image.mode in ("RGBA", "LA", "P"):
+        image = image.convert("RGBA")
+        flat = Image.new("RGB", image.size, (255, 255, 255))
+        flat.paste(image, mask=image.split()[-1])
+        image = flat
+    else:
+        image = image.convert("RGB")
+    image.thumbnail((IMAGE_MAX_EDGE, IMAGE_MAX_EDGE), Image.LANCZOS)
+    out = _io.BytesIO()
+    image.save(out, "JPEG", quality=IMAGE_JPEG_QUALITY, optimize=True,
+               progressive=True)
+    thumb = image.copy()
+    thumb.thumbnail((THUMB_EDGE, THUMB_EDGE), Image.LANCZOS)
+    small = _io.BytesIO()
+    thumb.save(small, "JPEG", quality=THUMB_QUALITY)
+    return out.getvalue(), image.width, image.height, b64e(small.getvalue())
+
+
+def voice_label(duration_ms: int) -> str:
+    seconds = max(0, int(round((duration_ms or 0) / 1000.0)))
+    return f"Voice message ({seconds // 60}:{seconds % 60:02d})"
+
+
+def seal_media(data: bytes) -> tuple:
+    """Encrypt one media file for upload. Returns (blob, key_b64, sha_hex).
+
+    A fresh 256-bit key per file, never reused, so the relay's copy is just
+    noise and forwarding a photo can share its reference without sharing any
+    other key. The key travels inside the end-to-end envelope; `sha` lets
+    the recipient reject a corrupted or substituted download BEFORE trying
+    to decrypt it.
+    """
+    key, nonce = os.urandom(32), os.urandom(12)
+    blob = nonce + AESGCM(key).encrypt(nonce, data, MEDIA_AAD)
+    return blob, b64e(key), hashlib.sha256(blob).hexdigest()
+
+
+def open_media(blob: bytes, key_b64: str, sha_hex: str) -> bytes:
+    """Verify and decrypt a downloaded blob; raises ValueError on mismatch."""
+    if hashlib.sha256(blob).hexdigest() != sha_hex:
+        raise ValueError("media failed its integrity check")
+    if len(blob) < 12 + 16:
+        raise ValueError("media blob is truncated")
+    try:
+        return AESGCM(b64d(key_b64)).decrypt(blob[:12], blob[12:], MEDIA_AAD)
+    except Exception:
+        raise ValueError("media could not be decrypted")
+
+
+def discard_media_file(path: Optional[str]) -> None:
+    """Delete a decrypted media file — but only one inside MEDIA_DIR, so a
+    corrupted database row can never point this at anything else."""
+    if not path:
+        return
+    try:
+        target = Path(path).resolve()
+        if MEDIA_DIR.resolve() in target.parents and target.is_file():
+            target.unlink()
+    except OSError:
+        log.warning("could not remove media file %s", path)
 
 
 def valid_username(name: str) -> bool:
@@ -1084,6 +1284,423 @@ def run_on_ui(fn: Callable, *args) -> None:
     """Hop onto the Kivy main thread (the tkinter `after(0, …)` of this app).
     ALL widget mutation from worker threads goes through here."""
     Clock.schedule_once(lambda _dt: fn(*args), 0)
+
+
+# =============================================================================
+#  Platform glue — Android through pyjnius, with desktop fallbacks
+# =============================================================================
+# Everything Android-specific lives here so the rest of the file stays
+# platform-neutral. Each entry point is defensive: on a desktop, or if a
+# device's media stack misbehaves, the caller gets an exception or a False
+# and turns it into a status line. None of it may take the app down.
+
+REQ_PICK_IMAGE = 4711
+NOTIFY_CHANNEL = "messages"
+
+
+def _jni():
+    from jnius import autoclass, cast            # Android only
+    return autoclass, cast
+
+
+def android_context():
+    """The Activity in the app process; the Service in the sync service."""
+    autoclass, _ = _jni()
+    activity = autoclass("org.kivy.android.PythonActivity").mActivity
+    if activity is not None:
+        return activity
+    return autoclass("org.kivy.android.PythonService").mService
+
+
+def android_sdk() -> int:
+    autoclass, _ = _jni()
+    return int(autoclass("android.os.Build$VERSION").SDK_INT)
+
+
+def _charseq(text: str):
+    autoclass, cast = _jni()
+    return cast("java.lang.CharSequence", autoclass("java.lang.String")(text))
+
+
+def android_request_permissions(permissions: list, callback=None) -> None:
+    """Runtime permissions (Android 6+). Missing ones are simply asked for;
+    the OS remembers a refusal, so asking again is harmless."""
+    try:
+        from android.permissions import request_permissions
+        request_permissions(permissions, callback)
+    except Exception:
+        log.exception("could not request %s", permissions)
+
+
+def android_has_permission(permission: str) -> bool:
+    try:
+        from android.permissions import check_permission
+        return bool(check_permission(permission))
+    except Exception:
+        return False
+
+
+def android_share_text(text: str) -> None:
+    autoclass, cast = _jni()
+    Intent = autoclass("android.content.Intent")
+    intent = Intent(Intent.ACTION_SEND)
+    intent.setType("text/plain")
+    intent.putExtra(Intent.EXTRA_TEXT, _charseq(text))
+    android_context().startActivity(
+        Intent.createChooser(intent, _charseq("Share")))
+
+
+def android_share_image(path: str) -> None:
+    """Share a photo with another app.
+
+    Other apps cannot read this app's private storage, and Android 7+
+    forbids handing them file:// paths anyway, so the photo is published
+    through MediaStore first and the resulting content:// URI is shared.
+    (A side effect is that a shared photo also lands in the gallery.)
+    """
+    autoclass, cast = _jni()
+    ctx = android_context()
+    media = autoclass("android.provider.MediaStore$Images$Media")
+    uri_text = media.insertImage(ctx.getContentResolver(), path,
+                                 "Ferritext photo", None)
+    if not uri_text:
+        raise RuntimeError("the gallery refused the photo")
+    Intent = autoclass("android.content.Intent")
+    intent = Intent(Intent.ACTION_SEND)
+    intent.setType("image/jpeg")
+    intent.putExtra(Intent.EXTRA_STREAM, cast(
+        "android.os.Parcelable", autoclass("android.net.Uri").parse(uri_text)))
+    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    ctx.startActivity(Intent.createChooser(intent, _charseq("Share photo")))
+
+
+def _notification_id(peer: str) -> int:
+    """Stable per chat, so a second message replaces the first notification
+    instead of stacking. (hash() is randomised per process — useless here.)"""
+    return 1000 + int(hashlib.sha256(peer.encode()).hexdigest()[:6], 16)
+
+
+def android_notify(peer: str, title: str, text: str) -> None:
+    """Post a 'new message' notification; tapping it opens that chat."""
+    autoclass, cast = _jni()
+    ctx = android_context()
+    Context = autoclass("android.content.Context")
+    manager = cast("android.app.NotificationManager",
+                   ctx.getSystemService(Context.NOTIFICATION_SERVICE))
+    Builder = autoclass("android.app.Notification$Builder")
+    if android_sdk() >= 26:
+        Channel = autoclass("android.app.NotificationChannel")
+        importance = autoclass("android.app.NotificationManager"
+                               ).IMPORTANCE_HIGH
+        channel = Channel(NOTIFY_CHANNEL, _charseq("Messages"), importance)
+        channel.setDescription("New messages")
+        manager.createNotificationChannel(channel)
+        builder = Builder(ctx, NOTIFY_CHANNEL)
+    else:
+        builder = Builder(ctx)
+        builder.setPriority(1)                    # PRIORITY_HIGH
+    res = ctx.getResources()
+    icon = res.getIdentifier("ic_stat_ferritext", "drawable",
+                             ctx.getPackageName())
+    builder.setSmallIcon(icon or ctx.getApplicationInfo().icon)
+    builder.setContentTitle(_charseq(title))
+    builder.setContentText(_charseq(text))
+    builder.setAutoCancel(True)
+    # The launcher intent, not an explicit Activity class: it is what a tap
+    # on the app icon would send, so it resumes the running instance.
+    intent = ctx.getPackageManager().getLaunchIntentForPackage(
+        ctx.getPackageName())
+    Intent = autoclass("android.content.Intent")
+    intent.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP |
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP |
+                    Intent.FLAG_ACTIVITY_NEW_TASK)
+    intent.putExtra("fext_peer", peer)
+    PendingIntent = autoclass("android.app.PendingIntent")
+    flags = PendingIntent.FLAG_UPDATE_CURRENT
+    if android_sdk() >= 23:
+        flags |= PendingIntent.FLAG_IMMUTABLE    # mandatory from Android 12
+    builder.setContentIntent(PendingIntent.getActivity(
+        ctx, _notification_id(peer), intent, flags))
+    manager.notify(_notification_id(peer), builder.build())
+
+
+def android_clear_notification(peer: str) -> None:
+    try:
+        autoclass, cast = _jni()
+        ctx = android_context()
+        Context = autoclass("android.content.Context")
+        cast("android.app.NotificationManager",
+             ctx.getSystemService(Context.NOTIFICATION_SERVICE)
+             ).cancel(_notification_id(peer))
+    except Exception:
+        pass
+
+
+def android_pick_image(callback: Callable[[str], None]) -> None:
+    """Open the system photo picker; `callback(path)` gets a private copy.
+
+    The picker hands back a content:// URI. Reading it through a detached
+    file descriptor gives Python an ordinary file object — no byte-by-byte
+    marshalling across the JNI boundary.
+    """
+    autoclass, _ = _jni()
+    from android import activity
+
+    def on_result(request, result, data):
+        if request != REQ_PICK_IMAGE:
+            return
+        activity.unbind(on_activity_result=on_result)
+        if result != -1 or data is None:          # -1 == RESULT_OK
+            return
+        try:
+            resolver = android_context().getContentResolver()
+            fd = resolver.openFileDescriptor(data.getData(), "r").detachFd()
+            MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+            target = MEDIA_DIR / f"pick_{uuid.uuid4().hex}"
+            with os.fdopen(fd, "rb") as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+        except Exception:
+            log.exception("could not read the picked image")
+            return
+        run_on_ui(callback, str(target))
+
+    activity.bind(on_activity_result=on_result)
+    Intent = autoclass("android.content.Intent")
+    intent = Intent(Intent.ACTION_GET_CONTENT)
+    intent.setType("image/*")
+    intent.addCategory(Intent.CATEGORY_OPENABLE)
+    android_context().startActivityForResult(
+        Intent.createChooser(intent, _charseq("Choose a photo")),
+        REQ_PICK_IMAGE)
+
+
+# ---- background delivery (Android) ------------------------------------------
+# Notifications only reach someone if something is listening for messages.
+# While the app's process is alive, its own SyncWorker does that. Android
+# kills background apps freely, though, so a small foreground service (a
+# separate process, see service.py and run_background_service) takes over
+# whenever the app's worker has gone quiet, and steps aside again the moment
+# it is back. Each side proves it is alive by touching a heartbeat file; two
+# processes never hold a connection for the same identity at once.
+SERVICE_NAME = "fextsync"          # must match `services =` in buildozer.spec
+HEARTBEAT_EVERY = 10.0             # seconds between beats
+HEARTBEAT_STALE = 35.0             # older than this: that process is gone
+
+
+def _beat_path(owner: str) -> Path:
+    return DATA_DIR / f".beat_{owner}"
+
+
+def write_heartbeat(owner: str) -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        _beat_path(owner).write_text(f"{time.time():.1f}")
+    except OSError:
+        pass
+
+
+def heartbeat_fresh(owner: str) -> bool:
+    try:
+        return time.time() - float(_beat_path(owner).read_text()) \
+            < HEARTBEAT_STALE
+    except (OSError, ValueError):
+        return False
+
+
+def load_prefs() -> dict:
+    """Device-wide preferences shared by the app and its service."""
+    try:
+        data = json.loads((DATA_DIR / "prefs.json").read_text("utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_pref(key: str, value) -> None:
+    prefs = load_prefs()
+    prefs[key] = value
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = DATA_DIR / "prefs.json.tmp"
+        tmp.write_text(json.dumps(prefs), "utf-8")
+        tmp.replace(DATA_DIR / "prefs.json")
+    except OSError:
+        log.exception("could not save preferences")
+
+
+def background_delivery_enabled() -> bool:
+    return bool(load_prefs().get("background_delivery", True))
+
+
+def android_service(start: bool) -> None:
+    """Start or stop the background sync service (Android only)."""
+    autoclass, _ = _jni()
+    ctx = android_context()
+    service = autoclass(f"{ctx.getPackageName()}.Service"
+                        f"{SERVICE_NAME.capitalize()}")
+    if start:
+        service.start(ctx, "ic_stat_ferritext", APP_NAME,
+                      "Ready for new messages", "")
+    else:
+        service.stop(ctx)
+
+
+class VoiceRecorder:
+    """Android voice-note recorder (MediaRecorder, AAC in MP4).
+
+    AAC-LC at 16 kHz mono is the format every Android version both records
+    and plays back, and the one Windows and macOS open natively, so a voice
+    note works on every device it lands on. Opus would be smaller, but
+    Android only gained an Opus encoder in 10 and older phones could not
+    play it. The level meter is sampled while recording, which yields the
+    waveform for free instead of decoding the audio afterwards.
+    """
+
+    def __init__(self) -> None:
+        autoclass, _ = _jni()
+        MediaRecorder = autoclass("android.media.MediaRecorder")
+        AudioSource = autoclass("android.media.MediaRecorder$AudioSource")
+        OutputFormat = autoclass("android.media.MediaRecorder$OutputFormat")
+        AudioEncoder = autoclass("android.media.MediaRecorder$AudioEncoder")
+        MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        self.path = str(MEDIA_DIR / f"rec_{uuid.uuid4().hex}.m4a")
+        self._rec = MediaRecorder()
+        self._rec.setAudioSource(AudioSource.MIC)
+        self._rec.setOutputFormat(OutputFormat.MPEG_4)
+        self._rec.setAudioEncoder(AudioEncoder.AAC)
+        self._rec.setAudioChannels(1)
+        self._rec.setAudioSamplingRate(VOICE_SAMPLE_RATE)
+        self._rec.setAudioEncodingBitRate(VOICE_BITRATE)
+        self._rec.setOutputFile(self.path)
+        self._rec.prepare()
+        self._rec.start()
+        self._started = time.monotonic()
+        self.levels: list = []
+        self._tick = Clock.schedule_interval(self._sample, 0.1)
+
+    def _sample(self, _dt) -> None:
+        try:
+            self.levels.append(int(self._rec.getMaxAmplitude()))
+        except Exception:
+            pass
+
+    @property
+    def elapsed_ms(self) -> int:
+        return int((time.monotonic() - self._started) * 1000)
+
+    def _halt(self) -> None:
+        self._tick.cancel()
+        try:
+            self._rec.stop()
+        finally:
+            self._rec.release()
+
+    def stop(self) -> tuple:
+        """Returns (path, duration_ms, waveform_b64)."""
+        duration = self.elapsed_ms
+        self._halt()
+        return self.path, duration, waveform_b64(self.levels)
+
+    def cancel(self) -> None:
+        try:
+            self._halt()
+        except Exception:
+            pass
+        discard_media_file(self.path)
+
+
+def waveform_b64(levels: list, bars: int = 48) -> str:
+    """Down-sample level readings to `bars` bytes (0-255), base64."""
+    if not levels:
+        return ""
+    peak = max(levels) or 1
+    step = len(levels) / float(bars)
+    out = bytearray()
+    for i in range(bars):
+        chunk = levels[int(i * step):max(int((i + 1) * step), int(i * step) + 1)]
+        out.append(min(255, int(255 * (max(chunk) if chunk else 0) / peak)))
+    return b64e(bytes(out))
+
+
+class VoicePlayer:
+    """Plays one voice note at a time.
+
+    Android: MediaPlayer, polled for progress (no Java listener class needed).
+    Desktop: Kivy's audio stack has no AAC decoder, so the file is handed to
+    the operating system's default player instead.
+    """
+
+    def __init__(self) -> None:
+        self._mp = None
+        self._poll = None
+        self.path: Optional[str] = None
+        self.on_progress: Optional[Callable] = None   # (path, fraction)
+        self.on_stop: Optional[Callable] = None       # (path)
+
+    @property
+    def playing(self) -> bool:
+        return self._mp is not None
+
+    def toggle(self, path: str) -> None:
+        if self.path == path and self._mp is not None:
+            self.stop()
+            return
+        self.stop()
+        if not IS_ANDROID:
+            open_with_system(path)
+            return
+        autoclass, _ = _jni()
+        mp = autoclass("android.media.MediaPlayer")()
+        mp.setDataSource(path)
+        mp.prepare()
+        mp.start()
+        self._mp, self.path = mp, path
+        self._poll = Clock.schedule_interval(self._check, 0.15)
+
+    def _check(self, _dt) -> None:
+        mp = self._mp
+        if mp is None:
+            return
+        try:
+            if not mp.isPlaying():
+                self.stop()
+                return
+            total = mp.getDuration() or 1
+            if self.on_progress:
+                self.on_progress(self.path, mp.getCurrentPosition() / total)
+        except Exception:
+            self.stop()
+
+    def stop(self) -> None:
+        if self._poll is not None:
+            self._poll.cancel()
+            self._poll = None
+        mp, path = self._mp, self.path
+        self._mp, self.path = None, None
+        if mp is not None:
+            try:
+                mp.stop()
+                mp.release()
+            except Exception:
+                pass
+        if path and self.on_stop:
+            self.on_stop(path)
+
+
+def open_with_system(path: str) -> bool:
+    """Open a file in the OS's default application (desktop)."""
+    system = platform.system()
+    try:
+        if system == "Windows":
+            os.startfile(path)                     # type: ignore[attr-defined]
+        elif system == "Darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+        return True
+    except Exception:
+        log.warning("no application to open %s", path)
+        return False
 
 
 _AVATAR_CACHE: dict = {}
@@ -1241,6 +1858,14 @@ class IdentityManager:
             except OSError:
                 pass         # best effort: the identity is gone regardless
         return self._data.get("active")
+
+    def rename_identity(self, address: str, label: str) -> None:
+        """Change the on-device label of an identity (not its username)."""
+        ident = self.find(address)
+        if ident is None:
+            raise KeyError(address)
+        ident["label"] = label.strip() or short_addr(address)
+        self._save()
 
     def clear_username(self) -> None:
         """Forget the registered name for the ACTIVE identity.
@@ -1401,16 +2026,55 @@ class CryptoEngine:
         return f"{version}|{msg_type}|{sha256_hex(body.encode())}|" \
                f"{sent_at}|{sender_address}".encode("utf-8")
 
+    # ---- v9 extension block --------------------------------------------------
+    #: Version of the `x` extension block. Readers ignore keys they do not
+    #: know, so this only changes for an incompatible reinterpretation.
+    X_VERSION = 1
+
+    @classmethod
+    def _x_canonical(cls, x: dict, base: bytes) -> bytes:
+        """What `xsig` signs: the extension, bound to the v2 canonical string.
+
+        v9 features — reply quotes, forwarded marks, media references and
+        delete-for-both — need metadata the v2 signature does not cover: it
+        signs only version|type|sha256(body)|sent_at|sender. Changing that
+        string would make every message from a v9 client fail verification
+        on a v8 client, so instead the metadata travels in a separate `x`
+        block with its OWN signature, which a v8 client simply never looks
+        at. Hashing `base` in binds the block to this exact body and time,
+        so it cannot be lifted onto a different message.
+
+        `x` is serialized with sorted keys and no whitespace, and carries
+        only strings, ints, lists and dicts, so both ends produce the same
+        bytes from it.
+        """
+        digest = sha256_hex(json.dumps(
+            x, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False).encode("utf-8"))
+        return f"fx{cls.X_VERSION}|{digest}|{sha256_hex(base)}".encode("utf-8")
+
     # ---- outgoing ------------------------------------------------------------
-    def build_envelope(self, body: str, recipient_pub_hex: str) -> tuple:
+    def build_envelope(self, body: str, recipient_pub_hex: str,
+                       x: Optional[dict] = None,
+                       recipient: Optional[str] = None,
+                       cid: Optional[str] = None) -> tuple:
         """Returns (envelope, sent_at). `envelope` is the ONLY thing that is
-        transmitted; it is opaque ciphertext to everyone but the recipient."""
+        transmitted; it is opaque ciphertext to everyone but the recipient.
+
+        `x`, when given, is the v9 extension block (see _x_canonical). It is
+        stamped with the recipient's address and the message's client id
+        before signing, which closes a replay the v2 format leaves open: a
+        v2 signature names no recipient, so anyone who RECEIVED a signed
+        message could re-encrypt it to a third party and it would verify as
+        genuinely from its author. An `x` block names exactly one recipient
+        and one message, and v9 clients refuse a block addressed elsewhere.
+        """
         sent_at = now_iso()
         sender_address = self._keys.address
 
         # ---- step 1: SIGN ----------------------------------------------------
-        signature = self._keys.sign(
-            self._canonical(2, "text", body, sent_at, sender_address))
+        base = self._canonical(2, "text", body, sent_at, sender_address)
+        signature = self._keys.sign(base)
         payload = {
             "v": 2,
             "type": "text",
@@ -1423,6 +2087,13 @@ class CryptoEngine:
             },
             "signature": b64e(signature),
         }
+        if x is not None:
+            if not recipient or not cid:
+                raise ValueError("an extension block needs its recipient "
+                                 "and client message id")
+            x = dict(x, xv=self.X_VERSION, to=recipient, cid=cid)
+            payload["x"] = x
+            payload["xsig"] = b64e(self._keys.sign(self._x_canonical(x, base)))
         plaintext = json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
         # ---- step 2: ENCRYPT -------------------------------------------------
@@ -1445,8 +2116,18 @@ class CryptoEngine:
         return envelope, sent_at
 
     # ---- incoming ------------------------------------------------------------
-    def open_envelope(self, envelope: dict, claimed_sender: str) -> dict:
-        """Decrypt + verify. Returns the trusted inner payload dict."""
+    def open_envelope(self, envelope: dict, claimed_sender: str,
+                      cid: Optional[str] = None) -> dict:
+        """Decrypt + verify. Returns the trusted inner payload dict.
+
+        A payload carrying an `x` block is accepted only if that block's own
+        signature verifies, it is addressed to THIS identity, and it is bound
+        to the client message id the relay delivered it under. Failing any
+        of those is treated exactly like a bad signature, never as "show the
+        body and drop the extras": a v9 sender always produces a valid block,
+        so an invalid one means tampering or a replay, and quietly showing
+        the body would hand the replay its payoff.
+        """
         try:
             eph_pub_raw = bytes.fromhex(envelope["ephemeral_public_key"])
             nonce = b64d(envelope["nonce"])
@@ -1474,12 +2155,26 @@ class CryptoEngine:
                 raise self.EnvelopeError("sender identity mismatch")
             if sender.get("address") != recomputed:
                 raise self.EnvelopeError("payload identity mismatch")
-            ok = ecdsa_verify(
-                self._canonical(payload["v"], payload["type"], payload["body"],
-                                payload["sent_at"], recomputed),
-                b64d(payload["signature"]), sender_point)
+            base = self._canonical(payload["v"], payload["type"],
+                                   payload["body"], payload["sent_at"],
+                                   recomputed)
+            ok = ecdsa_verify(base, b64d(payload["signature"]), sender_point)
             if not ok:
                 raise self.EnvelopeError("signature verification failed")
+            x = payload.get("x")
+            if x is not None:
+                if not isinstance(x, dict):
+                    raise self.EnvelopeError("malformed extension block")
+                if not ecdsa_verify(self._x_canonical(x, base),
+                                    b64d(payload.get("xsig", "")),
+                                    sender_point):
+                    raise self.EnvelopeError("extension signature failed")
+                if x.get("to") != self._keys.address:
+                    raise self.EnvelopeError(
+                        "extension addressed to a different identity")
+                if not x.get("cid") or (cid and x["cid"] != cid):
+                    raise self.EnvelopeError(
+                        "extension bound to a different message")
         except self.EnvelopeError:
             raise
         except (KeyError, ValueError, TypeError):
@@ -1691,6 +2386,60 @@ class ApiClient:
         headers = self._auth_headers("events.sync")
         return self._get("/api/events/sync", {}, headers)
 
+    # ---- v9: capabilities and media blobs ------------------------------------
+    def features(self) -> dict:
+        """The relay's advertised features, from /api/health.
+
+        A v8 relay advertises none, which is how the app knows to say "this
+        relay cannot carry photos or voice notes yet" instead of failing an
+        upload. Cached for the session; `refresh` is for the settings screen.
+        """
+        if getattr(self, "_features", None) is None:
+            try:
+                data = self._get("/api/health", {})
+            except (requests.RequestException, self.ApiError):
+                return {}                    # unknown; ask again next time
+            feats = data.get("features") if isinstance(data, dict) else None
+            self._features = {
+                "blobs": isinstance(feats, list) and "blobs" in feats,
+                "blob_max": int(data.get("blob_max") or MAX_MEDIA_BYTES)
+                if isinstance(data, dict) else MAX_MEDIA_BYTES,
+                "blob_ttl": int(data.get("blob_ttl") or 0)
+                if isinstance(data, dict) else 0,
+                "version": str(data.get("version", "")) if isinstance(
+                    data, dict) else ""}
+        return self._features
+
+    def upload_blob(self, blob: bytes) -> dict:
+        """Store one sealed media file on the relay; returns {'blob': id,
+        'expires_at': ...}. The signature binds the exact bytes."""
+        if len(blob) > MAX_MEDIA_BYTES:
+            raise self.ApiError(413, "too_large", "media is too large")
+        headers = self._auth_headers(f"blob.{sha256_hex(blob)}")
+        headers["Content-Type"] = "application/octet-stream"
+        return self._attempt(lambda base: self._handle(
+            self._session.post(f"{base}/api/blobs", data=blob,
+                               headers=headers,
+                               timeout=max(REQUEST_TIMEOUT, 60))))
+
+    def download_blob(self, blob_id: str) -> bytes:
+        """Fetch a sealed blob. 410 means the relay let it expire — the cue
+        to ask the sender for it again."""
+        if not _TOKEN_RE.match(blob_id or ""):
+            raise self.ApiError(400, "bad_blob", "malformed media id")
+        headers = self._auth_headers(f"blob.get.{blob_id}")
+
+        def call(base):
+            resp = self._session.get(f"{base}/api/blobs/{blob_id}",
+                                     headers=headers,
+                                     timeout=max(REQUEST_TIMEOUT, 60))
+            if resp.status_code >= 400:
+                self._handle(resp)                   # raises ApiError
+            if len(resp.content) > MAX_MEDIA_BYTES + 64:
+                raise self.ApiError(413, "too_large", "media is too large")
+            return resp.content
+        return self._attempt(call)
+
 
 # =============================================================================
 #  LocalStore — per-identity client-side history (plaintext stays local)
@@ -1734,14 +2483,42 @@ class LocalStore:
     );
     CREATE INDEX IF NOT EXISTS idx_local_msgs_peer ON messages (peer, id);
     CREATE INDEX IF NOT EXISTS idx_local_msgs_cmid ON messages (client_msg_id);
+    -- v9: client ids of messages deleted on this device, so a message the
+    -- relay re-pushes (an ack lost to a dropped socket) or one that arrives
+    -- AFTER its author's delete-for-both cannot come back from the dead.
+    CREATE TABLE IF NOT EXISTS tombstones (
+        cid  TEXT NOT NULL,
+        peer TEXT NOT NULL,
+        at   TEXT NOT NULL,
+        PRIMARY KEY (cid, peer)
+    );
     """
 
-    #: Columns added after v7.1 shipped, applied to databases that predate
-    #: them. SQLite has no "ADD COLUMN IF NOT EXISTS", so this is done by
-    #: inspection rather than by catching the error — an OperationalError is
-    #: too blunt an instrument to distinguish "already there" from "broken".
+    #: Current schema generation, recorded in PRAGMA user_version.
+    #:   0/1  up to v8.0.2 (receipt_sent added by inspection in v7.2)
+    #:   2    v9.0.0: message kinds, extension metadata, stars, media state,
+    #:        per-contact notifications and capabilities, tombstones
+    SCHEMA_VERSION = 2
+
+    #: Additive migrations: (table, column, statements). Applied when the
+    #: column is missing, decided by inspection rather than by catching the
+    #: error — an OperationalError is too blunt an instrument to tell
+    #: "already there" from "broken" — so they are idempotent and safe to run
+    #: against a database that was migrated halfway.
+    #:
+    #: COMPATIBILITY POLICY, which every future migration must keep:
+    #:   * only ever ADD tables and columns, each with a DEFAULT; never drop,
+    #:     rename or retype one, and never change what an existing column
+    #:     means;
+    #:   * `body` always holds a human-readable rendering of the message,
+    #:     whatever its kind, because older releases show nothing else.
+    #: Together these let an OLDER release open a database a newer one has
+    #: migrated — it ignores the columns it does not know and its INSERTs
+    #: name their columns, so the new ones take their defaults — and a
+    #: newer release open anything older. Both directions are exercised by
+    #: desktop/test_core.py against the previous release's real code.
     _MIGRATIONS = (
-        ("receipt_sent", (
+        ("messages", "receipt_sent", (
             "ALTER TABLE messages "
             "ADD COLUMN receipt_sent INTEGER NOT NULL DEFAULT 0",
             # Backfill: history predates the column, so treat it as settled.
@@ -1751,7 +2528,31 @@ class LocalStore:
             # and they would be retried on every sync cycle forever.
             "UPDATE messages SET receipt_sent = 1",
         )),
+        # ---- schema 2 (v9.0.0) ----------------------------------------------
+        ("messages", "kind", (
+            "ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL "
+            "DEFAULT 'text'",)),
+        ("messages", "ext", (
+            "ALTER TABLE messages ADD COLUMN ext TEXT",)),
+        ("messages", "starred", (
+            "ALTER TABLE messages ADD COLUMN starred INTEGER NOT NULL "
+            "DEFAULT 0",)),
+        ("messages", "media_path", (
+            "ALTER TABLE messages ADD COLUMN media_path TEXT",)),
+        ("messages", "media_state", (
+            "ALTER TABLE messages ADD COLUMN media_state TEXT NOT NULL "
+            "DEFAULT ''",)),
+        ("contacts", "notify", (
+            "ALTER TABLE contacts ADD COLUMN notify INTEGER NOT NULL "
+            "DEFAULT 1",)),
+        ("contacts", "caps", (
+            "ALTER TABLE contacts ADD COLUMN caps INTEGER NOT NULL "
+            "DEFAULT 0",)),
     )
+
+    #: contacts.caps bit: this peer has sent us a valid v9 extension block,
+    #: so it understands delete-for-both, replies and media references.
+    CAP_V9 = 1
 
     def __init__(self, path: Path) -> None:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -1765,15 +2566,34 @@ class LocalStore:
 
     def _migrate(self) -> None:
         """Bring an older database up to the current schema. Called with the
-        lock held."""
-        have = {r["name"] for r in
-                self._db.execute("PRAGMA table_info(messages)").fetchall()}
-        for column, statements in self._MIGRATIONS:
+        lock held.
+
+        A database stamped with a NEWER generation than this release knows
+        is opened anyway, never "repaired": under the additive policy above
+        everything this release reads is still there, and touching it would
+        risk damaging a schema this code does not understand.
+        """
+        found = self._db.execute("PRAGMA user_version").fetchone()[0]
+        if found > self.SCHEMA_VERSION:
+            log.warning("local store: database is schema %s, this release "
+                        "knows %s — opening it as-is (newer releases only "
+                        "ever add columns)", found, self.SCHEMA_VERSION)
+            return
+        columns = {}
+        for table, column, statements in self._MIGRATIONS:
+            have = columns.get(table)
+            if have is None:
+                have = columns[table] = {
+                    r["name"] for r in self._db.execute(
+                        f"PRAGMA table_info({table})").fetchall()}
             if column in have:
                 continue
-            log.info("local store: adding messages.%s", column)
+            log.info("local store: adding %s.%s", table, column)
             for statement in statements:
                 self._db.execute(statement)
+            have.add(column)
+        if found < self.SCHEMA_VERSION:
+            self._db.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
 
     def close(self) -> None:
         with self._lock:
@@ -1814,12 +2634,31 @@ class LocalStore:
         return dict(row) if row else None
 
     def set_contact_setting(self, address: str, field: str, value: int) -> None:
-        assert field in ("ticks_enabled", "auto_read")   # whitelisted columns
+        assert field in ("ticks_enabled", "auto_read",   # whitelisted columns
+                         "notify")
         with self._lock:
             self._db.execute(
                 f"UPDATE contacts SET {field} = ? WHERE address = ?",
                 (int(value), address))
             self._db.commit()
+
+    def add_caps(self, address: str, bits: int) -> None:
+        """Record what a peer has PROVEN it understands (OR-ed in, never
+        cleared: a peer that rolls back simply stops getting the benefit of
+        features it can no longer act on, which degrades to v2 text)."""
+        with self._lock:
+            self._db.execute(
+                "UPDATE contacts SET caps = caps | ? WHERE address = ?",
+                (int(bits), address))
+            self._db.commit()
+
+    def contacts(self) -> list:
+        """Every contact of this identity, for pickers (forward-to)."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM contacts ORDER BY COALESCE(username, address)"
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # ---- messages ------------------------------------------------------------
     def _claim_server_id(self, server_id: int, keep_local_id: int = -1) -> bool:
@@ -1860,14 +2699,24 @@ class LocalStore:
         return True
 
     def add_out(self, peer: str, body: str, created_at: str,
-                client_msg_id: str) -> int:
-        """Insert an outgoing message at 0/3 (grey tick). Returns local id."""
+                client_msg_id: str, kind: str = "text",
+                ext: Optional[dict] = None, media_path: Optional[str] = None,
+                media_state: str = "") -> int:
+        """Insert an outgoing message at 0/3 (grey tick). Returns local id.
+
+        `body` is always the human-readable rendering ("Photo", the caption,
+        "Voice message (0:07)"…); `kind`/`ext` carry what a v9 screen needs
+        to draw it richly. See the compatibility policy on _MIGRATIONS.
+        """
         with self._lock:
             cur = self._db.execute(
                 """INSERT INTO messages (client_msg_id, peer, direction, body,
-                                         status, read, created_at)
-                   VALUES (?, ?, 'out', ?, 0, 1, ?)""",
-                (client_msg_id, peer, body, created_at))
+                                         status, read, created_at, kind, ext,
+                                         media_path, media_state)
+                   VALUES (?, ?, 'out', ?, 0, 1, ?, ?, ?, ?, ?)""",
+                (client_msg_id, peer, body, created_at, kind,
+                 json.dumps(ext, separators=(",", ":")) if ext else None,
+                 media_path, media_state))
             self._db.commit()
             return cur.lastrowid
 
@@ -1923,7 +2772,8 @@ class LocalStore:
 
     def add_in(self, peer: str, body: str, created_at: str,
                server_id: Optional[int], client_msg_id: Optional[str],
-               unread: bool = True) -> str:
+               unread: bool = True, kind: str = "text",
+               ext: Optional[dict] = None, media_state: str = "") -> str:
         """Insert an incoming message (unread).
 
         Returns STORED, DUPLICATE or FAILED. The old boolean collapsed
@@ -1939,6 +2789,13 @@ class LocalStore:
         """
         try:
             with self._lock:
+                if client_msg_id and self._db.execute(
+                        "SELECT 1 FROM tombstones WHERE cid = ? AND peer = ?",
+                        (client_msg_id, peer)).fetchone():
+                    # Deleted here already — by its author, possibly before
+                    # it even arrived. Report it as held so it is acked and
+                    # the relay stops offering it.
+                    return self.DUPLICATE
                 if client_msg_id:
                     dup = self._db.execute(
                         """SELECT 1 FROM messages WHERE client_msg_id = ?
@@ -1957,10 +2814,14 @@ class LocalStore:
                 self._db.execute(
                     """INSERT INTO messages (server_id, client_msg_id, peer,
                                              direction, body, status, read,
-                                             created_at, receipt_sent)
-                       VALUES (?, ?, ?, 'in', ?, 0, ?, ?, ?)""",
+                                             created_at, receipt_sent, kind,
+                                             ext, media_state)
+                       VALUES (?, ?, ?, 'in', ?, 0, ?, ?, ?, ?, ?, ?)""",
                     (server_id, client_msg_id, peer, body,
-                     0 if unread else 1, created_at, 0 if unread else 1))
+                     0 if unread else 1, created_at, 0 if unread else 1,
+                     kind,
+                     json.dumps(ext, separators=(",", ":")) if ext else None,
+                     media_state))
                 self._db.commit()
                 return self.STORED
         except sqlite3.Error:
@@ -2086,7 +2947,7 @@ class LocalStore:
         """Distinct peers by recent activity, with preview + unread count."""
         with self._lock:
             rows = self._db.execute(
-                """SELECT m.peer, c.username, c.ticks_enabled,
+                """SELECT m.peer, c.username, c.ticks_enabled, c.notify,
                           (SELECT body FROM messages WHERE peer = m.peer
                              ORDER BY id DESC LIMIT 1) AS preview,
                           (SELECT created_at FROM messages
@@ -2099,13 +2960,154 @@ class LocalStore:
                    LEFT JOIN contacts c ON c.address = m.peer
                    GROUP BY m.peer ORDER BY last_id DESC""").fetchall()
             contact_only = self._db.execute(
-                """SELECT address AS peer, username, ticks_enabled,
+                """SELECT address AS peer, username, ticks_enabled, notify,
                           NULL AS preview, added_at AS last_at,
                           0 AS unread, 0 AS last_id
                    FROM contacts
                    WHERE address NOT IN (SELECT DISTINCT peer FROM messages)
                    ORDER BY added_at DESC""").fetchall()
         return [dict(r) for r in rows] + [dict(r) for r in contact_only]
+
+    # ---- v9: stars, deletion, lookups, media ---------------------------------
+    def message(self, local_id: int) -> Optional[dict]:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM messages WHERE id = ?",
+                                   (local_id,)).fetchone()
+        return dict(row) if row else None
+
+    def messages_by_ids(self, local_ids: list) -> list:
+        if not local_ids:
+            return []
+        marks = ",".join("?" * len(local_ids))
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT * FROM messages WHERE id IN ({marks}) ORDER BY id",
+                [int(i) for i in local_ids]).fetchall()
+        return [dict(r) for r in rows]
+
+    def message_by_cid(self, peer: str, cid: str,
+                       direction: Optional[str] = None) -> Optional[dict]:
+        sql = "SELECT * FROM messages WHERE peer = ? AND client_msg_id = ?"
+        args = [peer, cid]
+        if direction:
+            sql += " AND direction = ?"
+            args.append(direction)
+        with self._lock:
+            row = self._db.execute(sql + " ORDER BY id DESC LIMIT 1",
+                                   args).fetchone()
+        return dict(row) if row else None
+
+    def set_starred(self, local_ids: list, starred: bool) -> None:
+        """Stars are private bookkeeping: they never leave this device."""
+        if not local_ids:
+            return
+        with self._lock:
+            self._db.executemany(
+                "UPDATE messages SET starred = ? WHERE id = ?",
+                [(1 if starred else 0, int(i)) for i in local_ids])
+            self._db.commit()
+
+    def starred(self, peer: Optional[str] = None) -> list:
+        """Starred messages, newest first; one chat or all of them."""
+        sql = "SELECT * FROM messages WHERE starred = 1"
+        args = []
+        if peer is not None:
+            sql += " AND peer = ?"
+            args.append(peer)
+        with self._lock:
+            rows = self._db.execute(sql + " ORDER BY id DESC", args).fetchall()
+        return [dict(r) for r in rows]
+
+    def _tombstone(self, peer: str, cids) -> None:
+        """Called with the lock held."""
+        stamp = now_iso()
+        self._db.executemany(
+            "INSERT OR IGNORE INTO tombstones (cid, peer, at) VALUES (?, ?, ?)",
+            [(c, peer, stamp) for c in cids if c])
+
+    def delete_messages(self, local_ids: list) -> list:
+        """Delete for me. Returns the removed rows (for their media files).
+
+        Each deleted message's client id is tombstoned so a re-push from the
+        relay cannot resurrect it.
+        """
+        rows = self.messages_by_ids(local_ids)
+        if not rows:
+            return []
+        with self._lock:
+            for row in rows:
+                self._tombstone(row["peer"], [row["client_msg_id"]])
+            self._db.executemany("DELETE FROM messages WHERE id = ?",
+                                 [(r["id"],) for r in rows])
+            self._db.commit()
+        return rows
+
+    def delete_by_author(self, author: str, cids: list) -> list:
+        """Apply a delete-for-both that `author` sent us.
+
+        Only INCOMING messages from `author` are eligible. The request is
+        authenticated as coming from `author` (it arrives in their signed,
+        recipient-bound envelope), and restricting it to their own messages
+        is what stops anyone deleting text they did not write — the same
+        rule the sending screen enforces, applied again here because a
+        modified client could ignore that screen. Tombstones are written
+        even for ids we do not hold yet, so a message that arrives after its
+        own deletion is never shown. Returns the removed rows.
+        """
+        cids = [c for c in cids if isinstance(c, str) and c][:500]
+        if not cids:
+            return []
+        marks = ",".join("?" * len(cids))
+        with self._lock:
+            rows = [dict(r) for r in self._db.execute(
+                f"""SELECT * FROM messages WHERE peer = ? AND direction = 'in'
+                    AND client_msg_id IN ({marks})""",
+                [author] + cids).fetchall()]
+            self._tombstone(author, cids)
+            if rows:
+                self._db.executemany("DELETE FROM messages WHERE id = ?",
+                                     [(r["id"],) for r in rows])
+            self._db.commit()
+        return rows
+
+    def consume_control(self, peer: str, cid: Optional[str]) -> bool:
+        """True the FIRST time a control message id is seen, False after.
+
+        Control messages are acted on, not stored, so the message table's
+        duplicate check cannot catch a relay re-push of one; without this a
+        re-pushed 'resend' would upload the same file again on every
+        reconnect. The tombstone table already means "this id is consumed".
+        """
+        if not cid:
+            return True
+        with self._lock:
+            if self._db.execute(
+                    "SELECT 1 FROM tombstones WHERE cid = ? AND peer = ?",
+                    (cid, peer)).fetchone():
+                return False
+            self._tombstone(peer, [cid])
+            self._db.commit()
+        return True
+
+    def set_media(self, local_id: int, *, path=None, state=None,
+                  ext: Optional[dict] = None) -> None:
+        sets, args = [], []
+        if path is not None:
+            sets.append("media_path = ?")
+            args.append(path)
+        if state is not None:
+            sets.append("media_state = ?")
+            args.append(state)
+        if ext is not None:
+            sets.append("ext = ?")
+            args.append(json.dumps(ext, separators=(",", ":")))
+        if not sets:
+            return
+        with self._lock:
+            self._db.execute(
+                f"UPDATE messages SET {', '.join(sets)} WHERE id = ?",
+                args + [int(local_id)])
+            self._db.commit()
 
     # ---- plaintext chat import / export --------------------------------------
     def import_message(self, peer: str, direction: str, body: str,
@@ -2347,6 +3349,16 @@ class SyncWorker(threading.Thread):
         # purpose: a restart is exactly when a key problem may have been
         # fixed, so the count should start again.
         self._decrypt_failures: dict = {}
+        # Which heartbeat this worker keeps alive ('app' or 'service'); see
+        # write_heartbeat. None disables beating (tests).
+        self.beat_owner: Optional[str] = "app"
+        self._last_beat = 0.0
+
+    def _beat(self) -> None:
+        if self.beat_owner and time.monotonic() - self._last_beat \
+                >= HEARTBEAT_EVERY:
+            self._last_beat = time.monotonic()
+            write_heartbeat(self.beat_owner)
 
     def nudge(self) -> None:
         """Cut any pending backoff short and re-dial immediately."""
@@ -2359,6 +3371,7 @@ class SyncWorker(threading.Thread):
         while time.monotonic() < end:
             if self.stop_event.is_set() or self.wake_event.is_set():
                 return
+            self._beat()
             time.sleep(min(0.1, end - time.monotonic()))
 
     # ---- outbound frames (called from UI thread too) -------------------------
@@ -2447,12 +3460,13 @@ class SyncWorker(threading.Thread):
         """
         server_id = msg.get("id")
         sender = msg.get("sender", "")
+        cid = msg.get("client_msg_id")
         who = MessageFlowLog.who(sender)
         fragment = MessageFlowLog.fragment(msg.get("envelope"))
 
         try:
             payload = self.app.crypto.open_envelope(msg.get("envelope", {}),
-                                                    sender)
+                                                    sender, cid=cid)
         except CryptoEngine.EnvelopeError as exc:
             return self._handle_undecryptable(server_id, sender, who,
                                               fragment, exc)
@@ -2468,11 +3482,31 @@ class SyncWorker(threading.Thread):
             MessageFlowLog.dropped(server_id, who, "contact upsert failed")
             return None
 
+        x = payload.get("x")
+        kind, ext, media_state = "text", None, ""
+        if x is not None:
+            # A verified block proves this peer runs v9: remember it, so the
+            # screen can offer what only v9 peers understand.
+            cid = cid or x.get("cid")
+            try:
+                self.app.store.add_caps(sender, LocalStore.CAP_V9)
+            except sqlite3.Error:
+                log.exception("could not record capabilities of %s", sender)
+            if x.get("k") == "ctl":
+                return self._handle_control(server_id, sender, cid,
+                                            x.get("ctl"), who)
+            ext = sanitize_ext(x) or None
+            media = (ext or {}).get("media")
+            if x.get("k") == "media" and media is not None:
+                kind, media_state = media["kind"], "pending"
+
+        body = sanitize_text(str(payload.get("body", "")))
         outcome = self.app.store.add_in(
-            peer=sender, body=sanitize_text(str(payload.get("body", ""))),
+            peer=sender, body=body,
             created_at=payload.get("sent_at",
                                    msg.get("created_at", now_iso())),
-            server_id=server_id, client_msg_id=msg.get("client_msg_id"))
+            server_id=server_id, client_msg_id=cid, kind=kind, ext=ext,
+            media_state=media_state)
 
         if outcome == LocalStore.FAILED:
             # Not ours yet. Withhold the ack; the relay keeps its copy and
@@ -2495,6 +3529,51 @@ class SyncWorker(threading.Thread):
                                                self.app.keys.username),
                             f"{fragment}  [stored locally — acking]")
         self.app.ui_queue.put(("message_stored", sender))
+        # Separate from message_stored, which also fires for receipts and
+        # deletions: THIS one means a new message someone may want to hear
+        # about, and is what notifications are raised from.
+        self.app.ui_queue.put(("incoming", sender, body, kind))
+        if media_state == "pending":
+            self.app.ui_queue.put(("media_pending", sender, cid))
+        return server_id
+
+    def _handle_control(self, server_id, sender: str, cid: Optional[str],
+                        ctl, who: str) -> Optional[int]:
+        """Act on a control message (v9). Nothing is stored for one — it is
+        an instruction, not a message — and it is always acknowledged, since
+        a malformed or unknown instruction is not going to improve by being
+        re-delivered."""
+        store = self.app.store
+        if not isinstance(ctl, dict) or not store.consume_control(sender, cid):
+            return server_id
+        op = ctl.get("op")
+        if op == "delete":
+            cids = ctl.get("cids") if isinstance(ctl.get("cids"), list) else []
+            removed = store.delete_by_author(sender, cids)
+            for row in removed:
+                discard_media_file(row.get("media_path"))
+            flow_log.info("✗   in   ctl  from %s  deleted %d of %d message(s) "
+                          "for both sides", who, len(removed), len(cids))
+            self.app.ui_queue.put(("message_stored", sender))
+        elif op == "resend":
+            # They could not fetch a photo/voice note we sent — the relay
+            # has let it expire. Our device still has the file: upload again.
+            target = _str(ctl.get("cid"), 64)
+            if target:
+                self.app.ui_queue.put(("resend_request", sender, target))
+        elif op == "remedia":
+            target = _str(ctl.get("cid"), 64)
+            media = sanitize_media(ctl.get("media"))
+            row = (store.message_by_cid(sender, target, "in")
+                   if target and media else None)
+            if row is not None:
+                ext = json.loads(row.get("ext") or "{}")
+                ext["media"] = media
+                store.set_media(row["id"], state="pending", ext=ext)
+                self.app.ui_queue.put(("message_stored", sender))
+                self.app.ui_queue.put(("media_pending", sender, target))
+        else:
+            log.info("ignoring unknown control op %r from %s", op, sender)
         return server_id
 
     def _handle_undecryptable(self, server_id, sender: str, who: str,
@@ -2629,6 +3708,7 @@ class SyncWorker(threading.Thread):
             ws.settimeout(WS_RECV_TICK)
             last_outbound = time.monotonic()
             while not self.stop_event.is_set():
+                self._beat()
                 if time.monotonic() - last_outbound >= WS_IDLE_TIMEOUT:
                     if not self.send_ws({"type": "ping"}):
                         break
@@ -2705,6 +3785,7 @@ class SyncWorker(threading.Thread):
         online: Optional[bool] = None
         backoff = WS_RECONNECT_MIN
         while not self.stop_event.is_set():
+            self._beat()
             had_ws = self._ws_session()
             if self.stop_event.is_set():
                 break
@@ -2836,43 +3917,207 @@ class CozyButton(ButtonBehavior, Label):
                               else self._bg_hex)
 
 
-class IconButton(ButtonBehavior, Widget):
-    """Hand-drawn vector icons ('plus', 'back', 'send') — crisp on every
-    platform, no reliance on emoji/glyph coverage in the bundled font."""
+def draw_icon(name: str, cx: float, cy: float, size: float, rgba,
+              width: Optional[float] = None) -> None:
+    """Draw one vector icon into the CURRENT canvas context.
 
-    def __init__(self, icon: str, tint=COL_APPBAR_TEXT, bg=None, **kw):
+    Every icon in the app is drawn rather than typed: Kivy's bundled Roboto
+    has no glyphs for symbols (stars, bells, arrows, ticks all render as
+    empty boxes), and drawing also keeps them crisp at any density. Each
+    icon fits a `size` square centred on (cx, cy).
+    """
+    h = size / 2.0
+    w = width or max(dp(1.4), size * 0.08)
+    Color(*rgba)
+    line = dict(width=w, cap="round", joint="round")
+    if name == "back":
+        Line(points=[cx + h * .30, cy + h * .62, cx - h * .32, cy,
+                     cx + h * .30, cy - h * .62], **line)
+    elif name == "close":
+        k = h * .55
+        Line(points=[cx - k, cy - k, cx + k, cy + k], **line)
+        Line(points=[cx - k, cy + k, cx + k, cy - k], **line)
+    elif name == "more":                       # vertical ellipsis
+        r = max(dp(1.7), size * .09)
+        for dy in (-h * .58, 0, h * .58):
+            Ellipse(pos=(cx - r, cy + dy - r), size=(2 * r, 2 * r))
+    elif name == "plus":
+        k = h * .62
+        Line(points=[cx - k, cy, cx + k, cy], **line)
+        Line(points=[cx, cy - k, cx, cy + k], **line)
+    elif name == "send":
+        Triangle(points=[cx - h * .78, cy + h * .72, cx - h * .78, cy - h * .72,
+                         cx + h * .88, cy])
+    elif name in ("reply", "forward"):
+        d = -1 if name == "reply" else 1       # which way the arrow points
+        tip = (cx + d * h * .72, cy + h * .22)
+        Line(points=[tip[0] - d * h * .48, tip[1] + h * .46, tip[0], tip[1],
+                     tip[0] - d * h * .48, tip[1] - h * .46], **line)
+        Line(bezier=[tip[0], tip[1], cx - d * h * .55, cy + h * .22,
+                     cx - d * h * .78, cy - h * .05,
+                     cx - d * h * .72, cy - h * .68], **line)
+    elif name == "copy":
+        r = size * .09
+        Line(rounded_rectangle=(cx - h * .72, cy - h * .78, h * 1.0, h * 1.18,
+                                r), width=w)
+        Line(points=[cx - h * .40, cy + h * .44, cx - h * .40, cy + h * .74,
+                     cx + h * .72, cy + h * .74, cx + h * .72, cy - h * .36,
+                     cx + h * .32, cy - h * .36], **line)
+    elif name in ("star", "star_filled"):
+        pts = []
+        for i in range(10):
+            ang = math.pi / 2 + i * math.pi / 5
+            rad = h * (.86 if i % 2 == 0 else .38)
+            pts += [cx + rad * math.cos(ang), cy + rad * math.sin(ang)]
+        if name == "star_filled":
+            verts = [cx, cy, 0, 0]
+            for i in range(0, len(pts), 2):
+                verts += [pts[i], pts[i + 1], 0, 0]
+            verts += [pts[0], pts[1], 0, 0]
+            Mesh(vertices=verts, indices=list(range(len(verts) // 4)),
+                 mode="triangle_fan")
+        else:
+            Line(points=pts, close=True, width=w, joint="round")
+    elif name == "share":
+        r = size * .12
+        a, b, c = ((cx + h * .52, cy + h * .58), (cx - h * .52, cy),
+                   (cx + h * .52, cy - h * .58))
+        Line(points=[a[0], a[1], b[0], b[1], c[0], c[1]], **line)
+        for px, py in (a, b, c):
+            Ellipse(pos=(px - r, py - r), size=(2 * r, 2 * r))
+    elif name == "delete":
+        top = cy + h * .52
+        Line(points=[cx - h * .74, top, cx + h * .74, top], **line)
+        Line(points=[cx - h * .26, top, cx - h * .26, top + h * .24,
+                     cx + h * .26, top + h * .24, cx + h * .26, top], **line)
+        Line(points=[cx - h * .56, top, cx - h * .44, cy - h * .78,
+                     cx + h * .44, cy - h * .78, cx + h * .56, top], **line)
+        for dx in (-.17, .17):
+            Line(points=[cx + dx * h, cy + h * .28, cx + dx * h * .8,
+                         cy - h * .52], width=w * .8, cap="round")
+    elif name == "edit":                       # a pen, nib bottom-left
+        ux, uy = .7071, .7071                  # along the pen
+        vx, vy = -.7071, .7071                 # across it
+        t = h * .24
+        nib = (cx - h * .70, cy - h * .70)
+        neck = (nib[0] + ux * h * .48, nib[1] + uy * h * .48)
+        end = (cx + h * .70, cy + h * .70)
+        body = [neck[0] + vx * t, neck[1] + vy * t,
+                end[0] + vx * t, end[1] + vy * t,
+                end[0] - vx * t, end[1] - vy * t,
+                neck[0] - vx * t, neck[1] - vy * t]
+        Line(points=body, close=True, **line)
+        Line(points=[neck[0] + vx * t, neck[1] + vy * t, nib[0], nib[1],
+                     neck[0] - vx * t, neck[1] - vy * t], **line)
+    elif name == "image":
+        Line(rounded_rectangle=(cx - h * .82, cy - h * .66, h * 1.64,
+                                h * 1.32, size * .1), width=w)
+        r = size * .09
+        Ellipse(pos=(cx + h * .32 - r, cy + h * .26 - r), size=(2 * r, 2 * r))
+        Line(points=[cx - h * .80, cy - h * .46, cx - h * .26, cy + h * .06,
+                     cx + h * .12, cy - h * .28, cx + h * .38, cy - h * .06,
+                     cx + h * .80, cy - h * .48], **line)
+    elif name == "mic":
+        Line(rounded_rectangle=(cx - h * .27, cy - h * .06, h * .54, h * .92,
+                                h * .27), width=w)
+        Line(circle=(cx, cy + h * .14, h * .52, 90, 270), width=w)
+        Line(points=[cx, cy - h * .38, cx, cy - h * .74], **line)
+        Line(points=[cx - h * .30, cy - h * .74, cx + h * .30, cy - h * .74],
+             **line)
+    elif name == "play":
+        Triangle(points=[cx - h * .40, cy + h * .58, cx - h * .40, cy - h * .58,
+                         cx + h * .62, cy])
+    elif name == "pause":
+        bw = size * .14
+        for dx in (-h * .30, h * .30):
+            Rectangle(pos=(cx + dx - bw / 2, cy - h * .56), size=(bw, h * 1.12))
+    elif name in ("bell", "bell_off"):
+        base = cy - h * .40
+        Line(points=[cx - h * .72, base, cx + h * .72, base], **line)
+        Line(bezier=[cx - h * .58, base, cx - h * .44, cy + h * .30,
+                     cx - h * .52, cy + h * 1.02, cx, cy + h * .66], **line)
+        Line(bezier=[cx + h * .58, base, cx + h * .44, cy + h * .30,
+                     cx + h * .52, cy + h * 1.02, cx, cy + h * .66], **line)
+        r = size * .085
+        Ellipse(pos=(cx - r, base - h * .26 - r), size=(2 * r, 2 * r))
+        Ellipse(pos=(cx - r * .8, cy + h * .66), size=(1.6 * r, 1.6 * r))
+        if name == "bell_off":
+            Line(points=[cx - h * .78, cy - h * .78, cx + h * .78,
+                         cy + h * .78], **line)
+    elif name == "check":
+        Line(points=[cx - h * .60, cy + h * .02, cx - h * .16, cy - h * .42,
+                     cx + h * .64, cy + h * .46], **line)
+    elif name == "download":
+        Line(points=[cx, cy + h * .66, cx, cy - h * .30], **line)
+        Line(points=[cx - h * .40, cy + h * .06, cx, cy - h * .32,
+                     cx + h * .40, cy + h * .06], **line)
+        Line(points=[cx - h * .62, cy - h * .70, cx + h * .62, cy - h * .70],
+             **line)
+    elif name == "retry":
+        rad = h * .58
+        Line(circle=(cx, cy, rad, 60, 330), width=w)
+        # Arrowhead at the 60-degree end, pointing back along the arc
+        # (Kivy measures circle angles clockwise from 12 o'clock).
+        ang = math.radians(60)
+        ex, ey = cx + rad * math.sin(ang), cy + rad * math.cos(ang)
+        tx, ty = -math.cos(ang), math.sin(ang)       # counter-clockwise
+        nx, ny = math.sin(ang), math.cos(ang)        # outward normal
+        k = h * .62
+        Triangle(points=[ex + tx * k, ey + ty * k,
+                         ex + nx * k * .62, ey + ny * k * .62,
+                         ex - nx * k * .62, ey - ny * k * .62])
+    elif name == "info":
+        Line(circle=(cx, cy, h * .82), width=w)
+        Line(points=[cx, cy - h * .42, cx, cy - h * .02], **line)
+        r = size * .075
+        Ellipse(pos=(cx - r, cy + h * .38 - r), size=(2 * r, 2 * r))
+
+
+class IconButton(ButtonBehavior, Widget):
+    """A round, tappable vector icon (see draw_icon for the set).
+
+    `bg` gives it a filled circle (the send and new-chat buttons); without
+    one it is a bare icon with a soft circular press highlight, which is how
+    app-bar actions behave in every modern Android app.
+    """
+
+    def __init__(self, icon: str, tint=COL_APPBAR_TEXT, bg=None,
+                 icon_size=None, press=None, **kw):
         kw.setdefault("size_hint", (None, None))
         kw.setdefault("size", (dp(44), dp(44)))
         super().__init__(**kw)
-        self._icon, self._tint = icon, tint
-        self._bg_col = paint_circle(self, bg) if isinstance(bg, str) else None
-        self._bg_hex = bg
-        self.bind(pos=self._redraw, size=self._redraw, state=self._redraw)
+        self._icon, self._tint, self._bg_hex = icon, tint, bg
+        self._icon_size = icon_size
+        self._press_rgba = (C(press) if press else
+                            [1, 1, 1, .16] if bg is None else None)
+        self.bind(pos=self._redraw, size=self._redraw, state=self._redraw,
+                  disabled=self._redraw)
+        self._redraw()
+
+    def set_icon(self, icon: str, tint: Optional[str] = None) -> None:
+        self._icon = icon
+        if tint is not None:
+            self._tint = tint
         self._redraw()
 
     def _redraw(self, *_a):
-        if self._bg_col is not None:
-            self._bg_col.rgba = C(COL_ACCENT_DARK if self.state == "down"
-                                  else self._bg_hex)
-        self.canvas.after.clear()
-        cx, cy = self.center_x, self.center_y
-        r = min(self.width, self.height) * 0.22
-        with self.canvas.after:
-            Color(*C(self._tint))
-            if self._icon == "plus":
-                Line(points=[cx - r, cy, cx + r, cy], width=dp(1.4),
-                     cap="round")
-                Line(points=[cx, cy - r, cx, cy + r], width=dp(1.4),
-                     cap="round")
-            elif self._icon == "back":
-                Line(points=[cx + r * 0.6, cy + r, cx - r * 0.6, cy,
-                             cx + r * 0.6, cy - r],
-                     width=dp(1.6), cap="round", joint="round")
-            elif self._icon == "send":
-                Triangle(points=[cx - r, cy + r, cx - r, cy - r,
-                                 cx + r * 1.2, cy])
-                Line(points=[cx - r, cy, cx - r * 0.1, cy], width=dp(1.2),
-                     cap="round")
+        self.canvas.clear()
+        side = min(self.width, self.height)
+        with self.canvas:
+            if self._bg_hex is not None:
+                Color(*C(COL_ACCENT_DARK if self.state == "down"
+                         else self._bg_hex))
+                Ellipse(pos=(self.center_x - side / 2,
+                             self.center_y - side / 2), size=(side, side))
+            elif self.state == "down" and self._press_rgba:
+                Color(*self._press_rgba)
+                Ellipse(pos=(self.center_x - side / 2,
+                             self.center_y - side / 2), size=(side, side))
+            rgba = C(self._tint)
+            if self.disabled:
+                rgba = rgba[:3] + [rgba[3] * .35]
+            draw_icon(self._icon, self.center_x, self.center_y,
+                      self._icon_size or side * .46, rgba)
 
 
 class TickMarks(Widget):
@@ -3346,6 +4591,323 @@ class ImportChooserModal(CozyModal):
             self._on_pick(path)
 
 
+class DropMenu(ModalView):
+    """The ⋮ overflow menu: a small card dropped from the top-right corner,
+    dismissed by tapping anywhere else."""
+
+    ITEM_H = dp(48)
+
+    def __init__(self, items: list, **kw):
+        super().__init__(background_color=(0, 0, 0, 0),
+                         overlay_color=(0, 0, 0, 0.08), auto_dismiss=True,
+                         size_hint=(None, None), **kw)
+        self.width = dp(236)
+        self.height = self.ITEM_H * len(items) + dp(12)
+        card = BoxLayout(orientation="vertical", padding=[0, dp(6), 0, dp(6)])
+        paint_round(card, COL_CARD, radius=dp(12))
+        paint_border(card, COL_CARD_EDGE, radius=dp(12))
+        for text, action in items:
+            row = CozyButton(text, bg=COL_CARD, fg=COL_TEXT, bold=False,
+                             radius=0, font_size=sp(15), height=self.ITEM_H,
+                             pressed=COL_PRESSED, halign="left",
+                             valign="middle", padding=[dp(18), 0])
+            row.bind(size=lambda w, v: setattr(w, "text_size", v))
+            row.bind(on_release=lambda _w, a=action: self._run(a))
+            card.add_widget(row)
+        self.add_widget(card)
+
+    def _run(self, action: Callable) -> None:
+        self.dismiss()
+        Clock.schedule_once(lambda _dt: action(), 0.05)
+
+    def open_below(self, anchor) -> None:
+        """Anchor the card under `anchor`, kept inside the window."""
+        self._anchor_xy = anchor.to_window(anchor.right, anchor.y)
+        self.open()
+        # open() assigns `center` BEFORE it binds _align_center, so the
+        # override has to be applied once by hand; it then holds on resize.
+        self._align_center()
+
+    def _align_center(self, *_args):
+        """ModalView re-centres itself on every open and window resize;
+        a dropdown must stay pinned under its button instead."""
+        anchor = getattr(self, "_anchor_xy", None)
+        if anchor is None:
+            return super()._align_center(*_args)
+        ax, ay = anchor
+        self.x = max(dp(8), min(ax - self.width,
+                                Window.width - self.width - dp(8)))
+        self.top = max(self.height + dp(8), ay - dp(2))
+
+
+class ContactPickRow(ButtonBehavior, BoxLayout):
+    """A contact with a tick that toggles (forward-to picker)."""
+
+    def __init__(self, contact: dict, **kw):
+        kw.setdefault("size_hint_y", None)
+        kw.setdefault("height", dp(56))
+        kw.setdefault("padding", [dp(4), dp(6), dp(8), dp(6)])
+        kw.setdefault("spacing", dp(12))
+        super().__init__(**kw)
+        self.address = contact["address"]
+        self.picked = False
+        name = contact.get("username") or short_addr(self.address, 14)
+        self.add_widget(Avatar(self.address, name, diameter=dp(40)))
+        texts = BoxLayout(orientation="vertical")
+        texts.add_widget(single_line(name, sp(15), COL_TEXT, bold=True))
+        texts.add_widget(single_line(short_addr(self.address, 18), sp(12),
+                                     COL_TEXT_DIM))
+        self.add_widget(texts)
+        self.tick = Widget(size_hint_x=None, width=dp(28))
+        self.tick.bind(pos=self._paint, size=self._paint)
+        self.add_widget(self.tick)
+        self.bind(on_release=lambda _w: self.toggle())
+
+    def toggle(self) -> None:
+        self.picked = not self.picked
+        self._paint()
+
+    def _paint(self, *_a) -> None:
+        t = self.tick
+        t.canvas.clear()
+        with t.canvas:
+            Color(*C(COL_ACCENT if self.picked else COL_CARD_EDGE))
+            Ellipse(pos=(t.center_x - dp(11), t.center_y - dp(11)),
+                    size=(dp(22), dp(22)))
+            if self.picked:
+                draw_icon("check", t.center_x, t.center_y, dp(13),
+                          C("#FFFFFF"), width=dp(1.8))
+            else:
+                Color(*C(COL_CARD))
+                Ellipse(pos=(t.center_x - dp(9.5), t.center_y - dp(9.5)),
+                        size=(dp(19), dp(19)))
+
+
+class ForwardModal(CozyModal):
+    """Pick one or more contacts of THIS identity to forward to."""
+
+    def __init__(self, app: "FextApp", local_ids: list,
+                 on_done: Optional[Callable] = None) -> None:
+        n = len(local_ids)
+        super().__init__(f"Forward {n} message{'s' if n != 1 else ''} to…")
+        self.app, self.local_ids, self.on_done = app, local_ids, on_done
+        contacts = app.store.contacts() if app.store else []
+        scroll = ScrollView(size_hint_y=None, bar_width=dp(3),
+                            height=min(dp(56) * max(1, len(contacts)) + dp(4),
+                                       Window.height * 0.5))
+        box = BoxLayout(orientation="vertical", size_hint_y=None)
+        box.bind(minimum_height=box.setter("height"))
+        self.rows = [ContactPickRow(c) for c in contacts]
+        for row in self.rows:
+            box.add_widget(row)
+        if not self.rows:
+            box.add_widget(InfoLabel("No contacts yet.", color=COL_TEXT_DIM))
+        scroll.add_widget(box)
+        self.add(scroll)
+        buttons = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(10))
+        buttons.add_widget(CozyButton("Cancel", bg=COL_BG_LIST,
+                                      fg=COL_TEXT_DIM, outline=COL_CARD_EDGE,
+                                      on_release=lambda _w: self.dismiss()))
+        buttons.add_widget(CozyButton("Forward",
+                                      on_release=lambda _w: self._go()))
+        self.add(buttons)
+
+    def _go(self) -> None:
+        targets = [r.address for r in self.rows if r.picked]
+        if not targets:
+            return
+        self.dismiss()
+        sent = self.app.forward_messages(self.local_ids, targets)
+        if self.on_done:
+            self.on_done()
+        who = (len(targets) == 1 and (self.app.store.get_contact(targets[0])
+               or {}).get("username")) or f"{len(targets)} chats"
+        self.app._set_status(f"Forwarded {sent} message"
+                             f"{'s' if sent != 1 else ''} to {who}", COL_OK)
+
+
+class DeleteModal(CozyModal):
+    """Delete for me, or — only when every message is yours — for both."""
+
+    def __init__(self, app: "FextApp", msgs: list,
+                 on_done: Optional[Callable] = None) -> None:
+        n = len(msgs)
+        super().__init__(f"Delete {n} message{'s' if n != 1 else ''}?")
+        # NOT self.ids: every Kivy widget already has an `ids` property (a
+        # dict of kv-language children), and assigning a list to it raises.
+        self.app, self.msg_ids, self.on_done = app, [m["id"] for m in msgs], \
+            on_done
+        own = all(m["direction"] == "out" and m.get("client_msg_id")
+                  for m in msgs)
+        peer = msgs[0]["peer"] if msgs else None
+        contact = (app.store.get_contact(peer) or {}) if peer else {}
+        name = contact.get("username") or "them"
+        if own:
+            self.add(CozyButton(f"Delete for me and {name}", bg=COL_DANGER,
+                                on_release=lambda _w: self._go(True)))
+            if not contact.get("caps", 0) & LocalStore.CAP_V9:
+                self.add(InfoLabel(
+                    f"If {name} is still on an older version of the app, "
+                    f"their copy stays and they see a note instead.",
+                    color=COL_TEXT_DIM, font_size=sp(12.5)))
+        self.add(CozyButton("Delete for me", bg=COL_BG_LIST, fg=COL_DANGER,
+                            outline=COL_DANGER,
+                            on_release=lambda _w: self._go(False)))
+        if not own:
+            self.add(InfoLabel("Only your own messages can be deleted for "
+                               "both sides.", color=COL_TEXT_DIM,
+                               font_size=sp(12.5)))
+        self.add(CozyButton("Cancel", bg=COL_BG_LIST, fg=COL_TEXT_DIM,
+                            outline=COL_CARD_EDGE,
+                            on_release=lambda _w: self.dismiss()))
+
+    def _go(self, for_everyone: bool) -> None:
+        self.dismiss()
+        if self.on_done:
+            self.on_done()
+        self.app.delete_messages(self.msg_ids, for_everyone)
+
+
+class StarredModal(CozyModal):
+    """Starred messages of one chat — private bookmarks, never sent."""
+
+    def __init__(self, app: "FextApp", peer: Optional[str]) -> None:
+        super().__init__("Starred messages")
+        self.app = app
+        rows = app.store.starred(peer) if app.store else []
+        scroll = ScrollView(size_hint_y=None, bar_width=dp(3),
+                            height=min(max(dp(70), dp(66) * len(rows)),
+                                       Window.height * 0.6))
+        box = BoxLayout(orientation="vertical", size_hint_y=None,
+                        spacing=dp(6))
+        box.bind(minimum_height=box.setter("height"))
+        screen = app.conversation_screen
+        for msg in rows:
+            item = TappableBox(size_hint_y=None, height=dp(60),
+                               padding=[dp(12), dp(6)],
+                               on_tap=lambda m=msg: self._open(m))
+            paint_round(item, COL_CARD, radius=dp(12))
+            who = screen.author_name(screen._author_of(msg))
+            day = pretty_day(msg["created_at"])
+            clock = pretty_time(msg["created_at"])
+            # pretty_day already IS the time for today's messages.
+            when = clock if day == clock else f"{day}, {clock}"
+            item.add_widget(single_line(f"{who}  ·  {when}", sp(12),
+                                        COL_ACCENT_DARK, bold=True))
+            item.add_widget(single_line(msg["body"], sp(14), COL_TEXT))
+            box.add_widget(item)
+        if not rows:
+            box.add_widget(InfoLabel(
+                "Nothing starred yet. Long-press a message and tap the star "
+                "to keep it here.", color=COL_TEXT_DIM, font_size=sp(13)))
+        scroll.add_widget(box)
+        self.add(scroll)
+        self.add(CozyButton("Done", on_release=lambda _w: self.dismiss()))
+
+    def _open(self, msg: dict) -> None:
+        self.dismiss()
+        if msg["peer"] != self.app.current_peer:
+            self.app.open_conversation(msg["peer"])
+        Clock.schedule_once(lambda _dt: self.app.conversation_screen
+                            .jump_to_cid(msg.get("client_msg_id")), 0.3)
+
+
+class ImageViewer(ModalView):
+    """A photo, full screen on black. Tap anywhere to close."""
+
+    def __init__(self, path: str, **kw):
+        super().__init__(background_color=(0, 0, 0, 0),
+                         overlay_color=(0, 0, 0, 0.94), auto_dismiss=True,
+                         size_hint=(1, 1), **kw)
+        box = TappableBox(on_tap=self.dismiss)
+        box.add_widget(KivyImage(source=path, allow_stretch=True,
+                                 keep_ratio=True))
+        self.add_widget(box)
+
+
+class ImageChooserModal(CozyModal):
+    """Desktop photo picker."""
+
+    def __init__(self, on_pick: Callable[[str], None]) -> None:
+        super().__init__("Send a photo")
+        self._on_pick = on_pick
+        self.chooser = FileChooserListView(
+            path=str(Path.home()),
+            filters=["*.jpg", "*.jpeg", "*.png", "*.webp", "*.JPG",
+                     "*.JPEG", "*.PNG", "*.bmp", "*.gif"],
+            size_hint_y=None, height=min(dp(360), Window.height * 0.55))
+        self.add(self.chooser)
+        row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(10))
+        row.add_widget(CozyButton("Cancel", bg=COL_BG_LIST, fg=COL_TEXT_DIM,
+                                  outline=COL_CARD_EDGE,
+                                  on_release=lambda _w: self.dismiss()))
+        row.add_widget(CozyButton("Choose", on_release=lambda _w:
+                                  self._pick()))
+        self.add(row)
+
+    def _pick(self) -> None:
+        if self.chooser.selection:
+            path = self.chooser.selection[0]
+            self.dismiss()
+            self._on_pick(path)
+
+
+class AttachPreviewModal(CozyModal):
+    """Check the photo and add a caption before it is compressed and sent."""
+
+    def __init__(self, app: "FextApp", path: str) -> None:
+        super().__init__("Send photo")
+        self.app, self.path = app, path
+        self.add(KivyImage(source=path, allow_stretch=True, keep_ratio=True,
+                           size_hint_y=None,
+                           height=min(dp(300), Window.height * 0.4)))
+        self.caption = self.add(CozyInput(hint="Add a caption…"))
+        self.add(InfoLabel(
+            "Sent compressed, with location and camera details removed.",
+            color=COL_TEXT_DIM, font_size=sp(12)))
+        row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(10))
+        row.add_widget(CozyButton("Cancel", bg=COL_BG_LIST, fg=COL_TEXT_DIM,
+                                  outline=COL_CARD_EDGE,
+                                  on_release=lambda _w: self.dismiss()))
+        row.add_widget(CozyButton("Send", on_release=lambda _w: self._send()))
+        self.add(row)
+
+    def _send(self) -> None:
+        self.dismiss()
+        self.app.send_image(self.path, sanitize_text(self.caption.text))
+
+
+class RenameIdentityModal(CozyModal):
+    """Rename an identity's on-device label (its relay username is fixed)."""
+
+    def __init__(self, app: "FextApp", address: str) -> None:
+        super().__init__("Rename identity")
+        self.app, self.address = app, address
+        ident = app.keys.find(address) or {}
+        self.add(InfoLabel(
+            "This label is only shown on this device, to tell your "
+            "identities apart. Your username on the relay stays "
+            f"@{ident.get('username') or '(unregistered)'}.",
+            color=COL_TEXT_DIM, font_size=sp(12.5)))
+        self.entry = self.add(CozyInput(hint="Label"))
+        self.entry.text = ident.get("label", "")
+        row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(10))
+        row.add_widget(CozyButton("Cancel", bg=COL_BG_LIST, fg=COL_TEXT_DIM,
+                                  outline=COL_CARD_EDGE,
+                                  on_release=lambda _w: self.dismiss()))
+        row.add_widget(CozyButton("Save", on_release=lambda _w: self._save()))
+        self.add(row)
+
+    def _save(self) -> None:
+        label = sanitize_text(self.entry.text)[:40]
+        if not label:
+            return
+        self.app.keys.rename_identity(self.address, label)
+        self.dismiss()
+        self.app.chats_screen.refresh_header()
+        ProfileMenuModal(self.app).open()
+
+
 class ContactSettingsModal(CozyModal):
     """Opened by tapping the chat title bar. Per-contact controls:
       * Ticks status  — 'Enable ticks status' / 'No ticks status'. The choice
@@ -3566,10 +5128,37 @@ class SettingsModal(CozyModal):
         body.bind(minimum_height=body.setter("height"))
         scroll.add_widget(body)
         self.add(scroll)
+        if IS_ANDROID or os.environ.get("FEXT_SHOW_ANDROID_SETTINGS"):
+            self._build_delivery(body)
         self._build_identity(body)
         self._build_public(body)
         self._build_private(body)
+        body.add_widget(InfoLabel(f"{APP_NAME} {APP_VERSION}",
+                                  color=COL_TEXT_DIM, font_size=sp(11.5),
+                                  halign="center"))
         self.add(CozyButton("Done", on_release=lambda _w: self.dismiss()))
+
+    # ---- notifications (Android) ---------------------------------------------
+    def _build_delivery(self, body) -> None:
+        card = SectionCard("Notifications")
+        row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(10))
+        row.add_widget(InfoLabel("Receive messages when the app is closed",
+                                 font_size=sp(14)))
+        row.add_widget(ToggleSwitch(background_delivery_enabled(),
+                                    self._on_delivery,
+                                    pos_hint={"center_y": .5}))
+        card.add_widget(row)
+        card.add_widget(InfoLabel(
+            "Android closes apps in the background. With this on, a small "
+            "service keeps listening so notifications still arrive; Android "
+            "shows it as a running app. Turn it off to save battery — you "
+            "will then only be notified while Ferritext is open.",
+            color=COL_TEXT_DIM, font_size=sp(12.5)))
+        body.add_widget(card)
+
+    def _on_delivery(self, on: bool) -> None:
+        save_pref("background_delivery", bool(on))
+        self.app._sync_background_service()
 
     def _qr_image(self, data: str, side=dp(190)) -> KivyImage:
         img = KivyImage(size_hint=(None, None), size=(side, side),
@@ -3827,28 +5416,36 @@ class ProfileMenuModal(CozyModal):
         card = SectionCard("Identities on this device")
         for ident in keys.identities:
             active = ident["address"] == keys.address
-            # U+25CF/U+25CB (black/white circle) are ALSO missing from the
-            # bundled font and rendered as boxes. U+2022 BULLET does render;
-            # inactive rows are distinguished by colour and weight instead.
-            marker = "\u2022  " if active else "     "
-            line = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(6))
-            row = CozyButton(
-                f"{marker}{ident.get('label') or '?'}   "
-                f"{short_addr(ident['address'], 10)}",
-                height=dp(42), font_size=sp(13.5),
-                bg=COL_BUBBLE_ME if active else COL_BG_LIST,
-                fg=COL_TEXT if active else COL_TEXT_DIM,
-                pressed=COL_PRESSED)
-            row.bind(on_release=lambda _w, a=ident["address"]:
-                     self._switch(a))
+            line = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(4))
+            row = TappableBox(orientation="horizontal", spacing=dp(10),
+                              padding=[dp(8), dp(6), dp(4), dp(6)],
+                              on_tap=lambda a=ident["address"]:
+                              self._switch(a))
+            col, _r = paint_round(row, COL_BUBBLE_ME if active else COL_CARD,
+                                  radius=dp(12))
+            row.add_widget(Avatar(ident["address"],
+                                  ident.get("username") or
+                                  ident.get("label") or "?",
+                                  diameter=dp(34)))
+            texts = BoxLayout(orientation="vertical")
+            texts.add_widget(single_line(ident.get("label") or "?", sp(14.5),
+                                         COL_TEXT, bold=active))
+            texts.add_widget(single_line(
+                f"@{ident.get('username') or 'unregistered'}  ·  "
+                f"{short_addr(ident['address'], 10)}", sp(11.5),
+                COL_TEXT_DIM))
+            row.add_widget(texts)
             line.add_widget(row)
-            remove = CozyButton("Remove", size_hint_x=None, width=dp(78),
-                                height=dp(42), font_size=sp(12),
-                                bg=COL_BG_LIST, fg=COL_DANGER,
-                                outline=COL_DANGER)
-            remove.bind(on_release=lambda _w, a=ident["address"]:
-                        self._remove(a))
-            line.add_widget(remove)
+            # Rename (pen) and delete (bin): icons, as in every contacts app,
+            # instead of a word button that ate a third of the row.
+            line.add_widget(IconButton(
+                "edit", tint=COL_TEXT_DIM, press=COL_PRESSED,
+                size=(dp(40), dp(40)), pos_hint={"center_y": .5},
+                on_release=lambda _w, a=ident["address"]: self._rename(a)))
+            line.add_widget(IconButton(
+                "delete", tint=COL_DANGER, press=COL_PRESSED,
+                size=(dp(40), dp(40)), pos_hint={"center_y": .5},
+                on_release=lambda _w, a=ident["address"]: self._remove(a)))
             card.add_widget(line)
         card.add_widget(CozyButton("New identity…", height=dp(42),
                                    bg=COL_BG_LIST, fg=COL_ACCENT_DARK,
@@ -3866,6 +5463,10 @@ class ProfileMenuModal(CozyModal):
     def _remove(self, address: str) -> None:
         self.dismiss()
         RemoveIdentityModal(self.app, address).open()
+
+    def _rename(self, address: str) -> None:
+        self.dismiss()
+        RenameIdentityModal(self.app, address).open()
 
     def _new(self) -> None:
         self.dismiss()
@@ -3897,61 +5498,94 @@ class TappableBox(ButtonBehavior, BoxLayout):
             self.bind(on_release=lambda _w: on_tap())
 
 
+class UnreadBadge(Label):
+    """Gold pill with the unread count; widens for two digits."""
+
+    def __init__(self, count: int, muted: bool = False, **kw):
+        text = str(count) if count < 1000 else "999+"
+        super().__init__(text=text, bold=True, font_size=sp(11.5),
+                         color=C("#FFFFFF"), size_hint=(None, None),
+                         height=dp(22), **kw)
+        with self.canvas.before:
+            Color(*C(COL_TICK_GREY if muted else COL_ACCENT))
+            self._pill = RoundedRectangle(radius=[dp(11)])
+        self.bind(pos=self._sync, size=self._sync,
+                  texture_size=lambda w, v: setattr(
+                      w, "width", max(dp(22), v[0] + dp(12))))
+        self.texture_update()
+
+    def _sync(self, *_a):
+        self._pill.pos, self._pill.size = self.pos, self.size
+
+
 class ConversationRow(ButtonBehavior, BoxLayout):
-    """One warm row in the chat list: avatar, name, preview, time, and an
-    unread pip in gold."""
+    """One chat in the list: avatar, name over a one-line
+    preview, time and unread badge on the right, a hairline divider that
+    starts where the text does."""
 
     def __init__(self, conv: dict, on_open: Callable[[str], None], **kw):
         kw.setdefault("size_hint_y", None)
-        kw.setdefault("height", dp(74))
-        kw.setdefault("padding", [dp(12), dp(10), dp(12), dp(10)])
+        kw.setdefault("height", dp(72))
+        kw.setdefault("padding", [dp(12), dp(8), dp(14), dp(8)])
         kw.setdefault("spacing", dp(12))
         super().__init__(**kw)
         peer = conv["peer"]
         name = conv.get("username") or short_addr(peer, 14)
         unread = int(conv.get("unread") or 0)
-        preview = (conv.get("preview") or
-                   "Say hello — this chat is end-to-end encrypted")[:70]
-        self._bg_col, _ = paint_round(self, COL_CARD, radius=dp(16))
-        paint_border(self, COL_CARD_EDGE, radius=dp(16))
-        self.bind(state=lambda _w, s: setattr(
-            self._bg_col, "rgba", C(COL_PRESSED if s == "down" else COL_CARD)))
+        muted = not conv.get("notify", 1)
+        preview = conv.get("preview") or "Say hello — this chat is end-to-end " \
+            "encrypted"
+        with self.canvas.before:
+            self._bg = Color(*C(COL_BG_LIST))
+            self._rect = Rectangle()
+            Color(*C(COL_DIVIDER))
+            self._rule = Rectangle()
+        self.bind(pos=self._sync, size=self._sync,
+                  state=lambda _w, st: setattr(
+                      self._bg, "rgba", C(COL_PRESSED if st == "down"
+                                          else COL_BG_LIST)))
         self.bind(on_release=lambda _w: on_open(peer))
 
-        self.add_widget(Avatar(peer, name, diameter=dp(48)))
-
-        middle = BoxLayout(orientation="vertical", spacing=dp(3))
-        title = Label(text=name, bold=True, font_size=sp(15),
-                      color=C(COL_TEXT), halign="left", valign="middle",
-                      size_hint_y=None, height=dp(22), shorten=True,
-                      shorten_from="right")
-        title.bind(size=lambda w, v: setattr(w, "text_size", v))
-        sub = Label(text=preview, font_size=sp(12.5),
-                    color=C(COL_TICK_GOLD if unread else COL_TEXT_DIM),
-                    halign="left", valign="middle", size_hint_y=None,
-                    height=dp(20), shorten=True, shorten_from="right")
-        sub.bind(size=lambda w, v: setattr(w, "text_size", v))
-        middle.add_widget(title)
-        middle.add_widget(sub)
+        self.add_widget(Avatar(peer, name, diameter=dp(52)))
+        middle = BoxLayout(orientation="vertical", padding=[0, dp(4)])
+        top = BoxLayout(spacing=dp(6))
+        top.add_widget(single_line(name, sp(16), COL_TEXT, bold=True))
+        if muted:
+            bell = Widget(size_hint_x=None, width=dp(16))
+            bell.bind(pos=lambda w, *_a: self._bell(w),
+                      size=lambda w, *_a: self._bell(w))
+            top.add_widget(bell)
+        when = Label(text=pretty_day(conv.get("last_at") or ""),
+                     font_size=sp(12),
+                     color=C(COL_ACCENT if unread else COL_TEXT_DIM),
+                     size_hint_x=None, halign="right", valign="middle")
+        when.bind(texture_size=lambda w, v: setattr(w, "width", v[0]),
+                  size=lambda w, v: setattr(w, "text_size", (None, v[1])))
+        when.texture_update()
+        top.add_widget(when)
+        middle.add_widget(top)
+        bottom = BoxLayout(spacing=dp(6))
+        bottom.add_widget(single_line(preview, sp(14), COL_TEXT_DIM))
+        if unread:
+            holder = AnchorLayout(size_hint_x=None, width=dp(36),
+                                  anchor_x="right")
+            holder.add_widget(UnreadBadge(min(unread, 9999), muted=muted))
+            bottom.add_widget(holder)
+        middle.add_widget(bottom)
         self.add_widget(middle)
 
-        right = BoxLayout(orientation="vertical", size_hint_x=None,
-                          width=dp(50), spacing=dp(4))
-        right.add_widget(Label(text=pretty_day(conv.get("last_at") or ""),
-                               font_size=sp(11), color=C(COL_TEXT_DIM),
-                               size_hint_y=None, height=dp(20)))
-        if unread:
-            holder = AnchorLayout(anchor_x="right", anchor_y="top")
-            pip = AnchorLayout(size_hint=(None, None), size=(dp(24), dp(24)),
-                               anchor_x="center", anchor_y="center")
-            paint_circle(pip, COL_ACCENT)
-            pip.add_widget(Label(text=str(min(unread, 99)), bold=True,
-                                 font_size=sp(11), color=C("#FFFFFF")))
-            holder.add_widget(pip)
-            right.add_widget(holder)
-        else:
-            right.add_widget(Widget())
-        self.add_widget(right)
+    def _sync(self, *_a):
+        self._rect.pos, self._rect.size = self.pos, self.size
+        inset = self.padding[0] + dp(52) + self.spacing
+        self._rule.pos = (self.x + inset, self.y)
+        self._rule.size = (self.width - inset, dp(1))
+
+    @staticmethod
+    def _bell(widget):
+        widget.canvas.clear()
+        with widget.canvas:
+            draw_icon("bell_off", widget.center_x, widget.center_y, dp(13),
+                      C(COL_TICK_GREY))
 
 
 class ChatsScreen(Screen):
@@ -3965,26 +5599,25 @@ class ChatsScreen(Screen):
         self.add_widget(root)
 
         # ---- app bar ---------------------------------------------------------
-        bar = BoxLayout(size_hint_y=None, height=dp(64),
-                        padding=[dp(12), 0, dp(8), 0], spacing=dp(10))
+        bar = BoxLayout(size_hint_y=None, height=dp(56),
+                        padding=[dp(10), 0, dp(6), 0], spacing=dp(10))
         paint_round(bar, COL_APPBAR, radius=dp(0))
-        self.avatar_holder = AnchorLayout(size_hint_x=None, width=dp(44))
+        self.avatar_holder = AnchorLayout(size_hint_x=None, width=dp(40))
         bar.add_widget(self.avatar_holder)
 
         titles = BoxLayout(orientation="vertical")
-        brand = Label(text=APP_NAME, bold=True, font_size=sp(19),
-                      color=C(COL_APPBAR_TEXT), halign="left",
-                      valign="bottom", size_hint_y=None, height=dp(26))
-        brand.bind(size=lambda w, v: setattr(w, "text_size", v))
-        self.me_label = Label(text="", font_size=sp(11.5),
-                              color=C(COL_APPBAR_DIM), halign="left",
-                              valign="top", size_hint_y=None, height=dp(20),
-                              shorten=True, shorten_from="right")
-        self.me_label.bind(size=lambda w, v: setattr(w, "text_size", v))
+        brand = single_line(APP_NAME, sp(19), COL_APPBAR_TEXT, bold=True,
+                            size_hint_y=None, height=dp(25))
+        brand.valign = "bottom"
+        self.me_label = single_line("", sp(11.5), COL_APPBAR_DIM,
+                                    size_hint_y=None, height=dp(18))
+        self.me_label.valign = "top"
         titles.add_widget(brand)
         titles.add_widget(self.me_label)
         bar.add_widget(titles)
         bar.add_widget(IconButton("plus", bg=COL_ACCENT, tint="#FFFFFF",
+                                  size=(dp(40), dp(40)),
+                                  pos_hint={"center_y": .5},
                                   on_release=lambda _w:
                                   self.app.open_add_contact()))
         root.add_widget(bar)
@@ -4014,8 +5647,7 @@ class ChatsScreen(Screen):
         # ---- conversation list ----------------------------------------------
         self.scroll = ScrollView(bar_width=dp(3))
         self.list = BoxLayout(orientation="vertical", size_hint_y=None,
-                              padding=[dp(10), dp(10), dp(10), dp(16)],
-                              spacing=dp(8))
+                              padding=[0, 0, 0, dp(16)], spacing=0)
         self.list.bind(minimum_height=self.list.setter("height"))
         self.scroll.add_widget(self.list)
         root.add_widget(self.scroll)
@@ -4026,7 +5658,7 @@ class ChatsScreen(Screen):
         if not keys.has_identity:
             return
         avatar = AvatarButton(keys.address, keys.username or keys.label,
-                              diameter=dp(42))
+                              diameter=dp(38))
         avatar.bind(on_release=lambda _w: ProfileMenuModal(self.app).open())
         self.avatar_holder.add_widget(avatar)
         self.me_label.text = (f"@{keys.username or 'unregistered'}  ·  "
@@ -4091,8 +5723,21 @@ def measure_text(text: str, font_size: float, wrap_width: float) -> tuple:
                               size_hint=(None, None))
     metric = _METRIC_LABEL
     metric.font_size = font_size
-    metric.text_size = (wrap_width, None)
     metric.text = text
+    # First the NATURAL size, unwrapped: a Label given a wrap width renders
+    # its texture at that full width, so measuring wrapped made a two-letter
+    # "ok" as wide as a paragraph — every bubble used to span 78% of the
+    # screen. Text that fits on its lines keeps its natural width; only text
+    # that genuinely needs wrapping is measured at the wrap width. (The
+    # length check skips the unwrapped pass for text that cannot possibly
+    # fit, which would otherwise build a texture wider than the GPU allows.)
+    if len(text) * font_size * 0.42 < wrap_width * 3:
+        metric.text_size = (None, None)
+        metric.texture_update()
+        width, height = metric.texture_size
+        if width <= wrap_width:
+            return width, height
+    metric.text_size = (wrap_width, None)
     metric.texture_update()
     return metric.texture_size
 
@@ -4158,21 +5803,250 @@ class SelectableText(TextInput):
         return handled
 
 
-class MessageBubble(ButtonBehavior, BoxLayout):
-    """One message. Outgoing = gold, right-aligned, carrying the tick tier.
-    Incoming = white, left-aligned; tapping an unread one marks it read."""
+def message_ext(msg: dict) -> dict:
+    """The parsed `ext` column of a message row (reply, fwd, media)."""
+    try:
+        ext = json.loads(msg.get("ext") or "{}")
+        return ext if isinstance(ext, dict) else {}
+    except (TypeError, ValueError):
+        return {}
 
-    def __init__(self, msg: dict, ticks_enabled: bool,
+
+def texture_from_b64(data: str):
+    """Kivy texture for a small inline JPEG (the photo thumbnail)."""
+    import io as _io
+    try:
+        return CoreImage(_io.BytesIO(b64d(data)), ext="jpg").texture
+    except Exception:
+        return None
+
+
+def single_line(text: str, font_size, color, bold=False, **kw) -> Label:
+    """A one-line label that truncates with an ellipsis instead of
+    overflowing — the default for every name and preview in the app."""
+    label = Label(text=text, font_size=font_size, color=C(color), bold=bold,
+                  halign="left", valign="middle", shorten=True,
+                  shorten_from="right", max_lines=1, **kw)
+    label.bind(size=lambda w, v: setattr(w, "text_size", v))
+    return label
+
+
+class QuoteBlock(ButtonBehavior, BoxLayout):
+    """The quoted message inside a reply: an accent bar, who said it, and
+    one line of what they said. Tapping it scrolls to the original."""
+
+    HEIGHT = dp(42)
+
+    def __init__(self, author: str, snippet: str, outgoing: bool,
                  on_tap: Optional[Callable] = None, **kw):
         kw.setdefault("orientation", "vertical")
         kw.setdefault("size_hint", (None, None))
-        kw.setdefault("padding", [dp(12), dp(8), dp(12), dp(6)])
-        kw.setdefault("spacing", dp(3))
+        kw.setdefault("height", self.HEIGHT)
+        kw.setdefault("padding", [dp(10), dp(4), dp(8), dp(4)])
         super().__init__(**kw)
-        self._last_width = 0.0            # remembered for in-place updates
+        with self.canvas.before:
+            Color(*C(COL_QUOTE_ME if outgoing else COL_QUOTE_PEER))
+            self._bg = RoundedRectangle(radius=[dp(6)])
+            Color(*C(COL_ACCENT))
+            self._bar = RoundedRectangle(radius=[dp(2)])
+        self.bind(pos=self._sync, size=self._sync)
+        self.author = single_line(author, sp(12.5), COL_ACCENT_DARK, bold=True,
+                                  size_hint_y=None, height=dp(17))
+        self.snippet = single_line(snippet, sp(12.5), COL_TEXT_DIM,
+                                   size_hint_y=None, height=dp(17))
+        self.add_widget(self.author)
+        self.add_widget(self.snippet)
+        if on_tap is not None:
+            self.bind(on_release=lambda _w: on_tap())
+
+    def _sync(self, *_a):
+        self._bg.pos, self._bg.size = self.pos, self.size
+        self._bar.pos, self._bar.size = self.pos, (dp(3), self.height)
+
+    def natural_width(self) -> float:
+        """Width the quote would like (capped by the bubble later)."""
+        self.author.texture_update()
+        self.snippet.texture_update()
+        return max(measure_text(self.author.text, sp(12.5), dp(600))[0],
+                   measure_text(self.snippet.text, sp(12.5), dp(600))[0]
+                   ) + dp(22)
+
+
+class MediaStatus(Label):
+    """A small caption chip drawn over a photo ('Downloading…', etc.)."""
+
+    def __init__(self, **kw):
+        super().__init__(font_size=sp(11.5), color=C("#FFFFFF"),
+                         size_hint=(None, None), **kw)
+        with self.canvas.before:
+            self._col = Color(0, 0, 0, .45)
+            self._bg = RoundedRectangle(radius=[dp(10)])
+        self.bind(pos=self._sync, size=self._sync,
+                  texture_size=lambda w, v: setattr(
+                      w, "size", (v[0] + dp(16), dp(22))))
+
+    def _sync(self, *_a):
+        self._bg.pos, self._bg.size = self.pos, self.size
+        self._col.a = .45 if self.text else 0
+
+
+class ImageContent(ButtonBehavior, FloatLayout):
+    """A photo in a bubble: the full image once it is here, the blurry
+    inline thumbnail (plus a status chip) until then."""
+
+    def __init__(self, msg: dict, media: dict, screen, **kw):
+        kw.setdefault("size_hint", (None, None))
+        super().__init__(**kw)
+        self.msg, self.media, self.screen = msg, media, screen
+        with self.canvas.before:
+            Color(*C("#E9DFCF"))
+            self._ground = RoundedRectangle(radius=[dp(10)])
+        self.bind(pos=self._sync, size=self._sync)
+        self.picture = KivyImage(allow_stretch=True, keep_ratio=True,
+                                 size_hint=(1, 1),
+                                 pos_hint={"x": 0, "y": 0})
+        self.add_widget(self.picture)
+        self.chip = MediaStatus(pos_hint={"center_x": .5, "center_y": .5})
+        self.add_widget(self.chip)
+        self.bind(on_release=lambda _w: screen.on_media_tap(self.msg))
+        self.refresh(msg)
+
+    def _sync(self, *_a):
+        self._ground.pos, self._ground.size = self.pos, self.size
+
+    def natural_size(self, max_w: float) -> tuple:
+        w0, h0 = self.media.get("w") or 4, self.media.get("h") or 3
+        width = min(max_w, dp(250))
+        height = max(dp(90), min(dp(330), width * h0 / float(w0)))
+        return width, height
+
+    def refresh(self, msg: dict) -> None:
+        self.msg = msg
+        state = msg.get("media_state") or ""
+        path = msg.get("media_path")
+        if path and Path(path).is_file() and state in ("ready", ""):
+            self.picture.texture = None
+            self.picture.source = path
+        elif self.media.get("thumb"):
+            self.picture.source = ""
+            self.picture.texture = texture_from_b64(self.media["thumb"])
         outgoing = msg["direction"] == "out"
-        # Tail corner points at the speaker — the small cue that makes a
-        # chat feel like a chat.
+        self.chip.text = {
+            "uploading": "Sending…",
+            "pending": "Downloading…",
+            "downloading": "Downloading…",
+            "expired": "Expired · tap to ask again",
+            "requested": "Asked them to send it again",
+            "failed": ("Upload failed · tap to retry" if outgoing
+                       else "Download failed · tap to retry"),
+        }.get(state, "")
+
+
+class Waveform(Widget):
+    """Voice-note level bars; the played part is drawn in the accent."""
+
+    def __init__(self, wave: str = "", **kw):
+        super().__init__(**kw)
+        try:
+            self._levels = list(b64d(wave)) if wave else []
+        except (TypeError, ValueError):
+            self._levels = []
+        self.progress = 0.0
+        self.bind(pos=self._redraw, size=self._redraw)
+
+    def set_progress(self, fraction: float) -> None:
+        self.progress = max(0.0, min(1.0, fraction))
+        self._redraw()
+
+    def _redraw(self, *_a):
+        self.canvas.clear()
+        bars = max(8, int(self.width / dp(4)))
+        levels = self._levels or [60] * bars
+        with self.canvas:
+            for i in range(bars):
+                lvl = levels[int(i * len(levels) / bars)] / 255.0
+                height = max(dp(3), self.height * (0.18 + 0.82 * lvl))
+                played = (i + 0.5) / bars <= self.progress
+                Color(*C(COL_ACCENT if played else COL_TICK_GREY))
+                Rectangle(pos=(self.x + i * dp(4),
+                               self.center_y - height / 2),
+                          size=(dp(2.2), height))
+
+
+class VoiceContent(BoxLayout):
+    """▶ + waveform + duration. Plays from the local copy once it is here."""
+
+    def __init__(self, msg: dict, media: dict, screen, **kw):
+        kw.setdefault("size_hint", (None, None))
+        kw.setdefault("height", dp(46))
+        kw.setdefault("spacing", dp(8))
+        super().__init__(**kw)
+        self.msg, self.media, self.screen = msg, media, screen
+        self.button = IconButton("play", tint="#FFFFFF", bg=COL_ACCENT,
+                                 size=(dp(40), dp(40)),
+                                 pos_hint={"center_y": .5},
+                                 on_release=lambda _w:
+                                 screen.on_media_tap(self.msg))
+        self.add_widget(self.button)
+        self.wave = Waveform(media.get("wave", ""), size_hint_y=None,
+                             height=dp(26), pos_hint={"center_y": .5})
+        self.add_widget(self.wave)
+        dur = int(media.get("dur") or 0) // 1000
+        self.length = Label(text=f"{dur // 60}:{dur % 60:02d}",
+                            font_size=sp(11.5), color=C(COL_TEXT_DIM),
+                            size_hint=(None, 1), width=dp(34))
+        self.add_widget(self.length)
+        self.refresh(msg)
+
+    def natural_size(self, max_w: float) -> tuple:
+        return min(max_w, dp(230)), dp(46)
+
+    def refresh(self, msg: dict) -> None:
+        self.msg = msg
+        state = msg.get("media_state") or ""
+        if state in ("expired",):
+            self.button.set_icon("retry")
+        elif state in ("pending", "downloading", "uploading", "requested"):
+            self.button.set_icon("download")
+        elif state == "failed":
+            self.button.set_icon("retry")
+        else:
+            playing = self.screen.app.voice.path == msg.get("media_path") \
+                and self.screen.app.voice.playing
+            self.button.set_icon("pause" if playing else "play")
+
+
+def make_body(text: str, font_size) -> Widget:
+    """The message text widget. On a desktop it is selectable (drag to
+    highlight, Ctrl+C); on a phone a plain label, because long-press there
+    selects the whole message and a focusable field would only fight it."""
+    if IS_MOBILE:
+        return Label(text=text, color=C(COL_TEXT), font_size=font_size,
+                     halign="left", valign="top", size_hint=(None, None))
+    return SelectableText(text=text, font_size=font_size)
+
+
+class MessageBubble(BoxLayout):
+    """One message: an optional 'Forwarded' mark, reply quote, photo or
+    voice note, the text, and a meta row (star, time, ticks).
+
+    Outgoing = gold and right-aligned; incoming = white and left-aligned.
+    Touches belong to the enclosing BubbleRow, which owns tap, long-press
+    and selection, so this class only lays things out.
+    """
+
+    def __init__(self, msg: dict, ticks_enabled: bool, screen, **kw):
+        kw.setdefault("orientation", "vertical")
+        kw.setdefault("size_hint", (None, None))
+        kw.setdefault("padding", [dp(10), dp(7), dp(10), dp(6)])
+        kw.setdefault("spacing", dp(4))
+        super().__init__(**kw)
+        self.msg, self.screen = msg, screen
+        self._last_width = 0.0
+        self._text_w = self._text_h = 0.0
+        self._body_floor = 0.0
+        outgoing = msg["direction"] == "out"
+        ext = message_ext(msg)
         corners = ([dp(16), dp(16), dp(4), dp(16)] if outgoing
                    else [dp(16), dp(16), dp(16), dp(4)])
         paint_round(self, COL_BUBBLE_ME if outgoing else COL_BUBBLE_PEER,
@@ -4180,30 +6054,82 @@ class MessageBubble(ButtonBehavior, BoxLayout):
         if not outgoing:
             paint_border(self, COL_CARD_EDGE, radius=dp(16))
 
-        self.body = SelectableText(text=msg["body"], font_size=sp(14.5),
-                                   on_tap=on_tap)
-        self.body.bind(minimum_height=self._body_min_height)
-        self.add_widget(self.body)
+        self.fwd = None
+        if ext.get("fwd"):
+            self.fwd = Label(text="Forwarded", italic=True, font_size=sp(11.5),
+                             color=C(COL_ACCENT_DARK), halign="left",
+                             size_hint=(None, None), height=dp(15))
+            self.fwd.bind(size=lambda w, v: setattr(w, "text_size", v))
+            self.add_widget(self.fwd)
 
-        # Meta line = timestamp + vector ticks. Kept as two widgets rather
-        # than one markup Label so the ticks can be DRAWN (see TickMarks).
+        self.quote = None
+        reply = ext.get("reply")
+        if isinstance(reply, dict):
+            author = screen.author_name(reply.get("from"), outgoing)
+            snippet = reply.get("snip") or {"image": "Photo",
+                                            "voice": "Voice message"}.get(
+                reply.get("kind"), "Message")
+            self.quote = QuoteBlock(author, snippet, outgoing,
+                                    on_tap=lambda c=reply.get("cid"):
+                                    screen.jump_to_cid(c))
+            self.add_widget(self.quote)
+
+        self.media = None
+        media = ext.get("media")
+        if msg.get("kind") == "image" and isinstance(media, dict):
+            self.media = ImageContent(msg, media, screen)
+        elif msg.get("kind") == "voice" and isinstance(media, dict):
+            self.media = VoiceContent(msg, media, screen)
+        if self.media is not None:
+            self.add_widget(self.media)
+
+        text = self._display_text(msg, media)
+        self.body = make_body(text, sp(14.5)) if text else None
+        if self.body is not None:
+            self.body.bind(minimum_height=self._body_min_height) \
+                if isinstance(self.body, SelectableText) else None
+            self.add_widget(self.body)
+
         self.meta = Label(text=self._stamp_text(msg), markup=True,
                           font_size=sp(10.5), color=C(COL_TEXT_DIM),
                           halign="right", valign="middle",
                           size_hint=(None, None), height=dp(14))
         count, tint = self._tick_state(msg, outgoing, ticks_enabled)
         self.ticks = TickMarks(count=count, tint=tint)
+        self.star = Widget(size_hint=(None, None), size=(dp(12), dp(14)))
+        self.star.bind(pos=self._draw_star, size=self._draw_star)
         self.meta_box = BoxLayout(orientation="horizontal", spacing=dp(4),
                                   size_hint=(None, None), height=dp(14))
+        self.meta_box.add_widget(self.star)
         self.meta_box.add_widget(self.meta)
         self.meta_box.add_widget(self.ticks)
         meta_row = AnchorLayout(anchor_x="right", size_hint_y=None,
                                 height=dp(14))
         meta_row.add_widget(self.meta_box)
         self.add_widget(meta_row)
+        self._draw_star()
 
-        if on_tap is not None:
-            self.bind(on_release=lambda _w: on_tap())
+    # ---- content -------------------------------------------------------------
+    @staticmethod
+    def _display_text(msg: dict, media) -> str:
+        """What the text part shows. A photo shows its caption (if any), a
+        voice note shows nothing — their readable `body` exists for older
+        clients, previews and exports, not to be printed twice."""
+        if msg.get("kind") == "image" and isinstance(media, dict):
+            return media.get("cap", "")
+        if msg.get("kind") == "voice" and isinstance(media, dict):
+            return ""
+        return msg["body"]
+
+    def _draw_star(self, *_a):
+        self.star.canvas.clear()
+        if not self.msg.get("starred"):
+            self.star.width = 0
+            return
+        self.star.width = dp(12)
+        with self.star.canvas:
+            draw_icon("star_filled", self.star.center_x, self.star.center_y,
+                      dp(11), C(COL_TICK_GOLD))
 
     @staticmethod
     def _stamp_text(msg: dict) -> str:
@@ -4247,74 +6173,179 @@ class MessageBubble(ButtonBehavior, BoxLayout):
         return min(status, 3), COL_TICK_GOLD
 
     def update(self, msg: dict, ticks_enabled: bool) -> None:
-        """Repaint in place after a status/read/body change.
+        """Repaint in place after a status/read/star/media change.
 
         A tick advancing 1/3 -> 2/3 -> 3/3 used to rebuild the entire
-        conversation; it now rewrites one short label. Only when the body
-        text itself changes does the bubble need re-wrapping.
+        conversation; it now rewrites one short label.
         """
         outgoing = msg["direction"] == "out"
+        self.msg = msg
         self.meta.text = self._stamp_text(msg)
         self.ticks.set_state(*self._tick_state(msg, outgoing, ticks_enabled))
-        if self.body.text != msg["body"]:
-            self.body.text = msg["body"]
+        if self.media is not None:
+            media = message_ext(msg).get("media")
+            if isinstance(media, dict):
+                self.media.media = media
+            self.media.refresh(msg)
+        self._draw_star()
         if self._last_width:
             self.layout_for(self._last_width)
-        else:
-            self.meta.texture_update()
-            self.meta.size = (self.meta.texture_size[0], dp(14))
-            self.meta_box.width = (self.meta.width + self.ticks.width
-                                   + (dp(4) if self.ticks.width else 0))
 
     def _body_min_height(self, _w, value: float) -> None:
-        """Safety net for the measured height.
+        """Safety net for the measured height (desktop's selectable text).
 
-        The TextInput re-wraps a frame after it is given a width. If it ends
-        up wanting more room than measure_text predicted — a font metric
-        rounding apart — grow the bubble rather than clip the message.
+        The TextInput re-wraps a frame after it is given a width. If, AT ITS
+        FINAL WIDTH, it wants more room than measure_text predicted — a font
+        metric rounding apart — grow the bubble rather than clip the text.
+
+        Values reported before then are ignored: a TextInput starts life
+        100px wide, and its first wrap at that width asks for several times
+        the real height. Trusting that reading is what made every bubble
+        balloon in an early v9 build.
         """
-        if value > self.body.height + 0.5:
-            self.body.height = value
-            self.height = self.body.height + dp(14) + dp(20)
+        if self.body is None or not self._last_width or \
+                self.body.width < self._text_w:
+            return
+        floor = value if value > self._text_h + 0.5 else 0.0
+        if abs(floor - self._body_floor) > 0.5:
+            self._body_floor = floor
+            self.layout_for(self._last_width)
 
     def layout_for(self, available: float) -> None:
-        """Wrap to at most 76% of the viewport, then size to content."""
+        """Size every part, then the bubble to fit them.
+
+        The widest part decides the content width, capped at 78% of the
+        row; the quote and the meta row stretch to it, the text wraps
+        inside it, and a photo keeps its own aspect-correct size.
+        """
         self._last_width = available
-        max_text = max(dp(120), available * 0.76 - dp(24))
-        text_w, text_h = measure_text(self.body.text, self.body.font_size,
-                                      max_text)
-        # +2px of slack: the TextInput re-wraps at whatever width it is
-        # given, and handing it the exact width of the widest measured line
-        # can tip that line over by a rounding error. Invisible, and it
-        # keeps a one-line message on one line.
-        self.body.width = text_w + dp(2)
-        self.body.height = text_h
+        max_w = max(dp(150), available * 0.78 - dp(20))
+        parts = []                                  # (widget, w, h)
+        widest = dp(60)
+        if self.media is not None:
+            mw, mh = self.media.natural_size(max_w)
+            self.media.size = (mw, mh)
+            widest = max(widest, mw)
+            parts.append(mh)
+        text_w = text_h = 0
+        if self.body is not None:
+            wrap = self.media.width if isinstance(self.media,
+                                                  ImageContent) else max_w
+            text_w, text_h = measure_text(self.body.text, self.body.font_size,
+                                          wrap)
+            self._text_w, self._text_h = text_w, text_h
+            if isinstance(self.body, SelectableText):
+                # +2px of slack: handing a TextInput the exact width of its
+                # widest measured line can tip that line over by a rounding
+                # error and add a wrap. Invisible, and it prevents that.
+                self.body.width = text_w + dp(2)
+                self.body.height = max(text_h, self._body_floor)
+            else:
+                self.body.width = text_w
+                self.body.text_size = (text_w + 0.5, None)
+                self.body.height = text_h
+            widest = max(widest, self.body.width)
+            parts.append(self.body.height)
+        if self.quote is not None:
+            widest = max(widest, min(max_w, self.quote.natural_width()))
+        if self.fwd is not None:
+            widest = max(widest, measure_text("Forwarded", sp(11.5),
+                                              dp(300))[0])
         self.meta.texture_update()
         self.meta.size = (self.meta.texture_size[0], dp(14))
-        # Composite meta row: timestamp + drawn ticks + the gap between them.
-        meta_w = self.meta.width + self.ticks.width
-        if self.ticks.width:
-            meta_w += dp(4)
+        meta_w = self.meta.width + self.ticks.width + self.star.width
+        meta_w += dp(4) * (1 + (1 if self.ticks.width else 0))
         self.meta_box.width = meta_w
-        content = max(self.body.width, meta_w)
-        self.width = content + dp(24)
-        self.height = self.body.height + dp(14) + dp(20)
+        widest = max(widest, meta_w)
+        if self.quote is not None:
+            self.quote.width = widest
+            parts.append(self.quote.height)
+        if self.fwd is not None:
+            self.fwd.width = widest
+            parts.append(self.fwd.height)
+        parts.append(dp(14))                        # meta row
+        pad_l, pad_t, pad_r, pad_b = self.padding
+        self.width = widest + pad_l + pad_r
+        self.height = (sum(parts) + self.spacing * (len(parts) - 1)
+                       + pad_t + pad_b)
 
 
 class BubbleRow(AnchorLayout):
-    """Aligns a bubble left (incoming) or right (outgoing) and tracks its
-    wrapped height."""
+    """A full-width row holding one bubble, and the owner of its touches.
 
-    def __init__(self, bubble: MessageBubble, outgoing: bool, **kw):
+    Long-press (or right-click) selects the message — the "highlight mode"
+    the app bar switches into — and while anything is selected a tap
+    toggles a message in or out instead of doing its normal thing. A
+    selected row is washed in gold across the whole width, which also makes
+    multi-select obvious.
+    """
+
+    LONG_PRESS = 0.42                     # seconds
+
+    def __init__(self, bubble: MessageBubble, outgoing: bool, screen, **kw):
         kw.setdefault("size_hint_y", None)
         kw.setdefault("height", dp(48))
         kw.setdefault("padding", [dp(10), dp(3), dp(10), dp(3)])
         super().__init__(anchor_x="right" if outgoing else "left",
                          anchor_y="center", **kw)
-        self.bubble = bubble
+        self.bubble, self.screen = bubble, screen
+        self.msg_id = bubble.msg["id"]
+        with self.canvas.before:
+            self._tint = Color(*COL_SELECT_RGBA)
+            self._wash = Rectangle()
+        self._tint.a = 0
+        self.bind(pos=self._sync, size=self._sync)
         self.add_widget(bubble)
         bubble.bind(height=lambda _w, v: setattr(self, "height", v + dp(6)))
         self.bind(width=lambda _w, v: bubble.layout_for(v))
+        self._press = None
+
+    def _sync(self, *_a):
+        self._wash.pos, self._wash.size = self.pos, self.size
+
+    def set_selected(self, selected: bool) -> None:
+        self._tint.a = COL_SELECT_RGBA[3] if selected else 0
+
+    # ---- touches -------------------------------------------------------------
+    def on_touch_down(self, touch):
+        if not self.collide_point(*touch.pos) or touch.is_mouse_scrolling:
+            return super().on_touch_down(touch)
+        if self.screen.selecting:
+            self.screen.toggle_selection(self.msg_id)
+            return True
+        if getattr(touch, "button", "left") == "right":
+            self.screen.start_selection(self.msg_id)
+            return True
+        touch.grab(self)
+        self._press = (touch.uid, touch.pos, Clock.schedule_once(
+            lambda _dt: self._long_press(touch), self.LONG_PRESS))
+        super().on_touch_down(touch)       # children: links, play, text drag
+        return True
+
+    def _long_press(self, touch):
+        if self._press and self._press[0] == touch.uid:
+            self._press = None
+            touch.ud["fext_long_press"] = True
+            self.screen.start_selection(self.msg_id)
+
+    def on_touch_move(self, touch):
+        if self._press and self._press[0] == touch.uid:
+            ox, oy = self._press[1]
+            if abs(touch.x - ox) > dp(10) or abs(touch.y - oy) > dp(10):
+                self._press[2].cancel()
+                self._press = None
+        return super().on_touch_move(touch)
+
+    def on_touch_up(self, touch):
+        if touch.grab_current is self:
+            touch.ungrab(self)
+            pending, self._press = self._press, None
+            if pending:
+                pending[2].cancel()
+                if not touch.ud.get("fext_long_press"):
+                    self.screen.on_bubble_tap(self.msg_id)
+            return True
+        return super().on_touch_up(touch)
 
 
 class DayDivider(AnchorLayout):
@@ -4430,39 +6461,72 @@ class ConversationScreen(Screen):
             outline=COL_CARD_EDGE, size_hint_y=None, height=dp(38),
             font_size=sp(12.5), pressed=COL_PRESSED,
             on_release=lambda _w: self.app.load_older_messages())
+        self.selected: dict = {}          # local id -> message, highlighted
+        self._rows: dict = {}             # local id -> BubbleRow
+        self.reply_to: Optional[dict] = None
+        self.recorder = None              # VoiceRecorder while recording
+        self._rec_tick = None
+        self.peer: Optional[str] = None
+        self.peer_name_text = ""
         root = BoxLayout(orientation="vertical")
         paint_round(root, COL_BG, radius=dp(0))
         self.add_widget(root)
 
-        # ---- app bar ---------------------------------------------------------
-        self.bar = BoxLayout(size_hint_y=None, height=dp(64),
-                             padding=[dp(4), 0, dp(10), 0], spacing=dp(6))
+        # ---- app bar: normal mode and highlight (selection) mode -------------
+        # Two complete bars swapped in one slot, rather than one bar whose
+        # buttons come and go: each mode lays out exactly once, so nothing
+        # shifts sideways when the mode changes.
+        self.bar = FloatLayout(size_hint_y=None, height=dp(56))
         paint_round(self.bar, COL_APPBAR, radius=dp(0))
-        self.bar.add_widget(IconButton("back", on_release=lambda _w:
-                                       self.app.go_back_to_chats()))
-        self.peer_avatar_holder = AnchorLayout(size_hint_x=None, width=dp(42))
-        self.bar.add_widget(self.peer_avatar_holder)
+        root.add_widget(self.bar)
 
-        titles = TappableBox(on_tap=lambda: self.app.open_contact_settings())
-        self.peer_name = Label(text="", bold=True, font_size=sp(16),
-                               color=C(COL_APPBAR_TEXT), halign="left",
-                               valign="bottom", size_hint_y=None,
-                               height=dp(24), shorten=True,
-                               shorten_from="right")
-        self.peer_name.bind(size=lambda w, v: setattr(w, "text_size", v))
-        self.peer_sub = Label(text="", font_size=sp(11),
-                              color=C(COL_APPBAR_DIM), halign="left",
-                              valign="top", size_hint_y=None, height=dp(20),
-                              shorten=True, shorten_from="right")
-        self.peer_sub.bind(size=lambda w, v: setattr(w, "text_size", v))
+        self.normal_bar = BoxLayout(padding=[dp(2), 0, dp(4), 0],
+                                    spacing=dp(2), size_hint=(1, 1),
+                                    pos_hint={"x": 0, "y": 0})
+        self.normal_bar.add_widget(IconButton(
+            "back", size=(dp(44), dp(56)),
+            on_release=lambda _w: self.app.go_back_to_chats()))
+        self.peer_avatar_holder = AnchorLayout(size_hint_x=None, width=dp(40))
+        self.normal_bar.add_widget(self.peer_avatar_holder)
+        titles = TappableBox(on_tap=lambda: self.app.open_chat_info(),
+                             padding=[dp(8), dp(8), 0, dp(8)])
+        self.peer_name = single_line("", sp(16.5), COL_APPBAR_TEXT, bold=True,
+                                     size_hint_y=None, height=dp(22))
+        self.peer_sub = single_line("", sp(12), COL_APPBAR_DIM,
+                                    size_hint_y=None, height=dp(18))
         titles.add_widget(self.peer_name)
         titles.add_widget(self.peer_sub)
-        self.bar.add_widget(titles)
-        self.mark_read_button = CozyButton(
-            "Mark read", size_hint=(None, None), width=dp(92), height=dp(36),
-            font_size=sp(12), on_release=lambda _w:
-            self.app.mark_peer_read(self.app.current_peer))
-        root.add_widget(self.bar)
+        self.normal_bar.add_widget(titles)
+        self.more_button = IconButton(
+            "more", size=(dp(44), dp(56)),
+            on_release=lambda w: self.open_menu(w))
+        self.normal_bar.add_widget(self.more_button)
+
+        self.select_bar = BoxLayout(padding=[dp(2), 0, dp(2), 0],
+                                    size_hint=(1, 1),
+                                    pos_hint={"x": 0, "y": 0})
+        self.select_bar.add_widget(IconButton(
+            "close", size=(dp(44), dp(56)),
+            on_release=lambda _w: self.clear_selection()))
+        self.select_count = Label(text="1", bold=True, font_size=sp(18),
+                                  color=C(COL_APPBAR_TEXT), halign="left",
+                                  valign="middle", size_hint_x=None,
+                                  width=dp(34))
+        self.select_count.bind(size=lambda w, v: setattr(w, "text_size", v))
+        self.select_bar.add_widget(self.select_count)
+        self.select_bar.add_widget(Widget())
+        self.actions: dict = {}
+        for name, handler in (("reply", self._act_reply),
+                              ("copy", self._act_copy),
+                              ("star", self._act_star),
+                              ("forward", self._act_forward),
+                              ("share", self._act_share),
+                              ("delete", self._act_delete)):
+            button = IconButton(name, size=(dp(42), dp(56)),
+                                on_release=lambda _w, h=handler: h())
+            self.actions[name] = button
+            self.select_bar.add_widget(button)
+        self.bar.add_widget(self.normal_bar)
 
         # ---- messages --------------------------------------------------------
         stack = FloatLayout()
@@ -4490,35 +6554,95 @@ class ConversationScreen(Screen):
         self.scroll.bind(scroll_y=lambda *_a: self._on_scrolled())
         root.add_widget(stack)
 
-        # ---- composer --------------------------------------------------------
-        composer = BoxLayout(size_hint_y=None, height=dp(66),
-                             padding=[dp(10), dp(10), dp(10), dp(10)],
-                             spacing=dp(8))
-        paint_round(composer, COL_BG_LIST, radius=dp(0))
-        self.entry = CozyInput(hint="Message", radius=dp(22),
+        # ---- reply preview (shown while composing a reply) -------------------
+        self.reply_bar = BoxLayout(size_hint_y=None, height=0, opacity=0,
+                                   disabled=True,
+                                   padding=[dp(14), dp(6), dp(4), dp(6)],
+                                   spacing=dp(10))
+        paint_round(self.reply_bar, COL_BG_LIST, radius=dp(0))
+        reply_icon = Widget(size_hint_x=None, width=dp(22))
+        reply_icon.bind(pos=lambda w, *_a: self._paint_reply_icon(w),
+                        size=lambda w, *_a: self._paint_reply_icon(w))
+        self.reply_bar.add_widget(reply_icon)
+        self.reply_bar.bind(pos=lambda *_a: self._paint_reply_icon(reply_icon),
+                            size=lambda *_a: self._paint_reply_icon(
+                                reply_icon))
+        texts = BoxLayout(orientation="vertical")
+        with texts.canvas.before:
+            Color(*C(COL_ACCENT))
+            self._reply_accent = Rectangle()
+        texts.bind(pos=lambda w, *_a: self._sync_reply_accent(w),
+                   size=lambda w, *_a: self._sync_reply_accent(w))
+        self.reply_author = single_line("", sp(13), COL_ACCENT_DARK, bold=True,
+                                        padding=[dp(10), 0])
+        self.reply_snip = single_line("", sp(13), COL_TEXT_DIM,
+                                      padding=[dp(10), 0])
+        texts.add_widget(self.reply_author)
+        texts.add_widget(self.reply_snip)
+        self.reply_bar.add_widget(texts)
+        self.reply_bar.add_widget(IconButton(
+            "close", tint=COL_TEXT_DIM, press="#E9DFCF",
+            size=(dp(40), dp(40)), pos_hint={"center_y": .5},
+            on_release=lambda _w: self.cancel_reply()))
+        root.add_widget(self.reply_bar)
+
+        # ---- composer ----------------------------------------------------------
+        self.composer = BoxLayout(size_hint_y=None, height=dp(60),
+                                  padding=[dp(4), dp(8), dp(8), dp(8)],
+                                  spacing=dp(4))
+        paint_round(self.composer, COL_BG_LIST, radius=dp(0))
+        with self.composer.canvas.before:
+            Color(*C(COL_DIVIDER))
+            self._composer_rule = Rectangle()
+        self.composer.bind(pos=self._sync_rule, size=self._sync_rule)
+        self.attach_button = IconButton(
+            "image", tint=COL_TEXT_DIM, press="#E9DFCF",
+            size=(dp(44), dp(44)), pos_hint={"center_y": .5},
+            on_release=lambda _w: self.pick_image())
+        self.entry = CozyInput(hint="Message", radius=dp(22), height=dp(44),
                                on_enter=self.app.send_current)
-        composer.add_widget(self.entry)
-        composer.add_widget(IconButton("send", bg=COL_ACCENT, tint="#FFFFFF",
-                                       size=(dp(46), dp(46)),
-                                       on_release=lambda _w:
-                                       self.app.send_current()))
-        root.add_widget(composer)
+        self.action_button = IconButton(
+            "send", bg=COL_ACCENT, tint="#FFFFFF", size=(dp(44), dp(44)),
+            pos_hint={"center_y": .5},
+            on_release=lambda _w: self._on_action_button())
+        self.entry.input.bind(text=lambda *_a: self._sync_action_button())
+        self.composer_parts = (self.attach_button, self.entry,
+                               self.action_button)
+        for part in self.composer_parts:
+            self.composer.add_widget(part)
+        # The recording strip that replaces the composer while recording.
+        self.rec_cancel = IconButton(
+            "delete", tint=COL_DANGER, press="#E9DFCF",
+            size=(dp(44), dp(44)), pos_hint={"center_y": .5},
+            on_release=lambda _w: self.cancel_recording())
+        self.rec_label = Label(text="", font_size=sp(14), color=C(COL_TEXT),
+                               halign="left", valign="middle", markup=True)
+        self.rec_label.bind(size=lambda w, v: setattr(w, "text_size", v))
+        self.rec_send = IconButton(
+            "send", bg=COL_ACCENT, tint="#FFFFFF", size=(dp(44), dp(44)),
+            pos_hint={"center_y": .5},
+            on_release=lambda _w: self.finish_recording())
+        root.add_widget(self.composer)
+        self._sync_action_button()
 
     # ---- header --------------------------------------------------------------
     def set_peer(self, peer: str, contact: dict, unread_count: int) -> None:
+        if peer != self.peer:
+            self.clear_selection()
+            self.cancel_reply()
+            self.cancel_recording()
+        self.peer = peer
         name = contact.get("username") or short_addr(peer, 14)
+        self.peer_name_text = name
         self.peer_avatar_holder.clear_widgets()
-        self.peer_avatar_holder.add_widget(Avatar(peer, name, diameter=dp(40)))
+        self.peer_avatar_holder.add_widget(Avatar(peer, name, diameter=dp(38)))
         self.peer_name.text = name
-        ticks = "ticks on" if contact.get("ticks_enabled", 1) else "no ticks"
-        auto = "auto-read" if contact.get("auto_read", 1) else "manual read"
-        self.peer_sub.text = f"{short_addr(peer, 12)}  ·  {ticks} · {auto}"
-        # "Mark read" only appears when it can actually do something.
-        manual = unread_count and not contact.get("auto_read", 1)
-        if manual and self.mark_read_button.parent is None:
-            self.bar.add_widget(self.mark_read_button)
-        elif not manual and self.mark_read_button.parent is not None:
-            self.bar.remove_widget(self.mark_read_button)
+        bits = [short_addr(peer, 12)]
+        if not contact.get("notify", 1):
+            bits.append("muted")
+        if unread_count and not contact.get("auto_read", 1):
+            bits.append(f"{unread_count} unread")
+        self.peer_sub.text = "  ·  ".join(bits)
 
     # ---- bubbles -------------------------------------------------------------
     def render(self, messages: list, ticks_enabled: bool,
@@ -4539,8 +6663,7 @@ class ConversationScreen(Screen):
         way appending cannot express (peer switch, history paged in, an
         import inserting older rows, messages deleted).
         """
-        signatures = {m["id"]: (m["status"], m["read"], m["body"])
-                      for m in messages}
+        signatures = {m["id"]: self._signature(m) for m in messages}
         ids = [m["id"] for m in messages]
 
         rebuild = (peer != self._rendered_peer
@@ -4592,6 +6715,7 @@ class ConversationScreen(Screen):
         self.messages.clear_widgets()
         self.messages.add_widget(self._filler)     # stays the topmost child
         self._bubbles.clear()
+        self._rows.clear()
         self._last_day = None
         if not messages:
             self.messages.add_widget(self._empty_state())
@@ -4602,12 +6726,18 @@ class ConversationScreen(Screen):
         for msg in messages:
             self._append_bubble(msg, ticks_enabled, on_tap_unread)
         self._rendered_ids = [m["id"] for m in messages]
-        self._rendered_sigs = {m["id"]: (m["status"], m["read"], m["body"])
+        self._rendered_sigs = {m["id"]: self._signature(m)
                                for m in messages}
         self._rendered_peer = peer
         self._rendered_ticks = ticks_enabled
         self._unseen = 0
         self.scroll_to_bottom(animate=False)
+
+    @staticmethod
+    def _signature(msg: dict) -> tuple:
+        """Everything that, if it changes, means a bubble must repaint."""
+        return (msg["status"], msg["read"], msg["body"], msg.get("starred"),
+                msg.get("media_state"), msg.get("media_path"), msg.get("ext"))
 
     def _append_bubble(self, msg: dict, ticks_enabled: bool,
                        on_tap_unread: Callable) -> None:
@@ -4616,12 +6746,392 @@ class ConversationScreen(Screen):
             self._last_day = day
             self.messages.add_widget(DayDivider(self._day_text(day)))
         outgoing = msg["direction"] == "out"
-        tap = None
-        if not outgoing and not msg["read"]:
-            tap = (lambda m=msg: on_tap_unread(m["id"], m.get("server_id")))
-        bubble = MessageBubble(msg, ticks_enabled, on_tap=tap)
+        bubble = MessageBubble(msg, ticks_enabled, self)
         self._bubbles[msg["id"]] = bubble
-        self.messages.add_widget(BubbleRow(bubble, outgoing))
+        row = BubbleRow(bubble, outgoing, self)
+        row.set_selected(msg["id"] in self.selected)
+        self._rows[msg["id"]] = row
+        self.messages.add_widget(row)
+
+    # =========================================================================
+    #  Highlight (selection) mode
+    # =========================================================================
+    @property
+    def selecting(self) -> bool:
+        return bool(self.selected)
+
+    def start_selection(self, msg_id: int) -> None:
+        if msg_id not in self.selected:
+            self.toggle_selection(msg_id)
+
+    def toggle_selection(self, msg_id: int) -> None:
+        bubble = self._bubbles.get(msg_id)
+        if bubble is None:
+            return
+        if msg_id in self.selected:
+            del self.selected[msg_id]
+            if isinstance(bubble.body, SelectableText):
+                bubble.body.cancel_selection()
+        else:
+            self.selected[msg_id] = bubble.msg
+        row = self._rows.get(msg_id)
+        if row is not None:
+            row.set_selected(msg_id in self.selected)
+        self._sync_selection()
+
+    def clear_selection(self) -> None:
+        for msg_id in list(self.selected):
+            row = self._rows.get(msg_id)
+            if row is not None:
+                row.set_selected(False)
+            bubble = self._bubbles.get(msg_id)
+            if bubble is not None and isinstance(bubble.body, SelectableText):
+                bubble.body.cancel_selection()
+        self.selected.clear()
+        self._sync_selection()
+
+    def _sync_selection(self) -> None:
+        """Swap the app bar and enable only the actions that apply."""
+        on = bool(self.selected)
+        if on and self.select_bar.parent is None:
+            self.bar.remove_widget(self.normal_bar)
+            self.bar.add_widget(self.select_bar)
+        elif not on and self.normal_bar.parent is None:
+            self.bar.remove_widget(self.select_bar)
+            self.bar.add_widget(self.normal_bar)
+        if not on:
+            return
+        msgs = list(self.selected.values())
+        self.select_count.text = str(len(msgs))
+        has_text = any(self._text_of(m) for m in msgs)
+        self.actions["reply"].disabled = len(msgs) != 1
+        self.actions["copy"].disabled = not has_text
+        self.actions["star"].set_icon(
+            "star_filled" if all(m.get("starred") for m in msgs) else "star")
+        self.actions["share"].disabled = not (has_text or any(
+            m.get("kind") == "image" and m.get("media_path") for m in msgs))
+        self.actions["forward"].disabled = any(
+            m.get("kind") in ("image", "voice") and not
+            (message_ext(m).get("media") or {}).get("blob") for m in msgs)
+
+    @staticmethod
+    def _text_of(msg: dict) -> str:
+        kind = msg.get("kind") or "text"
+        if kind == "image":
+            return (message_ext(msg).get("media") or {}).get("cap", "")
+        if kind == "voice":
+            return ""
+        return msg.get("body", "")
+
+    def _ordered(self) -> list:
+        return [self.selected[i] for i in sorted(self.selected)]
+
+    # ---- the six actions -------------------------------------------------------
+    def _act_reply(self) -> None:
+        if len(self.selected) == 1:
+            msg = next(iter(self.selected.values()))
+            self.clear_selection()
+            self.set_reply(msg)
+
+    def _act_copy(self) -> None:
+        msgs = self._ordered()
+        if len(msgs) == 1:
+            bubble = self._bubbles.get(msgs[0]["id"])
+            part = (bubble.body.selection_text if bubble is not None and
+                    isinstance(bubble.body, SelectableText) else "")
+            text = part or self._text_of(msgs[0])
+        else:
+            text = "\n".join(
+                f"[{pretty_time(m['created_at'])}] "
+                f"{self.author_name(self._author_of(m))}: {self._text_of(m)}"
+                for m in msgs if self._text_of(m))
+        self.clear_selection()
+        if text:
+            self.app.copy_text(text)
+
+    def _act_star(self) -> None:
+        msgs = self._ordered()
+        star = not all(m.get("starred") for m in msgs)
+        ids = [m["id"] for m in msgs]
+        self.clear_selection()
+        self.app.star_messages(ids, star)
+        self.app._set_status("Starred" if star else "Removed from starred",
+                             COL_OK)
+
+    def _act_forward(self) -> None:
+        ForwardModal(self.app, [m["id"] for m in self._ordered()],
+                     on_done=self.clear_selection).open()
+
+    def _act_share(self) -> None:
+        ids = [m["id"] for m in self._ordered()]
+        self.clear_selection()
+        self.app.share_messages(ids)
+
+    def _act_delete(self) -> None:
+        DeleteModal(self.app, self._ordered(),
+                    on_done=self.clear_selection).open()
+
+    # ---- replies ---------------------------------------------------------------
+    def _author_of(self, msg: dict) -> str:
+        return self.app.keys.address if msg["direction"] == "out" \
+            else msg["peer"]
+
+    def author_name(self, address: Optional[str],
+                    outgoing_bubble: bool = False) -> str:
+        if not address:
+            return "Message"
+        if address == self.app.keys.address:
+            return "You"
+        if address == self.peer:
+            return self.peer_name_text or short_addr(address, 12)
+        contact = self.app.store.get_contact(address) if self.app.store \
+            else None
+        return (contact or {}).get("username") or short_addr(address, 12)
+
+    def set_reply(self, msg: dict) -> None:
+        kind = msg.get("kind") or "text"
+        snip = self._text_of(msg) or {"image": "Photo",
+                                      "voice": "Voice message"}.get(kind, "")
+        reply = {"snip": snip[:120], "from": self._author_of(msg),
+                 "kind": kind}
+        if msg.get("client_msg_id"):
+            reply["cid"] = msg["client_msg_id"]
+        self.reply_to = reply
+        self.reply_author.text = self.author_name(reply["from"])
+        self.reply_snip.text = snip
+        self.reply_bar.height, self.reply_bar.opacity = dp(52), 1
+        self.reply_bar.disabled = False
+        self.entry.input.focus = True
+
+    def take_reply(self) -> Optional[dict]:
+        reply = self.reply_to
+        self.cancel_reply()
+        return reply
+
+    def cancel_reply(self) -> None:
+        self.reply_to = None
+        self.reply_bar.height, self.reply_bar.opacity = 0, 0
+        self.reply_bar.disabled = True
+
+    def jump_to_cid(self, cid: Optional[str]) -> None:
+        """Tap on a quote: scroll to the quoted message and flash it."""
+        if self.selecting or not cid:
+            return
+        for mid, bubble in self._bubbles.items():
+            if bubble.msg.get("client_msg_id") == cid:
+                row = self._rows.get(mid)
+                if row is None:
+                    return
+                self._stick_to_bottom = False
+                self.scroll.scroll_to(row, padding=dp(60), animate=True)
+                row.set_selected(True)
+                Clock.schedule_once(
+                    lambda _dt: row.set_selected(mid in self.selected), 0.9)
+                return
+        self.app._set_status("That message is further back — tap 'Load "
+                             "earlier messages' to find it", COL_TEXT_DIM)
+
+    # ---- taps ------------------------------------------------------------------
+    def on_bubble_tap(self, msg_id: int) -> None:
+        bubble = self._bubbles.get(msg_id)
+        if bubble is None:
+            return
+        msg = bubble.msg
+        if msg["direction"] == "in" and not msg["read"]:
+            self.app._mark_single_read(msg["id"], msg.get("server_id"))
+
+    def on_media_tap(self, msg: dict) -> None:
+        if self.selecting:
+            return                       # a long-press just selected it
+        msg = self.app.store.message(msg["id"]) or msg
+        state = msg.get("media_state") or ""
+        path = msg.get("media_path")
+        outgoing = msg["direction"] == "out"
+        if state == "expired":
+            self.app.request_resend(msg["id"])
+        elif state == "failed":
+            (self.app.retry_media if outgoing else self.app.fetch_media)(
+                msg["id"])
+        elif state == "pending" and not outgoing:
+            self.app.fetch_media(msg["id"])
+        elif path and Path(path).is_file():
+            if msg.get("kind") == "image":
+                ImageViewer(path).open()
+            elif msg.get("kind") == "voice":
+                try:
+                    self.app.voice.toggle(path)
+                except Exception:
+                    log.exception("could not play voice note")
+                    self.app._set_status("Couldn't play that voice note",
+                                         COL_DANGER)
+                self.refresh_voice_buttons()
+
+    def refresh_voice_buttons(self) -> None:
+        for bubble in self._bubbles.values():
+            if isinstance(bubble.media, VoiceContent):
+                bubble.media.refresh(bubble.msg)
+
+    def on_voice_progress(self, path: str, fraction: float) -> None:
+        for bubble in self._bubbles.values():
+            if isinstance(bubble.media, VoiceContent) and \
+                    bubble.msg.get("media_path") == path:
+                bubble.media.wave.set_progress(fraction)
+
+    def on_voice_stop(self, path: str) -> None:
+        self.on_voice_progress(path, 0.0)
+        self.refresh_voice_buttons()
+
+    # ---- the ⋮ menu (what used to sit behind the title tap) --------------------
+    def open_menu(self, anchor) -> None:
+        if self.peer is None or self.app.store is None:
+            return
+        peer = self.peer
+        contact = self.app.store.get_contact(peer) or {}
+        items = []
+        if self.app.store.unread_for(peer):
+            items.append(("Mark all as read",
+                          lambda: self.app.mark_peer_read(peer)))
+        items.append(("Chat info", self.app.open_chat_info))
+        items.append(("Starred messages",
+                      lambda: StarredModal(self.app, peer).open()))
+        items.append(("Mute notifications" if contact.get("notify", 1)
+                      else "Unmute notifications",
+                      lambda: self.app.toggle_notify(peer)))
+        items.append(("Ticks, read & export", self.app.open_contact_settings))
+        DropMenu(items).open_below(anchor)
+
+    # ---- composer: photo, voice, send ------------------------------------------
+    def _paint_reply_icon(self, widget) -> None:
+        widget.canvas.clear()
+        with widget.canvas:
+            draw_icon("reply", widget.center_x, self.reply_bar.center_y,
+                      dp(20), C(COL_ACCENT))
+
+    def _sync_reply_accent(self, widget) -> None:
+        self._reply_accent.pos = (widget.x, widget.y + dp(3))
+        self._reply_accent.size = (dp(2.5), max(0, widget.height - dp(6)))
+
+    def _sync_rule(self, *_a) -> None:
+        self._composer_rule.pos = (self.composer.x, self.composer.top - dp(1))
+        self._composer_rule.size = (self.composer.width, dp(1))
+
+    def _voice_possible(self) -> bool:
+        return IS_ANDROID
+
+    def _sync_action_button(self) -> None:
+        typing = bool(self.entry.input.text.strip())
+        self.action_button.set_icon(
+            "send" if typing or not self._voice_possible() else "mic")
+
+    def _on_action_button(self) -> None:
+        if self.entry.input.text.strip() or not self._voice_possible():
+            self.app.send_current()
+        else:
+            self.start_recording()
+
+    def pick_image(self) -> None:
+        if not self.app.media_available():
+            self.app._set_status("Photos and voice notes need the v9 relay — "
+                                 "this one can't carry them yet",
+                                 COL_TICK_GOLD)
+            return
+        if IS_ANDROID:
+            try:
+                android_pick_image(self._picked)
+            except Exception:
+                log.exception("photo picker failed")
+                self.app._set_status("Couldn't open the photo picker",
+                                     COL_DANGER)
+        else:
+            ImageChooserModal(self._picked).open()
+
+    def _picked(self, path: str) -> None:
+        AttachPreviewModal(self.app, path).open()
+
+    def start_recording(self) -> None:
+        if not self.app.media_available():
+            self.app._set_status("Voice notes need the v9 relay — this one "
+                                 "can't carry them yet", COL_TICK_GOLD)
+            return
+        if not android_has_permission("android.permission.RECORD_AUDIO"):
+            android_request_permissions(
+                ["android.permission.RECORD_AUDIO"],
+                lambda _p, grants: run_on_ui(
+                    self._after_mic_permission, bool(grants) and all(grants)))
+            return
+        try:
+            self.recorder = VoiceRecorder()
+        except Exception:
+            log.exception("could not start recording")
+            self.recorder = None
+            self.app._set_status("Couldn't start recording", COL_DANGER)
+            return
+        self.composer.clear_widgets()
+        for part in (self.rec_cancel, self._rec_dot_widget(), self.rec_label,
+                     self.rec_send):
+            self.composer.add_widget(part)
+        self._rec_tick = Clock.schedule_interval(self._update_rec_label, 0.2)
+        self._update_rec_label(0)
+
+    def _after_mic_permission(self, granted: bool) -> None:
+        if granted:
+            self.start_recording()
+        else:
+            self.app._set_status("Microphone permission is needed for voice "
+                                 "notes", COL_TICK_GOLD)
+
+    def _rec_dot_widget(self) -> Widget:
+        dot = Widget(size_hint_x=None, width=dp(14))
+
+        def paint(*_a):
+            dot.canvas.clear()
+            with dot.canvas:
+                Color(*C(COL_DANGER))
+                Ellipse(pos=(dot.center_x - dp(5), dot.center_y - dp(5)),
+                        size=(dp(10), dp(10)))
+        dot.bind(pos=paint, size=paint)
+        return dot
+
+    def _update_rec_label(self, _dt) -> None:
+        if self.recorder is None:
+            return
+        sec = self.recorder.elapsed_ms // 1000
+        self.rec_label.text = f"{sec // 60}:{sec % 60:02d}    Recording…"
+        if sec >= MAX_VOICE_SECONDS:
+            self.finish_recording()
+
+    def _end_recording_ui(self) -> None:
+        if self._rec_tick is not None:
+            self._rec_tick.cancel()
+            self._rec_tick = None
+        self.composer.clear_widgets()
+        for part in self.composer_parts:
+            self.composer.add_widget(part)
+        self._sync_action_button()
+
+    def finish_recording(self) -> None:
+        recorder, self.recorder = self.recorder, None
+        if recorder is None:
+            return
+        self._end_recording_ui()
+        try:
+            path, duration, wave = recorder.stop()
+        except Exception:
+            log.exception("recording failed")
+            self.app._set_status("Recording failed", COL_DANGER)
+            return
+        if duration < 700:
+            discard_media_file(path)
+            self.app._set_status("That was too short to send", COL_TEXT_DIM)
+            return
+        self.app.send_voice(path, duration, wave)
+
+    def cancel_recording(self) -> None:
+        recorder, self.recorder = self.recorder, None
+        if recorder is None:
+            return
+        self._end_recording_ui()
+        recorder.cancel()
 
     # ---- bottom alignment ----------------------------------------------------
     def content_height(self) -> float:
@@ -4824,7 +7334,9 @@ class SplashOverlay(FloatLayout):
 
     def __init__(self, **kw):
         super().__init__(**kw)
-        paint_round(self, COL_BG_LIST, radius=dp(0))
+        # White, as specified — the same ground as the launcher icon and
+        # the platform presplash, so the three hand over seamlessly.
+        paint_round(self, "#FFFFFF", radius=dp(0))
         column = BoxLayout(orientation="vertical", spacing=dp(22),
                            size_hint=(None, None), width=dp(280),
                            height=dp(300),
@@ -4845,6 +7357,184 @@ class SplashOverlay(FloatLayout):
         self.add_widget(column)
 
 
+class ToggleSwitch(ButtonBehavior, Widget):
+    """A pill switch, drawn (no glyphs), gold when on."""
+
+    def __init__(self, active: bool = False,
+                 on_change: Optional[Callable[[bool], None]] = None, **kw):
+        kw.setdefault("size_hint", (None, None))
+        kw.setdefault("size", (dp(44), dp(26)))
+        super().__init__(**kw)
+        self.active, self._on_change = bool(active), on_change
+        self.bind(pos=self._paint, size=self._paint,
+                  on_release=lambda _w: self.flip())
+        self._paint()
+
+    def flip(self) -> None:
+        self.set_active(not self.active)
+        if self._on_change:
+            self._on_change(self.active)
+
+    def set_active(self, active: bool) -> None:
+        self.active = bool(active)
+        self._paint()
+
+    def _paint(self, *_a) -> None:
+        self.canvas.clear()
+        h = self.height
+        with self.canvas:
+            Color(*C(COL_ACCENT if self.active else "#D8CBB8"))
+            RoundedRectangle(pos=self.pos, size=self.size, radius=[h / 2])
+            Color(*C("#FFFFFF"))
+            knob = h - dp(6)
+            x = self.right - knob - dp(3) if self.active else self.x + dp(3)
+            Ellipse(pos=(x, self.y + dp(3)), size=(knob, knob))
+
+
+class SettingRow(ButtonBehavior, BoxLayout):
+    """Icon · title (+ hint) · control. The whole row is the tap target."""
+
+    def __init__(self, icon: str, title: str, hint: str = "",
+                 control: Optional[Widget] = None,
+                 on_tap: Optional[Callable] = None, **kw):
+        kw.setdefault("size_hint_y", None)
+        kw.setdefault("height", dp(64) if hint else dp(52))
+        kw.setdefault("padding", [dp(16), dp(6), dp(16), dp(6)])
+        kw.setdefault("spacing", dp(16))
+        super().__init__(**kw)
+        glyph = Widget(size_hint_x=None, width=dp(24))
+        glyph.bind(pos=lambda w, *_a: self._glyph(w, icon),
+                   size=lambda w, *_a: self._glyph(w, icon))
+        self.add_widget(glyph)
+        texts = BoxLayout(orientation="vertical")
+        texts.add_widget(single_line(title, sp(15.5), COL_TEXT))
+        if hint:
+            self.hint = single_line(hint, sp(12.5), COL_TEXT_DIM)
+            texts.add_widget(self.hint)
+        self.add_widget(texts)
+        if control is not None:
+            holder = AnchorLayout(size_hint_x=None, width=control.width,
+                                  anchor_x="right")
+            holder.add_widget(control)
+            self.add_widget(holder)
+        self._bg_col, _ = paint_round(self, COL_CARD, radius=dp(0))
+        self.bind(state=lambda _w, st: setattr(
+            self._bg_col, "rgba", C(COL_PRESSED if st == "down"
+                                    else COL_CARD)))
+        if on_tap is not None:
+            self.bind(on_release=lambda _w: on_tap())
+
+    @staticmethod
+    def _glyph(widget, icon: str) -> None:
+        widget.canvas.clear()
+        with widget.canvas:
+            draw_icon(icon, widget.center_x, widget.center_y, dp(22),
+                      C(COL_TEXT_DIM))
+
+
+class ChatInfoScreen(Screen):
+    """Tap the name in a chat: who this is, and the switches for this chat
+    (notifications, ticks, auto-read), starred messages and export."""
+
+    def __init__(self, app: "FextApp", **kw):
+        super().__init__(name="info", **kw)
+        self.app = app
+        self.peer: Optional[str] = None
+        root = BoxLayout(orientation="vertical")
+        paint_round(root, COL_BG_LIST, radius=dp(0))
+        self.add_widget(root)
+        bar = BoxLayout(size_hint_y=None, height=dp(56),
+                        padding=[dp(2), 0, dp(12), 0], spacing=dp(6))
+        paint_round(bar, COL_APPBAR, radius=dp(0))
+        bar.add_widget(IconButton("back", size=(dp(44), dp(56)),
+                                  on_release=lambda _w:
+                                  self.app.close_chat_info()))
+        bar.add_widget(single_line("Chat info", sp(18), COL_APPBAR_TEXT,
+                                   bold=True))
+        root.add_widget(bar)
+        scroll = ScrollView(bar_width=dp(3))
+        self.body = BoxLayout(orientation="vertical", size_hint_y=None,
+                              spacing=dp(10), padding=[0, 0, 0, dp(16)])
+        self.body.bind(minimum_height=self.body.setter("height"))
+        scroll.add_widget(self.body)
+        root.add_widget(scroll)
+
+    def show(self, peer: str) -> None:
+        self.peer = peer
+        store = self.app.store
+        contact = store.get_contact(peer) or {}
+        name = contact.get("username") or short_addr(peer, 14)
+        self.body.clear_widgets()
+
+        head = BoxLayout(orientation="vertical", size_hint_y=None,
+                         height=dp(196), padding=[dp(16), dp(20), dp(16),
+                                                  dp(14)], spacing=dp(6))
+        paint_round(head, COL_CARD, radius=dp(0))
+        holder = AnchorLayout(size_hint_y=None, height=dp(92))
+        holder.add_widget(Avatar(peer, name, diameter=dp(88)))
+        head.add_widget(holder)
+        title = single_line(name, sp(21), COL_TEXT, bold=True,
+                            size_hint_y=None, height=dp(30))
+        title.halign = "center"
+        head.add_widget(title)
+        address = CozyButton(peer, bg=COL_CARD, fg=COL_TEXT_DIM, bold=False,
+                             font_size=sp(11.5), height=dp(26),
+                             pressed=COL_PRESSED, shorten=True,
+                             shorten_from="center", halign="center",
+                             valign="middle")
+        address.bind(size=lambda w, v: setattr(w, "text_size", v))
+        address.bind(on_release=lambda _w: self.app.copy_text(peer))
+        head.add_widget(address)
+        self.body.add_widget(head)
+
+        caps = contact.get("caps", 0) & LocalStore.CAP_V9
+        rows = [
+            SettingRow("bell", "Notifications",
+                       "Alerts for new messages in this chat",
+                       ToggleSwitch(contact.get("notify", 1),
+                                    lambda on: self.app.set_notify(peer, on))),
+            SettingRow("check", "Delivery & read ticks",
+                       "Off for either of you caps both at one tick",
+                       ToggleSwitch(contact.get("ticks_enabled", 1),
+                                    lambda on: self.app.set_ticks(peer, on))),
+            SettingRow("info", "Mark as read automatically",
+                       "When off, tap messages to mark them read",
+                       ToggleSwitch(contact.get("auto_read", 1),
+                                    lambda on: self.app.set_auto_read(peer,
+                                                                      on))),
+        ]
+        self.body.add_widget(self._card(rows))
+        starred = len(store.starred(peer))
+        self.body.add_widget(self._card([
+            SettingRow("star", "Starred messages",
+                       f"{starred} message{'s' if starred != 1 else ''}",
+                       on_tap=lambda: StarredModal(self.app, peer).open()),
+            SettingRow("share", "Export or import chat",
+                       "Plaintext copies, kept on this device",
+                       on_tap=lambda: ContactSettingsModal(self.app,
+                                                           peer).open()),
+        ]))
+        self.body.add_widget(InfoLabel(
+            "End-to-end encrypted. " +
+            ("This contact runs Ferritext 9: replies, photos, voice notes "
+             "and delete-for-both all reach them." if caps else
+             "Replies, photos, voice notes and delete-for-both reach this "
+             "contact fully once they are on Ferritext 9."),
+            color=COL_TEXT_DIM, font_size=sp(12.5), padding=[dp(18), 0]))
+
+    @staticmethod
+    def _card(rows: list) -> BoxLayout:
+        card = BoxLayout(orientation="vertical", size_hint_y=None)
+        card.bind(minimum_height=card.setter("height"))
+        for i, row in enumerate(rows):
+            if i:
+                rule = Widget(size_hint_y=None, height=dp(1))
+                paint_round(rule, COL_DIVIDER, radius=dp(0))
+                card.add_widget(rule)
+            card.add_widget(row)
+        return card
+
+
 class FextApp(App):
     """Owns the identity lifecycle, the two screens and the UI-queue pump.
 
@@ -4856,7 +7546,8 @@ class FextApp(App):
 
     def __init__(self, **kw) -> None:
         super().__init__(**kw)
-        self.title = f"{APP_NAME} — end-to-end encrypted messenger"
+        self.title = f"{APP_NAME} {APP_VERSION} — end-to-end encrypted " \
+                     f"messenger"
         self.keys = IdentityManager()
         self.crypto: Optional[CryptoEngine] = None
         self.api: Optional[ApiClient] = None
@@ -4888,10 +7579,16 @@ class FextApp(App):
             duration=0.18, direction="left"))
         self.chats_screen = ChatsScreen(self)
         self.conversation_screen = ConversationScreen(self)
+        self.chat_info_screen = ChatInfoScreen(self)
         self.manager.add_widget(self.chats_screen)
         self.manager.add_widget(self.conversation_screen)
+        self.manager.add_widget(self.chat_info_screen)
+        self.voice = VoicePlayer()
+        self.voice.on_progress = self.conversation_screen.on_voice_progress
+        self.voice.on_stop = self.conversation_screen.on_voice_stop
         Window.bind(on_keyboard=self._on_keyboard)     # Android back button
         Clock.schedule_interval(self._drain_ui_queue, 0.15)
+        self._bind_notification_taps()
         # The loading screen sits over the whole app until it fades, so the
         # root has to be something that can stack widgets. Nothing else
         # reaches for App.root; the rest of the app talks to self.manager.
@@ -4952,10 +7649,23 @@ class FextApp(App):
             self.store.close()
 
     def _on_keyboard(self, _window, key, *_args) -> bool:
-        """Android/Esc back: leave the conversation before leaving the app."""
+        """Android/Esc back, innermost first: highlight mode, a recording, a
+        pending reply, chat info, the chat — and only then the app."""
         if key in (27, 1001):
-            if self.manager.current == "conversation":
-                self.go_back_to_chats()
+            current = self.manager.current
+            if current == "info":
+                self.close_chat_info()
+                return True
+            if current == "conversation":
+                screen = self.conversation_screen
+                if screen.selecting:
+                    screen.clear_selection()
+                elif screen.recorder is not None:
+                    screen.cancel_recording()
+                elif screen.reply_to is not None:
+                    screen.cancel_reply()
+                else:
+                    self.go_back_to_chats()
                 return True
         return False
 
@@ -4983,6 +7693,11 @@ class FextApp(App):
         self.refresh_sidebar()
         if self.keys.username:
             self._start_worker()
+            self._ask_notification_permission()
+            self._sync_background_service()
+            peer = self._launch_peer()
+            if peer and self.store.get_contact(peer):
+                self.open_conversation(peer)
         else:
             self._set_status("Pick a username to start chatting",
                              COL_TICK_GOLD)
@@ -4992,6 +7707,21 @@ class FextApp(App):
         self.worker = SyncWorker(self)
         self.worker.start()
         self._set_status("Connecting…", COL_TEXT_DIM)
+        # Learn what the relay can carry (media needs v9) off the UI thread,
+        # so the composer knows before anyone reaches for the camera.
+        api = self.api
+        threading.Thread(target=lambda: api.features(), daemon=True).start()
+
+    def media_available(self) -> bool:
+        """Non-blocking: answers from the cached /api/health probe."""
+        features = getattr(self.api, "_features", None) if self.api else None
+        if features is None:
+            if self.api is not None:
+                api = self.api
+                threading.Thread(target=lambda: api.features(),
+                                 daemon=True).start()
+            return False
+        return bool(features.get("blobs"))
 
     def on_registered(self) -> None:
         self.chats_screen.refresh_header()
@@ -5042,6 +7772,8 @@ class FextApp(App):
     #  Navigation
     # =========================================================================
     def open_conversation(self, peer: str) -> None:
+        if IS_ANDROID:
+            android_clear_notification(peer)
         self.current_peer = peer
         self._chat_anchor = None                # fresh window per chat
         contact = self.store.get_contact(peer) or {}
@@ -5053,6 +7785,10 @@ class FextApp(App):
         self.refresh_sidebar()
 
     def go_back_to_chats(self) -> None:
+        screen = self.conversation_screen
+        screen.clear_selection()
+        screen.cancel_recording()
+        self.voice.stop()
         self.current_peer = None
         self.manager.transition.direction = "right"
         self.manager.current = "chats"
@@ -5093,6 +7829,12 @@ class FextApp(App):
         self.conversation_screen.render(
             messages, bool(contact.get("ticks_enabled", 1)),
             self._mark_single_read, peer=peer)
+        # Photos/voice notes that arrived while the background service was
+        # syncing were never downloaded (it has no screen to show them on);
+        # fetch them now that someone is looking.
+        for msg in messages:
+            if msg["direction"] == "in" and msg.get("media_state") == "pending":
+                self.fetch_media(msg["id"])
 
     def load_older_messages(self) -> None:
         """Page one more CHAT_PAGE_SIZE of history in above the anchor."""
@@ -5139,33 +7881,75 @@ class FextApp(App):
     #  Sending
     # =========================================================================
     def send_current(self) -> None:
+        """Send what is in the composer — as a reply, if one is pending."""
         if self.store is None or self.current_peer is None:
             return
-        body = sanitize_text(self.conversation_screen.entry.text)
+        screen = self.conversation_screen
+        body = sanitize_text(screen.entry.text)
         if not body:
             return
-        contact = self.store.get_contact(self.current_peer)
+        screen.entry.text = ""
+        reply = screen.take_reply()
+        self.send_text(self.current_peer, body, reply=reply)
+
+    def send_text(self, peer: str, body: str, reply: Optional[dict] = None,
+                  forwarded: bool = False) -> Optional[int]:
+        """Queue a text message. Returns its local id (None if impossible).
+
+        Every v9 message carries a signed extension block, even a plain one:
+        it is what binds the message to its recipient (see build_envelope)
+        and how the other side learns this device understands replies,
+        media and delete-for-both.
+        """
+        ext = {}
+        if reply:
+            ext["reply"] = reply
+        if forwarded:
+            ext["fwd"] = 1
+        return self._queue_message(peer, body, dict(ext, k="text"), "text",
+                                   ext)
+
+    def _queue_message(self, peer: str, body: str, x: dict, kind: str,
+                       ext: Optional[dict], media_path: Optional[str] = None,
+                       media_state: str = "",
+                       on_local_row: Optional[Callable] = None
+                       ) -> Optional[int]:
+        """Record an outgoing message at 0/3 and send it in the background."""
+        if self.store is None:
+            return None
+        contact = self.store.get_contact(peer)
         if contact is None:
             self._set_status("Unknown contact", COL_DANGER)
-            return
-        self.conversation_screen.entry.text = ""
+            return None
         client_msg_id = uuid.uuid4().hex
         # 0/3 immediately: the grey tick means "not yet on the server".
-        local_id = self.store.add_out(self.current_peer, body, now_iso(),
-                                      client_msg_id)
+        local_id = self.store.add_out(peer, body, now_iso(), client_msg_id,
+                                      kind=kind, ext=ext or None,
+                                      media_path=media_path,
+                                      media_state=media_state)
         MessageFlowLog.tick(
             0, None, MessageFlowLog.who(self.keys.address, self.keys.username),
-            MessageFlowLog.who(self.current_peer, contact.get("username")),
+            MessageFlowLog.who(peer, contact.get("username")),
             f"[local id {local_id}, client_msg_id {client_msg_id[:8]}…]")
-        self.refresh_chat(self.current_peer)
-        threading.Thread(
-            target=self._send_worker,
-            args=(local_id, self.current_peer, contact["public_key"], body,
-                  client_msg_id),
-            daemon=True).start()
+        if on_local_row is not None:
+            on_local_row(local_id, client_msg_id)
+        if threading.current_thread() is threading.main_thread():
+            if peer == self.current_peer:
+                self.refresh_chat(peer)
+            self._dirty_list = True
+        else:                         # media pipeline: repaint via the queue
+            self.ui_queue.put(("message_stored", peer))
+        if media_state != "uploading":
+            threading.Thread(
+                target=self._send_worker,
+                args=(local_id, peer, contact["public_key"], body,
+                      client_msg_id, x),
+                daemon=True).start()
+        return local_id
 
     def _send_worker(self, local_id: int, peer: str, peer_pub: str,
-                     body: str, client_msg_id: str) -> None:
+                     body: str, client_msg_id: str,
+                     x: Optional[dict] = None) -> bool:
         """SIGN → ENCRYPT → SEND, then record the server receipt (1/3).
 
         Every failure here has to end at the UI. The previous version caught
@@ -5179,13 +7963,14 @@ class FextApp(App):
         contact = self.store.get_contact(peer) or {}
         them = MessageFlowLog.who(peer, contact.get("username"))
         try:
-            envelope, _sent_at = self.crypto.build_envelope(body, peer_pub)
+            envelope, _sent_at = self.crypto.build_envelope(
+                body, peer_pub, x=x, recipient=peer, cid=client_msg_id)
         except Exception as exc:
             log.exception("could not build envelope for %s", peer)
             MessageFlowLog.failed(me, them, f"encryption failed: {exc}")
             self.ui_queue.put(("status", f"Could not encrypt: {exc}",
                                COL_DANGER))
-            return
+            return False
 
         fragment = MessageFlowLog.fragment(envelope)
         try:
@@ -5194,13 +7979,15 @@ class FextApp(App):
                 ValueError) as exc:
             MessageFlowLog.failed(me, them, str(exc), fragment)
             self.ui_queue.put(("status", f"Send failed: {exc}", COL_DANGER))
-            return
+            return False
         except Exception as exc:                     # never lose the thread
             log.exception("unexpected error sending to %s", peer)
             MessageFlowLog.failed(me, them, f"unexpected: {exc}", fragment)
             self.ui_queue.put(("status", f"Send failed: {exc}", COL_DANGER))
-            return
+            return False
 
+        if local_id is None:                         # a control: no row
+            return True
         server_id = result.get("server_id")
         if not self.store.mark_sent(local_id, server_id):
             # The relay HAS the message; we merely failed to write that
@@ -5211,9 +7998,335 @@ class FextApp(App):
             self.ui_queue.put(
                 ("status", "Sent, but this device could not record it — "
                  "the tick may be wrong", COL_DANGER))
-            return
+            return False
         MessageFlowLog.tick(1, server_id, me, them, fragment)
         self.ui_queue.put(("message_stored", peer))
+        return True
+
+    def _send_control(self, peer: str, op: dict, fallback: str) -> bool:
+        """Send a control message synchronously (call from a worker thread).
+
+        `fallback` is the body: what a pre-v9 client will display, since it
+        cannot act on the instruction. Returns True once the relay has it.
+        """
+        contact = self.store.get_contact(peer) if self.store else None
+        if contact is None:
+            return False
+        return self._send_worker(None, peer, contact["public_key"], fallback,
+                                 uuid.uuid4().hex, {"k": "ctl", "ctl": op})
+
+    # =========================================================================
+    #  Message actions (v9): star, delete, forward, share, copy
+    # =========================================================================
+    def star_messages(self, local_ids: list, starred: bool) -> None:
+        self.store.set_starred(local_ids, starred)
+        self.refresh_chat(self.current_peer)
+
+    def delete_messages(self, local_ids: list, for_everyone: bool) -> None:
+        """Delete for me, or — for the user's OWN messages only — for both.
+
+        For both: the instruction is sent first, and nothing is removed here
+        until the relay has accepted it, so a failure leaves the messages
+        visible and the user able to try again, rather than gone from this
+        screen while still sitting on the other phone.
+        """
+        rows = self.store.messages_by_ids(local_ids)
+        if not rows:
+            return
+        peer = rows[0]["peer"]
+        if not for_everyone:
+            for row in self.store.delete_messages([r["id"] for r in rows]):
+                discard_media_file(row.get("media_path"))
+            self.refresh_chat(self.current_peer)
+            self._dirty_list = True
+            return
+        own = [r for r in rows if r["direction"] == "out"
+               and r.get("client_msg_id")]
+        if len(own) != len(rows):
+            self._set_status("You can only delete your own messages for "
+                             "everyone", COL_TICK_GOLD)
+            return
+
+        def work():
+            ok = self._send_control(
+                peer, {"op": "delete",
+                       "cids": [r["client_msg_id"] for r in own]},
+                "Deleted a message" if len(own) == 1
+                else f"Deleted {len(own)} messages")
+            run_on_ui(self._finish_delete_for_everyone, own, ok)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_delete_for_everyone(self, rows: list, ok: bool) -> None:
+        if not ok:
+            self._set_status("Couldn't delete for everyone — check your "
+                             "connection and try again", COL_DANGER)
+            return
+        for row in self.store.delete_messages([r["id"] for r in rows]):
+            discard_media_file(row.get("media_path"))
+        self.refresh_chat(self.current_peer)
+        self.refresh_sidebar()
+
+    def forward_messages(self, local_ids: list, targets: list) -> int:
+        """Send copies to other contacts of this identity. Photos and voice
+        notes are forwarded by REFERENCE — the sealed blob already on the
+        relay, with its key — so nothing is uploaded again."""
+        rows = self.store.messages_by_ids(local_ids)
+        sent = 0
+        for target in targets:
+            for row in rows:
+                ext = json.loads(row.get("ext") or "{}")
+                media = ext.get("media")
+                if row["kind"] in ("image", "voice") and media and \
+                        media.get("blob"):
+                    self._queue_message(
+                        target, row["body"],
+                        {"k": "media", "media": media, "fwd": 1}, row["kind"],
+                        {"media": media, "fwd": 1},
+                        media_path=row.get("media_path"),
+                        media_state="ready" if row.get("media_path") else "")
+                else:
+                    self.send_text(target, row["body"], forwarded=True)
+                sent += 1
+        self.refresh_sidebar()
+        return sent
+
+    def copy_text(self, text: str) -> None:
+        Clipboard.copy(text)
+        self._set_status("Copied", COL_OK)
+
+    def share_messages(self, local_ids: list) -> None:
+        """Hand messages to another app: Android's share sheet, or — on a
+        desktop, which has no share sheet — the clipboard."""
+        rows = self.store.messages_by_ids(local_ids)
+        if not rows:
+            return
+        image = next((r for r in rows if r["kind"] == "image"
+                      and r.get("media_path")), None)
+        text = "\n\n".join(r["body"] for r in rows if r["kind"] == "text")
+        if IS_ANDROID:
+            try:
+                if image is not None and len(rows) == 1:
+                    android_share_image(image["media_path"])
+                else:
+                    android_share_text(text or rows[0]["body"])
+                return
+            except Exception:
+                log.exception("share sheet failed; copying instead")
+        self.copy_text(text or rows[0]["body"])
+        self._set_status("Copied — paste it into any app", COL_OK)
+
+    # =========================================================================
+    #  Media (v9): photos and voice notes
+    # =========================================================================
+    def send_image(self, path: str, caption: str = "") -> None:
+        peer = self.current_peer
+        if peer is None:
+            return
+        reply = self.conversation_screen.take_reply()
+        threading.Thread(target=self._prepare_image,
+                         args=(peer, path, caption, reply),
+                         daemon=True).start()
+
+    def _prepare_image(self, peer, path, caption, reply) -> None:
+        try:
+            data, width, height, thumb = compress_image(path)
+        except Exception as exc:
+            log.warning("could not read image %s: %s", path, exc)
+            self.ui_queue.put(("status", "That file isn't an image this "
+                               "app can read", COL_DANGER))
+            return
+        extra = {"w": width, "h": height, "thumb": thumb}
+        if caption:
+            extra["cap"] = caption
+        self._send_media(peer, "image", data, "image/jpeg", extra,
+                         caption or "Photo", reply, "jpg")
+
+    def send_voice(self, path: str, duration_ms: int, wave: str = "") -> None:
+        peer = self.current_peer
+        if peer is None:
+            return
+        reply = self.conversation_screen.take_reply()
+
+        def work():
+            try:
+                data = Path(path).read_bytes()
+            except OSError as exc:
+                self.ui_queue.put(("status", f"Recording unavailable: {exc}",
+                                   COL_DANGER))
+                return
+            finally:
+                discard_media_file(path)
+            extra = {"dur": int(duration_ms)}
+            if wave:
+                extra["wave"] = wave
+            self._send_media(peer, "voice", data, "audio/mp4", extra,
+                             voice_label(duration_ms), reply, "m4a")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _send_media(self, peer, kind, data, mime, extra, body, reply,
+                    suffix) -> None:
+        """Worker thread: keep a local copy, seal, upload, then send the
+        reference. The bubble appears at once, marked 'uploading'."""
+        if not (self.api is not None and self.api.features().get("blobs")):
+            self.ui_queue.put((
+                "status", "This relay can't carry photos or voice notes "
+                "yet — it needs the v9 relay", COL_TICK_GOLD))
+            return
+        if len(data) > MAX_MEDIA_BYTES - 64:
+            self.ui_queue.put(("status", "That's too large to send",
+                               COL_DANGER))
+            return
+        MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        local_path = MEDIA_DIR / f"{uuid.uuid4().hex}.{suffix}"
+        try:
+            local_path.write_bytes(data)
+        except OSError as exc:
+            self.ui_queue.put(("status", f"Could not save media: {exc}",
+                               COL_DANGER))
+            return
+        media = dict(extra, kind=kind, mime=mime, size=len(data))
+        ext = {"media": media}
+        if reply:
+            ext["reply"] = reply
+        rows = {}
+        self._queue_message(
+            peer, body, {}, kind, ext, media_path=str(local_path),
+            media_state="uploading",
+            on_local_row=lambda lid, cid: rows.update(id=lid, cid=cid))
+        local_id, cid = rows.get("id"), rows.get("cid")
+        if local_id is None:
+            return
+        try:
+            blob, key, sha = seal_media(data)
+            blob_id = self.api.upload_blob(blob).get("blob", "")
+            if not _TOKEN_RE.match(blob_id or ""):
+                raise ValueError("relay returned no media id")
+        except (requests.RequestException, ApiClient.ApiError,
+                ValueError) as exc:
+            log.warning("media upload failed: %s", exc)
+            self.store.set_media(local_id, state="failed")
+            self.ui_queue.put(("message_stored", peer))
+            self.ui_queue.put(("status", f"Upload failed: {exc}",
+                               COL_DANGER))
+            return
+        media = dict(media, blob=blob_id, key=key, sha=sha)
+        ext["media"] = media
+        self.store.set_media(local_id, state="ready", ext=ext)
+        contact = self.store.get_contact(peer) or {}
+        x = dict(ext, k="media")
+        self._send_worker(local_id, peer, contact.get("public_key", ""),
+                          body, cid, x)
+        self.ui_queue.put(("message_stored", peer))
+
+    def retry_media(self, local_id: int) -> None:
+        """Re-run a failed upload from the copy kept on this device."""
+        row = self.store.message(local_id)
+        if not row or not row.get("media_path"):
+            return
+        ext = json.loads(row.get("ext") or "{}")
+        media = ext.get("media") or {}
+        peer = row["peer"]
+        self.store.delete_messages([local_id])       # replaced, not duplicated
+
+        def work():
+            try:
+                data = Path(row["media_path"]).read_bytes()
+            except OSError:
+                self.ui_queue.put(("status", "The original file is gone",
+                                   COL_DANGER))
+                return
+            extra = {k: v for k, v in media.items()
+                     if k in ("w", "h", "thumb", "dur", "wave", "cap")}
+            self._send_media(peer, row["kind"], data,
+                             media.get("mime", "application/octet-stream"),
+                             extra, row["body"], ext.get("reply"),
+                             Path(row["media_path"]).suffix.lstrip(".")
+                             or "bin")
+        threading.Thread(target=work, daemon=True).start()
+
+    def fetch_media(self, local_id: int) -> None:
+        """Download + verify + decrypt one media message, in the background.
+
+        A 404/410 from the relay means it let the blob expire: the message
+        is marked 'expired' and the bubble offers to ask the sender for it
+        again, which their device does automatically if it still has it.
+        """
+        row = self.store.message(local_id) if self.store else None
+        if not row or row["direction"] != "in":
+            return
+        media = json.loads(row.get("ext") or "{}").get("media") or {}
+        if not media.get("blob") or row.get("media_state") in (
+                "downloading", "ready"):
+            return
+        self.store.set_media(local_id, state="downloading")
+        peer = row["peer"]
+
+        def work():
+            try:
+                blob = self.api.download_blob(media["blob"])
+                data = open_media(blob, media["key"], media["sha"])
+                MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+                suffix = {"image": "jpg", "voice": "m4a"}.get(row["kind"],
+                                                             "bin")
+                target = MEDIA_DIR / f"{row.get('client_msg_id') or uuid.uuid4().hex}.{suffix}"
+                target.write_bytes(data)
+                self.store.set_media(local_id, path=str(target),
+                                     state="ready")
+            except ApiClient.ApiError as exc:
+                self.store.set_media(
+                    local_id, state="expired" if exc.status in (404, 410)
+                    else "failed")
+            except (requests.RequestException, ValueError, OSError) as exc:
+                log.warning("media download failed: %s", exc)
+                self.store.set_media(local_id, state="failed")
+            self.ui_queue.put(("message_stored", peer))
+        threading.Thread(target=work, daemon=True).start()
+
+    def request_resend(self, local_id: int) -> None:
+        """Ask the sender to upload an expired photo/voice note again."""
+        row = self.store.message(local_id)
+        if not row or not row.get("client_msg_id"):
+            return
+        peer = row["peer"]
+        what = "voice message" if row["kind"] == "voice" else "photo"
+        self.store.set_media(local_id, state="requested")
+        self.refresh_chat(self.current_peer)
+
+        def work():
+            ok = self._send_control(
+                peer, {"op": "resend", "cid": row["client_msg_id"]},
+                f"Please send that {what} again")
+            if not ok:
+                self.store.set_media(local_id, state="expired")
+                self.ui_queue.put(("message_stored", peer))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_resend_request(self, peer: str, cid: str) -> None:
+        """They asked for a file the relay no longer has: upload our copy
+        again and point their existing message at it (no duplicate)."""
+        row = self.store.message_by_cid(peer, cid, "out")
+        if not row or not row.get("media_path") or \
+                not Path(row["media_path"]).is_file():
+            log.info("resend requested for %s but no local copy remains", cid)
+            return
+        ext = json.loads(row.get("ext") or "{}")
+
+        def work():
+            try:
+                data = Path(row["media_path"]).read_bytes()
+                blob, key, sha = seal_media(data)
+                blob_id = self.api.upload_blob(blob).get("blob", "")
+            except (OSError, requests.RequestException,
+                    ApiClient.ApiError) as exc:
+                log.warning("re-upload for %s failed: %s", cid, exc)
+                return
+            media = dict(ext.get("media") or {}, blob=blob_id, key=key,
+                         sha=sha)
+            ext["media"] = media
+            self.store.set_media(row["id"], ext=ext)
+            self._send_control(peer, {"op": "remedia", "cid": cid,
+                                      "media": media}, row["body"])
+        threading.Thread(target=work, daemon=True).start()
 
     # =========================================================================
     #  UI-queue pump (the only place workers reach the UI)
@@ -5235,12 +8348,20 @@ class FextApp(App):
                     self._handle_needs_registration(event[1])
                 elif kind == "message_stored":
                     peer = event[1]
-                    if peer == self.current_peer:
+                    if peer == self.current_peer and self.store is not None:
                         contact = self.store.get_contact(peer) or {}
-                        if contact.get("auto_read", 1):
+                        if contact.get("auto_read", 1) and self.foreground:
                             self.mark_peer_read(peer, refresh=False)
                         self._dirty_chat = True
                     self._dirty_list = True
+                elif kind == "incoming":
+                    self._notify_incoming(event[1], event[2], event[3])
+                elif kind == "media_pending" and self.store is not None:
+                    row = self.store.message_by_cid(event[1], event[2], "in")
+                    if row is not None:
+                        self.fetch_media(row["id"])
+                elif kind == "resend_request" and self.store is not None:
+                    self._on_resend_request(event[1], event[2])
         except queue.Empty:
             pass
         if self._dirty_chat:
@@ -5249,6 +8370,88 @@ class FextApp(App):
         if self._dirty_list:
             self._dirty_list = False
             self.refresh_sidebar()
+
+    # =========================================================================
+    #  Notifications
+    # =========================================================================
+    def _notify_incoming(self, peer: str, body: str, kind: str) -> None:
+        """Raise a notification for a new message — unless the user is
+        looking at that very chat, or has muted it."""
+        if self.store is None:
+            return
+        if (self.foreground and peer == self.current_peer
+                and self.manager.current == "conversation"):
+            return
+        contact = self.store.get_contact(peer) or {}
+        if not contact.get("notify", 1):
+            return
+        name = contact.get("username") or short_addr(peer, 12)
+        preview = body if kind == "text" else (
+            "Photo" if kind == "image" else body)
+        if IS_ANDROID:
+            try:
+                android_notify(peer, name, preview[:160])
+            except Exception:
+                log.exception("could not post a notification")
+        elif not self.foreground or peer != self.current_peer:
+            self._set_status(f"New message from {name}", COL_ACCENT)
+
+    def _sync_background_service(self) -> None:
+        """Run the background service if the user wants delivery while the
+        app is closed (default), stop it if not. Started from here — the
+        foreground — because Android 12+ refuses to start one otherwise."""
+        if not IS_ANDROID:
+            return
+        try:
+            android_service(background_delivery_enabled())
+        except Exception:
+            log.exception("could not start/stop the background service")
+
+    def _ask_notification_permission(self) -> None:
+        """Android 13+ needs explicit permission before any notification
+        shows; earlier versions grant it at install."""
+        if IS_ANDROID:
+            try:
+                if android_sdk() >= 33 and not android_has_permission(
+                        "android.permission.POST_NOTIFICATIONS"):
+                    android_request_permissions(
+                        ["android.permission.POST_NOTIFICATIONS"])
+            except Exception:
+                log.exception("notification permission request failed")
+
+    def _bind_notification_taps(self) -> None:
+        if not IS_ANDROID:
+            return
+        try:
+            from android import activity
+            activity.bind(on_new_intent=self._on_new_intent)
+        except Exception:
+            log.exception("could not listen for notification taps")
+
+    def _on_new_intent(self, intent) -> None:
+        try:
+            peer = intent.getStringExtra("fext_peer")
+        except Exception:
+            peer = None
+        if peer:
+            run_on_ui(self._open_from_notification, str(peer))
+
+    def _open_from_notification(self, peer: str) -> None:
+        if self.store is not None and self.store.get_contact(peer):
+            self.open_conversation(peer)
+
+    def _launch_peer(self) -> Optional[str]:
+        """The chat a notification tap asked for when it COLD-started us."""
+        if not IS_ANDROID:
+            return None
+        try:
+            autoclass, _ = _jni()
+            intent = autoclass("org.kivy.android.PythonActivity"
+                               ).mActivity.getIntent()
+            peer = intent.getStringExtra("fext_peer") if intent else None
+            return str(peer) if peer else None
+        except Exception:
+            return None
 
     def _handle_needs_registration(self, message: str) -> None:
         """The relay does not recognise this identity — offer to register.
@@ -5305,6 +8508,15 @@ class FextApp(App):
             self.worker.nudge()
         elif self.keys.has_identity and self.keys.username:
             self._start_worker()
+        # Messages that arrived while we were in the background were left
+        # unread on purpose (nobody was looking); now somebody is.
+        peer = self.current_peer
+        if peer and self.store is not None and \
+                self.manager.current == "conversation":
+            if IS_ANDROID:
+                android_clear_notification(peer)
+            if (self.store.get_contact(peer) or {}).get("auto_read", 1):
+                self.mark_peer_read(peer)
 
     def _set_status(self, text: str, color: str = COL_TEXT_DIM) -> None:
         self._pending_status = (text, color)
@@ -5322,6 +8534,144 @@ class FextApp(App):
     def open_contact_settings(self) -> None:
         if self.current_peer is not None:
             ContactSettingsModal(self, self.current_peer).open()
+
+    def open_chat_info(self) -> None:
+        if self.current_peer is None or self.store is None:
+            return
+        self.chat_info_screen.show(self.current_peer)
+        self.manager.transition.direction = "left"
+        self.manager.current = "info"
+
+    def close_chat_info(self) -> None:
+        self.manager.transition.direction = "right"
+        self.manager.current = "conversation"
+        self.refresh_chat(self.current_peer)
+
+    # ---- per-chat switches (chat info and the ⋮ menu) ------------------------
+    def set_notify(self, peer: str, on: bool) -> None:
+        self.store.set_contact_setting(peer, "notify", int(on))
+        if not on and IS_ANDROID:
+            android_clear_notification(peer)
+        self.refresh_chat(peer)
+
+    def toggle_notify(self, peer: str) -> None:
+        on = not (self.store.get_contact(peer) or {}).get("notify", 1)
+        self.set_notify(peer, on)
+        self._set_status("Notifications on" if on else "Chat muted", COL_OK)
+
+    def set_ticks(self, peer: str, enabled: bool) -> None:
+        """Both ends must agree for 2nd/3rd ticks; the relay enforces it, so
+        the preference is synced there (and retried by being re-set)."""
+        self.store.set_contact_setting(peer, "ticks_enabled", int(enabled))
+        self.refresh_chat(peer)
+
+        def work():
+            try:
+                self.api.set_ticks(peer, enabled)
+            except (requests.RequestException, ApiClient.ApiError):
+                self.ui_queue.put(("status", "Ticks preference saved here; "
+                                   "the relay hears about it once you're "
+                                   "online", COL_TICK_GOLD))
+        threading.Thread(target=work, daemon=True).start()
+
+    def set_auto_read(self, peer: str, auto: bool) -> None:
+        self.store.set_contact_setting(peer, "auto_read", int(auto))
+        if auto:
+            self.mark_peer_read(peer)
+        self.refresh_chat(peer)
+
+
+# =============================================================================
+#  Background sync service (Android) — runs in its own process
+# =============================================================================
+class HeadlessApp:
+    """Everything SyncWorker and the media/send helpers need from an app,
+    with no UI: the background service's stand-in for FextApp."""
+
+    foreground = False
+    current_peer = None
+
+    # The very same code paths the app uses, not copies of them: sending a
+    # control, and answering a 'resend' request by uploading the file again.
+    _send_worker = FextApp._send_worker
+    _send_control = FextApp._send_control
+    _on_resend_request = FextApp._on_resend_request
+
+    def __init__(self, keys: "IdentityManager") -> None:
+        self.keys = keys
+        self.crypto = CryptoEngine(keys)
+        self.api = ApiClient(keys)
+        self.store = LocalStore(keys.store_path())
+        self.ui_queue: "queue.Queue" = queue.Queue()
+
+    def close(self) -> None:
+        self.store.close()
+
+
+def _service_handle(app: HeadlessApp, event: tuple) -> None:
+    kind = event[0]
+    if kind == "incoming":
+        peer, body, msg_kind = event[1], event[2], event[3]
+        contact = app.store.get_contact(peer) or {}
+        if contact.get("notify", 1):
+            name = contact.get("username") or short_addr(peer, 12)
+            text = "Photo" if msg_kind == "image" else body
+            try:
+                android_notify(peer, name, text[:160])
+            except Exception:
+                log.exception("service: notification failed")
+    elif kind == "resend_request":
+        app._on_resend_request(event[1], event[2])
+    # Everything else (status lines, repaint hints, media downloads) is for
+    # a screen; the app catches up from the database when it next opens.
+
+
+def run_background_service(max_cycles: Optional[int] = None,
+                           tick: float = 2.0) -> None:
+    """The service's main loop.
+
+    Idles while the app's own worker is alive (its heartbeat is fresh), and
+    syncs + notifies when it is not. Re-reads the identity file every cycle,
+    so switching identity in the app is picked up, and steps aside within a
+    few seconds of the app reappearing.
+    """
+    log.info("background service: started")
+    app = worker = None
+    cycles = 0
+    while max_cycles is None or cycles < max_cycles:
+        cycles += 1
+        keys = IdentityManager()
+        active = keys.active if keys.has_identity else None
+        wanted = (active is not None and active.get("username")
+                  and background_delivery_enabled()
+                  and not heartbeat_fresh("app"))
+        if worker is not None and (not wanted or
+                                   app.keys.address != active["address"]):
+            worker.stop_event.set()
+            worker.join(timeout=10)
+            app.close()
+            app = worker = None
+            log.info("background service: standing down")
+        if wanted and worker is None:
+            try:
+                app = HeadlessApp(keys)
+                worker = SyncWorker(app)
+                worker.beat_owner = "service"
+                worker.start()
+                log.info("background service: syncing %s", keys.address)
+            except Exception:
+                log.exception("background service: could not start a worker")
+                app = worker = None
+        if app is not None:
+            try:
+                while True:
+                    _service_handle(app, app.ui_queue.get_nowait())
+            except queue.Empty:
+                pass
+        time.sleep(tick)
+    if worker is not None:
+        worker.stop_event.set()
+        app.close()
 
 
 # =============================================================================

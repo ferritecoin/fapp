@@ -1,133 +1,197 @@
-"""Generate the Ferrite Text Messenger mark and the Android assets from it.
+"""Render the Ferrite Text Messenger mark and every Android asset from it.
 
-    python3 tools/make_logo.py            # rewrites everything under data/
+    python3 tools/make_logo.py            # rewrites the PNGs under data/
 
-The mark is a laurel wreath around a wire-frame globe, with a ferrite bead —
-a rectangle threaded by a wire, exactly as it is drawn on a schematic — as
-the central glyph. It is generated rather than stored as a binary so the
-geometry stays editable and every size can be regenerated from one source.
+The source of truth is data/ferritext_logo.svg, the supplied artwork, kept
+byte-for-byte as delivered. This script rasterizes that file's single path
+itself — a few dozen lines of path parsing and an even-odd fill — so the
+build needs nothing beyond Pillow, which the app already depends on. Any
+SVG library would add a native dependency to every machine that builds
+Ferritext, for the sake of one path.
 
-Needs Pillow. Everything is drawn at 5x and downsampled, which is cheaper
-than anti-aliasing each shape and gives cleaner leaf edges.
+The path is a filled disc with the ferrite-bead glyph (a rectangle on a
+wire) knocked out of it, drawn with fill-rule:evenodd: the bead's outline
+punches a hole, and the rectangle's interior, nested one level deeper, is
+filled again. Rendering it with any other fill rule gives a black blob.
 """
-import math
+import re
 import sys
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw
 
-S = 800                     # final size of the mark
-K = 5                       # supersample factor
-W = S * K
-U = K                       # one reference unit (of 800) in supersampled px
-CX, CY = 400 * U, 400 * U
+ROOT = Path(__file__).resolve().parent.parent
+SVG = ROOT / "data" / "ferritext_logo.svg"
 
-GREY = (150, 150, 150, 255)
-BLACK = (0, 0, 0, 255)
-CREAM = (253, 248, 238, 255)          # COL_BG_LIST, the app background
-
-img = Image.new("RGBA", (W, W), (0, 0, 0, 0))
-d = ImageDraw.Draw(img)
-
-# ---------------------------------------------------------------- globe ----
-R = 252 * U
-gw = 13 * U
-d.ellipse([CX - R, CY - R, CX + R, CY + R], outline=GREY, width=gw)
-for frac in (0.34, 0.68):                     # meridians, as nested ellipses
-    rw = int(R * frac)
-    d.ellipse([CX - rw, CY - R, CX + rw, CY + R], outline=GREY, width=gw)
-d.line([CX, CY - R, CX, CY + R], fill=GREY, width=gw)
-for frac in (-0.72, -0.38, 0.0, 0.38, 0.72):  # parallels, as chords
-    y = CY + int(R * frac)
-    half = int(math.sqrt(max(R * R - (y - CY) ** 2, 0)))
-    d.line([CX - half, y, CX + half, y], fill=GREY, width=gw)
+WHITE = (255, 255, 255, 255)
+_NUMBER = re.compile(r"[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?")
+_TOKEN = re.compile(r"[MmLlHhVvCcSsQqTtZz]|" + _NUMBER.pattern)
+_ARITY = {"M": 2, "L": 2, "H": 1, "V": 1, "C": 6, "S": 4, "Q": 4, "T": 2,
+          "Z": 0}
 
 
-# ---------------------------------------------------------------- laurel ---
-def leaf(cx, cy, length, width, point_dx, point_dy):
-    """One pointed laurel leaf, based at (cx, cy), aimed along the vector.
+def _bezier(points, steps):
+    """Flatten one Bezier segment (any degree) by de Casteljau."""
+    out = []
+    for i in range(1, steps + 1):
+        t = i / steps
+        pts = list(points)
+        while len(pts) > 1:
+            pts = [(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+                   for a, b in zip(pts, pts[1:])]
+        out.append(pts[0])
+    return out
 
-    Drawn into its own tile pointing +x and then rotated about its BASE, so
-    the base stays on the branch arc whatever the angle.
+
+def parse_path(d: str, steps: int = 24) -> list:
+    """SVG path data -> list of closed polygons (lists of (x, y)).
+
+    Supports every command the supplied artwork uses (and the rest of the
+    straight/Bezier set): absolute and relative, with implicit repetition of
+    a command's parameters, which is how most of this path is written.
     """
-    L, H = int(length), int(width)
-    top, bottom = [], []
-    for i in range(25):
-        t = i / 24.0
-        y = (H / 2.0) * math.sin(math.pi * t) ** 0.72     # a pointed lens
-        top.append((t * L, -y))
-        bottom.append((t * L, y))
-    pad = int(L * 0.75)
-    tile = Image.new("RGBA", (L + pad * 2, H + pad * 2), (0, 0, 0, 0))
-    ImageDraw.Draw(tile).polygon(
-        [(x + pad, y + pad + H / 2.0) for x, y in top + list(reversed(bottom))],
-        fill=BLACK)
-    angle = math.degrees(math.atan2(-point_dy, point_dx))   # y grows downward
-    tile = tile.rotate(-angle, resample=Image.BICUBIC, expand=True,
-                       center=(pad, pad + H / 2.0))
-    img.alpha_composite(tile, (int(cx - pad), int(cy - pad - H / 2.0)))
+    tokens = _TOKEN.findall(d)
+    contours, current = [], []
+    x = y = sx = sy = 0.0
+    cmd, prev_ctrl, i = None, None, 0
+    while i < len(tokens):
+        if tokens[i].isalpha():
+            cmd = tokens[i]
+            i += 1
+            if cmd in "Zz":
+                if current:
+                    contours.append(current)
+                current, x, y, prev_ctrl = [], sx, sy, None
+                continue
+        if cmd is None:
+            raise ValueError("path data must start with a command")
+        n = _ARITY[cmd.upper()]
+        args = [float(t) for t in tokens[i:i + n]]
+        if len(args) < n:
+            raise ValueError(f"truncated '{cmd}' segment in path data")
+        i += n
+        rel = cmd.islower()
+        up = cmd.upper()
+        ox, oy = (x, y) if rel else (0.0, 0.0)
+        if up == "M":
+            if current:
+                contours.append(current)
+            x, y = ox + args[0], oy + args[1]
+            sx, sy, current, prev_ctrl = x, y, [(x, y)], None
+            cmd = "l" if rel else "L"        # repeats after M are line-tos
+        elif up == "L":
+            x, y = ox + args[0], oy + args[1]
+            current.append((x, y))
+            prev_ctrl = None
+        elif up == "H":
+            x = (x if rel else 0.0) + args[0]
+            current.append((x, y))
+            prev_ctrl = None
+        elif up == "V":
+            y = (y if rel else 0.0) + args[0]
+            current.append((x, y))
+            prev_ctrl = None
+        elif up in "CS":
+            if up == "C":
+                c1 = (ox + args[0], oy + args[1])
+                c2, end = (ox + args[2], oy + args[3]), (ox + args[4],
+                                                         oy + args[5])
+            else:
+                c1 = ((2 * x - prev_ctrl[0], 2 * y - prev_ctrl[1])
+                      if prev_ctrl else (x, y))
+                c2, end = (ox + args[0], oy + args[1]), (ox + args[2],
+                                                         oy + args[3])
+            current.extend(_bezier([(x, y), c1, c2, end], steps))
+            prev_ctrl, (x, y) = c2, end
+        elif up in "QT":
+            if up == "Q":
+                c1, end = (ox + args[0], oy + args[1]), (ox + args[2],
+                                                         oy + args[3])
+            else:
+                c1 = ((2 * x - prev_ctrl[0], 2 * y - prev_ctrl[1])
+                      if prev_ctrl else (x, y))
+                end = (ox + args[0], oy + args[1])
+            current.extend(_bezier([(x, y), c1, end], steps))
+            prev_ctrl, (x, y) = c1, end
+    if current:
+        contours.append(current)
+    return contours
 
 
-def branch(side):
-    """Half the wreath: leaves along an arc, fanning up and outward.
+def load_svg(path: Path = SVG):
+    text = path.read_text("utf-8")
+    box = re.search(r'viewBox="([^"]+)"', text)
+    vx, vy, vw, vh = (float(v) for v in box.group(1).replace(",", " ").split())
+    d = re.search(r'\sd="([^"]+)"', text).group(1)
+    return (vx, vy, vw, vh), parse_path(d)
 
-    No stem is drawn. The leaf bases sit on the arc and overlap their
-    neighbours, so the branch reads as continuous — drawing the arc as well
-    leaves a bare wire showing through on the inside of the curve.
+
+def render(size: int, supersample: int = 4, path: Path = SVG) -> Image.Image:
+    """The mark as an RGBA image: black where the artwork is filled,
+    transparent elsewhere, anti-aliased by supersampling.
+
+    Even-odd is done by XOR: each contour is filled into its own mask and
+    toggled into the accumulator, so a point covered by an odd number of
+    contours ends up set — precisely fill-rule:evenodd.
     """
-    arc_r = 292 * U
-    ax, ay = 400 * U, 398 * U
-    n = 15
-    a0, a1 = 10.0, 128.0               # degrees from straight down
-    flare = math.radians(58)           # lean off the stem, towards the tips
-    for i in range(n):
-        t = i / (n - 1.0)
-        a = math.radians(a0 + (a1 - a0) * t)
-        px = ax + side * arc_r * math.sin(a)
-        py = ay + arc_r * math.cos(a)
-        rx, ry = side * math.sin(a), math.cos(a)          # outward radial
-        tx, ty = side * math.cos(a), -math.sin(a)         # along the branch
-        dx = tx * math.cos(flare) + rx * math.sin(flare)
-        dy = ty * math.cos(flare) + ry * math.sin(flare)
-        size = 1.0 - 0.24 * t                             # taper to the tip
-        leaf(px, py, 96 * U * size, 38 * U * size, dx, dy)
+    (vx, vy, vw, vh), contours = load_svg(path)
+    big = size * supersample
+    scale = big / max(vw, vh)
+    acc = Image.new("L", (big, big), 0)
+    for contour in contours:
+        layer = Image.new("L", (big, big), 0)
+        ImageDraw.Draw(layer).polygon(
+            [((px - vx) * scale, (py - vy) * scale) for px, py in contour],
+            fill=255)
+        acc = ImageChops.logical_xor(acc.convert("1"),
+                                     layer.convert("1")).convert("L")
+    alpha = acc.resize((size, size), Image.LANCZOS)
+    mark = Image.new("RGBA", (size, size), (0, 0, 0, 255))
+    mark.putalpha(alpha)
+    return mark
 
 
-for _side in (1, -1):
-    branch(_side)
-
-# ------------------------------------------------------- ferrite bead ------
-bw = 14 * U
-bx, by, lean = 45 * U, 115 * U, 48 * U
-corners = [(CX - bx + lean, CY - by), (CX + bx + lean, CY - by),
-           (CX + bx - lean, CY + by), (CX - bx - lean, CY + by)]
-d.line(corners + [corners[0]], fill=BLACK, width=bw, joint="curve")
-d.line([CX - 152 * U, CY, CX + 152 * U, CY], fill=BLACK, width=bw)
-
-# ---------------------------------------------------------------- output ---
-mark = img.resize((S, S), Image.LANCZOS)
-
-OUT = (Path(sys.argv[1]) if len(sys.argv) > 1
-       else Path(__file__).resolve().parent.parent / "data")
-OUT.mkdir(parents=True, exist_ok=True)
+#: The artwork's disc spans this fraction of its own canvas (4096 / 6628).
+#: Every size below is expressed as the fraction of the OUTPUT the disc
+#: should fill, which is what actually matters on a launcher or splash.
+DISC = 4096 / 6628
 
 
-def on_cream(size: int, inset: float) -> Image.Image:
-    """The mark centred on the app's cream, filling `inset` of the canvas."""
-    plate = Image.new("RGBA", (size, size), CREAM)
-    m = int(size * inset)
-    plate.alpha_composite(mark.resize((m, m), Image.LANCZOS),
-                          ((size - m) // 2, (size - m) // 2))
-    return plate
+def mark(size: int, disc: float, ground=None) -> Image.Image:
+    """A `size` square with the disc filling `disc` of it, centred, on an
+    optional solid ground (None = transparent)."""
+    canvas = int(round(size * disc / DISC))       # artwork canvas, scaled
+    art = render(canvas)
+    if canvas > size:                             # crop the margin away
+        off = (canvas - size) // 2
+        art = art.crop((off, off, off + size, off + size))
+    out = Image.new("RGBA", (size, size), ground or (0, 0, 0, 0))
+    out.alpha_composite(art, ((size - art.width) // 2,
+                              (size - art.height) // 2))
+    return out
 
 
-# Transparent — the in-app loading screen paints its own background.
-mark.save(OUT / "ferritext_logo.png")
-# Launcher icon on cream: a transparent icon picks up whatever the launcher
-# happens to be showing behind it.
-on_cream(512, 0.82).save(OUT / "icon.png")
-# Android presplash, shown by the platform before any Python is running.
-on_cream(800, 0.62).save(OUT / "presplash.png")
+def main(out: Path) -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    # In-app loading screen: transparent, so it sits on whatever the screen
+    # paints (white, as specified).
+    mark(800, 0.86).save(out / "ferritext_logo.png")
+    # Legacy launcher icon (Android < 8, and launchers that ignore adaptive
+    # icons): white ground, as specified, with the disc large enough to
+    # survive the circular crop some launchers apply to legacy icons.
+    mark(512, 0.84, WHITE).save(out / "icon.png")
+    # Adaptive icon (Android 8+). The launcher supplies the mask shape, so
+    # the background layer is plain white and the foreground keeps the disc
+    # inside the 66/108 safe zone that every mask shape is guaranteed to
+    # show in full — 0.58 leaves a little air inside it.
+    Image.new("RGBA", (432, 432), WHITE).save(out / "icon_bg.png")
+    mark(432, 0.58).save(out / "icon_fg.png")
+    # Platform presplash, shown before any Python runs: white ground.
+    mark(800, 0.40, WHITE).save(out / "presplash.png")
+    for name in ("ferritext_logo.png", "icon.png", "icon_bg.png",
+                 "icon_fg.png", "presplash.png"):
+        print("wrote", out / name)
 
-for _f in ("ferritext_logo.png", "icon.png", "presplash.png"):
-    print("wrote", OUT / _f)
+
+if __name__ == "__main__":
+    main(Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "data")
