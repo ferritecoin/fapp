@@ -205,14 +205,17 @@ key, kept in repository secrets.
    | --- | --- |
    | `FEXT_KEYSTORE_B64` | The encoded keystore from step 2 |
    | `FEXT_KEYSTORE_PASSWORD` | The keystore password |
-   | `FEXT_KEY_ALIAS` | The `-alias` from step 1 (`fext`) |
+   | `FEXT_KEY_ALIAS` | The `-alias` from step 1 (`fext` in that command); `keytool -list` shows it |
    | `FEXT_KEY_PASSWORD` | The key password. For PKCS12, the keystore password |
 
 The workflow checks the key before it spends 20 minutes building. If the
-keystore will not open, the alias is not in it, or the key password is wrong,
-the build fails within seconds and names the secret to fix. The log then
+keystore will not open, or the key password is wrong, the build fails within
+seconds and names the secret to fix. If the alias names no key, a keystore
+with exactly one key is signed with that key and the build warns you to fix
+the secret; with several keys, the build fails and lists them. The log then
 shows the certificate's owner, validity and SHA-256 fingerprint, so you can
-confirm the release was signed with your key.
+confirm the release was signed with your key. GitHub masks secret values in
+logs, so an alias that matches a secret shows as `***`.
 
 Keep the keystore file and its password safe, private and backed up. If they
 are lost, no later build can install as an update, and every user would have

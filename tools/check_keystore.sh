@@ -4,8 +4,11 @@
 #
 # Proves the signing secrets work BEFORE a 20-minute build, and names the
 # secret to fix when they do not. Reads STOREPASS and KEYPASS from the calling
-# shell; a PKCS12 keystore has a single password, so KEYPASS is set to
-# STOREPASS for one. Never prints a password. Returns non-zero on failure.
+# shell and may correct two things there: KEYPASS becomes STOREPASS for a
+# PKCS12 keystore (it has a single password), and ALIAS becomes the
+# keystore's only key when the configured alias names none. Both corrections
+# are announced as warnings. Never prints a password. Returns non-zero on
+# failure.
 check_keystore() {
   local ks="$1" alias="$2" list info type until_raw until_s names
   if [ ! -s "$ks" ]; then
@@ -21,10 +24,18 @@ check_keystore() {
     return 1
   fi
   if ! info="$(keytool -list -v -keystore "$ks" -storepass "$STOREPASS" -alias "$alias" 2>&1)"; then
-    names="$(printf '%s\n' "$list" | sed -n 's/^\([^,]*\), .*PrivateKeyEntry.*/\1/p' | paste -sd ' ' -)"
-    echo "::error::The keystore has no key named '$alias'. Set FEXT_KEY_ALIAS to: ${names:-(no keys found)}"
-    return 1
+    names="$(printf '%s\n' "$list" | sed -n 's/^\([^,]*\), .*PrivateKeyEntry.*/\1/p')"
+    if [ "$(printf '%s\n' "$names" | grep -c .)" -ne 1 ]; then
+      echo "::error::The keystore has no key named '$alias'. Set FEXT_KEY_ALIAS to one of: $(printf '%s\n' "$names" | paste -sd ' ' -)"
+      return 1
+    fi
+    # One key, under another name: it can only be the one meant. Use it,
+    # and say so, rather than fail a release over the alias secret.
+    echo "::warning::FEXT_KEY_ALIAS does not name a key in this keystore, but the keystore holds exactly one key, '$names', so that key is used. Set FEXT_KEY_ALIAS to '$names' to silence this warning."
+    alias="$names"
+    info="$(keytool -list -v -keystore "$ks" -storepass "$STOREPASS" -alias "$alias" 2>&1)"
   fi
+  ALIAS="$alias"
   type="$(printf '%s\n' "$list" | sed -n 's/^Keystore type: *//p' | head -1)"
   if [ "$type" = "PKCS12" ]; then
     if [ "${KEYPASS:-}" != "$STOREPASS" ]; then
