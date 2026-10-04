@@ -32,7 +32,7 @@ source.exclude_dirs = tests, bin, venv, .git, .github, .buildozer, __pycache__, 
 # loads data/ferritext_logo.png at runtime for the loading screen.
 
 # (str) Application versioning (method 1)
-version = 9.0.0
+version = 9.0.1
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy

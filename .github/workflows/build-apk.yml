@@ -128,10 +128,18 @@ jobs:
           KS="$RUNNER_TEMP/fext-release.keystore"
           if [ -n "${FEXT_KEYSTORE_B64:-}" ]; then
             echo "::notice::Signing with the keystore from repository secrets (persistent key)."
-            printf '%s' "$FEXT_KEYSTORE_B64" | base64 -d > "$KS"
-            STOREPASS="$FEXT_KEYSTORE_PASSWORD"
-            KEYPASS="${FEXT_KEY_PASSWORD:-$FEXT_KEYSTORE_PASSWORD}"
-            ALIAS="${FEXT_KEY_ALIAS:-fext}"
+            # A pasted secret can carry line breaks, spaces or a Windows CR
+            # (PowerShell, Notepad); none of them is base64, so drop them.
+            if ! printf '%s' "$FEXT_KEYSTORE_B64" | tr -d ' \r\n\t' | base64 -d > "$KS" 2>/dev/null; then
+              echo "::error::FEXT_KEYSTORE_B64 is not valid base64. Encode the .keystore file again (README: Release signing)."
+              exit 1
+            fi
+            STOREPASS="$(printf '%s' "${FEXT_KEYSTORE_PASSWORD:-}" | tr -d '\r\n')"
+            KEYPASS="$(printf '%s' "${FEXT_KEY_PASSWORD:-${FEXT_KEYSTORE_PASSWORD:-}}" | tr -d '\r\n')"
+            ALIAS="$(printf '%s' "${FEXT_KEY_ALIAS:-fext}" | tr -d ' \r\n\t')"
+            # Fail in seconds, naming the secret to fix, not after the build.
+            . tools/check_keystore.sh
+            check_keystore "$KS" "$ALIAS"
           else
             echo "::warning::No signing secrets set - generating an ephemeral keystore for this build. Add FEXT_KEYSTORE_B64/PASSWORD/ALIAS secrets for a persistent key so future updates install over this release."
             STOREPASS="$(openssl rand -hex 24)"

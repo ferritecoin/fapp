@@ -20,15 +20,29 @@ same key (see [Release signing](#release-signing)).
 ## Downloads
 
 Every push is tested, built and published to a GitHub Release. Open the
-**Releases** page (or the **`v9.0.0`** tag) and take:
+**Releases** page (or the **`v9.0.1`** tag) and take:
 
 | Asset | For |
 | --- | --- |
-| `Ferritext-9.0.0.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r` |
-| `Ferritext-9.0.0-desktop.py` | Windows / macOS / Linux — run with Python 3.11+, or package it with [`desktop/`](desktop/README.md) |
+| `Ferritext-9.0.1.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r` |
+| `Ferritext-9.0.1-desktop.py` | Windows / macOS / Linux — run with Python 3.11+, or package it with [`desktop/`](desktop/README.md) |
 
 Both are also attached to each Actions run as the **`ferritext-release`**
 artifact.
+
+## What's in 9.0.1
+
+The app is unchanged from 9.0.0. This release changes how it is built:
+
+- **Signed with the project's own key** once the signing secrets are set (see
+  [Release signing](#release-signing)), so later versions install as updates.
+  Moving from 9.0.0 or earlier needs one uninstall, explained there.
+- **The build checks the signing key first.** It fails within seconds, naming
+  the secret to fix, rather than after a 20-minute build.
+- **The README covers Windows**, including the PowerShell base64 step.
+
+Relay v9, which stores the sealed photos and voice notes, is ready and has
+been tested end to end against this app; media works once it is deployed.
 
 ## What's in 9.0
 
@@ -146,32 +160,77 @@ on first run.
 
 ```bash
 python3 -m pip install --user buildozer cython
-buildozer android debug          # produces bin/fext-9.0.0-*-debug.apk
+buildozer android debug          # produces bin/fext-9.0.1-*-debug.apk
 ```
 
 The mark is regenerated with `python3 tools/make_logo.py` (Pillow only).
 
 ## Release signing
 
-- **Persistent key (recommended for real distribution).** Generate a keystore
-  once and add it as repository secrets so every build is signed with the *same*
-  key — this is what lets a new version install as an update over the previous
-  one without uninstalling (which would delete local chats):
+Android identifies an app by the key it is signed with: a new version
+installs as an *update* only when it is signed with the same key as the one
+already on the phone. So every release should be signed with one persistent
+key, kept in repository secrets.
 
-  ```bash
-  keytool -genkeypair -v -keystore fext-release.keystore -alias fext \
-    -keyalg RSA -keysize 2048 -validity 10000
-  base64 -w0 fext-release.keystore    # value for the FEXT_KEYSTORE_B64 secret
-  ```
+1. **Create the key once.** `keytool` comes with any JDK (Temurin, for
+   example). The same command works in PowerShell on one line:
 
-  Then, under **Settings → Secrets and variables → Actions**, add:
-  `FEXT_KEYSTORE_B64`, `FEXT_KEYSTORE_PASSWORD`, `FEXT_KEY_ALIAS`,
-  `FEXT_KEY_PASSWORD`. Keep the keystore itself somewhere safe and private —
-  losing it means you can never ship an update that installs over this one.
+   ```bash
+   keytool -genkeypair -v -keystore fext-release.keystore -alias fext \
+     -keyalg RSA -keysize 2048 -validity 10000
+   ```
 
-- **No secrets set.** The workflow generates a throwaway keystore per build:
-  still a valid, installable release APK, but each build's signature differs,
-  so a later build will not update-install over an earlier one.
+   - Keep `-validity 10000` (about 27 years). Without it, keytool's
+     certificate expires after 90 days.
+   - keytool's default format, PKCS12, has a single password. If keytool asks
+     for a separate key password, use the keystore password again.
+   - `keytool -list -v -keystore fext-release.keystore` shows the alias, the
+     validity (`Valid from … until …`) and the SHA-256 fingerprint.
+
+2. **Encode it for the secret.**
+
+   - Linux: `base64 -w0 fext-release.keystore`
+   - macOS: `base64 -i fext-release.keystore`
+   - Windows PowerShell, which has no `base64` command. This copies the result
+     straight to the clipboard, so console line-wrapping cannot corrupt it:
+
+     ```powershell
+     [System.Convert]::ToBase64String([System.IO.File]::ReadAllBytes("$PWD\fext-release.keystore")) | Set-Clipboard
+     ```
+
+3. **Add four repository secrets** under **Settings → Secrets and variables →
+   Actions**:
+
+   | Secret | Value |
+   | --- | --- |
+   | `FEXT_KEYSTORE_B64` | The encoded keystore from step 2 |
+   | `FEXT_KEYSTORE_PASSWORD` | The keystore password |
+   | `FEXT_KEY_ALIAS` | The `-alias` from step 1 (`fext`) |
+   | `FEXT_KEY_PASSWORD` | The key password. For PKCS12, the keystore password |
+
+The workflow checks the key before it spends 20 minutes building. If the
+keystore will not open, the alias is not in it, or the key password is wrong,
+the build fails within seconds and names the secret to fix. The log then
+shows the certificate's owner, validity and SHA-256 fingerprint, so you can
+confirm the release was signed with your key.
+
+Keep the keystore file and its password safe, private and backed up. If they
+are lost, no later build can install as an update, and every user would have
+to uninstall, losing their chats.
+
+**Moving to the persistent key.** Every build up to and including 9.0.0 was
+signed with a throwaway key, so the first build signed with your key cannot
+update them; uninstall the old app first. Before you do, open **Settings →
+Private key** and use **Copy WIF** to save each identity's key somewhere safe.
+After reinstalling, choose **import an existing private key** to keep the same
+address and username. Chat history on that phone does not survive the
+uninstall: chat exports are kept inside the app's own storage on Android, and
+an uninstall deletes that storage. After this one change, updates install in
+place.
+
+**No secrets set.** The workflow then generates a throwaway keystore for each
+build. That is still a valid, installable release APK, but every build's
+signature differs, so no build can update another.
 
 A signing key is **never committed to this repository.**
 
