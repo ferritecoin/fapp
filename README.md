@@ -11,9 +11,11 @@ Messages are signed (secp256k1 ECDSA), sealed (ephemeral ECDH â†’ HKDF-SHA256 â†
 AES-256-GCM), and only opaque ciphertext is transmitted. Photos and voice notes
 are sealed with a fresh key per file before they are uploaded.
 
-The Android application id stays `org.fext`, and the identity/QR payload keeps
-its original `FEXT` tag: the brand changed, the protocol did not, so every
-release installs as an *update* and talks to every earlier one.
+The Android application id stays `org.fext.fext` (`package.domain` +
+`package.name`), and the identity/QR payload keeps its original `FEXT` tag:
+the brand changed, the protocol did not, so every release talks to every
+earlier one, and installs as an *update* to it when both are signed with the
+same key (see [Release signing](#release-signing)).
 
 ## Downloads
 
