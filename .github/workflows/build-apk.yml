@@ -118,6 +118,32 @@ jobs:
           restore-keys: |
             buildozer-${{ runner.os }}-
 
+      - name: Pre-fetch FreeType from either of its official hosts
+        run: |
+          set -euo pipefail
+          # python-for-android downloads FreeType from download.savannah.gnu.org
+          # alone, and a build has failed after 11 minutes on that host being
+          # unreachable. Seed its download cache (the file plus the .mark-
+          # file that tells it the download completed) from savannah or from
+          # SourceForge, FreeType's other official host — pinned by sha256,
+          # so either host is enough and neither has to be trusted blindly.
+          ARCHS="$(grep -E '^android.archs' buildozer.spec | sed -E 's/.*=//; s/[[:space:]]//g; s/,/_/g')"
+          PKG=".buildozer/android/platform/build-${ARCHS}/packages/freetype"
+          FILE="freetype-2.10.1.tar.gz"
+          SHA="3a60d391fd579440561bf0e7f31af2222bc610ad6ce4d9d7bd2165bca8669110"
+          mkdir -p "$PKG"
+          for URL in "https://download.savannah.gnu.org/releases/freetype/$FILE" \
+                     "https://sourceforge.net/projects/freetype/files/freetype2/2.10.1/$FILE/download"; do
+            if curl -fsSL --retry 3 --connect-timeout 20 --max-time 300 -o "$PKG/$FILE" "$URL" \
+                && echo "$SHA  $PKG/$FILE" | sha256sum -c --quiet -; then
+              touch "$PKG/.mark-$FILE"
+              echo "FreeType $FILE from $URL (sha256 verified)"
+              exit 0
+            fi
+            rm -f "$PKG/$FILE"
+          done
+          echo "::warning::Could not pre-fetch FreeType; python-for-android will try savannah itself"
+
       - name: Build & sign the release APK
         env:
           FEXT_KEYSTORE_B64: ${{ secrets.FEXT_KEYSTORE_B64 }}
