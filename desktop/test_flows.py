@@ -303,6 +303,159 @@ bob._notify_incoming(alice.keys.address, "muted?", "text")
 check("...nor for a muted chat", len(seen) == n)
 M.IS_ANDROID = False
 
+print("\nv9.1: notes to self")
+me = alice.keys.address
+before = len(relay.mail)
+note_id = alice.send_text(me, "buy stamps 📮")
+time.sleep(0.2)
+check("a note to self is kept and goes nowhere",
+      note_id and len(relay.mail) == before and
+      alice.store.message(note_id)["body"] == "buy stamps 📮")
+kinds = {c["peer"]: c["kind"] for c in alice.store.conversations(me=me)}
+check("...and is listed as the notes-to-self conversation",
+      kinds.get(me) == "self")
+alice.open_conversation(me)
+screen = alice.conversation_screen
+check("the screen knows it is notes to self, and shows no ticks",
+      screen.kind == "self" and screen.peer_name.text == "Notes to self" and
+      all(b.ticks.width == 0 for b in screen._bubbles.values()))
+
+print("\nv9.1: three parties, a group, reactions")
+cara = make_party("cara", relay)
+parties[cara.keys.address] = cara
+for x in (alice, bob, cara):
+    for y in (alice, bob, cara):
+        if x is not y:
+            x.store.upsert_contact(y.keys.address, y.keys.username,
+                                   y.keys.public_key_hex)
+A, B, K = alice.keys.address, bob.keys.address, cara.keys.address
+relay.mail.clear()
+gpeer = alice.create_group("The Reading Circle", [B, K])
+gid = M.gid_of(gpeer)
+wait_for(lambda: len(relay.mail) >= 2)
+check("creating a group invites each member with one sealed message",
+      sorted(m["recipient"] for m in relay.mail) == sorted([B, K]))
+deliver(relay, parties)
+for party in (bob, cara):
+    group = party.store.group(gid) or {}
+    pump(party)
+check("both members joined, with alice as admin and all three listed",
+      all((p.store.group(gid) or {}).get("state") == "active" and
+          (p.store.group(gid) or {}).get("admin") == A and
+          len((p.store.group(gid) or {}).get("members", [])) == 3
+          for p in (bob, cara)))
+check("...and the group is in their chat lists",
+      any(c["peer"] == gpeer and c["kind"] == "group"
+          for c in bob.store.conversations(me=B)))
+
+bob.current_peer = gpeer
+gm = bob.send_text(gpeer, "Chapter four next week? 📖")
+wait_for(lambda: len(relay.mail) >= 2)
+check("a group message goes to every other member, one copy each",
+      sorted(m["recipient"] for m in relay.mail) == sorted([A, K]))
+deliver(relay, parties)
+row = cara.store.messages_for(gpeer)[-1]
+check("it arrives in the group, signed by its author",
+      row["body"] == "Chapter four next week? 📖" and row["author"] == B)
+check("bob's copy tracks delivery per member",
+      len(bob.store.group_sends(gm)) == 2)
+title, text, muted = M.notification_text(cara.store, gpeer, row["body"],
+                                         "text", row["author"])
+check("a group notification is titled with the group and names the writer",
+      title == "The Reading Circle" and text.startswith("bob: ") and
+      not muted)
+
+cara.current_peer = gpeer
+cara.react(row["id"], "👍")
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+cid = row["client_msg_id"]
+check("a reaction reaches everyone in the group",
+      all((p.store.reactions_for(gpeer, [cid]).get(cid) or [[None]])[0][:2]
+          == ("👍", K) for p in (alice, bob)))
+alice.open_conversation(gpeer)
+pump(alice)
+bubble = next(b for b in alice.conversation_screen._bubbles.values()
+              if b.msg.get("client_msg_id") == cid)
+check("...and shows under the message, with the author's name above it",
+      [c.emoji for c in bubble.reactions.chips] == ["👍"] and
+      bubble.author is not None and bubble.author.text == "BOB")
+cara.react(row["id"], "👍")
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+pump(alice)
+alice.refresh_chat(gpeer)
+bubble = next(b for b in alice.conversation_screen._bubbles.values()
+              if b.msg.get("client_msg_id") == cid)
+check("reacting the same again takes it back, everywhere",
+      not bob.store.reactions_for(gpeer, [cid]) and not bubble.reactions.chips)
+
+screen = alice.conversation_screen
+screen.start_selection(bubble.msg["id"])
+check("holding a message raises the reaction strip",
+      not screen.strip.disabled and
+      wait_for(lambda: screen.strip.opacity == 1, 1.0))
+screen._strip_pick("🙏")
+wait_for(lambda: len(relay.mail) >= 2)
+check("...and picking from it reacts and closes the strip",
+      alice.store.reaction_of(gpeer, cid, A) == "🙏" and
+      screen.strip.disabled and not screen.selecting)
+deliver(relay, parties)
+screen.open_emoji()
+screen.entry.text = ""
+screen.emoji_panel._pick("🕯")
+check("the emoji panel writes into the message",
+      screen.entry.text == "🕯" and screen.emoji_panel.is_open)
+screen.close_emoji()
+screen.entry.text = ""
+
+alice.rename_group(gid, "The Saturday Walkers")
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+check("the admin renames the group for everyone",
+      all(p.store.group(gid)["name"] == "The Saturday Walkers"
+          for p in (bob, cara)))
+alice.remove_group_member(gid, K)
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+check("removing a member tells them and the others",
+      cara.store.group(gid)["state"] == "removed" and
+      [m["a"] for m in bob.store.group(gid)["members"]] == [A, B])
+cara.open_conversation(gpeer)
+check("...and their copy of the group becomes read-only",
+      cara.conversation_screen.closed_note.parent is not None and
+      cara.send_text(gpeer, "still here?") is None)
+bob.leave_group(gid)
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+check("leaving tells the rest of the group",
+      [m["a"] for m in alice.store.group(gid)["members"]] == [A] and
+      bob.store.group(gid)["state"] == "left")
+
+print("\nv9.1: a reaction in a direct chat, and the themes")
+relay.mail.clear()
+direct = bob.store.messages_for(A)[-1]
+bob.react(direct["id"], "❤️")
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+dcid = direct["client_msg_id"]
+check("a direct chat's reaction arrives",
+      alice.store.reaction_of(B, dcid, B) == "❤️")
+alice.open_conversation(B)
+alice.conversation_screen.entry.text = "half-written"
+alice.set_appearance(theme="light")
+check("switching theme rebuilds the app in the light theme",
+      M.T.name == "light" and alice.conversation_screen.peer == B)
+check("...keeping the open chat and its draft",
+      alice.manager.current == "conversation" and
+      alice.conversation_screen.entry.text == "half-written")
+alice.set_appearance(text_size="largest")
+check("a larger text size scales every font",
+      abs(M.APPEARANCE.scale - 1.3) < 1e-9 and
+      abs(M.fs(10) - M.sp(13)) < 0.01)
+alice.set_appearance(theme="dark", text_size="default")
+check("...and back", M.T.name == "dark" and M.APPEARANCE.scale == 1.0)
+
 print("\nIdentity rename")
 old_user = alice.keys.username
 alice.keys.rename_identity(alice.keys.address, "Work")

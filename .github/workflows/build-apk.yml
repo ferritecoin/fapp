@@ -70,6 +70,7 @@ jobs:
           python desktop/test_service.py main.py
           xvfb-run -a python desktop/test_core.py main.py $OLD
           xvfb-run -a python desktop/test_flows.py main.py
+          xvfb-run -a python desktop/test_design.py main.py
           xvfb-run -a python desktop/smoke_desktop.py main.py
           xvfb-run -a python desktop/smoke_chat.py main.py
 
@@ -168,6 +169,16 @@ jobs:
           # The desktop client IS main.py; shipped under a versioned name for
           # people who run it with Python or package it (desktop/README.md).
           cp main.py "release/${TITLE}-${VER}-desktop.py"
+          # ...and with the folder it draws on — the bundled type (with its
+          # licences) and the mark — since Kivy cannot fall back to another
+          # font: without them, emoji and the serif are lost.
+          STAGE="$RUNNER_TEMP/${TITLE}"
+          rm -rf "$STAGE" && mkdir -p "$STAGE"
+          cp main.py "$STAGE/ferritext.py"
+          cp -r data "$STAGE/data"
+          rm -f "$STAGE/data/ferritext_logo.svg"
+          (cd "$RUNNER_TEMP" && zip -qr "$GITHUB_WORKSPACE/release/${TITLE}-${VER}-desktop.zip" "${TITLE}")
+          unzip -l "release/${TITLE}-${VER}-desktop.zip" | tail -3
           ls -la release/
           echo "ver=$VER" >> "$GITHUB_OUTPUT"
           echo "title=$TITLE" >> "$GITHUB_OUTPUT"
@@ -189,7 +200,7 @@ jobs:
         run: |
           set -euo pipefail
           TAG="v${VER}"
-          NOTES="${TITLE} ${VER} (CI run #${{ github.run_number }}, commit ${GITHUB_SHA:0:7}). ${TITLE}-${VER}.apk: Android — sideload via 'Install unknown apps'. ${TITLE}-${VER}-desktop.py: the same client for Windows/macOS/Linux — run it with Python 3.11+, or package it with desktop/build_desktop.sh."
+          NOTES="${TITLE} ${VER} (CI run #${{ github.run_number }}, commit ${GITHUB_SHA:0:7}). ${TITLE}-${VER}.apk: Android — sideload via 'Install unknown apps'. ${TITLE}-${VER}-desktop.zip: the same client for Windows/macOS/Linux with its fonts — unzip and run ferritext.py with Python 3.11+. ${TITLE}-${VER}-desktop.py: the client file alone (falls back to Kivy's own font), or package it with desktop/build_desktop.sh."
           # Create the release if this tag is new; otherwise keep it and just
           # refresh the title/notes, so a rebuild of the same version does not
           # leave stale text (or a stale app name) on the downloads page.

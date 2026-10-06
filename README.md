@@ -20,15 +20,42 @@ same key (see [Release signing](#release-signing)).
 ## Downloads
 
 Every push is tested, built and published to a GitHub Release. Open the
-**Releases** page (or the **`v9.0.1`** tag) and take:
+**Releases** page (or the **`v9.1.0`** tag) and take:
 
 | Asset | For |
 | --- | --- |
-| `Ferritext-9.0.1.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r` |
-| `Ferritext-9.0.1-desktop.py` | Windows / macOS / Linux — run with Python 3.11+, or package it with [`desktop/`](desktop/README.md) |
+| `Ferritext-9.1.0.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r` |
+| `Ferritext-9.1.0-desktop.zip` | Windows / macOS / Linux — unzip, then run `python3 ferritext.py` (Python 3.11+). It carries the fonts the client draws with. |
+| `Ferritext-9.1.0-desktop.py` | The same client as a single file, to package with [`desktop/`](desktop/README.md). On its own it falls back to Kivy's font: no emoji, no serif. |
 
-Both are also attached to each Actions run as the **`ferritext-release`**
+All three are also attached to each Actions run as the **`ferritext-release`**
 artifact.
+
+## What's in 9.1
+
+- **A new look.** A serif with true italics for everything people write,
+  spaced capitals for section heads, buttons and dates, thin rules instead of
+  boxes, and colour only where it carries meaning — gold delivery ticks, red
+  for what is unread or cannot be undone.
+- **Dark and light, following the phone.** By default the app follows the
+  system setting, changing with it while open. *Settings → Appearance* can
+  fix either one.
+- **Groups.** Create one from the compose button: name it, choose up to 31
+  contacts. Messages show who wrote them; the admin renames, adds and removes;
+  anyone can leave. A group's tick is its slowest member's: three ticks once
+  everyone has read it. See [Groups](#groups).
+- **Notes to self**, pinned at the top of the chat list: text, photos and
+  forwarded messages that stay on this device.
+- **Reactions.** Hold a message: a strip of reactions rises over it (+ for
+  every emoji). One reaction per person per message; choose yours again to
+  take it back. They appear under the message, with a small animation.
+- **Emoji** in every message, from a panel beside the composer, and in the
+  bundled font, so they render on every phone.
+- **A more accessible interface.** Every dialog is a sheet rising from
+  the bottom edge; every control is at least 48 dp to touch; text meets WCAG AA
+  contrast in both themes; *Settings* offers four text sizes (on top of the
+  system's) and *Reduce motion*. Settings and group information are full pages,
+  and the identity switcher is a sheet from your initial on the chat list.
 
 ## What's in 9.0.1
 
@@ -72,6 +99,16 @@ been tested end to end against this app; media works once it is deployed.
 
 ## Compatibility
 
+**Groups and reactions with older phones.** Groups need no new relay: each
+message is sealed separately for every member (see [Groups](#groups)), so a
+member still on an older release still receives it.
+
+| | 9.1 | 9.0.x | 8.x and earlier |
+| --- | --- | --- | --- |
+| A group message | in the group, under its author's name | as a direct message from its author | as a direct message from its author |
+| Invitation, rename, add, remove, leave | updates the group | not shown (9.0 ignores instructions it does not know) | shown as text, e.g. "ann added you to the group …" |
+| A reaction | under the message | not shown | shown as text, e.g. "Reacted 👍 to …" |
+
 **On the wire.** v9 features travel in an extension block inside the
 encrypted payload, with its own signature that also names the recipient and
 the message — which closes a replay the older format allowed (anyone who
@@ -86,6 +123,49 @@ default, and the readable `body` is always filled in. A newer release opens
 any older database, and an older release can still open a database a newer
 one has migrated. `desktop/test_core.py` checks both directions against the
 previous release's real code.
+
+## Groups
+
+A group is a list of members, each with their address and public key, kept
+by every member's phone and changed only by its admin (its creator, or —
+should the admin leave — the next member). Every change carries a version
+number and the admin's signature, so a phone accepts an invitation only from
+the admin it names, only if it includes that phone, and only if each address
+really is the hash of its key; members cannot be slipped in by anyone else.
+
+There is no group on the relay. A message to a group is sealed and sent once
+per member, exactly as a direct message would be, with the group's id inside
+the signed extension block — so the relay sees ordinary one-to-one traffic
+and nothing about who is in which group. That is also why a group holds at
+most 32 people: each message costs one relay request per member, and the
+relay limits how many requests one connection may make a minute.
+
+Each copy has its own delivery and read receipt. The sender's tick shows the
+slowest member: two ticks once it is on every phone, three once everyone has
+read it.
+
+## Type and themes
+
+The serif is **EB Garamond**, merged with **Noto Emoji** into the four-style
+family *Ferritext Serif* (Kivy draws a label with one font file and cannot fall
+back to another, so the emoji must live in the same file). Emoji are
+monochrome, taking the colour of the text: Kivy cannot draw colour fonts.
+Combined emoji (family groups, flags with modifiers) appear as their separate
+parts, because Android's build of Kivy does not shape text.
+
+Capitals are set in the supplied `data/fonts/ui.ttf` (Titillium Web Light),
+with letter-spacing the app adds itself, since Kivy's text has none.
+
+All three are under the SIL Open Font License 1.1; the licence texts ship
+beside the fonts and inside the APK. `tools/build_fonts.py` rebuilds the merged
+family from pinned, checksummed upstream files.
+
+The two themes are sets of colour tokens at the top of the client's design
+system. `desktop/test_design.py` measures every text/ground pair both themes
+use against WCAG AA (4.5:1 for text, 3:1 for marks such as ticks).
+
+Kivy has no screen-reader support yet. Every control nonetheless carries a
+spoken label in the code, ready for when it does.
 
 ## Media
 
@@ -122,7 +202,9 @@ the phone, if it cannot).
 | `service.py` | Android background sync service (imports `main.py`, no UI). |
 | `buildozer.spec` | Android packaging: requirements, permissions, service, icons. |
 | `data/` | The Ferrite Text Messenger mark (`ferritext_logo.svg`, as supplied) and the PNGs rendered from it. |
+| `data/fonts/` | Ferritext Serif (four styles), the capitals face `ui.ttf`, and their licences. |
 | `tools/make_logo.py` | Renders every PNG in `data/` from the SVG — no dependency beyond Pillow. |
+| `tools/build_fonts.py` | Rebuilds Ferritext Serif from EB Garamond and Noto Emoji (needs fontTools). |
 | `tools/p4a_hook.py` | Build hook declaring the service type Android 14 requires. |
 | `src/android/res/` | Android resources: cleartext policy for the relay, status-bar icon. |
 | `desktop/` | Desktop packaging (Nuitka) and the headless test suites. |
@@ -137,19 +219,21 @@ CI runs them all before it will build an APK.
 python3 desktop/test_service.py main.py                  # no display at all
 xvfb-run -a python3 desktop/test_core.py  main.py old.py # old.py: previous release
 xvfb-run -a python3 desktop/test_flows.py main.py
+xvfb-run -a python3 desktop/test_design.py main.py
 xvfb-run -a python3 desktop/smoke_desktop.py main.py
 xvfb-run -a python3 desktop/smoke_chat.py main.py
 ```
 
 | Suite | Covers |
 | --- | --- |
-| `test_core.py` | Envelope extension (incl. replay/tamper refusal), wire compatibility with the previous release, migrations both ways, delete-for-both authorisation, tombstones, extension sanitising |
-| `test_flows.py` | Two real app controllers over an in-memory relay: replies, forwards, stars, delete for both, photos (EXIF stripping, rotation), expiry → ask again → re-upload, voice notes, notification rules |
+| `test_core.py` | Envelope extension (incl. replay/tamper refusal), wire compatibility with the previous release, migrations both ways, delete-for-both authorisation, tombstones, extension sanitising, group membership rules (who may invite, change and remove), per-member receipts, reactions |
+| `test_flows.py` | Three real app controllers over an in-memory relay: replies, forwards, stars, delete for both, photos (EXIF stripping, rotation), expiry → ask again → re-upload, voice notes, notification rules, notes to self, groups (create, write, rename, remove, leave), reactions and taking them back, the reaction strip and emoji panel, switching theme and text size |
+| `test_design.py` | WCAG AA contrast of every text/ground pair in both themes, fonts registered and packaged with their licences, following the system theme, tracked capitals, stacking buttons, Back closing a sheet |
 | `test_service.py` | Headless import as the service runs it, app ⇄ service hand-over, the Android 14 manifest hook |
 | `smoke_desktop.py` | Launch, branding and loading screen through the real `App.run()` path |
 | `smoke_chat.py` | Bottom-anchored short chats, scrolling, text selection and copy |
 
-To get `old.py`: `git show v8.0.2:main.py > old.py` (or the latest tag before
+To get `old.py`: `git show v9.0.1:main.py > old.py` (or the latest tag before
 the version under test).
 
 ## Building it yourself
@@ -160,7 +244,7 @@ on first run.
 
 ```bash
 python3 -m pip install --user buildozer cython
-buildozer android debug          # produces bin/fext-9.0.1-*-debug.apk
+buildozer android debug          # produces bin/fext-9.1.0-*-debug.apk
 ```
 
 The mark is regenerated with `python3 tools/make_logo.py` (Pillow only).

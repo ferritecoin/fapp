@@ -17,7 +17,7 @@ package.domain = org.fext
 source.dir = .
 
 # (list) Source files to include (let empty to include all the files)
-source.include_exts = py,png,jpg,kv,atlas,ttf
+source.include_exts = py,png,jpg,kv,atlas,ttf,txt
 
 # (list) List of inclusions using pattern matching
 #source.include_patterns = assets/*,images/*.png
@@ -32,7 +32,7 @@ source.exclude_dirs = tests, bin, venv, .git, .github, .buildozer, __pycache__, 
 # loads data/ferritext_logo.png at runtime for the loading screen.
 
 # (str) Application versioning (method 1)
-version = 9.0.1
+version = 9.1.0
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy

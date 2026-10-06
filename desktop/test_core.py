@@ -189,7 +189,8 @@ if OLD is not None:
     check("the old contact gains notify=1 and caps=0",
           (new.get_contact(PEER) or {}).get("notify") == 1 and
           new.get_contact(PEER).get("caps") == 0)
-    check("the database is stamped with schema 2", user_version(path) == 2)
+    check(f"the database is stamped with schema {M.LocalStore.SCHEMA_VERSION}",
+          user_version(path) == M.LocalStore.SCHEMA_VERSION)
     new.add_in(PEER, "Photo", "2026-01-02T00:00:00+00:00", 42, "m" * 32,
                kind="image", ext={"media": {"kind": "image"}},
                media_state="pending")
@@ -233,7 +234,8 @@ check("a database from a NEWER release opens and is left at its version",
 path = DB_DIR / "twice.db"
 M.LocalStore(path).close()
 M.LocalStore(path).close()
-check("migrating twice is a no-op", user_version(path) == 2)
+check("migrating twice is a no-op",
+      user_version(path) == M.LocalStore.SCHEMA_VERSION)
 
 section("Local storage: stars, deletion, tombstones")
 st = M.LocalStore(DB_DIR / "ops.db")
@@ -382,7 +384,7 @@ app.events()
 acked, _c = deliver("Please resend", x={"k": "ctl", "ctl": {
     "op": "resend", "cid": "ours" * 8}})
 check("a resend request reaches the app",
-      ("resend_request", sender.address, "ours" * 8) in app.events())
+      ("resend_request", sender.address, "ours" * 8, None) in app.events())
 
 new_ref = media_ref(blob="c" * 32)
 acked, _c = deliver("Photo", x={"k": "ctl", "ctl": {
@@ -412,6 +414,245 @@ if OLD is not None:
     check("...and its sender is not marked v9-capable",
           app.store.get_contact(old_sender.address)["caps"] == 0)
 app.store.close()
+
+
+# =============================================================================
+section("v9.1 storage: groups, delivery per member, reactions, listing")
+st = M.LocalStore(DB_DIR / "v91.db")
+ME = "Fec" + "M" * 31
+A, B = "Fec" + "A" * 31, "Fec" + "B" * 31
+GID = "ab" * 16
+GPEER = M.group_peer(GID)
+for addr, name in ((A, "ann"), (B, "ben")):
+    st.upsert_contact(addr, name, "02" + "ab" * 32)
+st.upsert_contact("Fec" + "C" * 31, "cat", "02" + "cd" * 32, listed=False)
+check("someone met only in a group is known but not listed",
+      st.get_contact("Fec" + "C" * 31)["listed"] == 0 and
+      all(c["username"] != "cat" for c in st.contacts()))
+st.upsert_contact("Fec" + "C" * 31, "cat", "02" + "cd" * 32)
+check("...and a later direct contact lists them for good",
+      st.get_contact("Fec" + "C" * 31)["listed"] == 1)
+st.save_group({"id": GID, "name": "Readers", "v": 1, "admin": ME,
+               "members": [{"a": ME, "k": "02" + "11" * 32},
+                           {"a": A, "k": "02" + "ab" * 32},
+                           {"a": B, "k": "02" + "ab" * 32}]})
+g = st.group(GID)
+check("a group round-trips with its members and version",
+      g["name"] == "Readers" and len(g["members"]) == 3 and g["version"] == 1
+      and g["state"] == "active")
+local = st.add_out(GPEER, "hello group", M.now_iso(), "gmsg" * 8,
+                   recipients=[A, B])
+check("a group message starts at 0 for every member",
+      [r["status"] for r in st.group_sends(local)] == [0, 0])
+st.group_send_sent(local, A, 501)
+check("one member's copy on the relay is not yet 1/3",
+      st.message(local)["status"] == 0)
+st.group_send_sent(local, B, 502)
+check("every copy on the relay: 1/3", st.message(local)["status"] == 1)
+peer = st.apply_receipt(501, "delivered")
+check("a receipt for one copy moves only that member",
+      peer == GPEER and st.message(local)["status"] == 1)
+st.apply_receipt(502, "delivered")
+st.apply_receipt(501, "read")
+check("delivered to all, read by one: 2/3", st.message(local)["status"] == 2)
+st.apply_receipt(502, "read")
+check("read by everyone: 3/3", st.message(local)["status"] == 3)
+st.add_in(GPEER, "from ann", M.now_iso(), 601, "ann1" * 8, author=A)
+st.add_in(GPEER, "from ben", M.now_iso(), 602, "ben1" * 8, author=B)
+check("the same client id from two authors are two messages",
+      st.add_in(GPEER, "dup?", M.now_iso(), 603, "ann1" * 8, author=B)
+      == M.LocalStore.STORED)
+removed = st.delete_by_author(A, ["ben1" * 8, "ann1" * 8], GPEER)
+check("in a group, delete-for-both removes only the author's own message",
+      [r["author"] for r in removed] == [A] and
+      st.message_by_cid(GPEER, "ben1" * 8) is not None)
+st.add_out(ME, "a note to myself", M.now_iso(), "self" * 8)
+convs = {c["peer"]: c for c in st.conversations(me=ME)}
+check("conversations: a group, notes to self and direct chats are told apart",
+      convs[GPEER]["kind"] == "group" and convs[GPEER]["group_name"] ==
+      "Readers" and convs[ME]["kind"] == "self" and convs[A]["kind"] == "dm")
+check("...with the newest message's author and direction",
+      convs[GPEER]["last_author"] == B and
+      convs[GPEER]["last_direction"] == "in")
+st.save_group({"id": "cd" * 16, "name": "Empty", "v": 1, "admin": ME,
+               "members": [{"a": ME, "k": "02" + "11" * 32},
+                           {"a": A, "k": "02" + "ab" * 32}]})
+check("a group with no messages yet is still listed",
+      M.group_peer("cd" * 16) in {c["peer"] for c in st.conversations(ME)})
+check("reactions: set, replace and take back",
+      st.set_reaction(GPEER, "ann1" * 8, B, "\U0001F44D") and
+      st.set_reaction(GPEER, "ann1" * 8, B, "\u2764\ufe0f") and
+      not st.set_reaction(GPEER, "ann1" * 8, B, "\u2764\ufe0f") and
+      st.reaction_of(GPEER, "ann1" * 8, B) == "\u2764\ufe0f")
+st.set_reaction(GPEER, "ann1" * 8, ME, "\U0001F44D")
+got = st.reactions_for(GPEER, ["ann1" * 8, "nope" * 8])
+check("one reaction per person per message",
+      sorted(e for e, _r, _a in got["ann1" * 8]) ==
+      sorted(["\u2764\ufe0f", "\U0001F44D"]) and "nope" * 8 not in got)
+st.set_reaction(GPEER, "ann1" * 8, ME, "")
+check("taking a reaction back removes it",
+      st.reaction_of(GPEER, "ann1" * 8, ME) == "")
+event = st.add_event(GPEER, "Ann added Ben")
+check("group events are stored as readable, already-read rows",
+      st.message(event)["kind"] == "event" and st.message(event)["read"] == 1)
+st.close()
+
+if OLD is not None:
+    try:
+        old = OLD.LocalStore(DB_DIR / "v91.db")
+        convs = old.conversations()
+        rows = old.messages_for(GPEER)
+        old.close()
+        check("the previous release still opens a 9.1 database (groups, "
+              "reactions and all)", convs and rows and
+              all(isinstance(r["body"], str) and r["body"] for r in rows))
+    except Exception as exc:                      # noqa: BLE001
+        check("the previous release still opens a 9.1 database", False,
+              f"{type(exc).__name__}: {exc}")
+
+check("emoji reactions are validated",
+      M.sanitize_emoji("\U0001F44D\U0001F3FD") and
+      M.sanitize_emoji("") == "" and M.sanitize_emoji("ok") is None and
+      M.sanitize_emoji("\U0001F44D x") is None and
+      M.sanitize_emoji("\U0001F600" * 17) is None)
+
+
+# =============================================================================
+section("v9.1 sync: group membership rules and reactions")
+admin, carol, dan = Party(M, "admin"), Party(M, "carol"), Party(M, "dan")
+gapp = StubApp(receiver, DB_DIR / "groups.db")
+gworker = M.SyncWorker(gapp)
+
+
+def gdeliver(body, frm, x=None, cid=None):
+    cid = cid or uuid.uuid4().hex
+    env, _ = frm.crypto.build_envelope(body, receiver.pub, x=x,
+                                       recipient=receiver.address, cid=cid)
+    _sid[0] += 1
+    acked = gworker._ingest_message({"id": _sid[0], "sender": frm.address,
+                                     "client_msg_id": cid, "envelope": env})
+    return acked, cid
+
+
+def member(p):
+    return {"a": p.address, "k": p.pub, "u": p.keys.username or "x_" +
+            p.address[3:8]}
+
+
+GID2 = "ef" * 16
+GP2 = M.group_peer(GID2)
+
+
+def state(v, members, name="Readers", adm=None):
+    return {"id": GID2, "name": name, "v": v,
+            "admin": (adm or admin).address,
+            "members": [member(p) for p in members]}
+
+
+acked, early = gdeliver("too early", carol, x={"k": "text",
+                                               "grp": {"id": GID2, "v": 1}})
+check("a message for an unknown group is kept, in a placeholder",
+      acked and gapp.store.group(GID2)["state"] == "pending" and
+      gapp.store.message_by_cid(GP2, early)["author"] == carol.address)
+gdeliver("join", carol, x={"k": "ctl", "ctl": {
+    "op": "group", "g": state(1, [admin, receiver, carol])}})
+check("an invitation from someone who is NOT the named admin is refused",
+      gapp.store.group(GID2)["state"] == "pending")
+forged = state(1, [admin, receiver, carol])
+forged["members"][2]["k"] = dan.pub            # dan's key under carol's name
+gdeliver("join", admin, x={"k": "ctl", "ctl": {"op": "group", "g": forged}})
+check("a state putting someone's key under another's address is refused",
+      gapp.store.group(GID2)["state"] == "pending")
+gdeliver("join", admin, x={"k": "ctl", "ctl": {
+    "op": "group", "g": state(1, [admin, receiver, carol])}})
+g = gapp.store.group(GID2)
+check("the admin's invitation replaces the placeholder",
+      g["state"] == "active" and g["name"] == "Readers" and
+      g["admin"] == admin.address and len(g["members"]) == 3)
+check("...and says so in the conversation",
+      any(m["kind"] == "event" and "added you" in m["body"]
+          for m in gapp.store.messages_for(GP2)))
+check("members met in the group are known but not listed",
+      gapp.store.get_contact(carol.address) is not None and
+      all(c["address"] != carol.address for c in gapp.store.contacts()))
+acked, gm = gdeliver("hello all", carol, x={"k": "text",
+                                            "grp": {"id": GID2, "v": 1}})
+row = gapp.store.message_by_cid(GP2, gm)
+check("a member's group message lands in the group, with its author",
+      acked and row and row["author"] == carol.address)
+acked, bad = gdeliver("let me in", dan, x={"k": "text",
+                                           "grp": {"id": GID2, "v": 1}})
+check("a non-member's group message is acked and dropped",
+      acked and gapp.store.message_by_cid(GP2, bad) is None)
+gdeliver("x", carol, x={"k": "ctl", "ctl": {
+    "op": "group", "g": state(5, [admin, receiver, carol, dan],
+                              name="Hijacked")}})
+check("a member who is not the admin cannot change the group",
+      gapp.store.group(GID2)["name"] == "Readers")
+gdeliver("x", admin, x={"k": "ctl", "ctl": {
+    "op": "group", "g": state(2, [admin, receiver, carol, dan],
+                              name="Readers' Circle")}})
+g = gapp.store.group(GID2)
+check("the admin renames and adds a member (version 2)",
+      g["name"] == "Readers' Circle" and g["version"] == 2 and
+      len(g["members"]) == 4)
+gdeliver("x", admin, x={"k": "ctl", "ctl": {
+    "op": "group", "g": state(2, [admin, receiver], name="Replayed")}})
+check("a replayed or stale version is ignored",
+      gapp.store.group(GID2)["name"] == "Readers' Circle")
+acked, _c = gdeliver("Reacted", carol, x={"k": "ctl", "ctl": {
+    "op": "react", "cid": gm, "e": "\U0001F44D", "grp": GID2}})
+check("a member's reaction is recorded on the group message",
+      gapp.store.reaction_of(GP2, gm, carol.address) == "\U0001F44D")
+check("...and announced to the screen (to animate it)",
+      any(e[0] == "reaction" for e in gapp.events()))
+gdeliver("Reacted", carol, x={"k": "ctl", "ctl": {
+    "op": "react", "cid": gm, "e": "<b>hi</b>", "grp": GID2}})
+check("text dressed up as a reaction is refused",
+      gapp.store.reaction_of(GP2, gm, carol.address) == "\U0001F44D")
+gdeliver("Removed", carol, x={"k": "ctl", "ctl": {
+    "op": "react", "cid": gm, "e": "", "grp": GID2}})
+check("a reaction can be taken back",
+      gapp.store.reaction_of(GP2, gm, carol.address) == "")
+gdeliver("Deleted", dan, x={"k": "ctl", "ctl": {
+    "op": "delete", "cids": [gm], "grp": GID2}})
+check("another member cannot delete someone's group message",
+      gapp.store.message_by_cid(GP2, gm) is not None)
+gdeliver("Deleted", carol, x={"k": "ctl", "ctl": {
+    "op": "delete", "cids": [gm], "grp": GID2}})
+check("its author can", gapp.store.message_by_cid(GP2, gm) is None)
+acked, dm = gdeliver("a direct one", carol)
+gdeliver("Reacted", carol, x={"k": "ctl", "ctl": {
+    "op": "react", "cid": dm, "e": "\U0001F602"}})
+check("reactions work in direct chats too",
+      gapp.store.reaction_of(carol.address, dm, carol.address) ==
+      "\U0001F602")
+gapp.events()
+gdeliver("left", admin, x={"k": "ctl", "ctl": {"op": "leave",
+                                               "grp": GID2}})
+g = gapp.store.group(GID2)
+check("when the admin leaves, the first remaining member takes over",
+      admin.address not in {m["a"] for m in g["members"]} and
+      g["admin"] == receiver.address)
+check("...and, being that member, this device publishes the new state",
+      ("group_publish", GID2) in gapp.events())
+gdeliver("left", dan, x={"k": "ctl", "ctl": {"op": "leave", "grp": GID2}})
+check("any member can leave", dan.address not in
+      {m["a"] for m in gapp.store.group(GID2)["members"]})
+GID3 = "12" * 16
+gdeliver("join", admin, x={"k": "ctl", "ctl": {"op": "group", "g": {
+    "id": GID3, "name": "Short-lived", "v": 1, "admin": admin.address,
+    "members": [member(admin), member(receiver), member(carol)]}}})
+gdeliver("out", admin, x={"k": "ctl", "ctl": {"op": "group", "g": {
+    "id": GID3, "name": "Short-lived", "v": 2, "admin": admin.address,
+    "members": [member(admin), member(carol)]}}})
+check("removed by the admin: the group is kept read-only",
+      gapp.store.group(GID3)["state"] == "removed")
+acked, after = gdeliver("still?", carol, x={"k": "text",
+                                            "grp": {"id": GID3, "v": 2}})
+check("...and nothing more arrives in it",
+      acked and gapp.store.message_by_cid(M.group_peer(GID3), after) is None)
+gapp.store.close()
 
 
 # =============================================================================

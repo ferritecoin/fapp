@@ -52,6 +52,11 @@ BODY = "The quick brown fox jumps over the lazy dog and keeps on running"
 class StubApp:
     """Just enough app for ConversationScreen to wire its callbacks to."""
     current_peer = PEER
+    keys = type("Keys", (), {"address": "FecMe1111111111111111111111111111"})
+    store = None
+
+    def conversation_kind(self, peer):
+        return "dm"
 
     def mark_peer_read(self, *a):
         pass
@@ -80,7 +85,7 @@ def messages(n, body=None):
 class Harness(App):
     def build(self):
         Window.size = (dp(420), dp(820))
-        Window.clearcolor = M.C(M.COL_BG_LIST)
+        Window.clearcolor = M.C(M.T.bg)
         self.screen = M.ConversationScreen(StubApp())
         manager = ScreenManager(transition=NoTransition())
         manager.add_widget(self.screen)

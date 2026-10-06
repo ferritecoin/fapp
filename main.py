@@ -124,15 +124,18 @@ from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.clipboard import Clipboard
 from kivy.core.image import Image as CoreImage
+from kivy.core.text import Label as CoreLabel, LabelBase
 from kivy.core.window import Window
-from kivy.graphics import Color, Ellipse, Line, Mesh, Rectangle, \
-    RoundedRectangle, Triangle
+from kivy.graphics import Color, Ellipse, Line, Mesh, PopMatrix, \
+    PushMatrix, Rectangle, RoundedRectangle, Scale, Triangle
 from kivy.metrics import dp, sp
+from kivy.properties import NumericProperty
 from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.filechooser import FileChooserListView
 from kivy.uix.floatlayout import FloatLayout
+from kivy.uix.gridlayout import GridLayout
 from kivy.uix.image import Image as KivyImage
 from kivy.uix.label import Label
 from kivy.uix.modalview import ModalView
@@ -849,7 +852,7 @@ REQUIRE_TLS = _os.environ.get("FEXT_REQUIRE_TLS", "") not in ("", "0", "false")
 
 APP_NAME = "Ferritext"
 #: Must equal `version` in buildozer.spec — CI refuses to build if not.
-APP_VERSION = "9.0.1"
+APP_VERSION = "9.1.0"
 
 # The identity/QR payload keeps carrying the ORIGINAL tag. It is wire data
 # that older clients already produce and consume, so renaming the app must
@@ -922,42 +925,251 @@ MEDIA_MIME = {"image": ("image/jpeg", "image/png", "image/webp"),
               "voice": ("audio/mp4", "audio/aac", "audio/ogg",
                         "audio/3gpp", "audio/amr", "audio/wav")}
 
-# ---- Palette -----------------------------------------------------------------
-# A beige chat background, a dark brown app bar, gold bubbles for your own
-# messages and cream cards everywhere else. The one non-negotiable brand
-# element is the golden tick.
-COL_BG           = "#F6EEDF"    # chat background
-COL_BG_LIST      = "#FDF8EE"    # conversation list background (cream)
-COL_CARD         = "#FFFFFF"    # cards, inputs, incoming bubbles
-COL_CARD_EDGE    = "#EADDC6"    # soft warm borders
-COL_APPBAR       = "#6B4632"    # dark brown
-COL_APPBAR_TEXT  = "#FFF6E8"    # warm white on the app bar
-COL_APPBAR_DIM   = "#D9BFA5"    # subdued text on the app bar
-COL_BUBBLE_ME    = "#FFE2AC"    # gold — outgoing bubbles
-COL_BUBBLE_PEER  = "#FFFFFF"    # incoming bubbles
-COL_TEXT         = "#3D2E22"    # espresso
-COL_TEXT_DIM     = "#9C8A76"    # latte
-COL_ACCENT       = "#D98E2B"    # gold — primary actions
-COL_ACCENT_DARK  = "#B9741C"    # pressed state
-COL_DANGER       = "#C25B4A"    # warm brick
-COL_OK           = "#69945F"    # sage
-COL_TICK_GOLD    = "#C9871B"    # the golden ticks
-COL_TICK_GREY    = "#B3A48F"    # 0/3 — not yet on the server
-COL_PRESSED      = "#F1E5CF"    # row press feedback
-COL_DIVIDER      = "#EFE4D2"    # hairlines between list rows
-COL_QUOTE_ME     = "#F7CF86"    # reply-quote ground inside an outgoing bubble
-COL_QUOTE_PEER   = "#F7EFE2"    # ... and inside an incoming one
-COL_SELECT_RGBA  = (0.851, 0.557, 0.169, 0.18)   # gold wash on selected rows
+# =============================================================================
+#  Design system (v9.1): two themes, type, text size, motion
+# =============================================================================
+# A serif with true italics for everything people write, spaced capitals for
+# section heads, buttons and dates, thin rules instead of boxes, and colour
+# only where it carries meaning: gold for the delivery ticks, red for what is
+# unread or cannot be undone.
+#
+# Every text/ground pair either theme uses is at least WCAG AA (4.5:1; 3:1
+# for non-text marks) — see desktop/test_design.py, which measures them.
+THEMES = {
+    "dark": {
+        "bg": "#11100E", "surface": "#1A1916", "surface_hi": "#24221E",
+        "own": "#2A2620", "peer": "#1A1916", "rule": "#2C2924",
+        "rule_strong": "#3D3931",
+        "text": "#ECE6D9", "text_2": "#B3AB9E", "text_3": "#9A9285",
+        "accent": "#CBA761", "accent_press": "#A98A4C", "on_accent": "#14120E",
+        "alert": "#D0654D", "on_alert": "#11100E", "ok": "#8FA67E",
+        "tick": "#CBA761", "tick_grey": "#857D71", "press": "#23211D",
+        "quote_own": "#35302A", "quote_peer": "#24221E",
+        "select": (0.796, 0.655, 0.380, 0.13), "scrim": (0, 0, 0, 0.62),
+        "plate": "#F4EFE4",         # the light plate a QR code sits on
+    },
+    "light": {
+        "bg": "#FFFFF8", "surface": "#F7F3E8", "surface_hi": "#EFE9DB",
+        "own": "#F1EADA", "peer": "#FFFFF8", "rule": "#E2DBCB",
+        "rule_strong": "#CFC6B3",
+        "text": "#1B1915", "text_2": "#4E483F", "text_3": "#6F685C",
+        "accent": "#7F5F18", "accent_press": "#634A12", "on_accent": "#FFFFF8",
+        "alert": "#A23A28", "on_alert": "#FFFFF8", "ok": "#4F6B3E",
+        "tick": "#9A7424", "tick_grey": "#8C8578", "press": "#EFE9DB",
+        "quote_own": "#E8DFCB", "quote_peer": "#EFE9DB",
+        "select": (0.498, 0.373, 0.094, 0.10), "scrim": (0.07, 0.06, 0.04, .48),
+        "plate": "#FFFFF8",
+    },
+}
+#: Avatar colours, picked by address hash. Each carries a light initial at
+#: >= 3:1 (initials are large text).
+AVATAR_PALETTE = ["#3E5A8C", "#B4472E", "#3F7F73", "#A87A2A",
+                  "#8E3B55", "#6E5238", "#4E7A45", "#6B3E6E"]
 
-# Avatar hues, assigned by address hash — every contact gets a stable, warm
-# colour of their own.
-AVATAR_PALETTE = ["#D98E2B", "#C25B4A", "#8A9A5B", "#B07B9E",
-                  "#5E8C8A", "#C97F5D", "#A9853F", "#7E9C6B"]
+
+class _Tokens:
+    """The live theme: `T.bg`, `T.text`, … — read when a widget is BUILT.
+    Changing theme rebuilds the widget tree (FextApp.apply_appearance), so
+    nothing has to repaint itself in place."""
+    name = "dark"
+
+    def load(self, name: str) -> None:
+        self.name = name if name in THEMES else "dark"
+        for key, value in THEMES[self.name].items():
+            setattr(self, key, value)
+
+    @property
+    def dark(self) -> bool:
+        return self.name == "dark"
+
+
+T = _Tokens()
+#: The pre-9.1 colour names, kept as live aliases of the theme's tokens:
+#: worker threads still post status colours by these names.
+_COL_TOKENS = {
+    "COL_BG": "bg", "COL_BG_LIST": "bg", "COL_CARD": "surface",
+    "COL_CARD_EDGE": "rule", "COL_APPBAR": "bg", "COL_APPBAR_TEXT": "text",
+    "COL_APPBAR_DIM": "text_3", "COL_BUBBLE_ME": "own",
+    "COL_BUBBLE_PEER": "peer", "COL_TEXT": "text", "COL_TEXT_DIM": "text_3",
+    "COL_ACCENT": "accent", "COL_ACCENT_DARK": "accent_press",
+    "COL_DANGER": "alert", "COL_OK": "ok", "COL_TICK_GOLD": "tick",
+    "COL_TICK_GREY": "tick_grey", "COL_PRESSED": "press",
+    "COL_DIVIDER": "rule", "COL_QUOTE_ME": "quote_own",
+    "COL_QUOTE_PEER": "quote_peer", "COL_SELECT_RGBA": "select",
+}
+
+
+def apply_theme(name: str) -> None:
+    T.load(name)
+    globals().update({alias: getattr(T, token)
+                      for alias, token in _COL_TOKENS.items()})
+
+
+def retint(hex_color: str) -> str:
+    """The current theme's version of a colour another theme produced (a
+    status line posted just before the theme changed)."""
+    if not isinstance(hex_color, str):
+        return hex_color
+    for theme in THEMES.values():
+        for token, value in theme.items():
+            if value == hex_color:
+                return getattr(T, token)
+    return hex_color
+
+
+apply_theme("dark")
+# Declared here for readers and linters; apply_theme() keeps them current.
+COL_BG = COL_BG_LIST = COL_APPBAR = T.bg
+COL_CARD = COL_BUBBLE_PEER = T.surface
+COL_CARD_EDGE = COL_DIVIDER = T.rule
+COL_APPBAR_TEXT, COL_TEXT = T.text, T.text
+COL_APPBAR_DIM = COL_TEXT_DIM = T.text_3
+COL_BUBBLE_ME, COL_ACCENT, COL_ACCENT_DARK = T.own, T.accent, T.accent_press
+COL_DANGER, COL_OK, COL_TICK_GOLD, COL_TICK_GREY = (T.alert, T.ok, T.tick,
+                                                    T.tick_grey)
+COL_PRESSED, COL_QUOTE_ME, COL_QUOTE_PEER = T.press, T.quote_own, T.quote_peer
+COL_SELECT_RGBA = T.select
 
 
 def C(hex_color: str) -> list:
     """Hex string -> kivy rgba. UI-side only; workers keep hex strings."""
     return get_color_from_hex(hex_color)
+
+
+def mix(a: str, b: str, t: float) -> str:
+    """`a` moved a fraction `t` of the way to `b` (hex colours)."""
+    a, b = a.lstrip("#"), b.lstrip("#")
+    return "#" + "".join(
+        f"{round(int(a[i:i + 2], 16) * (1 - t) + int(b[i:i + 2], 16) * t):02X}"
+        for i in (0, 2, 4))
+
+
+# ---- system appearance ------------------------------------------------------
+def system_prefers_dark() -> Optional[bool]:
+    """What the operating system is set to: True dark, False light, None
+    when it cannot be told. FEXT_THEME=dark|light overrides (tests,
+    screenshots)."""
+    forced = os.environ.get("FEXT_THEME", "").lower()
+    if forced in ("dark", "light"):
+        return forced == "dark"
+    try:
+        if IS_ANDROID:
+            autoclass, _ = _jni()
+            activity = autoclass("org.kivy.android.PythonActivity").mActivity
+            mode = activity.getResources().getConfiguration().uiMode
+            return (mode & 0x30) == 0x20          # UI_MODE_NIGHT_YES
+        if sys.platform == "win32":
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion"
+                                r"\Themes\Personalize") as key:
+                return winreg.QueryValueEx(key, "AppsUseLightTheme")[0] == 0
+        if sys.platform == "darwin":
+            out = subprocess.run(["defaults", "read", "-g",
+                                  "AppleInterfaceStyle"], capture_output=True,
+                                 text=True, timeout=2)
+            return "dark" in out.stdout.lower()
+        out = subprocess.run(["gsettings", "get", "org.gnome.desktop.interface",
+                              "color-scheme"], capture_output=True, text=True,
+                             timeout=2)
+        if out.returncode == 0 and out.stdout.strip():
+            return "dark" in out.stdout
+        out = subprocess.run(["gsettings", "get", "org.gnome.desktop.interface",
+                              "gtk-theme"], capture_output=True, text=True,
+                             timeout=2)
+        if out.returncode == 0 and out.stdout.strip():
+            return "dark" in out.stdout.lower()
+    except Exception:
+        pass
+    return None
+
+
+def system_reduces_motion() -> bool:
+    """Android's 'Remove animations' sets the animator scale to 0."""
+    if not IS_ANDROID:
+        return False
+    try:
+        autoclass, _ = _jni()
+        Global = autoclass("android.provider.Settings$Global")
+        resolver = android_context().getContentResolver()
+        return Global.getFloat(resolver, "animator_duration_scale", 1.0) == 0
+    except Exception:
+        return False
+
+
+#: Multiplies every font size, on top of the system font scale that sp()
+#: already applies.
+TEXT_SCALES = (("small", "S", 0.9), ("default", "M", 1.0),
+               ("large", "L", 1.15), ("largest", "XL", 1.3))
+THEME_CHOICES = (("system", "System"), ("light", "Light"), ("dark", "Dark"))
+
+
+class _Appearance:
+    mode = "system"                 # the user's choice: system/light/dark
+    scale = 1.0
+    reduce_motion = False
+
+    def resolve(self) -> str:
+        """Re-read the preferences and the system; returns the theme name."""
+        prefs = load_prefs()
+        self.mode = prefs.get("theme", "system")
+        if self.mode not in ("system", "light", "dark"):
+            self.mode = "system"
+        self.scale = dict((k, s) for k, _l, s in TEXT_SCALES).get(
+            prefs.get("text_size", "default"), 1.0)
+        motion = prefs.get("reduce_motion")
+        self.reduce_motion = bool(system_reduces_motion() if motion is None
+                                  else motion)
+        if self.mode != "system":
+            return self.mode
+        dark = system_prefers_dark()
+        return "light" if dark is False else "dark"
+
+
+APPEARANCE = _Appearance()
+
+
+def fs(size: float) -> float:
+    """A font size in sp, scaled by the user's text-size choice."""
+    return sp(size) * APPEARANCE.scale
+
+
+def motion(duration: float) -> float:
+    """An animation's duration, or 0 when the user has asked for less."""
+    return 0 if APPEARANCE.reduce_motion else duration
+
+
+# ---- type -------------------------------------------------------------------
+# Kivy draws a label with ONE font file and has no fallback, so the bundled
+# serif carries the emoji too (tools/build_fonts.py merges them). It is
+# registered under Kivy's default family name, so every Label and TextInput
+# in the app — and in Kivy's own widgets — is set in it.
+FONT_DIR = ASSET_DIR / "fonts"
+SERIF_FILES = {"fn_regular": "FerritextSerif-Regular.ttf",
+               "fn_italic": "FerritextSerif-Italic.ttf",
+               "fn_bold": "FerritextSerif-Bold.ttf",
+               "fn_bolditalic": "FerritextSerif-BoldItalic.ttf"}
+CAPS_FONT = FONT_DIR / "ui.ttf"          # Titillium Web Light, as supplied
+CAPS_FONT_NAME = "Roboto"
+
+
+def register_fonts() -> bool:
+    global CAPS_FONT_NAME
+    files = {k: FONT_DIR / v for k, v in SERIF_FILES.items()}
+    ok = all(p.is_file() for p in files.values())
+    if ok:
+        paths = {k: str(p) for k, p in files.items()}
+        LabelBase.register("Roboto", **paths)
+        LabelBase.register("FerritextSerif", **paths)
+    else:
+        log.warning("bundled fonts missing from %s — using Kivy's", FONT_DIR)
+    if CAPS_FONT.is_file():
+        LabelBase.register("FerritextCaps", str(CAPS_FONT))
+        CAPS_FONT_NAME = "FerritextCaps"
+    return ok
+
+
+register_fonts()
 
 # =============================================================================
 #  Small shared utilities (DRY helpers)
@@ -980,6 +1192,26 @@ def now_iso() -> str:
 
 def short_addr(address: str, n: int = 12) -> str:
     return f"{address[:n]}…" if len(address) > n else address
+
+
+def single_line_text(text: str, limit: int) -> str:
+    """`text` on one line, cut to `limit` characters with an ellipsis."""
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[:limit - 1].rstrip() + "…"
+
+
+def message_text(msg: dict) -> str:
+    """The words of a message, as a person would quote them: a photo's
+    caption, nothing for a voice note, the body otherwise."""
+    kind = msg.get("kind") or "text"
+    if kind in ("image", "voice"):
+        try:
+            ext = json.loads(msg.get("ext") or "{}")
+        except (TypeError, ValueError):
+            ext = {}
+        media = ext.get("media") if isinstance(ext, dict) else None
+        return (media or {}).get("cap", "") if kind == "image" else ""
+    return msg.get("body", "")
 
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -1082,6 +1314,99 @@ def sanitize_ext(x) -> dict:
     if media:
         out["media"] = media
     return out
+
+
+# ---- v9.1 groups and reactions ----------------------------------------------
+# A group is a list of members that every member keeps; the relay never knows
+# one exists. A group message travels as one ordinary 1:1 envelope per
+# member, each carrying {"grp": {"id", "v"}} in its signed extension block,
+# so it is as end-to-end encrypted, recipient-bound and replay-proof as a
+# direct message. Membership changes are signed control messages from the
+# group's admin, applied only when their version is newer.
+GROUP_PREFIX = "g:"            # messages.peer for a group's conversation
+MAX_GROUP_MEMBERS = 32         # pairwise fan-out: one send per member
+MAX_GROUP_NAME = 64
+_GID_RE = re.compile(r"^[0-9a-f]{32}$")
+#: Offered first in the reaction strip, in this order.
+QUICK_REACTIONS = ("\U0001F44D", "\u2764\ufe0f", "\U0001F602", "\U0001F62E",
+                   "\U0001F622", "\U0001F64F")
+
+
+def group_peer(gid: str) -> str:
+    return GROUP_PREFIX + gid
+
+
+def gid_of(peer: Optional[str]) -> Optional[str]:
+    """The group id behind a conversation key, or None for a direct chat."""
+    if isinstance(peer, str) and peer.startswith(GROUP_PREFIX):
+        gid = peer[len(GROUP_PREFIX):]
+        return gid if _GID_RE.match(gid) else None
+    return None
+
+
+def sanitize_gid(value) -> Optional[str]:
+    return value if isinstance(value, str) and _GID_RE.match(value) else None
+
+
+def sanitize_emoji(value) -> Optional[str]:
+    """A reaction: one emoji, which may be a sequence (skin tone, flag,
+    ZWJ family) of up to 16 code points. '' means "take it back". Anything
+    containing ASCII, letters, spaces or control characters is refused, so
+    a reaction can never smuggle text onto someone's screen."""
+    if value == "":
+        return ""
+    if not isinstance(value, str) or not 1 <= len(value) <= 16:
+        return None
+    for ch in value:
+        o = ord(ch)
+        if o < 0xa0 or ch.isspace() or ch.isalpha() or ch.isdigit():
+            return None
+    if all(ch in "\u200d\ufe0f\ufe0e" for ch in value):
+        return None
+    return value
+
+
+def sanitize_group_state(raw) -> Optional[dict]:
+    """Validate a peer-supplied group state, refusing it whole if any part
+    is wrong. Every member's address must be the hash of the key given for
+    it, so nobody can put a key of their choosing under someone else's
+    address and read that person's share of the group's messages."""
+    if not isinstance(raw, dict):
+        return None
+    gid = sanitize_gid(raw.get("id"))
+    name = sanitize_text(_str(raw.get("name"), 400) or "")[:MAX_GROUP_NAME]
+    version = _int(raw.get("v"), 1, 2 ** 31 - 1)
+    admin = _str(raw.get("admin"), 64)
+    members = raw.get("members")
+    if not (gid and name.strip() and version and admin and
+            isinstance(members, list) and
+            2 <= len(members) <= MAX_GROUP_MEMBERS):
+        return None
+    out, seen = [], set()
+    for member in members:
+        if not isinstance(member, dict):
+            return None
+        address = _str(member.get("a"), 64)
+        key = (_str(member.get("k"), 66) or "").lower()
+        if not address or address in seen or not valid_address(address):
+            return None
+        try:
+            pub = bytes.fromhex(key)
+            compressed_to_pub(pub)
+        except ValueError:
+            return None
+        if address_from_pub_bytes(pub) != address:
+            return None
+        username = _str(member.get("u"), 32)
+        entry = {"a": address, "k": key}
+        if username and valid_username(username):
+            entry["u"] = username
+        out.append(entry)
+        seen.add(address)
+    if admin not in seen:
+        return None
+    return {"id": gid, "name": name.strip(), "v": version, "admin": admin,
+            "members": out}
 
 
 MEDIA_AAD = b"fext.media.v1"
@@ -1532,6 +1857,39 @@ def background_delivery_enabled() -> bool:
     return bool(load_prefs().get("background_delivery", True))
 
 
+def android_style_system_bars() -> None:
+    """Paint Android's status and navigation bars in the page colour, with
+    dark icons on the light theme and light icons on the dark one."""
+    if not IS_ANDROID:
+        return
+    try:
+        from android.runnable import run_on_ui_thread   # type: ignore
+    except Exception:
+        return
+    bg, light = T.bg, not T.dark
+
+    @run_on_ui_thread
+    def apply():
+        try:
+            autoclass, _ = _jni()
+            activity = autoclass("org.kivy.android.PythonActivity").mActivity
+            Color_ = autoclass("android.graphics.Color")
+            LayoutParams = autoclass("android.view.WindowManager$LayoutParams")
+            window = activity.getWindow()
+            window.clearFlags(LayoutParams.FLAG_TRANSLUCENT_STATUS)
+            window.addFlags(LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS)
+            window.setStatusBarColor(Color_.parseColor(bg))
+            window.setNavigationBarColor(Color_.parseColor(bg))
+            view = window.getDecorView()
+            flags = view.getSystemUiVisibility()
+            light_bars = 0x2000 | (0x10 if android_sdk() >= 26 else 0)
+            flags = flags | light_bars if light else flags & ~light_bars
+            view.setSystemUiVisibility(flags)
+        except Exception:
+            log.exception("could not colour the system bars")
+    apply()
+
+
 def android_service(start: bool) -> None:
     """Start or stop the background sync service (Android only)."""
     autoclass, _ = _jni()
@@ -1725,7 +2083,7 @@ def initial_of(name: str) -> str:
     return "?"
 
 
-def qr_texture(data: str, fg: str = COL_TEXT, bg: str = "#FFFFFF"):
+def qr_texture(data: str, fg: str = "#1B1915", bg: str = "#FFFFF8"):
     """Render a QR code to a Kivy texture (via an in-memory PNG)."""
     qr = qrcode.QRCode(box_size=8, border=2)
     qr.add_data(data)
@@ -2492,13 +2850,50 @@ class LocalStore:
         at   TEXT NOT NULL,
         PRIMARY KEY (cid, peer)
     );
+    -- v9.1: group chats. The relay only ever carries 1:1 envelopes; a group
+    -- is a membership list every member keeps, and a group message is sent
+    -- to each member separately (pairwise fan-out). Conversation key for a
+    -- group's messages: messages.peer = 'g:' || gid.
+    CREATE TABLE IF NOT EXISTS groups (
+        gid        TEXT PRIMARY KEY,
+        name       TEXT NOT NULL,
+        admin      TEXT NOT NULL,
+        members    TEXT NOT NULL,              -- JSON [{a, u, k}]
+        version    INTEGER NOT NULL DEFAULT 1,
+        state      TEXT NOT NULL DEFAULT 'active',  -- active|pending|left|removed
+        notify     INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    -- One row per recipient of each outgoing group message: its relay id
+    -- (for receipts) and tick tier. The message's own status is the lowest.
+    CREATE TABLE IF NOT EXISTS group_sends (
+        local_id  INTEGER NOT NULL,
+        member    TEXT NOT NULL,
+        server_id INTEGER,
+        status    INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (local_id, member)
+    );
+    CREATE INDEX IF NOT EXISTS idx_group_sends_sid ON group_sends (server_id);
+    -- v9.1: reactions, one per person per message (choosing the same one
+    -- again takes it back). Keyed by conversation + the message's client id.
+    CREATE TABLE IF NOT EXISTS reactions (
+        peer    TEXT NOT NULL,
+        cid     TEXT NOT NULL,
+        reactor TEXT NOT NULL,
+        emoji   TEXT NOT NULL,
+        at      TEXT NOT NULL,
+        PRIMARY KEY (peer, cid, reactor)
+    );
     """
 
     #: Current schema generation, recorded in PRAGMA user_version.
     #:   0/1  up to v8.0.2 (receipt_sent added by inspection in v7.2)
     #:   2    v9.0.0: message kinds, extension metadata, stars, media state,
     #:        per-contact notifications and capabilities, tombstones
-    SCHEMA_VERSION = 2
+    #:   3    v9.1.0: group chats (groups, group_sends, messages.author),
+    #:        reactions, contacts.listed
+    SCHEMA_VERSION = 3
 
     #: Additive migrations: (table, column, statements). Applied when the
     #: column is missing, decided by inspection rather than by catching the
@@ -2548,6 +2943,15 @@ class LocalStore:
         ("contacts", "caps", (
             "ALTER TABLE contacts ADD COLUMN caps INTEGER NOT NULL "
             "DEFAULT 0",)),
+        # ---- schema 3 (v9.1.0) ----------------------------------------------
+        # Who wrote an incoming GROUP message (a DM's author is its peer).
+        ("messages", "author", (
+            "ALTER TABLE messages ADD COLUMN author TEXT",)),
+        # 0 for people met only inside a group: known (their key verifies
+        # their messages) but not added, so they stay out of the chat list.
+        ("contacts", "listed", (
+            "ALTER TABLE contacts ADD COLUMN listed INTEGER NOT NULL "
+            "DEFAULT 1",)),
     )
 
     #: contacts.caps bit: this peer has sent us a valid v9 extension block,
@@ -2616,15 +3020,22 @@ class LocalStore:
 
     # ---- contacts ------------------------------------------------------------
     def upsert_contact(self, address: str, username: Optional[str],
-                       public_key: str) -> None:
+                       public_key: str, listed: bool = True) -> None:
+        """Add or refresh a contact. `listed=False` is for someone known only
+        from a group: their key is kept (it verifies their messages, and lets
+        you message them later) but they are not put in the chat list. A
+        later listed upsert, or a direct message, lists them; nothing ever
+        unlists a contact."""
         with self._lock:
             self._db.execute(
-                """INSERT INTO contacts (address, username, public_key, added_at)
-                   VALUES (?, ?, ?, ?)
+                """INSERT INTO contacts (address, username, public_key, added_at,
+                                         listed)
+                   VALUES (?, ?, ?, ?, ?)
                    ON CONFLICT(address) DO UPDATE SET
                        username = COALESCE(excluded.username, contacts.username),
-                       public_key = excluded.public_key""",
-                (address, username, public_key, now_iso()))
+                       public_key = excluded.public_key,
+                       listed = MAX(contacts.listed, excluded.listed)""",
+                (address, username, public_key, now_iso(), 1 if listed else 0))
             self._db.commit()
 
     def get_contact(self, address: str) -> Optional[dict]:
@@ -2652,11 +3063,14 @@ class LocalStore:
                 (int(bits), address))
             self._db.commit()
 
-    def contacts(self) -> list:
-        """Every contact of this identity, for pickers (forward-to)."""
+    def contacts(self, listed_only: bool = True) -> list:
+        """Contacts of this identity, for pickers (forward-to, new group)."""
+        sql = "SELECT * FROM contacts"
+        if listed_only:
+            sql += " WHERE listed = 1"
         with self._lock:
             rows = self._db.execute(
-                "SELECT * FROM contacts ORDER BY COALESCE(username, address)"
+                sql + " ORDER BY COALESCE(username, address) COLLATE NOCASE"
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -2701,7 +3115,8 @@ class LocalStore:
     def add_out(self, peer: str, body: str, created_at: str,
                 client_msg_id: str, kind: str = "text",
                 ext: Optional[dict] = None, media_path: Optional[str] = None,
-                media_state: str = "") -> int:
+                media_state: str = "", recipients: Optional[list] = None
+                ) -> int:
         """Insert an outgoing message at 0/3 (grey tick). Returns local id.
 
         `body` is always the human-readable rendering ("Photo", the caption,
@@ -2717,6 +3132,11 @@ class LocalStore:
                 (client_msg_id, peer, body, created_at, kind,
                  json.dumps(ext, separators=(",", ":")) if ext else None,
                  media_path, media_state))
+            if recipients:
+                # A group message: one delivery row per recipient, all at 0.
+                self._db.executemany(
+                    "INSERT OR IGNORE INTO group_sends (local_id, member) "
+                    "VALUES (?, ?)", [(cur.lastrowid, m) for m in recipients])
             self._db.commit()
             return cur.lastrowid
 
@@ -2751,6 +3171,9 @@ class LocalStore:
                 "SELECT id, peer, status FROM messages WHERE server_id = ? "
                 "AND direction = 'out'", (server_id,)).fetchone()
             if row is None:
+                peer = self._group_receipt(server_id, tier)
+                if peer is not None:
+                    return peer
                 # Not an error: receipts for a conversation this identity no
                 # longer holds, or for a stale id we have already released.
                 log.debug("receipt '%s' for relay id %s matched no local "
@@ -2764,6 +3187,59 @@ class LocalStore:
             self._db.commit()
             return row["peer"]
 
+    def _group_receipt(self, server_id: int, tier: int) -> Optional[str]:
+        """A receipt for one recipient's copy of a group message. Called
+        with the lock held; returns the group's peer key if anything moved."""
+        hit = self._db.execute(
+            "SELECT local_id, member, status FROM group_sends "
+            "WHERE server_id = ?", (server_id,)).fetchone()
+        if hit is None or hit["status"] >= tier:
+            return None
+        self._db.execute(
+            "UPDATE group_sends SET status = ? WHERE local_id = ? "
+            "AND member = ?", (tier, hit["local_id"], hit["member"]))
+        peer = self._settle_group_status(hit["local_id"])
+        self._db.commit()
+        return peer
+
+    def _settle_group_status(self, local_id: int) -> Optional[str]:
+        """A group message's tick is its slowest recipient's. Lock held."""
+        low = self._db.execute(
+            "SELECT MIN(status) AS s FROM group_sends WHERE local_id = ?",
+            (local_id,)).fetchone()["s"]
+        row = self._db.execute("SELECT peer, status FROM messages WHERE id = ?",
+                               (local_id,)).fetchone()
+        if row is None:
+            return None
+        if low is not None and low > row["status"]:
+            self._db.execute("UPDATE messages SET status = ? WHERE id = ?",
+                             (low, local_id))
+        return row["peer"]
+
+    def group_send_sent(self, local_id: int, member: str,
+                        server_id: int) -> bool:
+        """The relay stored `member`'s copy (1/3 for that recipient)."""
+        try:
+            with self._lock:
+                self._db.execute(
+                    "UPDATE group_sends SET server_id = ?, status = "
+                    "MAX(status, 1) WHERE local_id = ? AND member = ?",
+                    (server_id, local_id, member))
+                self._settle_group_status(local_id)
+                self._db.commit()
+            return True
+        except sqlite3.Error:
+            log.exception("local store: could not record group send %s/%s",
+                          local_id, member)
+            return False
+
+    def group_sends(self, local_id: int) -> list:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM group_sends WHERE local_id = ? ORDER BY member",
+                (local_id,)).fetchall()
+        return [dict(r) for r in rows]
+
     # Outcomes of add_in(). The caller must be able to tell these apart,
     # because only two of the three make it safe to acknowledge delivery.
     STORED = "stored"          # plaintext is now durably ours
@@ -2773,7 +3249,8 @@ class LocalStore:
     def add_in(self, peer: str, body: str, created_at: str,
                server_id: Optional[int], client_msg_id: Optional[str],
                unread: bool = True, kind: str = "text",
-               ext: Optional[dict] = None, media_state: str = "") -> str:
+               ext: Optional[dict] = None, media_state: str = "",
+               author: Optional[str] = None) -> str:
         """Insert an incoming message (unread).
 
         Returns STORED, DUPLICATE or FAILED. The old boolean collapsed
@@ -2799,8 +3276,9 @@ class LocalStore:
                 if client_msg_id:
                     dup = self._db.execute(
                         """SELECT 1 FROM messages WHERE client_msg_id = ?
-                           AND peer = ? AND direction = 'in'""",
-                        (client_msg_id, peer)).fetchone()
+                           AND peer = ? AND direction = 'in'
+                           AND COALESCE(author, '') = ?""",
+                        (client_msg_id, peer, author or "")).fetchone()
                 elif server_id:
                     dup = self._db.execute(
                         """SELECT 1 FROM messages WHERE server_id = ?
@@ -2815,13 +3293,13 @@ class LocalStore:
                     """INSERT INTO messages (server_id, client_msg_id, peer,
                                              direction, body, status, read,
                                              created_at, receipt_sent, kind,
-                                             ext, media_state)
-                       VALUES (?, ?, ?, 'in', ?, 0, ?, ?, ?, ?, ?, ?)""",
+                                             ext, media_state, author)
+                       VALUES (?, ?, ?, 'in', ?, 0, ?, ?, ?, ?, ?, ?, ?)""",
                     (server_id, client_msg_id, peer, body,
                      0 if unread else 1, created_at, 0 if unread else 1,
                      kind,
                      json.dumps(ext, separators=(",", ":")) if ext else None,
-                     media_state))
+                     media_state, author))
                 self._db.commit()
                 return self.STORED
         except sqlite3.Error:
@@ -2943,30 +3421,60 @@ class LocalStore:
                 (peer,)).fetchone()
         return int(row["n"] if row else 0)
 
-    def conversations(self) -> list:
-        """Distinct peers by recent activity, with preview + unread count."""
+    def conversations(self, me: Optional[str] = None) -> list:
+        """Every conversation by recent activity, with preview + unread count.
+
+        Each row carries `kind`: 'dm', 'group' (peer 'g:<gid>') or 'self'
+        (peer == `me`, the notes-to-self chat). The newest message's
+        direction, kind, status and author come along, so the list can show
+        "You: …" and its tick without a query per row.
+        """
         with self._lock:
             rows = self._db.execute(
                 """SELECT m.peer, c.username, c.ticks_enabled, c.notify,
-                          (SELECT body FROM messages WHERE peer = m.peer
-                             ORDER BY id DESC LIMIT 1) AS preview,
-                          (SELECT created_at FROM messages
-                             WHERE peer = m.peer ORDER BY id DESC LIMIT 1)
-                             AS last_at,
+                          g.name AS group_name, g.notify AS group_notify,
+                          g.state AS group_state,
+                          l.body AS preview, l.created_at AS last_at,
+                          l.direction AS last_direction, l.kind AS last_kind,
+                          l.status AS last_status, l.author AS last_author,
                           SUM(CASE WHEN m.direction = 'in' AND m.read = 0
                               THEN 1 ELSE 0 END) AS unread,
                           MAX(m.id) AS last_id
                    FROM messages m
                    LEFT JOIN contacts c ON c.address = m.peer
+                   LEFT JOIN groups g ON 'g:' || g.gid = m.peer
+                   JOIN messages l ON l.id = (SELECT MAX(id) FROM messages
+                                              WHERE peer = m.peer)
                    GROUP BY m.peer ORDER BY last_id DESC""").fetchall()
             contact_only = self._db.execute(
                 """SELECT address AS peer, username, ticks_enabled, notify,
                           NULL AS preview, added_at AS last_at,
                           0 AS unread, 0 AS last_id
                    FROM contacts
-                   WHERE address NOT IN (SELECT DISTINCT peer FROM messages)
+                   WHERE listed = 1
+                     AND address NOT IN (SELECT DISTINCT peer FROM messages)
                    ORDER BY added_at DESC""").fetchall()
-        return [dict(r) for r in rows] + [dict(r) for r in contact_only]
+            group_only = self._db.execute(
+                """SELECT 'g:' || gid AS peer, name AS group_name,
+                          notify AS group_notify, state AS group_state,
+                          NULL AS preview, updated_at AS last_at,
+                          0 AS unread, 0 AS last_id
+                   FROM groups WHERE 'g:' || gid NOT IN
+                       (SELECT DISTINCT peer FROM messages)
+                   ORDER BY updated_at DESC""").fetchall()
+        out = []
+        for row in [dict(r) for r in rows] + [dict(r) for r in group_only] \
+                + [dict(r) for r in contact_only]:
+            peer = row["peer"]
+            if peer.startswith(GROUP_PREFIX):
+                row["kind"] = "group"
+                row["notify"] = row.get("group_notify", 1)
+            elif me is not None and peer == me:
+                row["kind"] = "self"
+            else:
+                row["kind"] = "dm"
+            out.append(row)
+        return out
 
     # ---- v9: stars, deletion, lookups, media ---------------------------------
     def message(self, local_id: int) -> Optional[dict]:
@@ -3029,7 +3537,8 @@ class LocalStore:
         """Delete for me. Returns the removed rows (for their media files).
 
         Each deleted message's client id is tombstoned so a re-push from the
-        relay cannot resurrect it.
+        relay cannot resurrect it; its reactions and group delivery rows go
+        with it.
         """
         rows = self.messages_by_ids(local_ids)
         if not rows:
@@ -3037,12 +3546,19 @@ class LocalStore:
         with self._lock:
             for row in rows:
                 self._tombstone(row["peer"], [row["client_msg_id"]])
+                if row["client_msg_id"]:
+                    self._db.execute(
+                        "DELETE FROM reactions WHERE peer = ? AND cid = ?",
+                        (row["peer"], row["client_msg_id"]))
             self._db.executemany("DELETE FROM messages WHERE id = ?",
+                                 [(r["id"],) for r in rows])
+            self._db.executemany("DELETE FROM group_sends WHERE local_id = ?",
                                  [(r["id"],) for r in rows])
             self._db.commit()
         return rows
 
-    def delete_by_author(self, author: str, cids: list) -> list:
+    def delete_by_author(self, author: str, cids: list,
+                         peer: Optional[str] = None) -> list:
         """Apply a delete-for-both that `author` sent us.
 
         Only INCOMING messages from `author` are eligible. The request is
@@ -3058,15 +3574,22 @@ class LocalStore:
         if not cids:
             return []
         marks = ",".join("?" * len(cids))
+        # In a group (`peer` 'g:…') the author is recorded per message; in a
+        # DM the author IS the peer.
+        peer = peer or author
         with self._lock:
             rows = [dict(r) for r in self._db.execute(
                 f"""SELECT * FROM messages WHERE peer = ? AND direction = 'in'
+                    AND COALESCE(author, peer) = ?
                     AND client_msg_id IN ({marks})""",
-                [author] + cids).fetchall()]
-            self._tombstone(author, cids)
+                [peer, author] + cids).fetchall()]
+            self._tombstone(peer, cids)
             if rows:
                 self._db.executemany("DELETE FROM messages WHERE id = ?",
                                      [(r["id"],) for r in rows])
+                self._db.executemany(
+                    "DELETE FROM reactions WHERE peer = ? AND cid = ?",
+                    [(peer, r["client_msg_id"]) for r in rows])
             self._db.commit()
         return rows
 
@@ -3108,6 +3631,127 @@ class LocalStore:
                 f"UPDATE messages SET {', '.join(sets)} WHERE id = ?",
                 args + [int(local_id)])
             self._db.commit()
+
+    # ---- v9.1: group chats ---------------------------------------------------
+    @staticmethod
+    def _group_row(row) -> Optional[dict]:
+        if row is None:
+            return None
+        group = dict(row)
+        try:
+            group["members"] = json.loads(group["members"] or "[]")
+        except (TypeError, ValueError):
+            group["members"] = []
+        return group
+
+    def group(self, gid: str) -> Optional[dict]:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM groups WHERE gid = ?",
+                                   (gid,)).fetchone()
+        return self._group_row(row)
+
+    def groups(self) -> list:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM groups ORDER BY name COLLATE NOCASE").fetchall()
+        return [self._group_row(r) for r in rows]
+
+    def save_group(self, state: dict, status: str = "active") -> None:
+        """Store a group's full state (already sanitised): insert or replace.
+        `notify` is the user's own setting and survives updates."""
+        stamp = now_iso()
+        with self._lock:
+            self._db.execute(
+                """INSERT INTO groups (gid, name, admin, members, version,
+                                       state, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(gid) DO UPDATE SET
+                       name = excluded.name, admin = excluded.admin,
+                       members = excluded.members, version = excluded.version,
+                       state = excluded.state, updated_at = excluded.updated_at""",
+                (state["id"], state["name"], state["admin"],
+                 json.dumps(state["members"], separators=(",", ":")),
+                 int(state["v"]), status, stamp, stamp))
+            self._db.commit()
+
+    def set_group_state(self, gid: str, status: str) -> None:
+        assert status in ("active", "pending", "left", "removed")
+        with self._lock:
+            self._db.execute("UPDATE groups SET state = ?, updated_at = ? "
+                             "WHERE gid = ?", (status, now_iso(), gid))
+            self._db.commit()
+
+    def set_group_notify(self, gid: str, on: bool) -> None:
+        with self._lock:
+            self._db.execute("UPDATE groups SET notify = ? WHERE gid = ?",
+                             (1 if on else 0, gid))
+            self._db.commit()
+
+    def add_event(self, peer: str, body: str,
+                  created_at: Optional[str] = None) -> int:
+        """A line of conversation history that nobody sent — "Ann added
+        Ben", "You left". Stored as an already-read incoming row of kind
+        'event', so older releases still show its text."""
+        with self._lock:
+            cur = self._db.execute(
+                """INSERT INTO messages (peer, direction, body, status, read,
+                                         created_at, receipt_sent, kind)
+                   VALUES (?, 'in', ?, 0, 1, ?, 1, 'event')""",
+                (peer, body, created_at or now_iso()))
+            self._db.commit()
+            return cur.lastrowid
+
+    # ---- v9.1: reactions -------------------------------------------------------
+    def set_reaction(self, peer: str, cid: str, reactor: str,
+                     emoji: str) -> bool:
+        """Record `reactor`'s reaction to message `cid` in `peer`'s chat;
+        an empty emoji takes it back. True if anything changed."""
+        with self._lock:
+            old = self._db.execute(
+                "SELECT emoji FROM reactions WHERE peer = ? AND cid = ? "
+                "AND reactor = ?", (peer, cid, reactor)).fetchone()
+            if emoji:
+                if old is not None and old["emoji"] == emoji:
+                    return False
+                self._db.execute(
+                    """INSERT INTO reactions (peer, cid, reactor, emoji, at)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(peer, cid, reactor) DO UPDATE SET
+                           emoji = excluded.emoji, at = excluded.at""",
+                    (peer, cid, reactor, emoji, now_iso()))
+            else:
+                if old is None:
+                    return False
+                self._db.execute(
+                    "DELETE FROM reactions WHERE peer = ? AND cid = ? "
+                    "AND reactor = ?", (peer, cid, reactor))
+            self._db.commit()
+        return True
+
+    def reaction_of(self, peer: str, cid: str, reactor: str) -> str:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT emoji FROM reactions WHERE peer = ? AND cid = ? "
+                "AND reactor = ?", (peer, cid, reactor)).fetchone()
+        return row["emoji"] if row else ""
+
+    def reactions_for(self, peer: str, cids: list) -> dict:
+        """{cid: [(emoji, reactor, at), …]} oldest first, for `cids`."""
+        cids = [c for c in cids if c]
+        if not cids:
+            return {}
+        out: dict = {}
+        with self._lock:
+            for start in range(0, len(cids), 400):
+                chunk = cids[start:start + 400]
+                marks = ",".join("?" * len(chunk))
+                for row in self._db.execute(
+                        f"""SELECT cid, emoji, reactor, at FROM reactions
+                            WHERE peer = ? AND cid IN ({marks})
+                            ORDER BY at, reactor""", [peer] + chunk):
+                    out.setdefault(row["cid"], []).append(
+                        (row["emoji"], row["reactor"], row["at"]))
+        return out
 
     # ---- plaintext chat import / export --------------------------------------
     def import_message(self, peer: str, direction: str, body: str,
@@ -3472,17 +4116,25 @@ class SyncWorker(threading.Thread):
                                               fragment, exc)
 
         inner = payload["sender"]
+        x = payload.get("x")
+        ctl = x.get("ctl") if isinstance(x, dict) and x.get("k") == "ctl" \
+            else None
+        group_traffic = isinstance(x, dict) and (
+            isinstance(x.get("grp"), dict) or (isinstance(ctl, dict) and (
+                ctl.get("grp") or ctl.get("op") in ("group", "leave"))))
         # Verified sender keys come from INSIDE the authenticated ciphertext
-        # — trust them over anything the directory says.
+        # — trust them over anything the directory says. Someone met only
+        # in a group is remembered but not added to the chat list.
         try:
             self.app.store.upsert_contact(sender, inner.get("username"),
-                                          inner["public_key"])
+                                          inner["public_key"],
+                                          listed=not group_traffic)
         except sqlite3.Error:
             log.exception("could not update contact record for %s", sender)
             MessageFlowLog.dropped(server_id, who, "contact upsert failed")
             return None
 
-        x = payload.get("x")
+        conversation, author = sender, None
         kind, ext, media_state = "text", None, ""
         if x is not None:
             # A verified block proves this peer runs v9: remember it, so the
@@ -3493,8 +4145,19 @@ class SyncWorker(threading.Thread):
             except sqlite3.Error:
                 log.exception("could not record capabilities of %s", sender)
             if x.get("k") == "ctl":
-                return self._handle_control(server_id, sender, cid,
-                                            x.get("ctl"), who)
+                return self._handle_control(server_id, sender, cid, ctl, who,
+                                            inner)
+            if isinstance(x.get("grp"), dict):
+                gid = self._group_route(sanitize_gid(x["grp"].get("id")),
+                                        sender, inner)
+                if gid is None:
+                    # From someone who is not (or no longer) a member of a
+                    # group we are in. Not ours to show: acknowledge it so
+                    # the relay forgets it, and store nothing.
+                    MessageFlowLog.dropped(server_id, who,
+                                           "group message from a non-member")
+                    return server_id
+                conversation, author = group_peer(gid), sender
             ext = sanitize_ext(x) or None
             media = (ext or {}).get("media")
             if x.get("k") == "media" and media is not None:
@@ -3502,11 +4165,11 @@ class SyncWorker(threading.Thread):
 
         body = sanitize_text(str(payload.get("body", "")))
         outcome = self.app.store.add_in(
-            peer=sender, body=body,
+            peer=conversation, body=body,
             created_at=payload.get("sent_at",
                                    msg.get("created_at", now_iso())),
             server_id=server_id, client_msg_id=cid, kind=kind, ext=ext,
-            media_state=media_state)
+            media_state=media_state, author=author)
 
         if outcome == LocalStore.FAILED:
             # Not ours yet. Withhold the ack; the relay keeps its copy and
@@ -3528,50 +4191,201 @@ class SyncWorker(threading.Thread):
                             MessageFlowLog.who(self.app.keys.address,
                                                self.app.keys.username),
                             f"{fragment}  [stored locally — acking]")
-        self.app.ui_queue.put(("message_stored", sender))
+        self.app.ui_queue.put(("message_stored", conversation))
         # Separate from message_stored, which also fires for receipts and
         # deletions: THIS one means a new message someone may want to hear
         # about, and is what notifications are raised from.
-        self.app.ui_queue.put(("incoming", sender, body, kind))
+        self.app.ui_queue.put(("incoming", conversation, body, kind, sender))
         if media_state == "pending":
-            self.app.ui_queue.put(("media_pending", sender, cid))
+            self.app.ui_queue.put(("media_pending", conversation, cid))
         return server_id
 
+    # ---- v9.1: groups ----------------------------------------------------------
+    def _member_entry(self, address: str, inner: Optional[dict] = None) -> dict:
+        if address == self.app.keys.address:
+            entry = {"a": address, "k": self.app.keys.public_key_hex}
+            if self.app.keys.username:
+                entry["u"] = self.app.keys.username
+            return entry
+        entry = {"a": address, "k": (inner or {}).get("public_key", "")}
+        if (inner or {}).get("username"):
+            entry["u"] = inner["username"]
+        return entry
+
+    def _group_route(self, gid: Optional[str], sender: str,
+                     inner: dict) -> Optional[str]:
+        """Which group conversation a group message belongs in, or None to
+        drop it. A message for a group we have never heard of — its
+        invitation is still on the way — is kept in a placeholder that the
+        group's real state replaces when it arrives."""
+        if gid is None:
+            return None
+        store = self.app.store
+        group = store.group(gid)
+        if group is None:
+            store.save_group({"id": gid, "name": "New group", "v": 0,
+                              "admin": sender,
+                              "members": [self._member_entry(sender, inner),
+                                          self._member_entry(
+                                              self.app.keys.address)]},
+                             status="pending")
+            return gid
+        if group["state"] in ("left", "removed"):
+            return None
+        if sender not in {m["a"] for m in group["members"]}:
+            return None
+        return gid
+
+    def _who(self, address: str, start: bool = True) -> str:
+        if address == self.app.keys.address:
+            return "You" if start else "you"
+        contact = self.app.store.get_contact(address) or {}
+        return contact.get("username") or short_addr(address, 10)
+
+    def _apply_group_state(self, sender: str, state: Optional[dict]) -> None:
+        """Adopt a group's new state — only from its admin, only if newer.
+
+        An invitation (a state we did not have) is accepted only from the
+        admin it names and only if it lists us; after that only the admin we
+        already know may change the group, and only with a higher version,
+        so neither a member nor a replay can rewrite it.
+        """
+        if state is None:
+            return
+        store, me = self.app.store, self.app.keys.address
+        gid = state["id"]
+        peer = group_peer(gid)
+        local = store.group(gid)
+        members = {m["a"] for m in state["members"]}
+        if local is None or local["state"] == "pending":
+            if sender != state["admin"] or me not in members:
+                return
+            store.save_group(state, "active")
+            for member in state["members"]:
+                if member["a"] != me:
+                    store.upsert_contact(member["a"], member.get("u"),
+                                         member["k"], listed=False)
+            store.add_event(peer, f"{self._who(sender)} added you to "
+                                  f"\u201c{state['name']}\u201d")
+            self.app.ui_queue.put(("message_stored", peer))
+            return
+        if sender != local["admin"] or state["v"] <= local["version"]:
+            return
+        before = {m["a"] for m in local["members"]}
+        status = "active" if me in members else (
+            "left" if local["state"] == "left" else "removed")
+        store.save_group(state, status)
+        for member in state["members"]:
+            if member["a"] != me:
+                store.upsert_contact(member["a"], member.get("u"),
+                                     member["k"], listed=False)
+        who = self._who(sender)
+        if state["name"] != local["name"]:
+            store.add_event(peer, f"{who} renamed the group "
+                                  f"\u201c{state['name']}\u201d")
+        added = [m for m in state["members"] if m["a"] not in before]
+        removed = [a for a in before if a not in members]
+        if added:
+            store.add_event(peer, f"{who} added " + ", ".join(
+                self._who(m["a"], start=False) if m["a"] == me
+                else m.get("u") or self._who(m["a"]) for m in added))
+        for address in removed:
+            if address == me:
+                store.add_event(peer, f"{who} removed you")
+            elif address != sender:
+                store.add_event(peer, f"{who} removed {self._who(address)}")
+        if state["admin"] != local["admin"]:
+            store.add_event(peer, f"{self._who(state['admin'])} now "
+                                  f"administers the group")
+        self.app.ui_queue.put(("message_stored", peer))
+
+    def _apply_leave(self, sender: str, gid: Optional[str]) -> None:
+        """A member left. Everyone drops them at once; if it was the admin,
+        the first remaining member takes over — the same choice on every
+        phone — and the admin (old or new) publishes the result."""
+        store, me = self.app.store, self.app.keys.address
+        local = store.group(gid) if gid else None
+        if local is None or sender not in {m["a"] for m in local["members"]}:
+            return
+        members = [m for m in local["members"] if m["a"] != sender]
+        admin = local["admin"]
+        if admin == sender:
+            admin = members[0]["a"] if members else me
+        store.save_group({"id": gid, "name": local["name"],
+                          "v": local["version"], "admin": admin,
+                          "members": members}, local["state"])
+        peer = group_peer(gid)
+        store.add_event(peer, f"{self._who(sender)} left")
+        self.app.ui_queue.put(("message_stored", peer))
+        if admin == me and local["state"] == "active" and len(members) > 1:
+            self.app.ui_queue.put(("group_publish", gid))
+
     def _handle_control(self, server_id, sender: str, cid: Optional[str],
-                        ctl, who: str) -> Optional[int]:
+                        ctl, who: str,
+                        inner: Optional[dict] = None) -> Optional[int]:
         """Act on a control message (v9). Nothing is stored for one — it is
         an instruction, not a message — and it is always acknowledged, since
         a malformed or unknown instruction is not going to improve by being
-        re-delivered."""
+        re-delivered.
+
+        A control naming a group ("grp") acts on that group's conversation,
+        and only if the sender is one of its members.
+        """
         store = self.app.store
         if not isinstance(ctl, dict) or not store.consume_control(sender, cid):
             return server_id
         op = ctl.get("op")
+        if op == "group":
+            self._apply_group_state(sender, sanitize_group_state(ctl.get("g")))
+            return server_id
+        if op == "leave":
+            self._apply_leave(sender, sanitize_gid(ctl.get("grp")))
+            return server_id
+        conversation = sender
+        if ctl.get("grp") is not None:
+            gid = sanitize_gid(ctl.get("grp"))
+            group = store.group(gid) if gid else None
+            if group is None or group["state"] != "active" or sender not in {
+                    m["a"] for m in group["members"]}:
+                log.info("ignoring %r from %s for a group it is not in", op,
+                         sender)
+                return server_id
+            conversation = group_peer(gid)
+        if op == "react":
+            target = _str(ctl.get("cid"), 64)
+            emoji = sanitize_emoji(ctl.get("e"))
+            if target and _TOKEN_RE.match(target) and emoji is not None:
+                if store.set_reaction(conversation, target, sender, emoji):
+                    self.app.ui_queue.put(("reaction", conversation, target,
+                                           sender, emoji))
+                    self.app.ui_queue.put(("message_stored", conversation))
+            return server_id
         if op == "delete":
             cids = ctl.get("cids") if isinstance(ctl.get("cids"), list) else []
-            removed = store.delete_by_author(sender, cids)
+            removed = store.delete_by_author(sender, cids, conversation)
             for row in removed:
                 discard_media_file(row.get("media_path"))
             flow_log.info("✗   in   ctl  from %s  deleted %d of %d message(s) "
                           "for both sides", who, len(removed), len(cids))
-            self.app.ui_queue.put(("message_stored", sender))
+            self.app.ui_queue.put(("message_stored", conversation))
         elif op == "resend":
             # They could not fetch a photo/voice note we sent — the relay
             # has let it expire. Our device still has the file: upload again.
             target = _str(ctl.get("cid"), 64)
             if target:
-                self.app.ui_queue.put(("resend_request", sender, target))
+                self.app.ui_queue.put(("resend_request", sender, target,
+                                       gid_of(conversation)))
         elif op == "remedia":
             target = _str(ctl.get("cid"), 64)
             media = sanitize_media(ctl.get("media"))
-            row = (store.message_by_cid(sender, target, "in")
+            row = (store.message_by_cid(conversation, target, "in")
                    if target and media else None)
-            if row is not None:
+            if row is not None and (row.get("author") or row["peer"]) == sender:
                 ext = json.loads(row.get("ext") or "{}")
                 ext["media"] = media
                 store.set_media(row["id"], state="pending", ext=ext)
-                self.app.ui_queue.put(("message_stored", sender))
-                self.app.ui_queue.put(("media_pending", sender, target))
+                self.app.ui_queue.put(("message_stored", conversation))
+                self.app.ui_queue.put(("media_pending", conversation, target))
         else:
             log.info("ignoring unknown control op %r from %s", op, sender)
         return server_id
@@ -3850,16 +4664,21 @@ class SyncWorker(threading.Thread):
 
 
 # =============================================================================
-#  Cozy widget kit — small, warm building blocks used by every screen
+#  Widget kit (v9.1) — the parts every screen is built from
 # =============================================================================
+TOUCH = dp(48)                     # the smallest tap target anywhere
+
+
 def paint_round(widget, hex_color: str, radius=None, corners=None):
-    """Rounded warm surface behind a widget. Returns the Color instruction so
-    callers can retint it (press feedback, selection)."""
+    """A rounded ground behind a widget. Returns (Color, shape) so callers
+    can retint it (press feedback, selection)."""
     with widget.canvas.before:
         col = Color(*C(hex_color))
         rect = RoundedRectangle(
             pos=widget.pos, size=widget.size,
-            radius=corners if corners is not None else [radius or dp(12)])
+            radius=corners if corners is not None else [radius if radius
+                                                        is not None else
+                                                        dp(6)])
 
     def _sync(*_a):
         rect.pos, rect.size = widget.pos, widget.size
@@ -3867,16 +4686,16 @@ def paint_round(widget, hex_color: str, radius=None, corners=None):
     return col, rect
 
 
-def paint_border(widget, hex_color: str, radius=None, width=1.1):
+def paint_border(widget, hex_color: str, radius=None, width=1.0):
+    radius = dp(6) if radius is None else radius
     with widget.canvas.after:
         col = Color(*C(hex_color))
         line = Line(width=dp(width) / 2.0, rounded_rectangle=(
-            widget.x, widget.y, widget.width, widget.height,
-            radius or dp(12)))
+            widget.x, widget.y, widget.width, widget.height, radius))
 
     def _sync(*_a):
-        line.rounded_rectangle = (widget.x, widget.y, widget.width,
-                                  widget.height, radius or dp(12))
+        line.rounded_rectangle = (widget.x + .5, widget.y + .5,
+                                  widget.width - 1, widget.height - 1, radius)
     widget.bind(pos=_sync, size=_sync)
     return col
 
@@ -3892,82 +4711,313 @@ def paint_circle(widget, hex_color: str):
     return col
 
 
-class CozyButton(ButtonBehavior, Label):
-    """Rounded, flat button. `filled` gives a gold primary;
-    `outline` gives a quiet bordered secondary."""
+def hairline(widget, edge: str = "bottom", color: Optional[str] = None,
+             inset: float = 0.0, inset_right: float = 0.0):
+    """A one-pixel rule along one edge — the app's only kind of border."""
+    with widget.canvas.after:
+        col = Color(*C(color or T.rule))
+        rule = Rectangle()
 
-    def __init__(self, text="", bg=COL_ACCENT, fg="#FFFFFF", outline=None,
-                 radius=None, font_size=None, bold=True, pressed=None, **kw):
+    def _sync(*_a):
+        y = widget.y if edge == "bottom" else widget.top - dp(1)
+        rule.pos = (widget.x + inset, y)
+        rule.size = (max(0, widget.width - inset - inset_right), dp(1))
+    widget.bind(pos=_sync, size=_sync)
+    _sync()
+    return col
+
+
+def ink_color(seed: str) -> str:
+    """A person's avatar colour, made readable as TEXT on this theme's
+    surfaces (author names in a group)."""
+    base = avatar_color(seed)
+    return mix(base, "#FFFFFF", .45) if T.dark else mix(base, "#000000", .18)
+
+
+class Rule(Widget):
+    """A free-standing hairline (between rows, under a heading)."""
+
+    def __init__(self, color: Optional[str] = None, inset: float = 0, **kw):
         kw.setdefault("size_hint_y", None)
-        kw.setdefault("height", dp(44))
-        super().__init__(text=text, **kw)
-        self.bold = bold
-        self.font_size = font_size or sp(15)
-        self.color = C(fg)
-        self._bg_hex, self._pressed_hex = bg, pressed or COL_ACCENT_DARK
-        radius = radius if radius is not None else dp(12)
-        self._bg_col, _ = paint_round(self, bg, radius=radius)
-        if outline:
-            paint_border(self, outline, radius=radius)
-            self._pressed_hex = pressed or COL_PRESSED
-        self.bind(state=self._on_state)
+        kw.setdefault("height", dp(1))
+        super().__init__(**kw)
+        with self.canvas:
+            Color(*C(color or T.rule))
+            self._r = Rectangle()
+        self._inset = inset
+        self.bind(pos=self._sync, size=self._sync)
+
+    def _sync(self, *_a):
+        self._r.pos = (self.x + self._inset, self.y)
+        self._r.size = (max(0, self.width - self._inset), dp(1))
+
+
+class CapsLabel(Widget):
+    """Tracked capitals in the caps face (data/fonts/ui.ttf).
+
+    Capitals want letter-spacing, and Kivy's text renderer has none, so
+    each glyph is rendered once (white, cached per size) and laid out here
+    with the tracking added; the colour is a tint over the cached glyphs.
+    Too long for its width, it ends in an ellipsis.
+    """
+
+    _glyphs: dict = {}
+
+    def __init__(self, text: str = "", size: float = 11.5,
+                 color: Optional[str] = None, tracking: float = 0.12,
+                 halign: str = "left", **kw):
+        self._px = fs(size)
+        kw.setdefault("size_hint_y", None)
+        kw.setdefault("height", round(self._px * 1.6))
+        super().__init__(**kw)
+        self._track = self._px * tracking
+        self._color = color or T.text_3
+        self.halign = halign
+        self._text = ""
+        self.natural_width = 0.0
+        self.bind(pos=self._redraw, size=self._redraw)
+        self.text = text
+
+    @classmethod
+    def glyph(cls, ch: str, px: float):
+        key = (ch, round(px, 1))
+        tex = cls._glyphs.get(key)
+        if tex is None:
+            core = CoreLabel(text=ch, font_size=px, font_name=CAPS_FONT_NAME,
+                             color=(1, 1, 1, 1))
+            core.refresh()
+            tex = cls._glyphs[key] = core.texture
+        return tex
+
+    @property
+    def text(self) -> str:
+        return self._text
+
+    @text.setter
+    def text(self, value: str) -> None:
+        self._text = str(value or "").upper()
+        widths = [self.glyph(c, self._px).width for c in self._text]
+        self.natural_width = (sum(widths) + self._track *
+                              max(0, len(widths) - 1))
+        self._redraw()
+
+    def set_color(self, hex_color: str) -> None:
+        self._color = hex_color
+        self._redraw()
+
+    def _fit(self) -> str:
+        text = self._text
+        if self.width <= 0 or self.natural_width <= self.width + 0.5:
+            return text
+        ell = self.glyph("…", self._px).width
+        room, out = self.width - ell, ""
+        for ch in text:
+            w = self.glyph(ch, self._px).width + self._track
+            if room - w < 0:
+                break
+            room -= w
+            out += ch
+        return out.rstrip() + "…"
+
+    def _redraw(self, *_a) -> None:
+        self.canvas.clear()
+        text = self._fit()
+        if not text:
+            return
+        texes = [self.glyph(c, self._px) for c in text]
+        total = sum(t.width for t in texes) + self._track * (len(texes) - 1)
+        if self.halign == "center":
+            x = (self.x + self.width / 2) - total / 2
+        elif self.halign == "right":
+            x = self.right - total
+        else:
+            x = self.x
+        with self.canvas:
+            Color(*C(self._color))
+            for tex in texes:
+                y = round((self.y + self.height / 2) - tex.height / 2)
+                Rectangle(texture=tex, pos=(round(x), y), size=tex.size)
+                x += tex.width + self._track
+
+
+class InfoLabel(Label):
+    """Wrapping serif text that sizes itself to its content."""
+
+    def __init__(self, text: str = "", color: Optional[str] = None,
+                 font_size=None, bold: bool = False, halign: str = "left",
+                 italic: bool = False, **kw):
+        kw.setdefault("size_hint_y", None)
+        kw.setdefault("markup", True)
+        super().__init__(text=text, color=C(color or T.text), bold=bold,
+                         italic=italic, font_size=font_size or fs(16),
+                         halign=halign, valign="top", **kw)
+        self.bind(width=lambda *_: setattr(self, "text_size",
+                                           (self.width, None)),
+                  texture_size=lambda *_: setattr(self, "height",
+                                                  self.texture_size[1]))
+
+
+def single_line(text: str, font_size, color, bold=False, **kw) -> Label:
+    """A one-line label that ends in an ellipsis rather than overflowing —
+    every name and preview in the app."""
+    label = Label(text=text, font_size=font_size, color=C(color), bold=bold,
+                  halign=kw.pop("halign", "left"), valign="middle",
+                  shorten=True, shorten_from="right", max_lines=1, **kw)
+    label.bind(size=lambda w, v: setattr(w, "text_size", v))
+    return label
+
+
+def line_height(size: float, factor: float = 1.32) -> float:
+    """The height a line of serif text at `size` (sp) needs."""
+    return round(fs(size) * factor)
+
+
+class Btn(ButtonBehavior, Widget):
+    """A button with a tracked-capitals label.
+
+    primary  — gold ground, the one thing the screen is for
+    quiet    — hairline outline, everything else
+    danger   — red outline and text, for what cannot be undone
+    solid_danger — red ground (the final 'Remove')
+    text     — no ground at all, in the accent
+    """
+
+    def __init__(self, text: str = "", kind: str = "primary", **kw):
+        kw.setdefault("size_hint_y", None)
+        kw.setdefault("height", TOUCH)
+        on_release = kw.pop("on_release", None)
+        super().__init__(**kw)
+        self.kind = kind
+        fill = {"primary": T.accent, "solid_danger": T.alert}.get(kind)
+        ink = {"primary": T.on_accent, "solid_danger": T.on_alert,
+               "danger": T.alert, "text": T.accent}.get(kind, T.text)
+        edge = {"quiet": T.rule_strong, "danger": T.alert}.get(kind)
+        self._fill_hex = fill
+        with self.canvas.before:
+            self._bg = Color(*(C(fill) if fill else (0, 0, 0, 0)))
+            self._shape = RoundedRectangle(radius=[dp(4)])
+            self._edge = Color(*(C(edge) if edge else (0, 0, 0, 0)))
+            self._line = Line(width=dp(1) / 2.0)
+        self.label = CapsLabel(text, size=12.5, color=ink, tracking=0.14,
+                               halign="center", size_hint=(None, None))
+        self.add_widget(self.label)
+        self.bind(pos=self._sync, size=self._sync, state=self._on_state,
+                  disabled=lambda _w, d: setattr(self, "opacity",
+                                                 .4 if d else 1))
+        if on_release is not None:
+            self.bind(on_release=on_release)
+
+    @property
+    def text(self) -> str:
+        return self.label.text
+
+    @text.setter
+    def text(self, value: str) -> None:
+        self.label.text = value
+
+    def natural_width(self) -> float:
+        return self.label.natural_width + dp(36)
+
+    def _sync(self, *_a):
+        self._shape.pos, self._shape.size = self.pos, self.size
+        self._line.rounded_rectangle = (self.x + .5, self.y + .5,
+                                        self.width - 1, self.height - 1,
+                                        dp(4))
+        self.label.size = (max(0, self.width - dp(20)), self.label.height)
+        self.label.center = (self.x + self.width / 2, self.y + self.height / 2)
 
     def _on_state(self, _w, state):
-        self._bg_col.rgba = C(self._pressed_hex if state == "down"
-                              else self._bg_hex)
+        if self._fill_hex:
+            self._bg.rgba = C(T.accent_press if self.kind == "primary"
+                              and state == "down" else self._fill_hex)
+            if self.kind == "solid_danger":
+                self._bg.a = .85 if state == "down" else 1
+        else:
+            self._bg.rgba = C(T.press) if state == "down" else (0, 0, 0, 0)
+
+
+class ButtonRow(BoxLayout):
+    """Buttons side by side — or stacked, when their labels would not fit
+    side by side (large text, a narrow phone)."""
+
+    def __init__(self, buttons, spacing=None, **kw):
+        kw.setdefault("size_hint_y", None)
+        kw.setdefault("height", TOUCH)
+        super().__init__(spacing=spacing if spacing is not None else dp(10),
+                         **kw)
+        self.buttons = list(buttons)
+        for b in self.buttons:
+            self.add_widget(b)
+        self.bind(width=self._reflow)
+
+    def _reflow(self, *_a) -> None:
+        share = (self.width - self.spacing * (len(self.buttons) - 1)) / \
+            max(1, len(self.buttons))
+        stack = any(b.natural_width() > share for b in self.buttons)
+        self.orientation = "vertical" if stack else "horizontal"
+        n = len(self.buttons) if stack else 1
+        self.height = TOUCH * n + self.spacing * (n - 1)
+
+
+def button_row(*buttons, spacing=None) -> BoxLayout:
+    return ButtonRow(buttons, spacing=spacing)
 
 
 def draw_icon(name: str, cx: float, cy: float, size: float, rgba,
               width: Optional[float] = None) -> None:
-    """Draw one vector icon into the CURRENT canvas context.
+    """Draw one line icon into the CURRENT canvas context.
 
-    Every icon in the app is drawn rather than typed: Kivy's bundled Roboto
-    has no glyphs for symbols (stars, bells, arrows, ticks all render as
-    empty boxes), and drawing also keeps them crisp at any density. Each
-    icon fits a `size` square centred on (cx, cy).
+    Icons are drawn, not typed: no font has the whole set, and drawing keeps
+    them crisp at any density. Each fits a `size` square centred on
+    (cx, cy), in thin even strokes.
     """
     h = size / 2.0
-    w = width or max(dp(1.4), size * 0.08)
+    w = width or max(dp(1.2), size * 0.072)
     Color(*rgba)
     line = dict(width=w, cap="round", joint="round")
     if name == "back":
-        Line(points=[cx + h * .30, cy + h * .62, cx - h * .32, cy,
-                     cx + h * .30, cy - h * .62], **line)
+        Line(points=[cx + h * .28, cy + h * .60, cx - h * .32, cy,
+                     cx + h * .28, cy - h * .60], **line)
+    elif name == "chevron":
+        Line(points=[cx - h * .18, cy + h * .44, cx + h * .22, cy,
+                     cx - h * .18, cy - h * .44], **line)
     elif name == "close":
-        k = h * .55
+        k = h * .52
         Line(points=[cx - k, cy - k, cx + k, cy + k], **line)
         Line(points=[cx - k, cy + k, cx + k, cy - k], **line)
     elif name == "more":                       # vertical ellipsis
-        r = max(dp(1.7), size * .09)
-        for dy in (-h * .58, 0, h * .58):
+        r = max(dp(1.6), size * .085)
+        for dy in (-h * .56, 0, h * .56):
             Ellipse(pos=(cx - r, cy + dy - r), size=(2 * r, 2 * r))
     elif name == "plus":
-        k = h * .62
+        k = h * .58
         Line(points=[cx - k, cy, cx + k, cy], **line)
         Line(points=[cx, cy - k, cx, cy + k], **line)
-    elif name == "send":
-        Triangle(points=[cx - h * .78, cy + h * .72, cx - h * .78, cy - h * .72,
-                         cx + h * .88, cy])
+    elif name == "send":                       # a paper plane, arrow-like
+        Line(points=[cx - h * .70, cy + h * .62, cx + h * .76, cy,
+                     cx - h * .70, cy - h * .62, cx - h * .40, cy,
+                     cx - h * .70, cy + h * .62], **line)
+        Line(points=[cx - h * .40, cy, cx + h * .76, cy], **line)
     elif name in ("reply", "forward"):
-        d = -1 if name == "reply" else 1       # which way the arrow points
-        tip = (cx + d * h * .72, cy + h * .22)
-        Line(points=[tip[0] - d * h * .48, tip[1] + h * .46, tip[0], tip[1],
-                     tip[0] - d * h * .48, tip[1] - h * .46], **line)
+        d = -1 if name == "reply" else 1
+        tip = (cx + d * h * .70, cy + h * .22)
+        Line(points=[tip[0] - d * h * .46, tip[1] + h * .44, tip[0], tip[1],
+                     tip[0] - d * h * .46, tip[1] - h * .44], **line)
         Line(bezier=[tip[0], tip[1], cx - d * h * .55, cy + h * .22,
                      cx - d * h * .78, cy - h * .05,
-                     cx - d * h * .72, cy - h * .68], **line)
+                     cx - d * h * .70, cy - h * .66], **line)
     elif name == "copy":
-        r = size * .09
-        Line(rounded_rectangle=(cx - h * .72, cy - h * .78, h * 1.0, h * 1.18,
+        r = size * .08
+        Line(rounded_rectangle=(cx - h * .70, cy - h * .76, h * 1.0, h * 1.16,
                                 r), width=w)
-        Line(points=[cx - h * .40, cy + h * .44, cx - h * .40, cy + h * .74,
-                     cx + h * .72, cy + h * .74, cx + h * .72, cy - h * .36,
+        Line(points=[cx - h * .38, cy + h * .44, cx - h * .38, cy + h * .72,
+                     cx + h * .70, cy + h * .72, cx + h * .70, cy - h * .36,
                      cx + h * .32, cy - h * .36], **line)
     elif name in ("star", "star_filled"):
         pts = []
         for i in range(10):
             ang = math.pi / 2 + i * math.pi / 5
-            rad = h * (.86 if i % 2 == 0 else .38)
+            rad = h * (.84 if i % 2 == 0 else .37)
             pts += [cx + rad * math.cos(ang), cy + rad * math.sin(ang)]
         if name == "star_filled":
             verts = [cx, cy, 0, 0]
@@ -3979,117 +5029,185 @@ def draw_icon(name: str, cx: float, cy: float, size: float, rgba,
         else:
             Line(points=pts, close=True, width=w, joint="round")
     elif name == "share":
-        r = size * .12
-        a, b, c = ((cx + h * .52, cy + h * .58), (cx - h * .52, cy),
-                   (cx + h * .52, cy - h * .58))
+        r = size * .11
+        a, b, c = ((cx + h * .50, cy + h * .56), (cx - h * .50, cy),
+                   (cx + h * .50, cy - h * .56))
         Line(points=[a[0], a[1], b[0], b[1], c[0], c[1]], **line)
         for px, py in (a, b, c):
             Ellipse(pos=(px - r, py - r), size=(2 * r, 2 * r))
     elif name == "delete":
-        top = cy + h * .52
-        Line(points=[cx - h * .74, top, cx + h * .74, top], **line)
-        Line(points=[cx - h * .26, top, cx - h * .26, top + h * .24,
-                     cx + h * .26, top + h * .24, cx + h * .26, top], **line)
-        Line(points=[cx - h * .56, top, cx - h * .44, cy - h * .78,
-                     cx + h * .44, cy - h * .78, cx + h * .56, top], **line)
-        for dx in (-.17, .17):
-            Line(points=[cx + dx * h, cy + h * .28, cx + dx * h * .8,
-                         cy - h * .52], width=w * .8, cap="round")
-    elif name == "edit":                       # a pen, nib bottom-left
-        ux, uy = .7071, .7071                  # along the pen
-        vx, vy = -.7071, .7071                 # across it
-        t = h * .24
+        top = cy + h * .50
+        Line(points=[cx - h * .72, top, cx + h * .72, top], **line)
+        Line(points=[cx - h * .25, top, cx - h * .25, top + h * .22,
+                     cx + h * .25, top + h * .22, cx + h * .25, top], **line)
+        Line(points=[cx - h * .54, top, cx - h * .42, cy - h * .76,
+                     cx + h * .42, cy - h * .76, cx + h * .54, top], **line)
+        for dx in (-.16, .16):
+            Line(points=[cx + dx * h, cy + h * .26, cx + dx * h * .8,
+                         cy - h * .50], width=w * .85, cap="round")
+    elif name == "edit":                       # a pen, nib down
+        ux, uy = .7071, .7071
+        vx, vy = -.7071, .7071
+        t = h * .22
         nib = (cx - h * .70, cy - h * .70)
-        neck = (nib[0] + ux * h * .48, nib[1] + uy * h * .48)
-        end = (cx + h * .70, cy + h * .70)
-        body = [neck[0] + vx * t, neck[1] + vy * t,
-                end[0] + vx * t, end[1] + vy * t,
-                end[0] - vx * t, end[1] - vy * t,
-                neck[0] - vx * t, neck[1] - vy * t]
-        Line(points=body, close=True, **line)
+        neck = (nib[0] + ux * h * .46, nib[1] + uy * h * .46)
+        end = (cx + h * .68, cy + h * .68)
+        Line(points=[neck[0] + vx * t, neck[1] + vy * t,
+                     end[0] + vx * t, end[1] + vy * t,
+                     end[0] - vx * t, end[1] - vy * t,
+                     neck[0] - vx * t, neck[1] - vy * t], close=True, **line)
         Line(points=[neck[0] + vx * t, neck[1] + vy * t, nib[0], nib[1],
                      neck[0] - vx * t, neck[1] - vy * t], **line)
     elif name == "image":
-        Line(rounded_rectangle=(cx - h * .82, cy - h * .66, h * 1.64,
-                                h * 1.32, size * .1), width=w)
-        r = size * .09
-        Ellipse(pos=(cx + h * .32 - r, cy + h * .26 - r), size=(2 * r, 2 * r))
-        Line(points=[cx - h * .80, cy - h * .46, cx - h * .26, cy + h * .06,
-                     cx + h * .12, cy - h * .28, cx + h * .38, cy - h * .06,
-                     cx + h * .80, cy - h * .48], **line)
+        Line(rounded_rectangle=(cx - h * .80, cy - h * .64, h * 1.60,
+                                h * 1.28, size * .08), width=w)
+        r = size * .08
+        Ellipse(pos=(cx + h * .30 - r, cy + h * .24 - r), size=(2 * r, 2 * r))
+        Line(points=[cx - h * .78, cy - h * .44, cx - h * .26, cy + h * .06,
+                     cx + h * .12, cy - h * .26, cx + h * .38, cy - h * .04,
+                     cx + h * .78, cy - h * .46], **line)
     elif name == "mic":
-        Line(rounded_rectangle=(cx - h * .27, cy - h * .06, h * .54, h * .92,
-                                h * .27), width=w)
-        Line(circle=(cx, cy + h * .14, h * .52, 90, 270), width=w)
-        Line(points=[cx, cy - h * .38, cx, cy - h * .74], **line)
-        Line(points=[cx - h * .30, cy - h * .74, cx + h * .30, cy - h * .74],
+        Line(rounded_rectangle=(cx - h * .26, cy - h * .04, h * .52, h * .90,
+                                h * .26), width=w)
+        Line(circle=(cx, cy + h * .14, h * .50, 90, 270), width=w)
+        Line(points=[cx, cy - h * .36, cx, cy - h * .72], **line)
+        Line(points=[cx - h * .30, cy - h * .72, cx + h * .30, cy - h * .72],
              **line)
     elif name == "play":
-        Triangle(points=[cx - h * .40, cy + h * .58, cx - h * .40, cy - h * .58,
-                         cx + h * .62, cy])
+        Triangle(points=[cx - h * .36, cy + h * .56, cx - h * .36, cy - h * .56,
+                         cx + h * .60, cy])
     elif name == "pause":
-        bw = size * .14
-        for dx in (-h * .30, h * .30):
-            Rectangle(pos=(cx + dx - bw / 2, cy - h * .56), size=(bw, h * 1.12))
+        bw = size * .13
+        for dx in (-h * .28, h * .28):
+            Rectangle(pos=(cx + dx - bw / 2, cy - h * .54), size=(bw, h * 1.08))
     elif name in ("bell", "bell_off"):
         base = cy - h * .40
-        Line(points=[cx - h * .72, base, cx + h * .72, base], **line)
-        Line(bezier=[cx - h * .58, base, cx - h * .44, cy + h * .30,
-                     cx - h * .52, cy + h * 1.02, cx, cy + h * .66], **line)
-        Line(bezier=[cx + h * .58, base, cx + h * .44, cy + h * .30,
-                     cx + h * .52, cy + h * 1.02, cx, cy + h * .66], **line)
-        r = size * .085
+        Line(points=[cx - h * .70, base, cx + h * .70, base], **line)
+        Line(bezier=[cx - h * .56, base, cx - h * .42, cy + h * .30,
+                     cx - h * .50, cy + h * .98, cx, cy + h * .64], **line)
+        Line(bezier=[cx + h * .56, base, cx + h * .42, cy + h * .30,
+                     cx + h * .50, cy + h * .98, cx, cy + h * .64], **line)
+        r = size * .08
         Ellipse(pos=(cx - r, base - h * .26 - r), size=(2 * r, 2 * r))
-        Ellipse(pos=(cx - r * .8, cy + h * .66), size=(1.6 * r, 1.6 * r))
         if name == "bell_off":
-            Line(points=[cx - h * .78, cy - h * .78, cx + h * .78,
-                         cy + h * .78], **line)
+            Line(points=[cx - h * .76, cy - h * .76, cx + h * .76,
+                         cy + h * .76], **line)
     elif name == "check":
-        Line(points=[cx - h * .60, cy + h * .02, cx - h * .16, cy - h * .42,
-                     cx + h * .64, cy + h * .46], **line)
+        Line(points=[cx - h * .58, cy + h * .02, cx - h * .16, cy - h * .40,
+                     cx + h * .62, cy + h * .44], **line)
     elif name == "download":
-        Line(points=[cx, cy + h * .66, cx, cy - h * .30], **line)
-        Line(points=[cx - h * .40, cy + h * .06, cx, cy - h * .32,
-                     cx + h * .40, cy + h * .06], **line)
-        Line(points=[cx - h * .62, cy - h * .70, cx + h * .62, cy - h * .70],
+        Line(points=[cx, cy + h * .64, cx, cy - h * .28], **line)
+        Line(points=[cx - h * .38, cy + h * .06, cx, cy - h * .30,
+                     cx + h * .38, cy + h * .06], **line)
+        Line(points=[cx - h * .60, cy - h * .68, cx + h * .60, cy - h * .68],
              **line)
     elif name == "retry":
-        rad = h * .58
+        rad = h * .56
         Line(circle=(cx, cy, rad, 60, 330), width=w)
-        # Arrowhead at the 60-degree end, pointing back along the arc
-        # (Kivy measures circle angles clockwise from 12 o'clock).
         ang = math.radians(60)
         ex, ey = cx + rad * math.sin(ang), cy + rad * math.cos(ang)
-        tx, ty = -math.cos(ang), math.sin(ang)       # counter-clockwise
-        nx, ny = math.sin(ang), math.cos(ang)        # outward normal
-        k = h * .62
+        tx, ty = -math.cos(ang), math.sin(ang)
+        nx, ny = math.sin(ang), math.cos(ang)
+        k = h * .58
         Triangle(points=[ex + tx * k, ey + ty * k,
-                         ex + nx * k * .62, ey + ny * k * .62,
-                         ex - nx * k * .62, ey - ny * k * .62])
+                         ex + nx * k * .6, ey + ny * k * .6,
+                         ex - nx * k * .6, ey - ny * k * .6])
     elif name == "info":
-        Line(circle=(cx, cy, h * .82), width=w)
-        Line(points=[cx, cy - h * .42, cx, cy - h * .02], **line)
-        r = size * .075
-        Ellipse(pos=(cx - r, cy + h * .38 - r), size=(2 * r, 2 * r))
+        Line(circle=(cx, cy, h * .80), width=w)
+        Line(points=[cx, cy - h * .40, cx, cy - h * .02], **line)
+        r = size * .07
+        Ellipse(pos=(cx - r, cy + h * .36 - r), size=(2 * r, 2 * r))
+    elif name == "smile":
+        Line(circle=(cx, cy, h * .80), width=w)
+        r = size * .065
+        for dx in (-h * .30, h * .30):
+            Ellipse(pos=(cx + dx - r, cy + h * .22 - r), size=(2 * r, 2 * r))
+        Line(circle=(cx, cy + h * .05, h * .44, 120, 240), width=w)
+    elif name == "keyboard":
+        Line(rounded_rectangle=(cx - h * .82, cy - h * .52, h * 1.64, h * 1.04,
+                                size * .07), width=w)
+        r = size * .045
+        for row, y in enumerate((cy + h * .20, cy - h * .06)):
+            for i in range(5 - row):
+                x = cx - h * .54 + i * h * .27 + row * h * .135
+                Ellipse(pos=(x - r, y - r), size=(2 * r, 2 * r))
+        Line(points=[cx - h * .36, cy - h * .30, cx + h * .36, cy - h * .30],
+             **line)
+    elif name in ("person", "person_add"):
+        hx = cx - (h * .18 if name == "person_add" else 0)
+        Line(circle=(hx, cy + h * .30, h * .30), width=w)
+        Line(bezier=[hx - h * .62, cy - h * .72, hx - h * .56, cy - h * .12,
+                     hx + h * .56, cy - h * .12, hx + h * .62, cy - h * .72],
+             **line)
+        if name == "person_add":
+            Line(points=[cx + h * .54, cy + h * .30, cx + h * .54,
+                         cy - h * .10], **line)
+            Line(points=[cx + h * .34, cy + h * .10, cx + h * .74,
+                         cy + h * .10], **line)
+    elif name == "group":
+        for dx, s in ((-h * .30, .9), (h * .34, 1.0)):
+            px = cx + dx
+            Line(circle=(px, cy + h * .30 * s, h * .25 * s), width=w)
+            Line(bezier=[px - h * .50 * s, cy - h * .70,
+                         px - h * .46 * s, cy - h * .16,
+                         px + h * .46 * s, cy - h * .16,
+                         px + h * .50 * s, cy - h * .70], **line)
+    elif name == "bookmark":
+        Line(points=[cx - h * .46, cy + h * .76, cx - h * .46, cy - h * .74,
+                     cx, cy - h * .36, cx + h * .46, cy - h * .74,
+                     cx + h * .46, cy + h * .76], close=True, **line)
+    elif name == "sliders":                    # settings
+        for i, (y, k) in enumerate(((cy + h * .52, -.30), (cy, .34),
+                                    (cy - h * .52, -.06))):
+            Line(points=[cx - h * .78, y, cx + h * .78, y], **line)
+            r = size * .12
+            Color(*rgba)
+            Ellipse(pos=(cx + k * h * 1.4 - r, y - r), size=(2 * r, 2 * r))
+    elif name == "key":
+        Line(circle=(cx - h * .38, cy + h * .02, h * .30), width=w)
+        Line(points=[cx - h * .08, cy + h * .02, cx + h * .76, cy + h * .02],
+             **line)
+        Line(points=[cx + h * .50, cy + h * .02, cx + h * .50, cy - h * .28],
+             **line)
+        Line(points=[cx + h * .72, cy + h * .02, cx + h * .72, cy - h * .22],
+             **line)
+    elif name == "leave":
+        Line(points=[cx + h * .10, cy + h * .76, cx - h * .70, cy + h * .76,
+                     cx - h * .70, cy - h * .76, cx + h * .10, cy - h * .76],
+             **line)
+        Line(points=[cx - h * .18, cy, cx + h * .78, cy], **line)
+        Line(points=[cx + h * .46, cy + h * .32, cx + h * .78, cy,
+                     cx + h * .46, cy - h * .32], **line)
+    elif name == "attach":                     # a paperclip
+        Line(points=[cx + h * .36, cy + h * .30, cx + h * .36, cy - h * .46],
+             **line)
+        Line(circle=(cx + h * .02, cy - h * .46, h * .34, 90, 270), width=w)
+        Line(points=[cx - h * .32, cy - h * .46, cx - h * .32, cy + h * .52],
+             **line)
+        Line(circle=(cx - h * .06, cy + h * .52, h * .26, 270, 450), width=w)
+        Line(points=[cx + h * .20, cy + h * .52, cx + h * .20, cy - h * .28],
+             **line)
 
 
 class IconButton(ButtonBehavior, Widget):
-    """A round, tappable vector icon (see draw_icon for the set).
+    """A tappable line icon, at least 48dp to touch.
 
-    `bg` gives it a filled circle (the send and new-chat buttons); without
-    one it is a bare icon with a soft circular press highlight, which is how
-    app-bar actions behave in every modern Android app.
+    `bg` gives it a filled disc (send, the compose button); without one it
+    is a bare icon with a soft circular highlight while pressed. `label` is
+    what a screen reader would say — Kivy cannot speak it yet, but it keeps
+    every control named for when it can, and the tests use it.
     """
 
-    def __init__(self, icon: str, tint=COL_APPBAR_TEXT, bg=None,
-                 icon_size=None, press=None, **kw):
+    def __init__(self, icon: str, tint: Optional[str] = None,
+                 bg: Optional[str] = None, icon_size=None, press=None,
+                 label: str = "", **kw):
         kw.setdefault("size_hint", (None, None))
-        kw.setdefault("size", (dp(44), dp(44)))
+        kw.setdefault("size", (TOUCH, TOUCH))
         super().__init__(**kw)
-        self._icon, self._tint, self._bg_hex = icon, tint, bg
+        self._icon, self._tint, self._bg_hex = icon, tint or T.text_2, bg
         self._icon_size = icon_size
-        self._press_rgba = (C(press) if press else
-                            [1, 1, 1, .16] if bg is None else None)
+        self.label = label or icon
+        self._press_hex = press
         self.bind(pos=self._redraw, size=self._redraw, state=self._redraw,
                   disabled=self._redraw)
         self._redraw()
@@ -4103,43 +5221,38 @@ class IconButton(ButtonBehavior, Widget):
     def _redraw(self, *_a):
         self.canvas.clear()
         side = min(self.width, self.height)
+        disc = min(side, dp(44))
         with self.canvas:
             if self._bg_hex is not None:
-                Color(*C(COL_ACCENT_DARK if self.state == "down"
-                         else self._bg_hex))
-                Ellipse(pos=(self.center_x - side / 2,
-                             self.center_y - side / 2), size=(side, side))
-            elif self.state == "down" and self._press_rgba:
-                Color(*self._press_rgba)
-                Ellipse(pos=(self.center_x - side / 2,
-                             self.center_y - side / 2), size=(side, side))
+                Color(*C(T.accent_press if self.state == "down" and
+                         self._bg_hex == T.accent else self._bg_hex))
+                Ellipse(pos=((self.x + self.width / 2) - disc / 2,
+                             (self.y + self.height / 2) - disc / 2), size=(disc, disc))
+            elif self.state == "down":
+                Color(*C(self._press_hex or T.press))
+                Ellipse(pos=((self.x + self.width / 2) - disc / 2,
+                             (self.y + self.height / 2) - disc / 2), size=(disc, disc))
             rgba = C(self._tint)
             if self.disabled:
                 rgba = rgba[:3] + [rgba[3] * .35]
-            draw_icon(self._icon, self.center_x, self.center_y,
-                      self._icon_size or side * .46, rgba)
+            draw_icon(self._icon, (self.x + self.width / 2), (self.y + self.height / 2),
+                      self._icon_size or dp(22), rgba)
 
 
 class TickMarks(Widget):
-    """Delivery ticks drawn as vector paths instead of text glyphs.
+    """Delivery ticks, drawn (no font has a dependable check mark).
 
-    v7 fix: these used to be U+2713 CHECK MARK printed through a Label, and
-    Kivy's bundled Roboto has no glyph for that codepoint — so the ticks
-    rendered as empty rectangles ("tofu") on desktop Linux and on any device
-    whose font fallback chain lacks it. Drawing the strokes removes the font
-    dependency completely, the same approach IconButton already uses for the
-    app-bar icons, and it renders identically on every platform.
-
-    Ticks overlap slightly so 2 and 3 read as a group rather than a row of
-    separate marks, which is the visual language people already know.
+    0 grey = still on this phone; 1 = on the relay; 2 = on their phone;
+    3 = read. In a group, the count is the slowest member's. Ticks overlap
+    so two and three read as one mark.
     """
 
-    def __init__(self, count: int = 0, tint: str = COL_TICK_GOLD,
+    def __init__(self, count: int = 0, tint: Optional[str] = None,
                  mark: float = None, **kw):
         kw.setdefault("size_hint", (None, None))
-        self._mark = mark or dp(9.0)         # height of one checkmark
-        self._step = self._mark * 0.52       # horizontal overlap between marks
-        self._count, self._tint = max(0, min(int(count), 3)), tint
+        self._mark = mark or dp(9.5)
+        self._step = self._mark * 0.52
+        self._count, self._tint = max(0, min(int(count), 3)), tint or T.tick
         kw.setdefault("size", (self._width_for(self._count), self._mark))
         super().__init__(**kw)
         self.bind(pos=self._redraw, size=self._redraw)
@@ -4168,56 +5281,107 @@ class TickMarks(Widget):
             for i in range(self._count):
                 x = self.x + i * self._step
                 y = self.y
-                # A checkmark: short down-stroke into a long up-stroke.
-                Line(points=[x, y + h * 0.45,
-                             x + h * 0.34, y + h * 0.06,
+                Line(points=[x, y + h * 0.45, x + h * 0.34, y + h * 0.06,
                              x + h * 0.92, y + h * 0.82],
-                     width=dp(1.15), cap="round", joint="round")
+                     width=dp(1.1), cap="round", joint="round")
 
 
-class Avatar(AnchorLayout):
-    """Warm coloured circle with the contact's initial — the cozy face of
-    every conversation."""
+class Avatar(Widget):
+    """A coloured disc with an initial.
 
-    def __init__(self, seed: str, name: str, diameter=dp(48), **kw):
+    A group's disc carries an inner ring; notes to self are a gold disc with
+    a bookmark.
+    """
+
+    def __init__(self, seed: str, name: str, diameter=dp(48),
+                 kind: str = "dm", **kw):
         kw.setdefault("size_hint", (None, None))
         kw.setdefault("size", (diameter, diameter))
-        super().__init__(anchor_x="center", anchor_y="center", **kw)
-        paint_circle(self, avatar_color(seed))
-        self.add_widget(Label(text=initial_of(name), bold=True,
-                              font_size=diameter * 0.42,
-                              color=C("#FFFFFF")))
+        super().__init__(**kw)
+        self.kind, self._d = kind, diameter
+        self._fill = T.accent if kind == "self" else avatar_color(seed)
+        self._initial = None
+        if kind != "self":
+            self._initial = Label(text=initial_of(name), bold=False,
+                                  font_size=diameter * 0.48,
+                                  color=C("#FFFFF8"), size_hint=(None, None))
+            self.add_widget(self._initial)
+        self.bind(pos=self._redraw, size=self._redraw)
+        self._redraw()
+
+    def _redraw(self, *_a):
+        self.canvas.before.clear()
+        d = min(self.width, self.height, self._d)
+        x, y = (self.x + self.width / 2) - d / 2, (self.y + self.height / 2) - d / 2
+        with self.canvas.before:
+            Color(*C(self._fill))
+            Ellipse(pos=(x, y), size=(d, d))
+            if self.kind == "group":
+                Color(1, 1, 1, .55)
+                inset = max(dp(2.5), d * .07)
+                Line(circle=((self.x + self.width / 2), (self.y + self.height / 2), d / 2 - inset),
+                     width=dp(.9))
+            if self.kind == "self":
+                draw_icon("bookmark", (self.x + self.width / 2), (self.y + self.height / 2), d * .46,
+                          C(T.on_accent), width=max(dp(1.3), d * .04))
+        if self._initial is not None:
+            self._initial.size = (d, d)
+            # Garamond's capitals sit high in their line box; nudge them to
+            # the optical centre of the disc.
+            self._initial.center = ((self.x + self.width / 2), (self.y + self.height / 2) - d * .03)
 
 
 class AvatarButton(ButtonBehavior, Avatar):
-    """Tappable avatar. ButtonBehavior sits first in the MRO and accepts only
-    keyword arguments, so the positional args are forwarded as keywords."""
+    """A tappable avatar: the disc as drawn, inside a full 48dp target
+    (ButtonBehavior takes keywords only)."""
 
-    def __init__(self, seed: str, name: str, diameter=dp(48), **kw):
-        super().__init__(seed=seed, name=name, diameter=diameter, **kw)
+    def __init__(self, seed: str, name: str, diameter=dp(48),
+                 kind: str = "dm", **kw):
+        kw.setdefault("size", (max(TOUCH, diameter), max(TOUCH, diameter)))
+        super().__init__(seed=seed, name=name, diameter=diameter, kind=kind,
+                         **kw)
 
 
-class CozyInput(BoxLayout):
-    """A rounded text input (white card, gold cursor)."""
+class Field(BoxLayout):
+    """A text field: an optional capitals label, the text, and a hairline
+    that turns gold while you type."""
 
-    def __init__(self, hint="", password=False, multiline=False,
-                 on_enter=None, radius=None, **kw):
+    def __init__(self, hint: str = "", label: str = "", password=False,
+                 multiline=False, on_enter=None, **kw):
+        kw.setdefault("orientation", "vertical")
         kw.setdefault("size_hint_y", None)
-        kw.setdefault("height", dp(46))
-        kw.setdefault("padding", [dp(14), dp(8), dp(10), dp(8)])
         super().__init__(**kw)
-        paint_round(self, COL_CARD, radius=radius or dp(14))
-        paint_border(self, COL_CARD_EDGE, radius=radius or dp(14))
+        self.caption = None
+        if label:
+            self.caption = CapsLabel(label, size=11, color=T.text_3)
+            self.add_widget(self.caption)
         self.input = TextInput(
             hint_text=hint, multiline=multiline, password=password,
             background_normal="", background_active="",
-            background_color=(0, 0, 0, 0),
-            foreground_color=C(COL_TEXT), hint_text_color=C(COL_TEXT_DIM),
-            cursor_color=C(COL_ACCENT), font_size=sp(15),
-            write_tab=False, padding=[0, dp(9), 0, 0])
+            background_color=(0, 0, 0, 0), foreground_color=C(T.text),
+            hint_text_color=C(T.text_3), cursor_color=C(T.accent),
+            selection_color=C(T.accent)[:3] + [.3], font_size=fs(17),
+            write_tab=False, padding=[0, dp(10), 0, dp(8)],
+            size_hint_y=None, height=round(fs(17) * 1.35 + dp(18)))
         if on_enter is not None:
             self.input.bind(on_text_validate=lambda _w: on_enter())
         self.add_widget(self.input)
+        self.height = self.input.height + (self.caption.height
+                                           if self.caption else 0)
+        with self.canvas.after:
+            self._rule_col = Color(*C(T.rule_strong))
+            self._rule = Rectangle()
+        self.bind(pos=self._sync, size=self._sync)
+        self.input.bind(focus=self._on_focus)
+
+    def _on_focus(self, _w, focused):
+        self._rule_col.rgba = C(T.accent if focused else T.rule_strong)
+        self._sync()
+
+    def _sync(self, *_a):
+        thick = dp(2) if self.input.focus else dp(1)
+        self._rule.pos = (self.x, self.y)
+        self._rule.size = (self.width, thick)
 
     @property
     def text(self) -> str:
@@ -4228,122 +5392,413 @@ class CozyInput(BoxLayout):
         self.input.text = value
 
 
-class SectionCard(BoxLayout):
-    """White rounded card with a small gold section title."""
+CozyInput = Field                       # pre-9.1 name
 
-    def __init__(self, title: str, **kw):
-        kw.setdefault("orientation", "vertical")
-        kw.setdefault("size_hint_y", None)
-        kw.setdefault("padding", [dp(14), dp(12), dp(14), dp(12)])
-        kw.setdefault("spacing", dp(8))
+
+class ToggleSwitch(ButtonBehavior, Widget):
+    """An on/off switch: a gold track when on, a hairline one when off."""
+
+    def __init__(self, active: bool = False,
+                 on_change: Optional[Callable[[bool], None]] = None, **kw):
+        kw.setdefault("size_hint", (None, None))
+        kw.setdefault("size", (dp(50), dp(30)))
         super().__init__(**kw)
-        self.bind(minimum_height=self.setter("height"))
-        paint_round(self, COL_CARD, radius=dp(16))
-        paint_border(self, COL_CARD_EDGE, radius=dp(16))
-        self.add_widget(InfoLabel(title, color=COL_ACCENT, bold=True,
-                                  font_size=sp(12.5)))
+        self.active, self._on_change = bool(active), on_change
+        self.bind(pos=self._paint, size=self._paint,
+                  on_release=lambda _w: self.flip())
+        self._paint()
+
+    def flip(self) -> None:
+        self.set_active(not self.active)
+        if self._on_change:
+            self._on_change(self.active)
+
+    def set_active(self, active: bool) -> None:
+        self.active = bool(active)
+        self._paint()
+
+    def _paint(self, *_a) -> None:
+        self.canvas.clear()
+        h = self.height
+        with self.canvas:
+            if self.active:
+                Color(*C(T.accent))
+                RoundedRectangle(pos=self.pos, size=self.size, radius=[h / 2])
+            else:
+                Color(*C(T.rule_strong))
+                Line(rounded_rectangle=(self.x + .5, self.y + .5,
+                                        self.width - 1, h - 1, h / 2 - .5),
+                     width=dp(1.1))
+            knob = h - dp(8)
+            x = self.right - knob - dp(4) if self.active else self.x + dp(4)
+            Color(*C(T.on_accent if self.active else T.text_3))
+            Ellipse(pos=(x, self.y + dp(4)), size=(knob, knob))
 
 
-class InfoLabel(Label):
-    """Left-aligned wrapping text label that sizes to its content."""
+Toggle = ToggleSwitch
 
-    def __init__(self, text="", color=COL_TEXT, font_size=None, bold=False,
-                 halign="left", **kw):
+
+class Segmented(BoxLayout):
+    """A choice of a few, in capitals: the chosen one is underlined in
+    gold, the others recede. Every segment is a full 48dp target."""
+
+    def __init__(self, options: list, value: str,
+                 on_change: Optional[Callable[[str], None]] = None, **kw):
         kw.setdefault("size_hint_y", None)
-        super().__init__(text=text, color=C(color), bold=bold,
-                         font_size=font_size or sp(14), halign=halign,
-                         valign="top", markup=True, **kw)
-        self.bind(width=lambda *_: setattr(self, "text_size",
-                                           (self.width, None)),
-                  texture_size=lambda *_: setattr(self, "height",
-                                                  self.texture_size[1]))
+        kw.setdefault("height", TOUCH)
+        super().__init__(**kw)
+        self.value, self._on_change = value, on_change
+        self.segments = {}
+        for key, text in options:
+            seg = _Segment(key, text, self)
+            self.segments[key] = seg
+            self.add_widget(seg)
+        hairline(self, "bottom")
+        self._paint()
+
+    def choose(self, key: str) -> None:
+        if key == self.value:
+            return
+        self.value = key
+        self._paint()
+        if self._on_change:
+            self._on_change(key)
+
+    def _paint(self) -> None:
+        for key, seg in self.segments.items():
+            seg.set_selected(key == self.value)
 
 
-class CozyModal(ModalView):
-    """Base for every dialog: dimmed backdrop, warm rounded card, title."""
+class _Segment(ButtonBehavior, Widget):
+    def __init__(self, key: str, text: str, owner: "Segmented", **kw):
+        super().__init__(**kw)
+        self.key = key
+        self.caps = CapsLabel(text, size=12, tracking=0.14, halign="center",
+                              size_hint=(None, None))
+        self.add_widget(self.caps)
+        with self.canvas.before:
+            self._press = Color(0, 0, 0, 0)
+            self._ground = Rectangle()
+            self._mark = Color(*C(T.accent))
+            self._bar = Rectangle()
+        self.bind(pos=self._sync, size=self._sync,
+                  state=lambda _w, s: setattr(
+                      self._press, "rgba", C(T.press) if s == "down"
+                      else (0, 0, 0, 0)),
+                  on_release=lambda _w: owner.choose(key))
 
-    def __init__(self, title: str, dismissable: bool = True, **kw):
-        kw.setdefault("size_hint", (0.92, None))
+    def set_selected(self, on: bool) -> None:
+        self.selected = on
+        self.caps.set_color(T.text if on else T.text_3)
+        self._mark.a = 1 if on else 0
+
+    def _sync(self, *_a):
+        self._ground.pos, self._ground.size = self.pos, self.size
+        self._bar.pos = (self.x + dp(8), self.y)
+        self._bar.size = (max(0, self.width - dp(16)), dp(2))
+        self.caps.size = (self.width - dp(8), self.caps.height)
+        self.caps.center = (self.x + self.width / 2, self.y + self.height / 2)
+
+
+class SectionHead(BoxLayout):
+    """A capitals heading over a group of rows."""
+
+    def __init__(self, text: str, **kw):
+        kw.setdefault("size_hint_y", None)
+        kw.setdefault("height", dp(44))
+        kw.setdefault("padding", [dp(20), dp(18), dp(20), dp(6)])
+        super().__init__(**kw)
+        self.caps = CapsLabel(text, size=11, color=T.accent, tracking=0.16)
+        self.add_widget(self.caps)
+
+
+class ListRow(ButtonBehavior, BoxLayout):
+    """Icon · title over an optional hint · a control or a chevron.
+
+    The whole row is the tap target; hints wrap rather than being cut off.
+    """
+
+    def __init__(self, icon: Optional[str], title: str, hint: str = "",
+                 control: Optional[Widget] = None,
+                 on_tap: Optional[Callable] = None, danger: bool = False,
+                 chevron: bool = False, title_color: Optional[str] = None,
+                 **kw):
+        kw.setdefault("size_hint_y", None)
+        kw.setdefault("padding", [dp(20), dp(10), dp(16), dp(10)])
+        kw.setdefault("spacing", dp(16))
+        super().__init__(**kw)
+        tint = T.alert if danger else T.text_2
+        if icon:
+            glyph = Widget(size_hint_x=None, width=dp(24))
+            glyph.bind(pos=lambda w, *_a: self._glyph(w, icon, tint),
+                       size=lambda w, *_a: self._glyph(w, icon, tint))
+            self.add_widget(glyph)
+        texts = BoxLayout(orientation="vertical", size_hint_y=None,
+                          spacing=dp(1))
+        texts.bind(minimum_height=texts.setter("height"))
+        self.title = InfoLabel(title, color=title_color or
+                               (T.alert if danger else T.text),
+                               font_size=fs(17))
+        texts.add_widget(self.title)
+        self.hint = None
+        if hint:
+            self.hint = InfoLabel(hint, color=T.text_3, font_size=fs(14.5))
+            texts.add_widget(self.hint)
+        holder = AnchorLayout(anchor_y="center")
+        holder.add_widget(texts)
+        self.add_widget(holder)
+        self._texts = texts
+        if control is None and chevron:
+            control = Widget(size_hint=(None, None), size=(dp(16), dp(24)))
+            control.bind(pos=lambda w, *_a: self._glyph(w, "chevron",
+                                                        T.text_3, dp(16)),
+                         size=lambda w, *_a: self._glyph(w, "chevron",
+                                                         T.text_3, dp(16)))
+        if control is not None:
+            box = AnchorLayout(size_hint_x=None, width=control.width,
+                               anchor_x="right")
+            box.add_widget(control)
+            self.add_widget(box)
+        texts.bind(height=self._fit)
+        self._fit()
+        with self.canvas.before:
+            self._bg = Color(0, 0, 0, 0)
+            self._rect = Rectangle()
+        self.bind(pos=self._sync, size=self._sync,
+                  state=lambda _w, st: setattr(
+                      self._bg, "rgba", C(T.press) if st == "down"
+                      else (0, 0, 0, 0)))
+        if on_tap is None and isinstance(control, ToggleSwitch):
+            on_tap = control.flip          # the whole row is the switch
+        if on_tap is not None:
+            self.bind(on_release=lambda _w: on_tap())
+
+    def _fit(self, *_a):
+        self.height = max(dp(56), self._texts.height + dp(22))
+
+    def _sync(self, *_a):
+        self._rect.pos, self._rect.size = self.pos, self.size
+
+    @staticmethod
+    def _glyph(widget, icon: str, tint: str, size=None) -> None:
+        widget.canvas.clear()
+        with widget.canvas:
+            draw_icon(icon, (widget.x + widget.width / 2), (widget.y + widget.height / 2), size or dp(22),
+                      C(tint))
+
+
+SettingRow = ListRow                    # pre-9.1 name
+
+
+def rows_card(rows: list, inset: float = dp(60)) -> BoxLayout:
+    """Rows stacked with hairlines between them (none above or below)."""
+    card = BoxLayout(orientation="vertical", size_hint_y=None)
+    card.bind(minimum_height=card.setter("height"))
+    for i, row in enumerate(rows):
+        if i:
+            card.add_widget(Rule(inset=inset))
+        card.add_widget(row)
+    return card
+
+
+class TappableBox(ButtonBehavior, BoxLayout):
+    """A tappable stack of widgets (a chat's title -> its info)."""
+
+    def __init__(self, on_tap=None, **kw):
+        kw.setdefault("orientation", "vertical")
+        super().__init__(**kw)
+        if on_tap is not None:
+            self.bind(on_release=lambda _w: on_tap())
+
+
+class UnreadBadge(Label):
+    """The unread count, in red. Muted chats show it in grey."""
+
+    def __init__(self, count: int, muted: bool = False, **kw):
+        text = str(count) if count < 1000 else "999+"
+        super().__init__(text=text, font_size=fs(13), bold=True,
+                         color=C(T.bg if muted else T.on_alert),
+                         size_hint=(None, None),
+                         height=max(dp(22), round(fs(13) * 1.6)), **kw)
+        with self.canvas.before:
+            Color(*C(T.text_3 if muted else T.alert))
+            self._pill = RoundedRectangle(radius=[self.height / 2])
+        self.bind(pos=self._sync, size=self._sync,
+                  texture_size=lambda w, v: setattr(
+                      w, "width", max(self.height, v[0] + dp(12))))
+        self.texture_update()
+
+    def _sync(self, *_a):
+        self._pill.pos, self._pill.size = self.pos, self.size
+        self._pill.radius = [self.height / 2]
+
+
+class Sheet(ModalView):
+    """Every dialog is a sheet that rises from the bottom edge, where a
+    thumb can reach it: a grab handle, a serif title, its contents (they
+    scroll when tall), and a dimmed page behind. Tap outside, or press
+    back, to close it (unless it must be answered)."""
+
+    rise = NumericProperty(0.0)
+    MAX_WIDTH = dp(600)
+
+    def __init__(self, title: str = "", dismissable: bool = True,
+                 subtitle: str = "", **kw):
+        kw.setdefault("size_hint", (None, None))
         kw.setdefault("auto_dismiss", dismissable)
         super().__init__(background_color=(0, 0, 0, 0),
-                         overlay_color=(0.18, 0.12, 0.07, 0.55), **kw)
+                         overlay_color=T.scrim, **kw)
+        self.dismissable = dismissable
         self.card = BoxLayout(orientation="vertical",
-                              padding=[dp(18), dp(16), dp(18), dp(16)],
-                              spacing=dp(10))
-        paint_round(self.card, COL_BG_LIST, radius=dp(20))
-        self.card.bind(minimum_height=self._fit_height)
+                              padding=[dp(22), dp(8), dp(22), dp(22)],
+                              spacing=dp(12))
+        paint_round(self.card, T.surface if T.dark else T.bg,
+                    corners=[dp(16), dp(16), 0, 0])
+        if not T.dark:
+            with self.card.canvas.after:
+                Color(*C(T.rule))
+                self._edge = Line(width=dp(1) / 2.0)
+            self.card.bind(pos=self._sync_edge, size=self._sync_edge)
+        handle = AnchorLayout(size_hint_y=None, height=dp(14))
+        grip = Widget(size_hint=(None, None), size=(dp(36), dp(4)))
+        paint_round(grip, T.rule_strong, radius=dp(2))
+        handle.add_widget(grip)
+        self.card.add_widget(handle)
+        if title:
+            self.title_label = InfoLabel(title, font_size=fs(22))
+            self.card.add_widget(self.title_label)
+        if subtitle:
+            self.card.add_widget(InfoLabel(subtitle, color=T.text_3,
+                                           italic=True, font_size=fs(15)))
+        self.body = BoxLayout(orientation="vertical", size_hint_y=None,
+                              spacing=dp(12))
+        self.body.bind(minimum_height=self.body.setter("height"))
+        self.scroller = ScrollView(size_hint_y=None, bar_width=dp(3),
+                                   do_scroll_x=False)
+        self.scroller.add_widget(self.body)
+        self.card.add_widget(self.scroller)
         self.add_widget(self.card)
-        self.card.add_widget(InfoLabel(title, bold=True, font_size=sp(18)))
+        self.body.bind(height=self._fit)
+        self.card.bind(minimum_height=self._fit)
+        Window.bind(size=self._fit)
+        self.bind(on_dismiss=lambda *_a: Window.unbind(size=self._fit))
+        self._fit()
 
-    def _fit_height(self, _w, value):
-        self.height = min(value, Window.height * 0.92)
+    def _sync_edge(self, *_a):
+        # The outline runs on below the bottom edge, so only its top and
+        # sides show: a hairline lip on the light theme's white page.
+        c = self.card
+        self._edge.rounded_rectangle = (c.x + .5, c.y - dp(20), c.width - 1,
+                                        c.height + dp(20) - .5, dp(16))
+
+    def _fit(self, *_a):
+        self.width = min(Window.width, self.MAX_WIDTH)
+        chrome = sum(w.height for w in self.card.children
+                     if w is not self.scroller)
+        chrome += self.card.padding[1] + self.card.padding[3]
+        chrome += self.card.spacing * max(0, len(self.card.children) - 1)
+        room = Window.height * 0.9 - chrome
+        self.scroller.height = max(dp(40), min(self.body.height, room))
+        self.height = chrome + self.scroller.height
+        self._align_center()
+
+    def _align_center(self, *_a):
+        self.x = (Window.width - self.width) / 2
+        self.y = -self.height * (1 - self.rise)
+
+    def on_rise(self, *_a):
+        self._align_center()
+
+    def open(self, *a, **kw):
+        self.rise = 0.0 if motion(1) else 1.0
+        super().open(*a, **kw)
+        self._align_center()
+        if motion(1):
+            Animation(rise=1.0, d=0.22, t="out_cubic").start(self)
 
     def add(self, widget):
-        self.card.add_widget(widget)
+        self.body.add_widget(widget)
         return widget
 
     def status_label(self) -> InfoLabel:
-        label = InfoLabel("", color=COL_TEXT_DIM, font_size=sp(13))
+        label = InfoLabel("", color=T.text_3, font_size=fs(15),
+                          italic=True)
         self.add(label)
         return label
 
     def set_status(self, label: InfoLabel, text: str,
-                   color: str = COL_TEXT_DIM) -> None:
-        label.color = C(color)
+                   color: Optional[str] = None) -> None:
+        label.color = C(retint(color) if color else T.text_3)
         label.text = text
 
 
+CozyModal = Sheet                       # pre-9.1 name
+
+
+class MenuSheet(Sheet):
+    """A short list of actions, one per full-width row (the ⋮ menu)."""
+
+    def __init__(self, items: list, title: str = "", **kw):
+        super().__init__(title, **kw)
+        self.card.padding = [0, dp(8), 0, dp(14)]
+        if title:
+            self.title_label.padding = [dp(22), 0]
+        rows = []
+        for item in items:
+            icon, text, action = item[:3]
+            danger = len(item) > 3 and item[3]
+            rows.append(ListRow(icon, text, danger=danger,
+                                on_tap=lambda a=action: self._run(a)))
+        self.add(rows_card(rows))
+
+    def _run(self, action: Callable) -> None:
+        self.dismiss()
+        Clock.schedule_once(lambda _dt: action(), 0.05)
+
+
 # =============================================================================
-#  Dialogs
+#  Sheets (dialogs)
 # =============================================================================
-class RegisterModal(CozyModal):
+def hint(text: str) -> InfoLabel:
+    """A quiet explanatory paragraph."""
+    return InfoLabel(text, color=T.text_3, font_size=fs(15))
+
+
+class RegisterModal(Sheet):
     """Pick a username for the ACTIVE identity.
 
     Registration sends only public values (username + public key + ownership
-    signature); the server recomputes the address and enforces the 'Fec'
-    proof-of-work.
-
-    v7: this dialog is also the RECOVERY path. It is reopened when the relay
-    reports that it does not know this address — which happens when the
-    relay's database is reset, or when the app was restored onto a device
-    whose identity was never registered here. Previously that state showed
-    "Realtime auth failed" in the status ribbon forever, with no way to pick
-    a new name and no way out except deleting app data.
-
-    It now handles all three server answers distinctly:
-      * username_taken      -> keep the dialog open, ask for another name
-      * address_registered  -> this key already has a name here; offer to
-                               adopt it in one tap rather than dead-ending
-      * success             -> register and start syncing
+    signature); the relay recomputes the address and enforces the 'Fec'
+    proof-of-work. It is also the recovery path when the relay no longer
+    knows this address (its database was reset), and it handles the three
+    answers distinctly: the name is taken (ask again), this key already has
+    a name (offer to adopt it), or success.
     """
 
     def __init__(self, app: "FextApp", reason: str = "") -> None:
-        super().__init__("Pick your name", dismissable=False)
+        super().__init__("Choose your name", dismissable=False,
+                         subtitle=f"for the identity "
+                                  f"{short_addr(app.keys.address, 16)}")
         self.app = app
         self._suggested: Optional[str] = None
         if reason:
-            self.add(InfoLabel(reason, color=COL_TICK_GOLD,
-                               font_size=sp(13)))
-        self.add(InfoLabel(f"for identity {short_addr(app.keys.address, 16)}"
-                           "\n3–32 characters: letters, digits, underscore",
-                           color=COL_TEXT_DIM, font_size=sp(13)))
-        self.entry = self.add(CozyInput(hint="username",
-                                        on_enter=self._submit))
+            self.add(InfoLabel(reason, color=T.accent, font_size=fs(15)))
+        self.entry = self.add(Field(hint="username", label="Username",
+                                    on_enter=self._submit))
+        self.add(hint("3–32 letters, digits or underscores. Others find "
+                      "you by it."))
         self.status = self.status_label()
-        self.button = self.add(CozyButton("Register", on_release=lambda
-                                          _w: self._submit()))
-        # Shown only when the relay tells us this key already has a name.
-        self.adopt_button = CozyButton(
-            "", bg=COL_BG_LIST, fg=COL_ACCENT_DARK, outline=COL_ACCENT,
-            on_release=lambda _w: self._adopt())
-        self.check_label = self.add(InfoLabel("", color=COL_TEXT_DIM,
-                                              font_size=sp(12.5)))
+        self.button = self.add(Btn("Register", on_release=lambda
+                                   _w: self._submit()))
+        # Shown only when the relay says this key already has a name.
+        self.adopt_button = Btn("", kind="quiet",
+                                on_release=lambda _w: self._adopt())
 
     def _submit(self) -> None:
         username = self.entry.text.strip()
         if not valid_username(username):
-            self.set_status(self.status, "That name doesn't fit the format "
-                            "yet — 3–32 letters, digits or _", COL_DANGER)
+            self.set_status(self.status, "That name doesn't fit yet — 3–32 "
+                            "letters, digits or _", T.alert)
             return
         self.button.disabled = True
         self.set_status(self.status, "Registering…")
@@ -4356,7 +5811,7 @@ class RegisterModal(CozyModal):
         except ApiClient.ApiError as exc:
             if exc.code == "username_taken":
                 run_on_ui(self._fail,
-                          f"'{username}' is already taken — try another name.")
+                          f"‘{username}’ is already taken — try another.")
             elif exc.code == "address_registered":
                 run_on_ui(self._offer_adopt,
                           exc.detail.get("username") or "")
@@ -4368,17 +5823,14 @@ class RegisterModal(CozyModal):
             run_on_ui(self._succeed, username)
 
     def _offer_adopt(self, existing: str) -> None:
-        """This key is already registered under `existing`. Let the user take
-        that name back instead of leaving them stuck."""
         self.button.disabled = False
         if not existing:
             self.set_status(self.status, "This identity is already "
-                            "registered on the relay.", COL_DANGER)
+                            "registered on the relay.", T.alert)
             return
         self._suggested = existing
-        self.set_status(self.status,
-                        f"This identity is already registered as "
-                        f"'{existing}'.", COL_TICK_GOLD)
+        self.set_status(self.status, f"This identity is already registered "
+                        f"as ‘{existing}’.", T.accent)
         self.adopt_button.text = f"Continue as {existing}"
         if self.adopt_button.parent is None:
             self.add(self.adopt_button)
@@ -4388,7 +5840,7 @@ class RegisterModal(CozyModal):
             self._succeed(self._suggested)
 
     def _fail(self, message: str) -> None:
-        self.set_status(self.status, message, COL_DANGER)
+        self.set_status(self.status, message, T.alert)
         self.button.disabled = False
 
     def _succeed(self, username: str) -> None:
@@ -4397,19 +5849,17 @@ class RegisterModal(CozyModal):
         self.app.on_registered()
 
 
-class AddContactModal(CozyModal):
-    """Find a contact by username OR by their Fec… address."""
+class AddContactModal(Sheet):
+    """Find someone by username OR by their Fec… address."""
 
     def __init__(self, app: "FextApp") -> None:
         super().__init__("Add a contact")
         self.app = app
-        self.add(InfoLabel("Enter their username or Fec… address",
-                           color=COL_TEXT_DIM, font_size=sp(13)))
-        self.entry = self.add(CozyInput(hint="username or address",
-                                        on_enter=self._submit))
+        self.entry = self.add(Field(hint="username or Fec… address",
+                                    label="Who", on_enter=self._submit))
         self.status = self.status_label()
-        self.button = self.add(CozyButton("Look up",
-                                          on_release=lambda _w: self._submit()))
+        self.button = self.add(Btn("Look up",
+                                   on_release=lambda _w: self._submit()))
 
     def _submit(self) -> None:
         query = self.entry.text.strip()
@@ -4427,24 +5877,26 @@ class AddContactModal(CozyModal):
             elif valid_username(query):
                 user = self.app.api.lookup(username=query)
             else:
-                run_on_ui(self._fail, "That is neither a valid username nor "
-                          "a valid Fec… address.")
+                run_on_ui(self._fail, "That is neither a username nor a "
+                          "Fec… address.")
                 return
             if user["address"] == self.app.keys.address:
-                run_on_ui(self._fail, "That's you — no need to add yourself.")
+                run_on_ui(self._fail, "That's you — your notes to self are "
+                          "at the top of the list.")
                 return
             self.app.store.upsert_contact(user["address"], user["username"],
                                           user["public_key"])
         except ApiClient.ApiError as exc:
             run_on_ui(self._fail,
-                      "No such user." if exc.status == 404 else str(exc))
+                      "No one by that name." if exc.status == 404
+                      else str(exc))
         except requests.RequestException as exc:
             run_on_ui(self._fail, describe_network_error(exc))
         else:
             run_on_ui(self._succeed, user["address"])
 
     def _fail(self, message: str) -> None:
-        self.set_status(self.status, message, COL_DANGER)
+        self.set_status(self.status, message, T.alert)
         self.button.disabled = False
 
     def _succeed(self, address: str) -> None:
@@ -4452,49 +5904,43 @@ class AddContactModal(CozyModal):
         self.app.on_contact_added(address)
 
 
-class NewIdentityModal(CozyModal):
-    """Create a new identity, either by MINING a fresh key until its address
-    starts with 'Fec' (live attempt counter) or by IMPORTING an existing
-    private key (raw hex or WIF — the same formats FEXT Core uses).
-    Imported keys whose address does not meet the PoW are rejected up front
-    with a clear explanation, because the server would reject them anyway."""
+class NewIdentityModal(Sheet):
+    """Create an identity: MINE a fresh key until its address starts with
+    'Fec' (a live attempt counter), or IMPORT one (hex or WIF). Imported
+    keys whose address misses the proof-of-work are refused here, since the
+    relay would refuse them anyway."""
 
     def __init__(self, app: "FextApp", first_run: bool = False) -> None:
         super().__init__(f"Welcome to {APP_NAME}" if first_run else
-                         "Create an identity", dismissable=False)
+                         "A new identity", dismissable=not first_run)
         self.app = app
         self.first_run = first_run
         self._mining = False
         self._cancel_mining = False
-        self.add(InfoLabel(
-            "FEXT identities are Bitcoin-compatible secp256k1 keys. The "
-            "network only accepts addresses starting with \u201cFec\u201d, "
-            "so new keys are mined until one matches (a few seconds).",
-            color=COL_TEXT_DIM, font_size=sp(13)))
-        self.add(InfoLabel("Identity label (stays on this device)",
-                           font_size=sp(13)))
-        self.label_entry = self.add(CozyInput(hint="e.g. Personal"))
-        self.mine_button = self.add(CozyButton(
-            "Mine my new Fec identity", on_release=lambda
-            _w: self._start_mining()))
-        self.progress = self.add(InfoLabel("", color=COL_TICK_GOLD,
-                                           font_size=sp(13),
-                                           halign="center"))
-        self.add(InfoLabel("— or import an existing private key —",
-                           color=COL_TEXT_DIM, font_size=sp(12.5),
-                           halign="center"))
-        self.key_entry = self.add(CozyInput(
-            hint="64-char hex  or  WIF (K… / L… / 5…)", password=True))
-        self.import_button = self.add(CozyButton(
-            "Import key", bg=COL_BG_LIST, fg=COL_ACCENT_DARK,
-            outline=COL_ACCENT, on_release=lambda _w: self._import_key()))
+        self.add(hint(
+            "An identity is a secp256k1 key, the kind Bitcoin uses. The "
+            "network only admits addresses that begin “Fec”, so a new key "
+            "is mined until one does — a few seconds."))
+        self.label_entry = self.add(Field(hint="e.g. Personal",
+                                          label="Label, on this device only"))
+        self.mine_button = self.add(Btn(
+            "Mine a new identity", on_release=lambda _w: self._start_mining()))
+        self.progress = self.add(InfoLabel("", color=T.accent,
+                                           font_size=fs(15), halign="center"))
+        self.add(CapsLabel("or import a key", size=11, halign="center"))
+        self.key_entry = self.add(Field(
+            hint="64 hex characters, or WIF (K… L… 5…)", password=True,
+            label="Private key"))
+        self.import_button = self.add(Btn(
+            "Import key", kind="quiet",
+            on_release=lambda _w: self._import_key()))
         self.status = self.status_label()
         if not first_run:
-            self.add(CozyButton("Cancel", bg=COL_BG_LIST, fg=COL_TEXT_DIM,
-                                outline=COL_CARD_EDGE,
-                                on_release=lambda _w: self._close()))
+            self.add(Btn("Cancel", kind="text",
+                         on_release=lambda _w: self._close()))
+        self.bind(on_dismiss=lambda *_a: setattr(self, "_cancel_mining",
+                                                 True))
 
-    # ---- mining --------------------------------------------------------------
     def _start_mining(self) -> None:
         if self._mining:
             return
@@ -4512,16 +5958,16 @@ class NewIdentityModal(CozyModal):
 
         def progress(attempts: int) -> None:
             now = time.time()
-            if now - last_ui[0] < 0.15:        # keep the UI queue calm
+            if now - last_ui[0] < 0.15:
                 return
             last_ui[0] = now
             rate = attempts / max(now - started, 0.001)
             run_on_ui(setattr, self.progress, "text",
-                      f"Mining… {attempts:,} attempts ({rate:,.0f}/s)")
+                      f"Mining… {attempts:,} attempts ({rate:,.0f} a second)")
 
         result = mine_identity(should_stop=lambda: self._cancel_mining,
                                progress=progress)
-        if result is None:                     # cancelled
+        if result is None:
             return
         priv, _pub, address, attempts = result
         run_on_ui(self._finish, priv, address, attempts)
@@ -4530,7 +5976,6 @@ class NewIdentityModal(CozyModal):
         self.progress.text = f"Found {address}\nafter {attempts:,} attempts"
         self._save(priv)
 
-    # ---- import --------------------------------------------------------------
     def _import_key(self) -> None:
         text = self.key_entry.text.strip()
         if not text:
@@ -4538,19 +5983,18 @@ class NewIdentityModal(CozyModal):
         try:
             priv = parse_private_key(text)
         except ValueError as exc:
-            self.set_status(self.status, f"Cannot parse key: {exc}",
-                            COL_DANGER)
+            self.set_status(self.status, f"Cannot read that key: {exc}",
+                            T.alert)
             return
         self._save(priv)
 
-    # ---- shared save path ----------------------------------------------------
     def _save(self, priv: int) -> None:
         label = self.label_entry.text.strip() or \
             f"Identity {len(self.app.keys.identities) + 1}"
         try:
             address = self.app.keys.add_identity(priv, label)
         except ValueError as exc:
-            self.set_status(self.status, str(exc), COL_DANGER)
+            self.set_status(self.status, str(exc), T.alert)
             self._mining = False
             self.mine_button.disabled = False
             self.import_button.disabled = False
@@ -4564,25 +6008,24 @@ class NewIdentityModal(CozyModal):
         self.app.on_identity_dialog_closed()
 
 
-class ImportChooserModal(CozyModal):
-    """Pick a .json chat export to import (cross-platform file picker)."""
+def _file_chooser(path: str, filters: list, height: float):
+    chooser = FileChooserListView(path=path, filters=filters,
+                                  size_hint_y=None, height=height)
+    return chooser
+
+
+class ImportChooserModal(Sheet):
+    """Pick a .json chat export to import."""
 
     def __init__(self, on_pick: Callable[[str], None]) -> None:
-        super().__init__("Choose a chat export (.json)")
+        super().__init__("Import a chat", subtitle="A .json export")
         self._on_pick = on_pick
         start = EXPORT_DIR if EXPORT_DIR.exists() else DATA_DIR
-        self.chooser = FileChooserListView(path=str(start),
-                                           filters=["*.json"],
-                                           size_hint_y=None,
-                                           height=dp(340))
-        self.add(self.chooser)
-        row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(10))
-        row.add_widget(CozyButton("Cancel", bg=COL_BG_LIST, fg=COL_TEXT_DIM,
-                                  outline=COL_CARD_EDGE,
-                                  on_release=lambda _w: self.dismiss()))
-        row.add_widget(CozyButton("Import this file",
-                                  on_release=lambda _w: self._pick()))
-        self.add(row)
+        self.chooser = self.add(_file_chooser(
+            str(start), ["*.json"], min(dp(340), Window.height * .5)))
+        self.add(button_row(Btn("Cancel", kind="quiet",
+                                on_release=lambda _w: self.dismiss()),
+                            Btn("Import", on_release=lambda _w: self._pick())))
 
     def _pick(self) -> None:
         if self.chooser.selection:
@@ -4591,126 +6034,122 @@ class ImportChooserModal(CozyModal):
             self._on_pick(path)
 
 
-class DropMenu(ModalView):
-    """The ⋮ overflow menu: a small card dropped from the top-right corner,
-    dismissed by tapping anywhere else."""
-
-    ITEM_H = dp(48)
-
-    def __init__(self, items: list, **kw):
-        super().__init__(background_color=(0, 0, 0, 0),
-                         overlay_color=(0, 0, 0, 0.08), auto_dismiss=True,
-                         size_hint=(None, None), **kw)
-        self.width = dp(236)
-        self.height = self.ITEM_H * len(items) + dp(12)
-        card = BoxLayout(orientation="vertical", padding=[0, dp(6), 0, dp(6)])
-        paint_round(card, COL_CARD, radius=dp(12))
-        paint_border(card, COL_CARD_EDGE, radius=dp(12))
-        for text, action in items:
-            row = CozyButton(text, bg=COL_CARD, fg=COL_TEXT, bold=False,
-                             radius=0, font_size=sp(15), height=self.ITEM_H,
-                             pressed=COL_PRESSED, halign="left",
-                             valign="middle", padding=[dp(18), 0])
-            row.bind(size=lambda w, v: setattr(w, "text_size", v))
-            row.bind(on_release=lambda _w, a=action: self._run(a))
-            card.add_widget(row)
-        self.add_widget(card)
-
-    def _run(self, action: Callable) -> None:
-        self.dismiss()
-        Clock.schedule_once(lambda _dt: action(), 0.05)
-
-    def open_below(self, anchor) -> None:
-        """Anchor the card under `anchor`, kept inside the window."""
-        self._anchor_xy = anchor.to_window(anchor.right, anchor.y)
-        self.open()
-        # open() assigns `center` BEFORE it binds _align_center, so the
-        # override has to be applied once by hand; it then holds on resize.
-        self._align_center()
-
-    def _align_center(self, *_args):
-        """ModalView re-centres itself on every open and window resize;
-        a dropdown must stay pinned under its button instead."""
-        anchor = getattr(self, "_anchor_xy", None)
-        if anchor is None:
-            return super()._align_center(*_args)
-        ax, ay = anchor
-        self.x = max(dp(8), min(ax - self.width,
-                                Window.width - self.width - dp(8)))
-        self.top = max(self.height + dp(8), ay - dp(2))
-
-
 class ContactPickRow(ButtonBehavior, BoxLayout):
-    """A contact with a tick that toggles (forward-to picker)."""
+    """Someone you can choose (forward to, a group's members): their disc,
+    their name, and a ring that fills with a tick."""
 
-    def __init__(self, contact: dict, **kw):
+    def __init__(self, contact: dict, picked: bool = False,
+                 on_change: Optional[Callable] = None, kind: str = "dm",
+                 name: Optional[str] = None, sub: Optional[str] = None, **kw):
         kw.setdefault("size_hint_y", None)
-        kw.setdefault("height", dp(56))
-        kw.setdefault("padding", [dp(4), dp(6), dp(8), dp(6)])
-        kw.setdefault("spacing", dp(12))
+        kw.setdefault("height", max(dp(60), line_height(17) +
+                                    line_height(14) + dp(16)))
+        kw.setdefault("padding", [dp(20), dp(6), dp(20), dp(6)])
+        kw.setdefault("spacing", dp(14))
         super().__init__(**kw)
         self.address = contact["address"]
-        self.picked = False
-        name = contact.get("username") or short_addr(self.address, 14)
-        self.add_widget(Avatar(self.address, name, diameter=dp(40)))
+        self.picked = picked
+        self._on_change = on_change
+        name = name or contact.get("username") or short_addr(self.address, 14)
+        self.add_widget(Avatar(self.address, name, diameter=dp(40),
+                               kind=kind, pos_hint={"center_y": .5}))
         texts = BoxLayout(orientation="vertical")
-        texts.add_widget(single_line(name, sp(15), COL_TEXT, bold=True))
-        texts.add_widget(single_line(short_addr(self.address, 18), sp(12),
-                                     COL_TEXT_DIM))
+        texts.add_widget(single_line(name, fs(17), T.text))
+        texts.add_widget(single_line(sub if sub is not None else
+                                     short_addr(self.address, 18), fs(14),
+                                     T.text_3))
         self.add_widget(texts)
         self.tick = Widget(size_hint_x=None, width=dp(28))
         self.tick.bind(pos=self._paint, size=self._paint)
         self.add_widget(self.tick)
-        self.bind(on_release=lambda _w: self.toggle())
+        with self.canvas.before:
+            self._bg = Color(0, 0, 0, 0)
+            self._rect = Rectangle()
+        self.bind(pos=self._sync, size=self._sync,
+                  state=lambda _w, st: setattr(
+                      self._bg, "rgba", C(T.press) if st == "down"
+                      else (0, 0, 0, 0)),
+                  on_release=lambda _w: self.toggle())
+
+    def _sync(self, *_a):
+        self._rect.pos, self._rect.size = self.pos, self.size
 
     def toggle(self) -> None:
         self.picked = not self.picked
         self._paint()
+        if self._on_change:
+            self._on_change(self)
 
     def _paint(self, *_a) -> None:
         t = self.tick
         t.canvas.clear()
+        r = dp(11)
         with t.canvas:
-            Color(*C(COL_ACCENT if self.picked else COL_CARD_EDGE))
-            Ellipse(pos=(t.center_x - dp(11), t.center_y - dp(11)),
-                    size=(dp(22), dp(22)))
             if self.picked:
-                draw_icon("check", t.center_x, t.center_y, dp(13),
-                          C("#FFFFFF"), width=dp(1.8))
+                Color(*C(T.accent))
+                Ellipse(pos=((t.x + t.width / 2) - r, (t.y + t.height / 2) - r), size=(2 * r,
+                                                                    2 * r))
+                draw_icon("check", (t.x + t.width / 2), (t.y + t.height / 2), dp(13),
+                          C(T.on_accent), width=dp(1.7))
             else:
-                Color(*C(COL_CARD))
-                Ellipse(pos=(t.center_x - dp(9.5), t.center_y - dp(9.5)),
-                        size=(dp(19), dp(19)))
+                Color(*C(T.rule_strong))
+                Line(circle=((t.x + t.width / 2), (t.y + t.height / 2), r - dp(.5)),
+                     width=dp(1.1))
 
 
-class ForwardModal(CozyModal):
-    """Pick one or more contacts of THIS identity to forward to."""
+def conversation_title(app, peer: str) -> tuple:
+    """(name, kind) for any conversation key — a contact, a group, or
+    notes to self."""
+    kind = app.conversation_kind(peer)
+    if kind == "self":
+        return "Notes to self", kind
+    if kind == "group":
+        group = app.store.group(gid_of(peer)) if app.store else None
+        return (group or {}).get("name") or "Group", kind
+    contact = app.store.get_contact(peer) if app.store else None
+    return (contact or {}).get("username") or short_addr(peer, 14), kind
+
+
+class ForwardModal(Sheet):
+    """Forward to any chat of this identity: notes to self, a group, a
+    contact — several at once."""
 
     def __init__(self, app: "FextApp", local_ids: list,
                  on_done: Optional[Callable] = None) -> None:
         n = len(local_ids)
-        super().__init__(f"Forward {n} message{'s' if n != 1 else ''} to…")
+        super().__init__(f"Forward {n} message{'s' if n != 1 else ''}")
         self.app, self.local_ids, self.on_done = app, local_ids, on_done
-        contacts = app.store.contacts() if app.store else []
-        scroll = ScrollView(size_hint_y=None, bar_width=dp(3),
-                            height=min(dp(56) * max(1, len(contacts)) + dp(4),
-                                       Window.height * 0.5))
-        box = BoxLayout(orientation="vertical", size_hint_y=None)
-        box.bind(minimum_height=box.setter("height"))
-        self.rows = [ContactPickRow(c) for c in contacts]
-        for row in self.rows:
-            box.add_widget(row)
-        if not self.rows:
-            box.add_widget(InfoLabel("No contacts yet.", color=COL_TEXT_DIM))
-        scroll.add_widget(box)
-        self.add(scroll)
-        buttons = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(10))
-        buttons.add_widget(CozyButton("Cancel", bg=COL_BG_LIST,
-                                      fg=COL_TEXT_DIM, outline=COL_CARD_EDGE,
-                                      on_release=lambda _w: self.dismiss()))
-        buttons.add_widget(CozyButton("Forward",
-                                      on_release=lambda _w: self._go()))
-        self.add(buttons)
+        self.card.padding = [0, dp(8), 0, dp(18)]
+        self.title_label.padding = [dp(22), 0]
+        targets = [{"address": app.keys.address}]
+        for group in app.store.groups() if app.store else []:
+            if group["state"] == "active":
+                targets.append({"address": group_peer(group["gid"])})
+        targets += app.store.contacts() if app.store else []
+        self.rows = []
+        for target in targets:
+            peer = target["address"]
+            name, kind = conversation_title(app, peer)
+            sub = {"self": "Kept on this device",
+                   "group": f"{len((app.store.group(gid_of(peer)) or {}).get('members', []))} members"
+                   }.get(kind)
+            self.rows.append(ContactPickRow(
+                {"address": peer}, kind=kind, name=name, sub=sub,
+                on_change=lambda _r: self._sync_button()))
+        self.add(rows_card(self.rows, inset=dp(74)))
+        self.button = Btn("Forward", on_release=lambda _w: self._go(),
+                          size_hint_x=None)
+        holder = BoxLayout(size_hint_y=None, height=TOUCH,
+                           padding=[dp(22), 0])
+        self.button.size_hint_x = 1
+        holder.add_widget(self.button)
+        self.add(holder)
+        self._sync_button()
+
+    def _sync_button(self) -> None:
+        n = sum(1 for r in self.rows if r.picked)
+        self.button.disabled = n == 0
+        self.button.text = "Forward" if n <= 1 else f"Forward to {n} chats"
 
     def _go(self) -> None:
         targets = [r.address for r in self.rows if r.picked]
@@ -4720,46 +6159,48 @@ class ForwardModal(CozyModal):
         sent = self.app.forward_messages(self.local_ids, targets)
         if self.on_done:
             self.on_done()
-        who = (len(targets) == 1 and (self.app.store.get_contact(targets[0])
-               or {}).get("username")) or f"{len(targets)} chats"
+        who = (len(targets) == 1 and conversation_title(
+            self.app, targets[0])[0]) or f"{len(targets)} chats"
         self.app._set_status(f"Forwarded {sent} message"
-                             f"{'s' if sent != 1 else ''} to {who}", COL_OK)
+                             f"{'s' if sent != 1 else ''} to {who}", T.ok)
 
 
-class DeleteModal(CozyModal):
-    """Delete for me, or — only when every message is yours — for both."""
+class DeleteModal(Sheet):
+    """Delete for me, or — only when every message is yours — for
+    everyone in the chat."""
 
     def __init__(self, app: "FextApp", msgs: list,
                  on_done: Optional[Callable] = None) -> None:
         n = len(msgs)
         super().__init__(f"Delete {n} message{'s' if n != 1 else ''}?")
-        # NOT self.ids: every Kivy widget already has an `ids` property (a
-        # dict of kv-language children), and assigning a list to it raises.
+        # NOT self.ids: every Kivy widget already has an `ids` property.
         self.app, self.msg_ids, self.on_done = app, [m["id"] for m in msgs], \
             on_done
         own = all(m["direction"] == "out" and m.get("client_msg_id")
                   for m in msgs)
         peer = msgs[0]["peer"] if msgs else None
-        contact = (app.store.get_contact(peer) or {}) if peer else {}
-        name = contact.get("username") or "them"
-        if own:
-            self.add(CozyButton(f"Delete for me and {name}", bg=COL_DANGER,
-                                on_release=lambda _w: self._go(True)))
-            if not contact.get("caps", 0) & LocalStore.CAP_V9:
-                self.add(InfoLabel(
-                    f"If {name} is still on an older version of the app, "
-                    f"their copy stays and they see a note instead.",
-                    color=COL_TEXT_DIM, font_size=sp(12.5)))
-        self.add(CozyButton("Delete for me", bg=COL_BG_LIST, fg=COL_DANGER,
-                            outline=COL_DANGER,
-                            on_release=lambda _w: self._go(False)))
-        if not own:
-            self.add(InfoLabel("Only your own messages can be deleted for "
-                               "both sides.", color=COL_TEXT_DIM,
-                               font_size=sp(12.5)))
-        self.add(CozyButton("Cancel", bg=COL_BG_LIST, fg=COL_TEXT_DIM,
-                            outline=COL_CARD_EDGE,
-                            on_release=lambda _w: self.dismiss()))
+        kind = app.conversation_kind(peer) if peer else "dm"
+        if own and kind != "self":
+            if kind == "group":
+                label, note = "Delete for everyone", ""
+            else:
+                contact = (app.store.get_contact(peer) or {}) if peer else {}
+                name = contact.get("username") or "them"
+                label = f"Delete for me and {name}"
+                note = ("" if contact.get("caps", 0) & LocalStore.CAP_V9 else
+                        f"If {name} is still on an older version, their "
+                        f"copy stays and they see a note instead.")
+            self.add(Btn(label, kind="solid_danger",
+                         on_release=lambda _w: self._go(True)))
+            if note:
+                self.add(hint(note))
+        self.add(Btn("Delete for me", kind="danger",
+                     on_release=lambda _w: self._go(False)))
+        if not own and kind != "self":
+            self.add(hint("Only your own messages can be deleted for "
+                          "everyone."))
+        self.add(Btn("Cancel", kind="text",
+                     on_release=lambda _w: self.dismiss()))
 
     def _go(self, for_everyone: bool) -> None:
         self.dismiss()
@@ -4768,41 +6209,34 @@ class DeleteModal(CozyModal):
         self.app.delete_messages(self.msg_ids, for_everyone)
 
 
-class StarredModal(CozyModal):
+class StarredModal(Sheet):
     """Starred messages of one chat — private bookmarks, never sent."""
 
     def __init__(self, app: "FextApp", peer: Optional[str]) -> None:
-        super().__init__("Starred messages")
+        super().__init__("Starred")
         self.app = app
         rows = app.store.starred(peer) if app.store else []
-        scroll = ScrollView(size_hint_y=None, bar_width=dp(3),
-                            height=min(max(dp(70), dp(66) * len(rows)),
-                                       Window.height * 0.6))
-        box = BoxLayout(orientation="vertical", size_hint_y=None,
-                        spacing=dp(6))
-        box.bind(minimum_height=box.setter("height"))
         screen = app.conversation_screen
         for msg in rows:
-            item = TappableBox(size_hint_y=None, height=dp(60),
-                               padding=[dp(12), dp(6)],
+            item = TappableBox(size_hint_y=None, padding=[0, dp(6)],
+                               spacing=dp(2),
                                on_tap=lambda m=msg: self._open(m))
-            paint_round(item, COL_CARD, radius=dp(12))
+            item.bind(minimum_height=item.setter("height"))
             who = screen.author_name(screen._author_of(msg))
             day = pretty_day(msg["created_at"])
             clock = pretty_time(msg["created_at"])
-            # pretty_day already IS the time for today's messages.
             when = clock if day == clock else f"{day}, {clock}"
-            item.add_widget(single_line(f"{who}  ·  {when}", sp(12),
-                                        COL_ACCENT_DARK, bold=True))
-            item.add_widget(single_line(msg["body"], sp(14), COL_TEXT))
-            box.add_widget(item)
+            item.add_widget(CapsLabel(f"{who} · {when}", size=10.5,
+                                      color=T.accent))
+            item.add_widget(InfoLabel(single_line_text(msg["body"], 240),
+                                      font_size=fs(16)))
+            self.add(item)
+            self.add(Rule())
         if not rows:
-            box.add_widget(InfoLabel(
-                "Nothing starred yet. Long-press a message and tap the star "
-                "to keep it here.", color=COL_TEXT_DIM, font_size=sp(13)))
-        scroll.add_widget(box)
-        self.add(scroll)
-        self.add(CozyButton("Done", on_release=lambda _w: self.dismiss()))
+            self.add(hint("Nothing starred yet. Hold a message and choose "
+                          "the star to keep it here."))
+        self.add(Btn("Done", kind="quiet",
+                     on_release=lambda _w: self.dismiss()))
 
     def _open(self, msg: dict) -> None:
         self.dismiss()
@@ -4825,25 +6259,19 @@ class ImageViewer(ModalView):
         self.add_widget(box)
 
 
-class ImageChooserModal(CozyModal):
+class ImageChooserModal(Sheet):
     """Desktop photo picker."""
 
     def __init__(self, on_pick: Callable[[str], None]) -> None:
         super().__init__("Send a photo")
         self._on_pick = on_pick
-        self.chooser = FileChooserListView(
-            path=str(Path.home()),
-            filters=["*.jpg", "*.jpeg", "*.png", "*.webp", "*.JPG",
-                     "*.JPEG", "*.PNG", "*.bmp", "*.gif"],
-            size_hint_y=None, height=min(dp(360), Window.height * 0.55))
-        self.add(self.chooser)
-        row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(10))
-        row.add_widget(CozyButton("Cancel", bg=COL_BG_LIST, fg=COL_TEXT_DIM,
-                                  outline=COL_CARD_EDGE,
-                                  on_release=lambda _w: self.dismiss()))
-        row.add_widget(CozyButton("Choose", on_release=lambda _w:
-                                  self._pick()))
-        self.add(row)
+        self.chooser = self.add(_file_chooser(
+            str(Path.home()), ["*.jpg", "*.jpeg", "*.png", "*.webp", "*.JPG",
+                               "*.JPEG", "*.PNG", "*.bmp", "*.gif"],
+            min(dp(360), Window.height * 0.5)))
+        self.add(button_row(Btn("Cancel", kind="quiet",
+                                on_release=lambda _w: self.dismiss()),
+                            Btn("Choose", on_release=lambda _w: self._pick())))
 
     def _pick(self) -> None:
         if self.chooser.selection:
@@ -4852,8 +6280,8 @@ class ImageChooserModal(CozyModal):
             self._on_pick(path)
 
 
-class AttachPreviewModal(CozyModal):
-    """Check the photo and add a caption before it is compressed and sent."""
+class AttachPreviewModal(Sheet):
+    """See the photo and add a caption before it is compressed and sent."""
 
     def __init__(self, app: "FextApp", path: str) -> None:
         super().__init__("Send photo")
@@ -4861,222 +6289,125 @@ class AttachPreviewModal(CozyModal):
         self.add(KivyImage(source=path, allow_stretch=True, keep_ratio=True,
                            size_hint_y=None,
                            height=min(dp(300), Window.height * 0.4)))
-        self.caption = self.add(CozyInput(hint="Add a caption…"))
-        self.add(InfoLabel(
-            "Sent compressed, with location and camera details removed.",
-            color=COL_TEXT_DIM, font_size=sp(12)))
-        row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(10))
-        row.add_widget(CozyButton("Cancel", bg=COL_BG_LIST, fg=COL_TEXT_DIM,
-                                  outline=COL_CARD_EDGE,
-                                  on_release=lambda _w: self.dismiss()))
-        row.add_widget(CozyButton("Send", on_release=lambda _w: self._send()))
-        self.add(row)
+        self.caption = self.add(Field(hint="Add a caption…",
+                                      on_enter=self._send))
+        self.add(hint("Sent compressed, with its location and camera "
+                      "details removed."))
+        self.add(button_row(Btn("Cancel", kind="quiet",
+                                on_release=lambda _w: self.dismiss()),
+                            Btn("Send", on_release=lambda _w: self._send())))
 
     def _send(self) -> None:
         self.dismiss()
         self.app.send_image(self.path, sanitize_text(self.caption.text))
 
 
-class RenameIdentityModal(CozyModal):
+class TextPromptSheet(Sheet):
+    """One line of text, confirmed (rename an identity, rename a group)."""
+
+    def __init__(self, title: str, label: str, value: str, note: str,
+                 on_save: Callable[[str], bool], limit: int = 40) -> None:
+        super().__init__(title)
+        self._on_save, self._limit = on_save, limit
+        self.entry = self.add(Field(label=label, on_enter=self._save))
+        self.entry.text = value
+        if note:
+            self.add(hint(note))
+        self.add(button_row(Btn("Cancel", kind="quiet",
+                                on_release=lambda _w: self.dismiss()),
+                            Btn("Save", on_release=lambda _w: self._save())))
+
+    def _save(self) -> None:
+        value = sanitize_text(self.entry.text)[:self._limit].strip()
+        if value and self._on_save(value) is not False:
+            self.dismiss()
+
+
+class RenameIdentityModal(TextPromptSheet):
     """Rename an identity's on-device label (its relay username is fixed)."""
 
     def __init__(self, app: "FextApp", address: str) -> None:
-        super().__init__("Rename identity")
-        self.app, self.address = app, address
         ident = app.keys.find(address) or {}
-        self.add(InfoLabel(
-            "This label is only shown on this device, to tell your "
-            "identities apart. Your username on the relay stays "
-            f"@{ident.get('username') or '(unregistered)'}.",
-            color=COL_TEXT_DIM, font_size=sp(12.5)))
-        self.entry = self.add(CozyInput(hint="Label"))
-        self.entry.text = ident.get("label", "")
-        row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(10))
-        row.add_widget(CozyButton("Cancel", bg=COL_BG_LIST, fg=COL_TEXT_DIM,
-                                  outline=COL_CARD_EDGE,
-                                  on_release=lambda _w: self.dismiss()))
-        row.add_widget(CozyButton("Save", on_release=lambda _w: self._save()))
-        self.add(row)
+        self.app, self.address = app, address
+        super().__init__(
+            "Rename identity", "Label", ident.get("label", ""),
+            "Only this device shows the label, to tell your identities "
+            "apart. Your name on the relay stays "
+            f"@{ident.get('username') or '(unregistered)'}.", self._apply)
 
-    def _save(self) -> None:
-        label = sanitize_text(self.entry.text)[:40]
-        if not label:
-            return
+    def _apply(self, label: str) -> bool:
         self.app.keys.rename_identity(self.address, label)
-        self.dismiss()
         self.app.chats_screen.refresh_header()
-        ProfileMenuModal(self.app).open()
+        Clock.schedule_once(lambda _dt: IdentitySheet(self.app).open(), 0.1)
+        return True
 
 
-class ContactSettingsModal(CozyModal):
-    """Opened by tapping the chat title bar. Per-contact controls:
-      * Ticks status  — 'Enable ticks status' / 'No ticks status'. The choice
-        is synced to the server; if EITHER side chooses 'No ticks', the
-        server relays nothing and both sides cap at one golden tick.
-      * Auto mark all as read (default ON). When off, incoming messages stay
-        unread (sender stuck at 2/3) until manually marked.
-      * Plaintext chat export (.json / .txt) and import (.json)."""
+class ChatHistorySheet(Sheet):
+    """Plaintext export (.json / .txt) and import (.json) of one chat."""
 
     def __init__(self, app: "FextApp", peer: str) -> None:
-        contact = app.store.get_contact(peer) or {}
-        name = contact.get("username") or short_addr(peer)
-        super().__init__(f"Chat with {name}")
-        self.app = app
-        self.peer = peer
-        self.add(InfoLabel(peer, color=COL_TEXT_DIM, font_size=sp(11.5)))
-        scroll = ScrollView(size_hint_y=None, height=min(dp(430),
-                            Window.height * 0.62), bar_width=dp(3))
-        body = BoxLayout(orientation="vertical", size_hint_y=None,
-                         spacing=dp(10))
-        body.bind(minimum_height=body.setter("height"))
-        scroll.add_widget(body)
-        self.add(scroll)
+        name, _kind = conversation_title(app, peer)
+        super().__init__("Chat history", subtitle=f"{name} — plaintext copies "
+                                                  f"that stay on this device")
+        self.app, self.peer, self.name = app, peer, name
+        self.add(button_row(Btn("Export .json", kind="quiet",
+                                on_release=lambda _w: self._export("json")),
+                            Btn("Export .txt", kind="quiet",
+                                on_release=lambda _w: self._export("txt"))))
+        self.add(Btn("Import .json", kind="quiet",
+                     on_release=lambda _w: self._import()))
+        self.io_status = self.status_label()
+        self.add(Btn("Done", kind="text",
+                     on_release=lambda _w: self.dismiss()))
 
-        # ---- ticks privacy ---------------------------------------------------
-        card = SectionCard("Ticks status")
-        self._ticks_enabled = bool(contact.get("ticks_enabled", 1))
-        seg = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
-        self.seg_on = CozyButton("Ticks on", height=dp(42), font_size=sp(13.5),
-                                 on_release=lambda _w:
-                                 self._on_ticks_change(True))
-        self.seg_off = CozyButton("No ticks", height=dp(42),
-                                  font_size=sp(13.5),
-                                  on_release=lambda _w:
-                                  self._on_ticks_change(False))
-        seg.add_widget(self.seg_on)
-        seg.add_widget(self.seg_off)
-        card.add_widget(seg)
-        # Described in words, not glyphs: the check-mark codepoint has no
-        # glyph in the bundled font and rendered as an empty box here too.
-        card.add_widget(InfoLabel(
-            "Ticks on: delivered and read receipts flow both ways when you "
-            "both enable them, so messages can reach two and three ticks.\n"
-            "No ticks: either side choosing this caps both chats at a "
-            "single tick.", color=COL_TEXT_DIM, font_size=sp(12.5)))
-        self.ticks_status = InfoLabel("", color=COL_TEXT_DIM,
-                                      font_size=sp(12.5))
-        card.add_widget(self.ticks_status)
-        body.add_widget(card)
+    def _author(self, m: dict) -> str:
+        if m["direction"] == "out":
+            return self.app.keys.username or "Me"
+        if m.get("kind") == "event":
+            return "·"
+        return self.app.conversation_screen.author_name(
+            m.get("author") or m["peer"])
 
-        # ---- auto-read -------------------------------------------------------
-        card = SectionCard("Read behaviour")
-        self._auto = bool(contact.get("auto_read", 1))
-        self.auto_button = CozyButton("", height=dp(42), font_size=sp(13.5),
-                                      on_release=lambda _w:
-                                      self._on_auto_change())
-        card.add_widget(self.auto_button)
-        card.add_widget(InfoLabel(
-            "When off, messages stay unread (their sender sees two ticks at "
-            "most) until you press \u201cMark all as read\u201d or tap a "
-            "message.", color=COL_TEXT_DIM, font_size=sp(12.5)))
-        body.add_widget(card)
-
-        # ---- import / export -------------------------------------------------
-        card = SectionCard("Chat history (plaintext, stays on this device)")
-        row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
-        row.add_widget(CozyButton("Export .json", height=dp(42),
-                                  bg=COL_BG_LIST, fg=COL_ACCENT_DARK,
-                                  outline=COL_ACCENT, font_size=sp(13),
-                                  on_release=lambda _w: self._export("json")))
-        row.add_widget(CozyButton("Export .txt", height=dp(42),
-                                  bg=COL_BG_LIST, fg=COL_ACCENT_DARK,
-                                  outline=COL_ACCENT, font_size=sp(13),
-                                  on_release=lambda _w: self._export("txt")))
-        row.add_widget(CozyButton("Import .json", height=dp(42),
-                                  bg=COL_BG_LIST, fg=COL_TICK_GOLD,
-                                  outline=COL_TICK_GOLD, font_size=sp(13),
-                                  on_release=lambda _w: self._import()))
-        card.add_widget(row)
-        self.io_status = InfoLabel("", color=COL_TEXT_DIM, font_size=sp(12.5))
-        card.add_widget(self.io_status)
-        body.add_widget(card)
-
-        self.add(CozyButton("Done", on_release=lambda _w: self.dismiss()))
-        self._style_toggles()
-
-    # ---- toggle styling ------------------------------------------------------
-    def _style_toggles(self) -> None:
-        on, off = self._ticks_enabled, not self._ticks_enabled
-        self.seg_on._bg_hex = COL_ACCENT if on else COL_BG_LIST
-        self.seg_on.color = C("#FFFFFF" if on else COL_TEXT_DIM)
-        self.seg_off._bg_hex = COL_ACCENT if off else COL_BG_LIST
-        self.seg_off.color = C("#FFFFFF" if off else COL_TEXT_DIM)
-        for seg in (self.seg_on, self.seg_off):
-            seg._on_state(seg, seg.state)
-        self.auto_button.text = ("Auto mark all as read:  ON" if self._auto
-                                 else "Auto mark all as read:  OFF")
-        self.auto_button._bg_hex = COL_ACCENT if self._auto else COL_BG_LIST
-        self.auto_button.color = C("#FFFFFF" if self._auto else COL_TEXT_DIM)
-        self.auto_button._on_state(self.auto_button, self.auto_button.state)
-
-    # ---- ticks ---------------------------------------------------------------
-    def _on_ticks_change(self, enabled: bool) -> None:
-        self._ticks_enabled = enabled
-        self._style_toggles()
-        self.app.store.set_contact_setting(self.peer, "ticks_enabled",
-                                           int(enabled))
-        self.ticks_status.text = "Syncing preference…"
-        threading.Thread(target=self._ticks_worker, args=(enabled,),
-                         daemon=True).start()
-        self.app.refresh_chat(self.peer)
-
-    def _ticks_worker(self, enabled: bool) -> None:
-        try:
-            self.app.api.set_ticks(self.peer, enabled)
-            note = "Preference synced to server."
-        except (requests.RequestException, ApiClient.ApiError):
-            note = "Saved here; the server learns about it once you're online."
-        run_on_ui(setattr, self.ticks_status, "text", note)
-
-    # ---- auto-read -----------------------------------------------------------
-    def _on_auto_change(self) -> None:
-        self._auto = not self._auto
-        self._style_toggles()
-        self.app.store.set_contact_setting(self.peer, "auto_read",
-                                           int(self._auto))
-        if self._auto:
-            self.app.mark_peer_read(self.peer)
-        self.app.refresh_chat(self.peer)
-
-    # ---- export / import -----------------------------------------------------
     def _export(self, fmt: str) -> None:
-        contact = self.app.store.get_contact(self.peer) or {}
-        name = contact.get("username") or short_addr(self.peer, 10)
         EXPORT_DIR.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = EXPORT_DIR / f"fext_chat_{name}_{stamp}.{fmt}"
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", self.name)[:40] or "chat"
+        path = EXPORT_DIR / f"fext_chat_{safe}_{stamp}.{fmt}"
         messages = self.app.store.messages_for(self.peer)
+        contact = self.app.store.get_contact(self.peer) or {}
         try:
             if fmt == "json":
                 path.write_text(json.dumps({
                     "fext_chat_export": 2,
                     "identity": self.app.keys.address,
                     "peer": {"address": self.peer,
-                             "username": contact.get("username")},
+                             "username": contact.get("username") or
+                             self.name},
                     "exported_at": now_iso(),
-                    "messages": [{"direction": m["direction"],
-                                  "body": m["body"],
-                                  "created_at": m["created_at"],
-                                  "status": m["status"], "read": m["read"]}
-                                 for m in messages],
+                    "messages": [dict({"direction": m["direction"],
+                                       "body": m["body"],
+                                       "created_at": m["created_at"],
+                                       "status": m["status"],
+                                       "read": m["read"]},
+                                      **({"author": m["author"]}
+                                         if m.get("author") else {}))
+                                 for m in messages
+                                 if m.get("kind") != "event"],
                 }, indent=2, ensure_ascii=False), "utf-8")
             else:
-                me = self.app.keys.username or "Me"
-                lines = [f"{APP_NAME} chat with {name} ({self.peer})",
+                lines = [f"{APP_NAME} — {self.name} ({self.peer})",
                          f"Exported {now_iso()}", ""]
                 for m in messages:
-                    who = me if m["direction"] == "out" else name
-                    lines.append(f"[{m['created_at']}] {who}: {m['body']}")
+                    lines.append(f"[{m['created_at']}] {self._author(m)}: "
+                                 f"{m['body']}")
                 path.write_text("\n".join(lines) + "\n", "utf-8")
             opened = open_folder_in_explorer(EXPORT_DIR)
-            note = f"Exported {len(messages)} messages to\n{path}"
+            note = f"Exported {len(messages)} messages to {path}"
             if opened:
-                note += "\n(opened the exports folder for you)"
-            self.io_status.color = C(COL_TEXT_DIM)
-            self.io_status.text = note
+                note += " (the folder is open)"
+            self.set_status(self.io_status, note)
         except OSError as exc:
-            self.io_status.color = C(COL_DANGER)
-            self.io_status.text = f"Export failed: {exc}"
+            self.set_status(self.io_status, f"Export failed: {exc}", T.alert)
 
     def _import(self) -> None:
         ImportChooserModal(self._import_file).open()
@@ -5100,184 +6431,26 @@ class ContactSettingsModal(CozyModal):
                     str(m.get("status", 1)).lstrip("-").isdigit() else 1,
                     read=1)
                 added += 1 if ok else 0
-            self.io_status.color = C(COL_TEXT_DIM)
-            self.io_status.text = (
+            self.set_status(self.io_status, (
                 f"Imported {added} new messages "
-                f"({len(data['messages']) - added} duplicates skipped)")
+                f"({len(data['messages']) - added} already here)"))
+            self.app.conversation_screen._rendered_peer = None
             self.app.refresh_chat(self.peer)
             self.app.refresh_sidebar()
         except (OSError, ValueError, json.JSONDecodeError) as exc:
-            self.io_status.color = C(COL_DANGER)
-            self.io_status.text = f"Import failed: {exc}"
+            self.set_status(self.io_status, f"Import failed: {exc}", T.alert)
 
 
-class SettingsModal(CozyModal):
-    """Identity settings: address/username info, key-folder access, a
-    shareable public bundle (with QR), and tap-to-reveal private key export
-    (hex + WIF — both import into FEXT Core)."""
-
-    def __init__(self, app: "FextApp") -> None:
-        super().__init__("Settings")
-        self.app = app
-        self._revealed = False
-        scroll = ScrollView(size_hint_y=None,
-                            height=min(dp(520), Window.height * 0.72),
-                            bar_width=dp(3))
-        body = BoxLayout(orientation="vertical", size_hint_y=None,
-                         spacing=dp(10))
-        body.bind(minimum_height=body.setter("height"))
-        scroll.add_widget(body)
-        self.add(scroll)
-        if IS_ANDROID or os.environ.get("FEXT_SHOW_ANDROID_SETTINGS"):
-            self._build_delivery(body)
-        self._build_identity(body)
-        self._build_public(body)
-        self._build_private(body)
-        body.add_widget(InfoLabel(f"{APP_NAME} {APP_VERSION}",
-                                  color=COL_TEXT_DIM, font_size=sp(11.5),
-                                  halign="center"))
-        self.add(CozyButton("Done", on_release=lambda _w: self.dismiss()))
-
-    # ---- notifications (Android) ---------------------------------------------
-    def _build_delivery(self, body) -> None:
-        card = SectionCard("Notifications")
-        row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(10))
-        row.add_widget(InfoLabel("Receive messages when the app is closed",
-                                 font_size=sp(14)))
-        row.add_widget(ToggleSwitch(background_delivery_enabled(),
-                                    self._on_delivery,
-                                    pos_hint={"center_y": .5}))
-        card.add_widget(row)
-        card.add_widget(InfoLabel(
-            "Android closes apps in the background. With this on, a small "
-            "service keeps listening so notifications still arrive; Android "
-            "shows it as a running app. Turn it off to save battery — you "
-            "will then only be notified while Ferritext is open.",
-            color=COL_TEXT_DIM, font_size=sp(12.5)))
-        body.add_widget(card)
-
-    def _on_delivery(self, on: bool) -> None:
-        save_pref("background_delivery", bool(on))
-        self.app._sync_background_service()
-
-    def _qr_image(self, data: str, side=dp(190)) -> KivyImage:
-        img = KivyImage(size_hint=(None, None), size=(side, side),
-                        allow_stretch=True)
-        img.texture = qr_texture(data)
-        return img
-
-    # ---- identity ------------------------------------------------------------
-    def _build_identity(self, body) -> None:
-        keys = self.app.keys
-        card = SectionCard("Identity")
-        card.add_widget(InfoLabel(f"Label:  {keys.label}"))
-        card.add_widget(InfoLabel(
-            f"Username:  {keys.username or '(not registered)'}"))
-        card.add_widget(InfoLabel(f"Address:  {keys.address}",
-                                  color=COL_TICK_GOLD, font_size=sp(12.5)))
-        card.add_widget(InfoLabel(
-            "The address is the HASH160 of your public key in Base58Check "
-            "(version 0x24) — the same P2PKH construction Bitcoin uses. Its "
-            "\u201cFec\u201d prefix is this network's anti-spam "
-            "proof-of-work.", color=COL_TEXT_DIM, font_size=sp(12.5)))
-        # A QR of the raw address on its own (distinct from the full public
-        # bundle QR further down): scan it to grab just the address — e.g. to
-        # add this identity as a contact or receive coins — without pulling
-        # in the username/public-key payload.
-        holder = AnchorLayout(size_hint_y=None, height=dp(200))
-        holder.add_widget(self._qr_image(keys.address, side=dp(170)))
-        card.add_widget(holder)
-        card.add_widget(InfoLabel("Scan for address only", halign="center",
-                                  color=COL_TEXT_DIM, font_size=sp(11.5)))
-        row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
-        row.add_widget(CozyButton("Copy address", height=dp(42),
-                                  bg=COL_BG_LIST, fg=COL_ACCENT_DARK,
-                                  outline=COL_ACCENT, font_size=sp(13),
-                                  on_release=lambda _w:
-                                  Clipboard.copy(keys.address)))
-        if not IS_MOBILE:
-            row.add_widget(CozyButton("Open key folder", height=dp(42),
-                                      bg=COL_BG_LIST, fg=COL_TICK_GOLD,
-                                      outline=COL_TICK_GOLD,
-                                      font_size=sp(13),
-                                      on_release=lambda _w:
-                                      open_folder_in_explorer(DATA_DIR)))
-        card.add_widget(row)
-        card.add_widget(InfoLabel(
-            f"Keys and chat databases live in {DATA_DIR}",
-            color=COL_TEXT_DIM, font_size=sp(11.5)))
-        body.add_widget(card)
-
-    # ---- public bundle -------------------------------------------------------
-    def _build_public(self, body) -> None:
-        card = SectionCard("Public bundle (safe to share)")
-        bundle_pretty = json.dumps(self.app.keys.public_bundle(), indent=2)
-        card.add_widget(InfoLabel(bundle_pretty, font_size=sp(11.5),
-                                  color=COL_TEXT))
-        card.add_widget(CozyButton("Copy bundle", height=dp(42),
-                                   bg=COL_BG_LIST, fg=COL_ACCENT_DARK,
-                                   outline=COL_ACCENT, font_size=sp(13),
-                                   on_release=lambda _w:
-                                   Clipboard.copy(bundle_pretty)))
-        holder = AnchorLayout(size_hint_y=None, height=dp(210))
-        holder.add_widget(self._qr_image(json.dumps(
-            self.app.keys.public_bundle(), separators=(",", ":"))))
-        card.add_widget(holder)
-        body.add_widget(card)
-
-    # ---- private key ---------------------------------------------------------
-    def _build_private(self, body) -> None:
-        card = SectionCard("Private key (NEVER share this)")
-        card.add_widget(InfoLabel(
-            "Your secp256k1 private key, shown as raw hex and as WIF. "
-            "Import either format into FEXT Core to spend the coins "
-            "attached to this address.", color=COL_TEXT_DIM,
-            font_size=sp(12.5)))
-        self.private_label = InfoLabel("\u2022\u2022\u2022\u2022\u2022\u2022"
-                                       "  hidden  \u2022\u2022\u2022\u2022"
-                                       "\u2022\u2022", color=COL_DANGER,
-                                       font_size=sp(12))
-        card.add_widget(self.private_label)
-        row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
-        self.reveal_button = CozyButton("Reveal", height=dp(42),
-                                        bg=COL_BG_LIST, fg=COL_DANGER,
-                                        outline=COL_DANGER, font_size=sp(13),
-                                        on_release=lambda _w:
-                                        self._toggle_private())
-        row.add_widget(self.reveal_button)
-        row.add_widget(CozyButton("Copy WIF", height=dp(42), bg=COL_BG_LIST,
-                                  fg=COL_DANGER, outline=COL_DANGER,
-                                  font_size=sp(13),
-                                  on_release=lambda _w: self._copy_wif()))
-        card.add_widget(row)
-        body.add_widget(card)
-
-    def _toggle_private(self) -> None:
-        self._revealed = not self._revealed
-        self.private_label.text = (
-            self.app.keys.private_export() if self._revealed
-            else "\u2022\u2022\u2022\u2022\u2022\u2022  hidden  "
-                 "\u2022\u2022\u2022\u2022\u2022\u2022")
-        self.reveal_button.text = "Hide" if self._revealed else "Reveal"
-
-    def _copy_wif(self) -> None:
-        data = json.loads(self.app.keys.private_export())
-        Clipboard.copy(data["private_key_wif"])
+ContactSettingsModal = ChatHistorySheet     # pre-9.1 name
 
 
-class RemoveIdentityModal(CozyModal):
-    """Confirm removal of an identity from this device.
+class RemoveIdentityModal(Sheet):
+    """Confirm removing an identity from this device.
 
-    This is irreversible in the way that matters: the private key IS the
-    identity, so once it is gone the address, its message history and any
-    coins attached to it are unrecoverable. The dialog therefore puts the
-    key export in front of the user BEFORE the destructive button, rather
-    than warning about it afterwards.
-
-    Releasing the name on the relay is offered separately, because the two
-    are genuinely different decisions: you may want the identity off a
-    shared device while keeping the username reserved for another device
-    that holds the same key.
+    The private key IS the identity: once it is gone, the address, its
+    history and any coins on it cannot be recovered. So the key export is
+    offered BEFORE the destructive button. Releasing the name on the relay
+    is a separate choice — another device may still use the same key.
     """
 
     def __init__(self, app: "FextApp", address: str) -> None:
@@ -5288,80 +6461,48 @@ class RemoveIdentityModal(CozyModal):
         self.address = address
         self.username = ident.get("username")
         self._release = bool(self.username)
-
-        self.add(InfoLabel(
-            "Removing this identity deletes its private key and its chat "
-            "history from this device. The key cannot be recovered "
-            "afterwards — if you might want this identity back, copy the "
-            "key first.", color=COL_TEXT_DIM, font_size=sp(13)))
-        self.add(InfoLabel(address, color=COL_TICK_GOLD, font_size=sp(11.5)))
-
-        self.add(CozyButton("Copy private key (WIF) first", height=dp(42),
-                            bg=COL_BG_LIST, fg=COL_DANGER,
-                            outline=COL_DANGER, font_size=sp(13),
-                            on_release=lambda _w: self._copy_key()))
-
+        self.add(hint(
+            "This deletes its private key and its chats from this device. "
+            "The key cannot be recovered afterwards — if you might want "
+            "this identity back, copy the key first."))
+        self.add(InfoLabel(address, color=T.accent, font_size=fs(14)))
+        self.add(Btn("Copy the private key first", kind="danger",
+                     on_release=lambda _w: self._copy_key()))
         if self.username:
-            self.release_button = self.add(CozyButton(
-                "", height=dp(42), font_size=sp(13),
-                on_release=lambda _w: self._toggle_release()))
-            self.add(InfoLabel(
-                f"Releasing “{self.username}” removes it from the relay's "
-                f"directory so nobody can look you up, and frees the name "
-                f"for reuse. Leave it on if another device still uses this "
-                f"same key.", color=COL_TEXT_DIM, font_size=sp(12)))
-            self._style_release()
-
+            self.release_switch = ToggleSwitch(
+                True, lambda on: setattr(self, "_release", on))
+            self.add(ListRow(None, f"Release “{self.username}” on the relay",
+                             "Frees the name and removes you from the "
+                             "directory. Leave it if another device still "
+                             "uses this key.", control=self.release_switch,
+                             on_tap=self.release_switch.flip,
+                             padding=[0, dp(8), 0, dp(8)]))
         self.status = self.status_label()
-        row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(10))
-        row.add_widget(CozyButton("Cancel", bg=COL_BG_LIST, fg=COL_TEXT_DIM,
-                                  outline=COL_CARD_EDGE,
-                                  on_release=lambda _w: self.dismiss()))
-        self.confirm = CozyButton("Remove identity", bg=COL_DANGER,
-                                  pressed=COL_DANGER,
-                                  on_release=lambda _w: self._confirm())
-        row.add_widget(self.confirm)
-        self.add(row)
+        self.confirm = Btn("Remove identity", kind="solid_danger",
+                           on_release=lambda _w: self._confirm())
+        self.add(button_row(Btn("Cancel", kind="quiet",
+                                on_release=lambda _w: self.dismiss()),
+                            self.confirm))
 
     def _copy_key(self) -> None:
-        """Export the key of the identity being removed.
-
-        private_export() reads the ACTIVE identity, so this switches, reads,
-        and switches back — in a finally, because leaving the app pointed at
-        a different identity after an error would be far worse than the
-        failed copy itself.
-        """
+        """private_export() reads the ACTIVE identity, so switch, read and
+        switch back — in a finally."""
         active = self.app.keys.address
         try:
             self.app.keys.activate(self.address)
             data = json.loads(self.app.keys.private_export())
             Clipboard.copy(data["private_key_wif"])
-            self.set_status(self.status, "Private key copied to the "
+            self.set_status(self.status, "The private key is on the "
                             "clipboard — paste it somewhere safe now.",
-                            COL_TICK_GOLD)
+                            T.accent)
         except Exception as exc:
             self.set_status(self.status, f"Could not export the key: {exc}",
-                            COL_DANGER)
+                            T.alert)
         finally:
             try:
                 self.app.keys.activate(active)
             except Exception:
                 pass
-
-    def _toggle_release(self) -> None:
-        self._release = not self._release
-        self._style_release()
-
-    def _style_release(self) -> None:
-        self.release_button.text = (
-            f"Release “{self.username}” on the relay:  "
-            f"{'YES' if self._release else 'NO'}")
-        self.release_button._bg_hex = (COL_ACCENT if self._release
-                                       else COL_BG_LIST)
-        self.release_button.color = C("#FFFFFF" if self._release
-                                      else COL_TEXT_DIM)
-        self.release_button._on_state(self.release_button,
-                                      self.release_button.state)
 
     def _confirm(self) -> None:
         self.confirm.disabled = True
@@ -5371,15 +6512,11 @@ class RemoveIdentityModal(CozyModal):
     def _worker(self) -> None:
         note = ""
         if self._release and self.username:
-            # Deregistration must be signed by the identity being removed,
-            # so switch to it for the call and restore in a finally.
             previous = self.app.keys.address
             try:
                 self.app.keys.activate(self.address)
                 ApiClient(self.app.keys).deregister()
             except (requests.RequestException, ApiClient.ApiError):
-                # Removal is still correct locally; the name simply stays
-                # claimed on the relay until the identity is deleted there.
                 note = (" (the relay could not be reached, so the name is "
                         "still registered)")
             finally:
@@ -5394,66 +6531,63 @@ class RemoveIdentityModal(CozyModal):
         self.app.on_identity_removed(self.address, note)
 
 
-class ProfileMenuModal(CozyModal):
-    """Tap your avatar in the chat list: identity switcher + settings —
-    the whole multi-identity story, one warm sheet."""
+class IdentitySheet(Sheet):
+    """Tap your disc on the chat list: who you are now, every identity on
+    this device (switch, rename, remove), a new one, and settings."""
 
     def __init__(self, app: "FextApp") -> None:
-        super().__init__("You")
+        super().__init__("Identities")
         self.app = app
         keys = app.keys
-        head = BoxLayout(size_hint_y=None, height=dp(58), spacing=dp(12))
-        head.add_widget(Avatar(keys.address, keys.username or keys.label,
-                               diameter=dp(50)))
-        info = BoxLayout(orientation="vertical")
-        info.add_widget(InfoLabel(f"@{keys.username or '(unregistered)'}",
-                                  bold=True, font_size=sp(15)))
-        info.add_widget(InfoLabel(short_addr(keys.address, 24),
-                                  color=COL_TEXT_DIM, font_size=sp(11.5)))
-        head.add_widget(info)
-        self.add(head)
-
-        card = SectionCard("Identities on this device")
+        self.card.padding = [0, dp(8), 0, dp(16)]
+        self.title_label.padding = [dp(22), 0]
+        rows = []
         for ident in keys.identities:
-            active = ident["address"] == keys.address
-            line = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(4))
-            row = TappableBox(orientation="horizontal", spacing=dp(10),
-                              padding=[dp(8), dp(6), dp(4), dp(6)],
-                              on_tap=lambda a=ident["address"]:
-                              self._switch(a))
-            col, _r = paint_round(row, COL_BUBBLE_ME if active else COL_CARD,
-                                  radius=dp(12))
-            row.add_widget(Avatar(ident["address"],
-                                  ident.get("username") or
-                                  ident.get("label") or "?",
-                                  diameter=dp(34)))
-            texts = BoxLayout(orientation="vertical")
-            texts.add_widget(single_line(ident.get("label") or "?", sp(14.5),
-                                         COL_TEXT, bold=active))
-            texts.add_widget(single_line(
-                f"@{ident.get('username') or 'unregistered'}  ·  "
-                f"{short_addr(ident['address'], 10)}", sp(11.5),
-                COL_TEXT_DIM))
-            row.add_widget(texts)
-            line.add_widget(row)
-            # Rename (pen) and delete (bin): icons, as in every contacts app,
-            # instead of a word button that ate a third of the row.
-            line.add_widget(IconButton(
-                "edit", tint=COL_TEXT_DIM, press=COL_PRESSED,
-                size=(dp(40), dp(40)), pos_hint={"center_y": .5},
-                on_release=lambda _w, a=ident["address"]: self._rename(a)))
-            line.add_widget(IconButton(
-                "delete", tint=COL_DANGER, press=COL_PRESSED,
-                size=(dp(40), dp(40)), pos_hint={"center_y": .5},
-                on_release=lambda _w, a=ident["address"]: self._remove(a)))
-            card.add_widget(line)
-        card.add_widget(CozyButton("New identity…", height=dp(42),
-                                   bg=COL_BG_LIST, fg=COL_ACCENT_DARK,
-                                   outline=COL_ACCENT, font_size=sp(13.5),
-                                   on_release=lambda _w: self._new()))
-        self.add(card)
-        self.add(CozyButton("Settings",
-                            on_release=lambda _w: self._settings()))
+            rows.append(self._row(ident, ident["address"] == keys.address))
+        self.add(rows_card(rows, inset=dp(76)))
+        self.add(Rule())
+        self.add(rows_card([
+            ListRow("plus", "New identity", "Mine a fresh key or import one",
+                    on_tap=self._new),
+            ListRow("sliders", "Settings", "Appearance, notifications, keys",
+                    on_tap=self._settings)]))
+
+    def _row(self, ident: dict, active: bool) -> BoxLayout:
+        address = ident["address"]
+        line = BoxLayout(size_hint_y=None, height=max(dp(68), line_height(17)
+                                                      + line_height(14) +
+                                                      dp(22)),
+                         padding=[dp(20), 0, dp(8), 0], spacing=dp(4))
+        row = TappableBox(orientation="horizontal", spacing=dp(14),
+                          on_tap=lambda a=address: self._switch(a))
+        row.add_widget(Avatar(address, ident.get("username") or
+                              ident.get("label") or "?", diameter=dp(42),
+                              pos_hint={"center_y": .5}))
+        texts = BoxLayout(orientation="vertical", padding=[0, dp(12)])
+        name = single_line(ident.get("label") or "?", fs(17), T.text,
+                           bold=active)
+        texts.add_widget(name)
+        texts.add_widget(single_line(
+            f"@{ident.get('username') or 'unregistered'} · "
+            f"{short_addr(address, 10)}", fs(14), T.text_3))
+        row.add_widget(texts)
+        if active:
+            mark = CapsLabel("Active", size=10.5, color=T.accent,
+                             size_hint=(None, None), halign="right",
+                             pos_hint={"center_y": .5})
+            mark.width = mark.natural_width
+            row.add_widget(mark)
+        line.add_widget(row)
+        line.add_widget(IconButton("edit", label="Rename identity",
+                                   pos_hint={"center_y": .5},
+                                   on_release=lambda _w: self._rename(
+                                       address)))
+        line.add_widget(IconButton("delete", tint=T.alert,
+                                   label="Remove identity",
+                                   pos_hint={"center_y": .5},
+                                   on_release=lambda _w: self._remove(
+                                       address)))
+        return line
 
     def _switch(self, address: str) -> None:
         self.dismiss()
@@ -5474,248 +6608,396 @@ class ProfileMenuModal(CozyModal):
 
     def _settings(self) -> None:
         self.dismiss()
-        SettingsModal(self.app).open()
+        self.app.open_settings()
 
+
+ProfileMenuModal = IdentitySheet            # pre-9.1 name
 
 
 # =============================================================================
-#  Chat list — the "home" screen
+#  The chat list — the "home" screen
 # =============================================================================
-# Ticks are DRAWN (see TickMarks), so no check-mark codepoint is needed.
-# U+2022 BULLET is used rather than U+25CF BLACK CIRCLE because only the
-# former has a glyph in Kivy's bundled Roboto — the latter renders as an
-# empty box, which is what the tick marks used to do.
-BULLET = "\u2022"
+BULLET = "•"
+FLEURON = "❦"                 # ❦ — the empty page's ornament
 
 
-class TappableBox(ButtonBehavior, BoxLayout):
-    """A tappable stack of widgets (chat title -> contact settings, etc.)."""
+class AppBar(BoxLayout):
+    """A screen's head: no filled bar, just the page, a title in the serif,
+    an optional italic subtitle, and a hairline beneath."""
 
-    def __init__(self, on_tap=None, **kw):
-        kw.setdefault("orientation", "vertical")
+    def __init__(self, title: str = "", on_back: Optional[Callable] = None,
+                 **kw):
+        kw.setdefault("size_hint_y", None)
+        kw.setdefault("height", max(dp(60), line_height(20) + dp(20)))
+        kw.setdefault("padding", [dp(4), 0, dp(8), 0])
+        kw.setdefault("spacing", dp(4))
         super().__init__(**kw)
+        if on_back is not None:
+            self.add_widget(IconButton("back", label="Back",
+                                       pos_hint={"center_y": .5},
+                                       on_release=lambda _w: on_back()))
+        else:
+            self.add_widget(Widget(size_hint_x=None, width=dp(16)))
+        self.title = single_line(title, fs(20), T.text)
+        self.add_widget(self.title)
+        hairline(self, "bottom")
+
+
+class PersonRow(ButtonBehavior, BoxLayout):
+    """Someone (or a group) to tap: their disc, a name, a line beneath."""
+
+    def __init__(self, seed: str, name: str, sub: str = "",
+                 on_tap: Optional[Callable] = None, kind: str = "dm",
+                 trailing: Optional[Widget] = None,
+                 initial_from: Optional[str] = None, **kw):
+        kw.setdefault("size_hint_y", None)
+        kw.setdefault("height", max(dp(64), line_height(17) +
+                                    line_height(14) + dp(20)))
+        kw.setdefault("padding", [dp(20), dp(6), dp(16), dp(6)])
+        kw.setdefault("spacing", dp(14))
+        super().__init__(**kw)
+        self.add_widget(Avatar(seed, initial_from or name, diameter=dp(42),
+                               kind=kind, pos_hint={"center_y": .5}))
+        texts = BoxLayout(orientation="vertical", padding=[0, dp(4)])
+        texts.add_widget(single_line(name, fs(17), T.text))
+        if sub:
+            texts.add_widget(single_line(sub, fs(14), T.text_3))
+        self.add_widget(texts)
+        if trailing is not None:
+            trailing.pos_hint = {"center_y": .5}
+            self.add_widget(trailing)
+        with self.canvas.before:
+            self._bg = Color(0, 0, 0, 0)
+            self._rect = Rectangle()
+        self.bind(pos=self._sync, size=self._sync,
+                  state=lambda _w, st: setattr(
+                      self._bg, "rgba", C(T.press) if st == "down"
+                      else (0, 0, 0, 0)))
         if on_tap is not None:
             self.bind(on_release=lambda _w: on_tap())
 
-
-class UnreadBadge(Label):
-    """Gold pill with the unread count; widens for two digits."""
-
-    def __init__(self, count: int, muted: bool = False, **kw):
-        text = str(count) if count < 1000 else "999+"
-        super().__init__(text=text, bold=True, font_size=sp(11.5),
-                         color=C("#FFFFFF"), size_hint=(None, None),
-                         height=dp(22), **kw)
-        with self.canvas.before:
-            Color(*C(COL_TICK_GREY if muted else COL_ACCENT))
-            self._pill = RoundedRectangle(radius=[dp(11)])
-        self.bind(pos=self._sync, size=self._sync,
-                  texture_size=lambda w, v: setattr(
-                      w, "width", max(dp(22), v[0] + dp(12))))
-        self.texture_update()
-
     def _sync(self, *_a):
-        self._pill.pos, self._pill.size = self.pos, self.size
+        self._rect.pos, self._rect.size = self.pos, self.size
+
+
+def caps_tag(text: str, color: Optional[str] = None) -> CapsLabel:
+    """A small capitals tag sized to its text (ADMIN, YOU, ACTIVE)."""
+    tag = CapsLabel(text, size=10.5, color=color or T.accent,
+                    size_hint=(None, None), halign="right")
+    tag.width = tag.natural_width + dp(2)
+    return tag
 
 
 class ConversationRow(ButtonBehavior, BoxLayout):
-    """One chat in the list: avatar, name over a one-line
-    preview, time and unread badge on the right, a hairline divider that
-    starts where the text does."""
+    """One chat in the list: disc, name over a one-line preview, the time
+    and the unread count on the right, a hairline that starts where the
+    text does. Groups show who spoke last; your own last message shows its
+    ticks."""
 
-    def __init__(self, conv: dict, on_open: Callable[[str], None], **kw):
+    def __init__(self, conv: dict, on_open: Callable[[str], None],
+                 author_name: Optional[Callable] = None, **kw):
         kw.setdefault("size_hint_y", None)
-        kw.setdefault("height", dp(72))
-        kw.setdefault("padding", [dp(12), dp(8), dp(14), dp(8)])
-        kw.setdefault("spacing", dp(12))
+        kw.setdefault("height", max(dp(76), line_height(18) +
+                                    line_height(15.5) + dp(26)))
+        kw.setdefault("padding", [dp(18), dp(10), dp(18), dp(10)])
+        kw.setdefault("spacing", dp(14))
         super().__init__(**kw)
-        peer = conv["peer"]
-        name = conv.get("username") or short_addr(peer, 14)
+        peer, kind = conv["peer"], conv.get("kind", "dm")
+        self.peer = peer
+        if kind == "self":
+            name = "Notes to self"
+        elif kind == "group":
+            name = conv.get("group_name") or "Group"
+        else:
+            name = conv.get("username") or short_addr(peer, 14)
         unread = int(conv.get("unread") or 0)
-        muted = not conv.get("notify", 1)
-        preview = conv.get("preview") or "Say hello — this chat is end-to-end " \
-            "encrypted"
+        notify = conv.get("notify")
+        muted = kind != "self" and notify is not None and not notify
         with self.canvas.before:
-            self._bg = Color(*C(COL_BG_LIST))
+            self._bg = Color(0, 0, 0, 0)
             self._rect = Rectangle()
-            Color(*C(COL_DIVIDER))
-            self._rule = Rectangle()
+        hairline(self, "bottom", inset=dp(18) + dp(52) + dp(14))
         self.bind(pos=self._sync, size=self._sync,
                   state=lambda _w, st: setattr(
-                      self._bg, "rgba", C(COL_PRESSED if st == "down"
-                                          else COL_BG_LIST)))
+                      self._bg, "rgba", C(T.press) if st == "down"
+                      else (0, 0, 0, 0)))
         self.bind(on_release=lambda _w: on_open(peer))
 
-        self.add_widget(Avatar(peer, name, diameter=dp(52)))
-        middle = BoxLayout(orientation="vertical", padding=[0, dp(4)])
+        self.add_widget(Avatar(peer, name, diameter=dp(52), kind=kind,
+                               pos_hint={"center_y": .5}))
+        middle = BoxLayout(orientation="vertical", padding=[0, dp(2)])
         top = BoxLayout(spacing=dp(6))
-        top.add_widget(single_line(name, sp(16), COL_TEXT, bold=True))
+        top.add_widget(single_line(name, fs(18), T.text, bold=True))
         if muted:
-            bell = Widget(size_hint_x=None, width=dp(16))
+            bell = Widget(size_hint_x=None, width=dp(18))
             bell.bind(pos=lambda w, *_a: self._bell(w),
                       size=lambda w, *_a: self._bell(w))
             top.add_widget(bell)
-        when = Label(text=pretty_day(conv.get("last_at") or ""),
-                     font_size=sp(12),
-                     color=C(COL_ACCENT if unread else COL_TEXT_DIM),
+        when = Label(text=pretty_day(conv.get("last_at") or "")
+                     if conv.get("preview") is not None else "",
+                     font_size=fs(13.5),
+                     color=C(T.accent if unread and not muted else T.text_3),
                      size_hint_x=None, halign="right", valign="middle")
         when.bind(texture_size=lambda w, v: setattr(w, "width", v[0]),
                   size=lambda w, v: setattr(w, "text_size", (None, v[1])))
         when.texture_update()
         top.add_widget(when)
         middle.add_widget(top)
+
         bottom = BoxLayout(spacing=dp(6))
-        bottom.add_widget(single_line(preview, sp(14), COL_TEXT_DIM))
+        preview, italic = self._preview(conv, kind, author_name)
+        if conv.get("last_direction") == "out" and \
+                conv.get("last_kind") != "event" and kind != "self":
+            status = int(conv.get("last_status") or 0)
+            if not conv.get("ticks_enabled", 1) and kind == "dm":
+                status = min(status, 1)
+            ticks = TickMarks(count=max(1, min(status, 3)),
+                              tint=T.tick if status > 0 else T.tick_grey,
+                              pos_hint={"center_y": .5})
+            bottom.add_widget(ticks)
+        text = single_line(preview, fs(15.5), T.text_2 if unread else T.text_3,
+                           italic=italic)
+        bottom.add_widget(text)
         if unread:
-            holder = AnchorLayout(size_hint_x=None, width=dp(36),
+            holder = AnchorLayout(size_hint_x=None, width=dp(44),
                                   anchor_x="right")
             holder.add_widget(UnreadBadge(min(unread, 9999), muted=muted))
             bottom.add_widget(holder)
         middle.add_widget(bottom)
         self.add_widget(middle)
 
+    @staticmethod
+    def _preview(conv: dict, kind: str, author_name) -> tuple:
+        body = conv.get("preview")
+        if body is None:
+            if kind == "self":
+                return ("Jot things down — they stay on this device", True)
+            if kind == "group":
+                return ("A new group. Say something to everyone", True)
+            return ("Say hello — sealed end to end", True)
+        body = " ".join(str(body).split())
+        if conv.get("last_kind") == "event":
+            return body, True
+        if kind == "group":
+            if conv.get("last_direction") == "out":
+                return f"You: {body}", False
+            who = author_name(conv.get("last_author")) if author_name and \
+                conv.get("last_author") else ""
+            return (f"{who}: {body}" if who else body), False
+        return body, False
+
     def _sync(self, *_a):
         self._rect.pos, self._rect.size = self.pos, self.size
-        inset = self.padding[0] + dp(52) + self.spacing
-        self._rule.pos = (self.x + inset, self.y)
-        self._rule.size = (self.width - inset, dp(1))
 
     @staticmethod
     def _bell(widget):
         widget.canvas.clear()
         with widget.canvas:
-            draw_icon("bell_off", widget.center_x, widget.center_y, dp(13),
-                      C(COL_TICK_GREY))
+            draw_icon("bell_off", (widget.x + widget.width / 2), (widget.y + widget.height / 2), dp(14),
+                      C(T.text_3))
+
+
+class FabButton(IconButton):
+    """The compose button: a larger gold disc, lifted off the page."""
+
+    def _redraw(self, *_a):
+        self.canvas.clear()
+        d = min(self.width, self.height)
+        with self.canvas:
+            Color(0, 0, 0, .28 if T.dark else .12)
+            Ellipse(pos=((self.x + self.width / 2) - d / 2, (self.y + self.height / 2) - d / 2 -
+                         dp(2)), size=(d, d))
+            Color(*C(T.accent_press if self.state == "down" else T.accent))
+            Ellipse(pos=((self.x + self.width / 2) - d / 2, (self.y + self.height / 2) - d / 2),
+                    size=(d, d))
+            draw_icon(self._icon, (self.x + self.width / 2), (self.y + self.height / 2), dp(24),
+                      C(T.on_accent), width=dp(1.6))
 
 
 class ChatsScreen(Screen):
-    """The home screen: your identity in the app bar, conversations below."""
+    """Home: the wordmark, who you are, your conversations, and the button
+    that starts a new one."""
 
     def __init__(self, app: "FextApp", **kw):
         super().__init__(name="chats", **kw)
         self.app = app
-        root = BoxLayout(orientation="vertical")
-        paint_round(root, COL_BG_LIST, radius=dp(0))
+        root = FloatLayout()
+        paint_round(root, T.bg, radius=0)
         self.add_widget(root)
+        column = BoxLayout(orientation="vertical", size_hint=(1, 1),
+                           pos_hint={"x": 0, "y": 0})
+        root.add_widget(column)
 
-        # ---- app bar ---------------------------------------------------------
-        bar = BoxLayout(size_hint_y=None, height=dp(56),
-                        padding=[dp(10), 0, dp(6), 0], spacing=dp(10))
-        paint_round(bar, COL_APPBAR, radius=dp(0))
-        self.avatar_holder = AnchorLayout(size_hint_x=None, width=dp(40))
-        bar.add_widget(self.avatar_holder)
-
-        titles = BoxLayout(orientation="vertical")
-        brand = single_line(APP_NAME, sp(19), COL_APPBAR_TEXT, bold=True,
-                            size_hint_y=None, height=dp(25))
-        brand.valign = "bottom"
-        self.me_label = single_line("", sp(11.5), COL_APPBAR_DIM,
-                                    size_hint_y=None, height=dp(18))
-        self.me_label.valign = "top"
-        titles.add_widget(brand)
+        # ---- the head: wordmark, identity, settings --------------------------
+        head = BoxLayout(size_hint_y=None, height=max(dp(84), line_height(30)
+                                                      + dp(30)),
+                         padding=[dp(20), dp(6), dp(6), dp(4)], spacing=dp(2))
+        titles = BoxLayout(orientation="vertical", padding=[0, dp(8)])
+        self.brand = single_line(APP_NAME, fs(30), T.text)
+        titles.add_widget(self.brand)
+        # Not in capitals: an address is case-sensitive Base58.
+        self.me_label = single_line("", fs(14), T.text_3, italic=True)
         titles.add_widget(self.me_label)
-        bar.add_widget(titles)
-        bar.add_widget(IconButton("plus", bg=COL_ACCENT, tint="#FFFFFF",
-                                  size=(dp(40), dp(40)),
-                                  pos_hint={"center_y": .5},
-                                  on_release=lambda _w:
-                                  self.app.open_add_contact()))
-        root.add_widget(bar)
+        head.add_widget(titles)
+        self.avatar_holder = AnchorLayout(size_hint_x=None, width=TOUCH)
+        head.add_widget(self.avatar_holder)
+        head.add_widget(IconButton("sliders", label="Settings",
+                                   pos_hint={"center_y": .5},
+                                   on_release=lambda _w:
+                                   self.app.open_settings()))
+        hairline(head, "bottom", inset=dp(20), inset_right=dp(20))
+        column.add_widget(head)
 
-        # ---- status ribbon ---------------------------------------------------
-        # Tapping the ribbon forces an immediate reconnect. Without this the
-        # only cure for a stalled sync was to wait out the backoff or
-        # restart the app — which is what "sometimes messages don't arrive"
-        # felt like from the outside.
+        # ---- the status line: tap it to reconnect at once --------------------
         ribbon = TappableBox(on_tap=lambda: self.app.retry_now(),
                              orientation="horizontal", size_hint_y=None,
-                             height=dp(28), padding=[dp(14), 0, dp(14), 0])
-        paint_round(ribbon, COL_BG, radius=dp(0))
-        self.status_label = Label(text="Starting…", font_size=sp(11.5),
-                                  color=C(COL_TEXT_DIM), halign="left",
-                                  valign="middle")
+                             height=max(dp(40), line_height(14) + dp(12)),
+                             padding=[dp(20), 0, dp(20), 0])
+        self.status_label = Label(text="Starting…", font_size=fs(14),
+                                  italic=True, color=C(T.text_3),
+                                  halign="left", valign="middle",
+                                  shorten=True, shorten_from="right")
         self.status_label.bind(size=lambda w, v: setattr(w, "text_size", v))
         ribbon.add_widget(self.status_label)
-        self.retry_hint = Label(text="tap to retry", font_size=sp(10.5),
-                                color=C(COL_TEXT_DIM), halign="right",
-                                valign="middle", size_hint_x=None,
-                                width=dp(72), opacity=0)
-        self.retry_hint.bind(size=lambda w, v: setattr(w, "text_size", v))
+        self.retry_hint = CapsLabel("Tap to retry", size=10, color=T.accent,
+                                    size_hint=(None, 1), halign="right")
+        self.retry_hint.width = self.retry_hint.natural_width + dp(4)
+        self.retry_hint.opacity = 0
         ribbon.add_widget(self.retry_hint)
-        root.add_widget(ribbon)
+        column.add_widget(ribbon)
 
-        # ---- conversation list ----------------------------------------------
-        self.scroll = ScrollView(bar_width=dp(3))
+        # ---- the list --------------------------------------------------------
+        self.scroll = ScrollView(bar_width=dp(3), do_scroll_x=False)
         self.list = BoxLayout(orientation="vertical", size_hint_y=None,
-                              padding=[0, 0, 0, dp(16)], spacing=0)
+                              padding=[0, 0, 0, dp(96)])
         self.list.bind(minimum_height=self.list.setter("height"))
         self.scroll.add_widget(self.list)
-        root.add_widget(self.scroll)
+        column.add_widget(self.scroll)
+
+        # ---- the compose button ----------------------------------------------
+        self.fab = FabButton("edit", label="New conversation",
+                             size=(dp(60), dp(60)),
+                             on_release=lambda _w: self.app.open_compose())
+        holder = AnchorLayout(anchor_x="right", anchor_y="bottom",
+                              padding=[0, 0, dp(20), dp(24)],
+                              size_hint=(1, 1), pos_hint={"x": 0, "y": 0})
+        holder.add_widget(self.fab)
+        root.add_widget(holder)
 
     def refresh_header(self) -> None:
         keys = self.app.keys
         self.avatar_holder.clear_widgets()
         if not keys.has_identity:
+            self.me_label.text = "end-to-end encrypted correspondence"
             return
         avatar = AvatarButton(keys.address, keys.username or keys.label,
                               diameter=dp(38))
-        avatar.bind(on_release=lambda _w: ProfileMenuModal(self.app).open())
+        avatar.bind(on_release=lambda _w: IdentitySheet(self.app).open())
         self.avatar_holder.add_widget(avatar)
-        self.me_label.text = (f"@{keys.username or 'unregistered'}  ·  "
-                              f"{short_addr(keys.address, 16)}")
+        self.me_label.text = (f"@{keys.username}" if keys.username
+                              else "unregistered") + \
+            f"  ·  {short_addr(keys.address, 10)}"
 
     def set_status(self, text: str, color: str) -> None:
         self.status_label.text = text
-        self.status_label.color = C(color)
-        # Offer the retry affordance only when it would actually do
-        # something — a permanent "tap to retry" next to "Connected" is
-        # noise that trains people to ignore the ribbon.
-        self.retry_hint.opacity = 0 if color == COL_OK else 1
+        color = retint(color)
+        calm = color in (T.ok, T.text_3)
+        self.status_label.color = C(T.text_3 if calm else color)
+        # Offer the retry only when it would do something, and only once.
+        self.retry_hint.opacity = 0 if calm or "retry" in text.lower() else 1
 
     def refresh_list(self, conversations: list) -> None:
         self.list.clear_widgets()
-        if not conversations:
+        keys = self.app.keys
+        if not keys.has_identity:
             self.list.add_widget(self._empty_state())
             return
-        for conv in conversations:
-            self.list.add_widget(ConversationRow(conv,
-                                                 self.app.open_conversation))
+        notes = next((c for c in conversations if c.get("kind") == "self"),
+                     None) or {"peer": keys.address, "kind": "self",
+                               "preview": None, "unread": 0}
+        rest = [c for c in conversations if c.get("kind") != "self"]
+        author = self.app.conversation_screen.author_name
+        self.list.add_widget(ConversationRow(notes, self.app.open_conversation,
+                                             author))
+        for conv in rest:
+            self.list.add_widget(ConversationRow(
+                conv, self.app.open_conversation, author))
+        if not rest:
+            self.list.add_widget(self._empty_state())
 
     def _empty_state(self) -> BoxLayout:
         box = BoxLayout(orientation="vertical", size_hint_y=None,
-                        height=dp(230), padding=[dp(24), dp(44), dp(24), 0],
-                        spacing=dp(12))
-        box.add_widget(InfoLabel("No conversations yet", bold=True,
-                                 font_size=sp(17), halign="center"))
+                        padding=[dp(32), dp(40), dp(32), 0], spacing=dp(14))
+        box.bind(minimum_height=box.setter("height"))
+        box.add_widget(InfoLabel(FLEURON, color=T.accent, font_size=fs(34),
+                                 halign="center"))
+        box.add_widget(InfoLabel("No correspondence yet", font_size=fs(22),
+                                 halign="center"))
         box.add_widget(InfoLabel(
-            "Tap + to add someone by username or Fec… address. Every message "
-            "you send is encrypted on this device and can only be read by "
-            "the person you send it to.",
-            color=COL_TEXT_DIM, font_size=sp(13), halign="center"))
-        box.add_widget(CozyButton("Add your first contact",
-                                  size_hint_x=None, width=dp(230),
-                                  pos_hint={"center_x": 0.5},
-                                  on_release=lambda _w:
-                                  self.app.open_add_contact()))
+            "Add someone by their username or Fec… address, or gather "
+            "several into a group. Every word is sealed on this device "
+            "before it leaves, and only they can open it.",
+            color=T.text_3, font_size=fs(15.5), halign="center"))
+        holder = AnchorLayout(size_hint_y=None, height=TOUCH + dp(12))
+        button = Btn("Add a contact", size_hint_x=None,
+                     on_release=lambda _w: self.app.open_add_contact())
+        button.width = max(dp(200), button.natural_width())
+        holder.add_widget(button)
+        box.add_widget(holder)
         return box
 
 
+class ComposeSheet(Sheet):
+    """The compose button's sheet: a new contact, a new group, notes to self,
+    or one of the people you already know."""
+
+    def __init__(self, app: "FextApp") -> None:
+        super().__init__("New conversation")
+        self.app = app
+        self.card.padding = [0, dp(8), 0, dp(16)]
+        self.title_label.padding = [dp(22), 0]
+        self.add(rows_card([
+            ListRow("person_add", "Add a contact",
+                    "By username or Fec… address",
+                    on_tap=lambda: self._then(app.open_add_contact)),
+            ListRow("group", "New group",
+                    f"You and up to {MAX_GROUP_MEMBERS - 1} others",
+                    on_tap=lambda: self._then(app.open_new_group)),
+            ListRow("bookmark", "Notes to self", "Kept on this device only",
+                    on_tap=lambda: self._then(
+                        lambda: app.open_conversation(app.keys.address))),
+        ]))
+        contacts = app.store.contacts() if app.store else []
+        if contacts:
+            self.add(SectionHead("Contacts"))
+            self.add(rows_card([
+                PersonRow(c["address"], c.get("username") or
+                          short_addr(c["address"], 14),
+                          short_addr(c["address"], 18),
+                          on_tap=lambda a=c["address"]: self._then(
+                              lambda: app.open_conversation(a)))
+                for c in contacts], inset=dp(76)))
+
+    def _then(self, action: Callable) -> None:
+        self.dismiss()
+        Clock.schedule_once(lambda _dt: action(), 0.05)
+
+
 # =============================================================================
-#  Conversation screen
+#  The conversation
 # =============================================================================
 _METRIC_LABEL = None
 
 
-def measure_text(text: str, font_size: float, wrap_width: float) -> tuple:
+def measure_text(text: str, font_size: float, wrap_width: float,
+                 italic: bool = False) -> tuple:
     """Pixel (width, height) of `text` wrapped at `wrap_width`.
 
-    One shared, never-displayed Label measures for every bubble. The widget
-    that now DISPLAYS message text is a TextInput (so it can be selected and
-    copied), and a TextInput cannot report the size it wants until the frame
-    after it is given one — useless for laying a bubble out. Measuring with
-    the same Label the bubbles used in v8.0.1 keeps the geometry pixel-for-
-    pixel identical to the previous release, so making text selectable
-    changes nothing about how a conversation looks.
+    One shared, never-displayed Label measures every bubble: the widget
+    that DISPLAYS message text on a desktop is a TextInput (so it can be
+    selected), and a TextInput cannot report its size until the frame after
+    it is given one. Text that fits keeps its natural width; only text that
+    needs wrapping is measured at the wrap width.
     """
     global _METRIC_LABEL
     if _METRIC_LABEL is None:
@@ -5723,14 +7005,8 @@ def measure_text(text: str, font_size: float, wrap_width: float) -> tuple:
                               size_hint=(None, None))
     metric = _METRIC_LABEL
     metric.font_size = font_size
+    metric.italic = italic
     metric.text = text
-    # First the NATURAL size, unwrapped: a Label given a wrap width renders
-    # its texture at that full width, so measuring wrapped made a two-letter
-    # "ok" as wide as a paragraph — every bubble used to span 78% of the
-    # screen. Text that fits on its lines keeps its natural width; only text
-    # that genuinely needs wrapping is measured at the wrap width. (The
-    # length check skips the unwrapped pass for text that cannot possibly
-    # fit, which would otherwise build a texture wider than the GPU allows.)
     if len(text) * font_size * 0.42 < wrap_width * 3:
         metric.text_size = (None, None)
         metric.texture_update()
@@ -5743,24 +7019,12 @@ def measure_text(text: str, font_size: float, wrap_width: float) -> tuple:
 
 
 class SelectableText(TextInput):
-    """Message text you can highlight and copy — on a phone and on a PC.
+    """Message text you can highlight and copy (desktop).
 
-    A Kivy Label cannot be selected at all, so until now the only way to get
-    a message back out of the app was to retype it. A READ-ONLY TextInput
-    gives the behaviour people already expect from every other app, for
-    free: drag to select plus Ctrl+A/Ctrl+C on desktop, and on Android a
-    long press raises the selection handles and a context bubble which —
-    because the field is readonly — offers exactly one action, Copy. Kivy
-    enables the handles and the bubble by itself off `_is_desktop`, so
-    neither needs configuring here.
-
-    Scrolling still works over it: a ScrollView holds each touch for
-    scroll_timeout (55ms) and only hands it to the child if the finger has
-    not travelled scroll_distance, so a flick scrolls and a press selects.
-
-    It is painted to look precisely like the Label it replaces — no
-    background, no border, no cursor, the same espresso text at the same
-    size.
+    A READ-ONLY TextInput: drag to select, Ctrl+A / Ctrl+C. A ScrollView
+    holds each touch for scroll_timeout and only hands it on if the finger
+    has not travelled, so a flick still scrolls. Painted to look exactly
+    like a label: no ground, no border, no cursor.
     """
 
     def __init__(self, on_tap: Optional[Callable] = None, **kw):
@@ -5770,22 +7034,27 @@ class SelectableText(TextInput):
         kw.setdefault("background_normal", "")
         kw.setdefault("background_active", "")
         kw.setdefault("background_disabled_normal", "")
-        kw.setdefault("foreground_color", C(COL_TEXT))
-        kw.setdefault("selection_color", C(COL_ACCENT)[:3] + [0.35])
+        kw.setdefault("foreground_color", C(T.text))
+        kw.setdefault("selection_color", C(T.accent)[:3] + [0.35])
         kw.setdefault("cursor_color", (0, 0, 0, 0))
         kw.setdefault("cursor_width", 0)
         kw.setdefault("padding", [0, 0, 0, 0])
         kw.setdefault("size_hint", (None, None))
         super().__init__(**kw)
         self._on_tap = on_tap
+        # A TextInput scrolls to keep its cursor in view. Given the width
+        # it starts with (100px) every message wraps tall, and with the
+        # cursor at the end it scrolled to the LAST line — which then stayed
+        # scrolled once the bubble gave it its real size, hiding the first
+        # lines. The cursor lives at the start, and the view never scrolls.
+        self.cursor = (0, 0)
+        self.bind(size=self._unscroll, text=self._unscroll)
 
-    # ---- tap-to-mark-read ----------------------------------------------------
-    # The bubble is a ButtonBehavior, but Kivy offers every touch to the
-    # children first, so the TextInput now swallows it and the bubble's
-    # on_release never fires. Tapping a message is exactly the gesture that
-    # marks it read, so re-dispatch it from here — but only when the press
-    # AND the release happened on this bubble, or merely scrolling past an
-    # unread message would mark it read.
+    def _unscroll(self, *_a):
+        self.scroll_x = self.scroll_y = 0
+
+    # Tapping a message marks it read; the TextInput swallows the touch, so
+    # re-dispatch it — only when the press AND release were on this text.
     def on_touch_down(self, touch):
         handled = super().on_touch_down(touch)
         if handled:
@@ -5794,8 +7063,6 @@ class SelectableText(TextInput):
 
     def on_touch_up(self, touch):
         handled = super().on_touch_up(touch)
-        # .get, not .pop: every bubble under the touch sees this event, and
-        # popping it in one would rob the bubble that actually started it.
         if (self._on_tap is not None
                 and touch.ud.get("fext_tap_origin") is self
                 and self.collide_point(*touch.pos)):
@@ -5821,73 +7088,57 @@ def texture_from_b64(data: str):
         return None
 
 
-def single_line(text: str, font_size, color, bold=False, **kw) -> Label:
-    """A one-line label that truncates with an ellipsis instead of
-    overflowing — the default for every name and preview in the app."""
-    label = Label(text=text, font_size=font_size, color=C(color), bold=bold,
-                  halign="left", valign="middle", shorten=True,
-                  shorten_from="right", max_lines=1, **kw)
-    label.bind(size=lambda w, v: setattr(w, "text_size", v))
-    return label
-
-
 class QuoteBlock(ButtonBehavior, BoxLayout):
-    """The quoted message inside a reply: an accent bar, who said it, and
-    one line of what they said. Tapping it scrolls to the original."""
-
-    HEIGHT = dp(42)
+    """The message a reply answers: a gold rule, who said it (capitals),
+    and a line of what they said (italic). Tap it to go there."""
 
     def __init__(self, author: str, snippet: str, outgoing: bool,
                  on_tap: Optional[Callable] = None, **kw):
         kw.setdefault("orientation", "vertical")
         kw.setdefault("size_hint", (None, None))
-        kw.setdefault("height", self.HEIGHT)
-        kw.setdefault("padding", [dp(10), dp(4), dp(8), dp(4)])
+        kw.setdefault("padding", [dp(12), dp(5), dp(8), dp(6)])
         super().__init__(**kw)
         with self.canvas.before:
-            Color(*C(COL_QUOTE_ME if outgoing else COL_QUOTE_PEER))
-            self._bg = RoundedRectangle(radius=[dp(6)])
-            Color(*C(COL_ACCENT))
-            self._bar = RoundedRectangle(radius=[dp(2)])
+            Color(*C(T.quote_own if outgoing else T.quote_peer))
+            self._bg = RoundedRectangle(radius=[dp(4)])
+            Color(*C(T.accent))
+            self._bar = Rectangle()
         self.bind(pos=self._sync, size=self._sync)
-        self.author = single_line(author, sp(12.5), COL_ACCENT_DARK, bold=True,
-                                  size_hint_y=None, height=dp(17))
-        self.snippet = single_line(snippet, sp(12.5), COL_TEXT_DIM,
-                                   size_hint_y=None, height=dp(17))
+        self.author = CapsLabel(author, size=10.5, color=T.accent)
+        self.snippet = single_line(snippet, fs(15), T.text_2, italic=True,
+                                   size_hint_y=None, height=line_height(15))
         self.add_widget(self.author)
         self.add_widget(self.snippet)
+        self.height = self.author.height + self.snippet.height + dp(11)
         if on_tap is not None:
             self.bind(on_release=lambda _w: on_tap())
 
     def _sync(self, *_a):
         self._bg.pos, self._bg.size = self.pos, self.size
-        self._bar.pos, self._bar.size = self.pos, (dp(3), self.height)
+        self._bar.pos, self._bar.size = self.pos, (dp(2), self.height)
 
     def natural_width(self) -> float:
-        """Width the quote would like (capped by the bubble later)."""
-        self.author.texture_update()
-        self.snippet.texture_update()
-        return max(measure_text(self.author.text, sp(12.5), dp(600))[0],
-                   measure_text(self.snippet.text, sp(12.5), dp(600))[0]
-                   ) + dp(22)
+        return max(self.author.natural_width,
+                   measure_text(self.snippet.text, fs(15), dp(600),
+                                italic=True)[0]) + dp(22)
 
 
 class MediaStatus(Label):
-    """A small caption chip drawn over a photo ('Downloading…', etc.)."""
+    """A small caption chip over a photo ('Downloading…', etc.)."""
 
     def __init__(self, **kw):
-        super().__init__(font_size=sp(11.5), color=C("#FFFFFF"),
-                         size_hint=(None, None), **kw)
+        super().__init__(font_size=fs(13.5), italic=True,
+                         color=C("#FFFFF8"), size_hint=(None, None), **kw)
         with self.canvas.before:
-            self._col = Color(0, 0, 0, .45)
-            self._bg = RoundedRectangle(radius=[dp(10)])
+            self._col = Color(0, 0, 0, .5)
+            self._bg = RoundedRectangle(radius=[dp(11)])
         self.bind(pos=self._sync, size=self._sync,
                   texture_size=lambda w, v: setattr(
-                      w, "size", (v[0] + dp(16), dp(22))))
+                      w, "size", (v[0] + dp(18), max(dp(24), v[1] + dp(6)))))
 
     def _sync(self, *_a):
         self._bg.pos, self._bg.size = self.pos, self.size
-        self._col.a = .45 if self.text else 0
+        self._col.a = .5 if self.text else 0
 
 
 class ImageContent(ButtonBehavior, FloatLayout):
@@ -5899,8 +7150,8 @@ class ImageContent(ButtonBehavior, FloatLayout):
         super().__init__(**kw)
         self.msg, self.media, self.screen = msg, media, screen
         with self.canvas.before:
-            Color(*C("#E9DFCF"))
-            self._ground = RoundedRectangle(radius=[dp(10)])
+            Color(*C(T.surface_hi))
+            self._ground = RoundedRectangle(radius=[dp(6)])
         self.bind(pos=self._sync, size=self._sync)
         self.picture = KivyImage(allow_stretch=True, keep_ratio=True,
                                  size_hint=(1, 1),
@@ -5916,8 +7167,8 @@ class ImageContent(ButtonBehavior, FloatLayout):
 
     def natural_size(self, max_w: float) -> tuple:
         w0, h0 = self.media.get("w") or 4, self.media.get("h") or 3
-        width = min(max_w, dp(250))
-        height = max(dp(90), min(dp(330), width * h0 / float(w0)))
+        width = min(max_w, dp(260))
+        height = max(dp(90), min(dp(340), width * h0 / float(w0)))
         return width, height
 
     def refresh(self, msg: dict) -> None:
@@ -5936,14 +7187,14 @@ class ImageContent(ButtonBehavior, FloatLayout):
             "pending": "Downloading…",
             "downloading": "Downloading…",
             "expired": "Expired · tap to ask again",
-            "requested": "Asked them to send it again",
-            "failed": ("Upload failed · tap to retry" if outgoing
-                       else "Download failed · tap to retry"),
+            "requested": "Asked for it again",
+            "failed": ("Not sent · tap to retry" if outgoing
+                       else "Not downloaded · tap to retry"),
         }.get(state, "")
 
 
 class Waveform(Widget):
-    """Voice-note level bars; the played part is drawn in the accent."""
+    """Voice-note level bars; the played part is drawn in gold."""
 
     def __init__(self, wave: str = "", **kw):
         super().__init__(**kw)
@@ -5967,23 +7218,23 @@ class Waveform(Widget):
                 lvl = levels[int(i * len(levels) / bars)] / 255.0
                 height = max(dp(3), self.height * (0.18 + 0.82 * lvl))
                 played = (i + 0.5) / bars <= self.progress
-                Color(*C(COL_ACCENT if played else COL_TICK_GREY))
+                Color(*C(T.accent if played else T.tick_grey))
                 Rectangle(pos=(self.x + i * dp(4),
-                               self.center_y - height / 2),
-                          size=(dp(2.2), height))
+                               (self.y + self.height / 2) - height / 2),
+                          size=(dp(2), height))
 
 
 class VoiceContent(BoxLayout):
-    """▶ + waveform + duration. Plays from the local copy once it is here."""
+    """Play · waveform · length. Plays from the local copy once here."""
 
     def __init__(self, msg: dict, media: dict, screen, **kw):
         kw.setdefault("size_hint", (None, None))
-        kw.setdefault("height", dp(46))
+        kw.setdefault("height", TOUCH)
         kw.setdefault("spacing", dp(8))
         super().__init__(**kw)
         self.msg, self.media, self.screen = msg, media, screen
-        self.button = IconButton("play", tint="#FFFFFF", bg=COL_ACCENT,
-                                 size=(dp(40), dp(40)),
+        self.button = IconButton("play", tint=T.on_accent, bg=T.accent,
+                                 icon_size=dp(18), label="Play voice message",
                                  pos_hint={"center_y": .5},
                                  on_release=lambda _w:
                                  screen.on_media_tap(self.msg))
@@ -5993,23 +7244,21 @@ class VoiceContent(BoxLayout):
         self.add_widget(self.wave)
         dur = int(media.get("dur") or 0) // 1000
         self.length = Label(text=f"{dur // 60}:{dur % 60:02d}",
-                            font_size=sp(11.5), color=C(COL_TEXT_DIM),
-                            size_hint=(None, 1), width=dp(34))
+                            font_size=fs(13.5), color=C(T.text_3),
+                            size_hint=(None, 1), width=dp(38))
         self.add_widget(self.length)
         self.refresh(msg)
 
     def natural_size(self, max_w: float) -> tuple:
-        return min(max_w, dp(230)), dp(46)
+        return min(max_w, dp(240)), TOUCH
 
     def refresh(self, msg: dict) -> None:
         self.msg = msg
         state = msg.get("media_state") or ""
-        if state in ("expired",):
+        if state in ("expired", "failed"):
             self.button.set_icon("retry")
         elif state in ("pending", "downloading", "uploading", "requested"):
             self.button.set_icon("download")
-        elif state == "failed":
-            self.button.set_icon("retry")
         else:
             playing = self.screen.app.voice.path == msg.get("media_path") \
                 and self.screen.app.voice.playing
@@ -6017,29 +7266,139 @@ class VoiceContent(BoxLayout):
 
 
 def make_body(text: str, font_size) -> Widget:
-    """The message text widget. On a desktop it is selectable (drag to
-    highlight, Ctrl+C); on a phone a plain label, because long-press there
-    selects the whole message and a focusable field would only fight it."""
+    """The message text: selectable on a desktop; on a phone a plain label
+    (a long press there selects the whole message instead)."""
     if IS_MOBILE:
-        return Label(text=text, color=C(COL_TEXT), font_size=font_size,
+        return Label(text=text, color=C(T.text), font_size=font_size,
                      halign="left", valign="top", size_hint=(None, None))
     return SelectableText(text=text, font_size=font_size)
 
 
-class MessageBubble(BoxLayout):
-    """One message: an optional 'Forwarded' mark, reply quote, photo or
-    voice note, the text, and a meta row (star, time, ticks).
+class ReactionChip(ButtonBehavior, Widget):
+    """One reaction under a message — the emoji and how many gave it. Your
+    own is ringed in gold; tap it to take it back (or to add yours)."""
 
-    Outgoing = gold and right-aligned; incoming = white and left-aligned.
-    Touches belong to the enclosing BubbleRow, which owns tap, long-press
-    and selection, so this class only lays things out.
+    pop = NumericProperty(1.0)
+
+    def __init__(self, emoji: str, count: int, mine: bool, on_tap, **kw):
+        kw.setdefault("size_hint", (None, None))
+        super().__init__(**kw)
+        self.emoji, self.mine = emoji, mine
+        self.label = Label(text=emoji if count < 2 else f"{emoji} {count}",
+                           font_size=fs(15), color=C(T.text),
+                           size_hint=(None, None))
+        self.label.texture_update()
+        self.size = (max(dp(40), self.label.texture_size[0] + dp(18)),
+                     max(dp(30), round(fs(15) * 1.7)))
+        self.label.size = self.label.texture_size
+        self.add_widget(self.label)
+        with self.canvas.before:
+            PushMatrix()
+            self._scale = Scale(1, 1, 1)
+            ground = T.bg if T.dark else T.surface_hi
+            self._ground_col = Color(*C(mix(T.accent, ground, .80) if mine
+                                        else ground))
+            self._ground = RoundedRectangle(radius=[dp(15)])
+            Color(*C(T.accent if mine else T.rule_strong))
+            self._edge = Line(width=dp(1) / 2.0)
+        with self.canvas.after:
+            PopMatrix()
+        self.bind(pos=self._sync, size=self._sync, pop=self._sync,
+                  state=lambda _w, s: setattr(self, "opacity",
+                                              .7 if s == "down" else 1))
+        self.bind(on_release=lambda _w: on_tap(emoji))
+
+    def _sync(self, *_a):
+        self._scale.origin = (self.x + self.width / 2, self.y + self.height / 2)
+        self._scale.x = self._scale.y = self.pop
+        self._ground.pos, self._ground.size = self.pos, self.size
+        self._ground.radius = [self.height / 2]
+        self._edge.rounded_rectangle = (self.x + .5, self.y + .5,
+                                        self.width - 1, self.height - 1,
+                                        self.height / 2 - .5)
+        self.label.center = ((self.x + self.width / 2), (self.y + self.height / 2) + dp(.5))
+
+    def animate_in(self) -> None:
+        if not motion(1):
+            return
+        Animation.cancel_all(self, "pop")
+        self.pop = 0.45
+        Animation(pop=1.0, d=0.34, t="out_back").start(self)
+
+
+class ReactionBar(Widget):
+    """The reactions under one message, wrapping onto a second line when
+    they must."""
+
+    GAP = dp(6)
+
+    def __init__(self, **kw):
+        kw.setdefault("size_hint", (None, None))
+        super().__init__(**kw)
+        self.chips: list = []
+        self.bind(pos=self._place)
+
+    def set(self, reactions: list, me: str, on_tap) -> None:
+        for chip in self.chips:
+            self.remove_widget(chip)
+        groups: dict = {}
+        for emoji, reactor, _at in reactions:
+            groups.setdefault(emoji, []).append(reactor)
+        self.chips = [ReactionChip(e, len(who), me in who, on_tap)
+                      for e, who in groups.items()]
+        for chip in self.chips:
+            self.add_widget(chip)
+
+    def chip_for(self, emoji: str) -> Optional[ReactionChip]:
+        return next((c for c in self.chips if c.emoji == emoji), None)
+
+    def layout_for(self, max_w: float) -> tuple:
+        """Size for `max_w`: (width, height); 0 high when there are none."""
+        if not self.chips:
+            self.size = (0, 0)
+            return 0, 0
+        x = widest = 0.0
+        rows = 1
+        for chip in self.chips:
+            if x and x + chip.width > max_w:
+                rows += 1
+                x = 0
+            x += chip.width + self.GAP
+            widest = max(widest, x - self.GAP)
+        h = self.chips[0].height
+        self.size = (widest, rows * h + (rows - 1) * self.GAP)
+        self._max_w = max_w
+        self._place()
+        return self.size
+
+    def _place(self, *_a):
+        if not self.chips:
+            return
+        max_w = getattr(self, "_max_w", self.width)
+        h = self.chips[0].height
+        x, y = self.x, self.top - h
+        for chip in self.chips:
+            if x > self.x and x - self.x + chip.width > max_w:
+                x, y = self.x, y - h - self.GAP
+            chip.pos = (x, y)
+            x += chip.width + self.GAP
+
+
+class MessageBubble(BoxLayout):
+    """One message: who wrote it (in a group), a 'Forwarded' note, the
+    quoted message it answers, a photo or voice note, the text, its
+    reactions, and the time with the ticks.
+
+    Yours sit right on a warmer ground; theirs left on the page's surface.
+    Touches belong to the enclosing BubbleRow (tap, long-press, selection);
+    this class only lays out.
     """
 
     def __init__(self, msg: dict, ticks_enabled: bool, screen, **kw):
         kw.setdefault("orientation", "vertical")
         kw.setdefault("size_hint", (None, None))
-        kw.setdefault("padding", [dp(10), dp(7), dp(10), dp(6)])
-        kw.setdefault("spacing", dp(4))
+        kw.setdefault("padding", [dp(12), dp(8), dp(12), dp(7)])
+        kw.setdefault("spacing", dp(5))
         super().__init__(**kw)
         self.msg, self.screen = msg, screen
         self._last_width = 0.0
@@ -6047,29 +7406,38 @@ class MessageBubble(BoxLayout):
         self._body_floor = 0.0
         outgoing = msg["direction"] == "out"
         ext = message_ext(msg)
-        corners = ([dp(16), dp(16), dp(4), dp(16)] if outgoing
-                   else [dp(16), dp(16), dp(16), dp(4)])
-        paint_round(self, COL_BUBBLE_ME if outgoing else COL_BUBBLE_PEER,
-                    corners=corners)
-        if not outgoing:
-            paint_border(self, COL_CARD_EDGE, radius=dp(16))
+        corners = ([dp(10), dp(10), dp(3), dp(10)] if outgoing
+                   else [dp(10), dp(10), dp(10), dp(3)])
+        paint_round(self, T.own if outgoing else T.peer, corners=corners)
+        if not outgoing and not T.dark:
+            # On the light page theirs are white cards with a hairline;
+            # yours keep the warm ground.
+            paint_border(self, T.rule_strong, radius=dp(10))
+
+        self.author = None
+        author = msg.get("author")
+        if not outgoing and screen.kind == "group" and author:
+            self.author = CapsLabel(screen.author_name(author), size=10.5,
+                                    color=ink_color(author), tracking=0.14,
+                                    size_hint=(None, None))
+            self.add_widget(self.author)
 
         self.fwd = None
         if ext.get("fwd"):
-            self.fwd = Label(text="Forwarded", italic=True, font_size=sp(11.5),
-                             color=C(COL_ACCENT_DARK), halign="left",
-                             size_hint=(None, None), height=dp(15))
+            self.fwd = Label(text="Forwarded", italic=True, font_size=fs(14),
+                             color=C(T.text_3), halign="left",
+                             size_hint=(None, None), height=line_height(14))
             self.fwd.bind(size=lambda w, v: setattr(w, "text_size", v))
             self.add_widget(self.fwd)
 
         self.quote = None
         reply = ext.get("reply")
         if isinstance(reply, dict):
-            author = screen.author_name(reply.get("from"), outgoing)
+            who = screen.author_name(reply.get("from"), outgoing)
             snippet = reply.get("snip") or {"image": "Photo",
                                             "voice": "Voice message"}.get(
                 reply.get("kind"), "Message")
-            self.quote = QuoteBlock(author, snippet, outgoing,
+            self.quote = QuoteBlock(who, snippet, outgoing,
                                     on_tap=lambda c=reply.get("cid"):
                                     screen.jump_to_cid(c))
             self.add_widget(self.quote)
@@ -6084,27 +7452,38 @@ class MessageBubble(BoxLayout):
             self.add_widget(self.media)
 
         text = self._display_text(msg, media)
-        self.body = make_body(text, sp(14.5)) if text else None
+        self.body = make_body(text, fs(17)) if text else None
         if self.body is not None:
-            self.body.bind(minimum_height=self._body_min_height) \
-                if isinstance(self.body, SelectableText) else None
+            if isinstance(self.body, SelectableText):
+                self.body.bind(minimum_height=self._body_min_height)
             self.add_widget(self.body)
 
+        self.reactions = ReactionBar()
+        self._react_row = AnchorLayout(anchor_x="left", anchor_y="top",
+                                       size_hint_y=None, height=0)
+        self._react_row.add_widget(self.reactions)
+        self._set_reactions(msg)
+
         self.meta = Label(text=self._stamp_text(msg), markup=True,
-                          font_size=sp(10.5), color=C(COL_TEXT_DIM),
+                          font_size=fs(12.5), color=C(T.text_3),
                           halign="right", valign="middle",
-                          size_hint=(None, None), height=dp(14))
+                          size_hint=(None, None), height=line_height(12.5))
         count, tint = self._tick_state(msg, outgoing, ticks_enabled)
-        self.ticks = TickMarks(count=count, tint=tint)
-        self.star = Widget(size_hint=(None, None), size=(dp(12), dp(14)))
+        if screen.kind == "self":
+            count = 0                    # nothing is sent, so nothing to tick
+        self.ticks = TickMarks(count=count, tint=tint,
+                               pos_hint={"center_y": .5})
+        self.star = Widget(size_hint=(None, None),
+                           size=(dp(12), line_height(12.5)))
         self.star.bind(pos=self._draw_star, size=self._draw_star)
-        self.meta_box = BoxLayout(orientation="horizontal", spacing=dp(4),
-                                  size_hint=(None, None), height=dp(14))
+        self.meta_box = BoxLayout(orientation="horizontal", spacing=dp(5),
+                                  size_hint=(None, None),
+                                  height=line_height(12.5))
         self.meta_box.add_widget(self.star)
         self.meta_box.add_widget(self.meta)
         self.meta_box.add_widget(self.ticks)
         meta_row = AnchorLayout(anchor_x="right", size_hint_y=None,
-                                height=dp(14))
+                                height=line_height(12.5))
         meta_row.add_widget(self.meta_box)
         self.add_widget(meta_row)
         self._draw_star()
@@ -6112,14 +7491,24 @@ class MessageBubble(BoxLayout):
     # ---- content -------------------------------------------------------------
     @staticmethod
     def _display_text(msg: dict, media) -> str:
-        """What the text part shows. A photo shows its caption (if any), a
-        voice note shows nothing — their readable `body` exists for older
-        clients, previews and exports, not to be printed twice."""
+        """A photo shows its caption, a voice note nothing — their readable
+        `body` is for older clients, previews and exports."""
         if msg.get("kind") == "image" and isinstance(media, dict):
             return media.get("cap", "")
         if msg.get("kind") == "voice" and isinstance(media, dict):
             return ""
         return msg["body"]
+
+    def _set_reactions(self, msg: dict) -> None:
+        reactions = msg.get("reactions") or []
+        self.reactions.set(reactions, self.screen.app.keys.address,
+                           lambda e, m=msg: self.screen.on_reaction_tap(m, e))
+        row = self._react_row
+        if reactions and row.parent is None:
+            # Just above the time: the meta row, when present, is last.
+            self.add_widget(row, index=1 if hasattr(self, "meta_box") else 0)
+        elif not reactions and row.parent is not None:
+            self.remove_widget(row)
 
     def _draw_star(self, *_a):
         self.star.canvas.clear()
@@ -6128,40 +7517,25 @@ class MessageBubble(BoxLayout):
             return
         self.star.width = dp(12)
         with self.star.canvas:
-            draw_icon("star_filled", self.star.center_x, self.star.center_y,
-                      dp(11), C(COL_TICK_GOLD))
+            draw_icon("star_filled", (self.star.x + self.star.width / 2), (self.star.y + self.star.height / 2),
+                      dp(11), C(T.accent))
 
     @staticmethod
     def _stamp_text(msg: dict) -> str:
-        """Timestamp, plus an unread nudge on incoming messages that still
-        need a tap (only shown when auto-read is off, otherwise nothing is
-        ever left unread and the hint would be noise)."""
+        """The time, plus a nudge on incoming messages still unread (only
+        ever left so when auto-read is off)."""
         stamp = pretty_time(msg["created_at"])
         if msg["direction"] == "in" and not msg["read"]:
-            return "%s   [color=%s]tap to mark read[/color]" % (
-                stamp, COL_ACCENT.lstrip("#"))
+            return "[i][color=%s]tap to mark read[/color][/i]   %s" % (
+                T.accent.lstrip("#"), stamp)
         return stamp
 
     @staticmethod
     def _tick_state(msg: dict, outgoing: bool, ticks_enabled: bool) -> tuple:
-        """(tick count, colour) for this message.
-
-        v7: BOTH SIDES now show ticks. Previously only the sender saw them,
-        so the same message displayed three ticks on one device and a bare
-        timestamp on the other, and the recipient had no way to tell whether
-        a read receipt had actually gone back.
-
-        Outgoing ticks come from the relay's receipts:
-            0 = queued on this device (grey)   1 = accepted by the relay
-            2 = delivered to their device      3 = read by them
-        Incoming ticks are derived LOCALLY from facts this device already
-        knows — it holds the message (2), and it knows whether the user has
-        read it (3) — so the same message reads the same on both screens
-        without the relay having to send anything extra.
-
-        Either side disabling ticks caps the display at one, matching the
-        privacy rule the relay already enforces for receipts.
-        """
+        """(tick count, colour). Outgoing ticks come from the relay's
+        receipts (in a group: the slowest member's); incoming ones from
+        what this phone knows — it holds the message (2), and whether you
+        read it (3). Either side turning ticks off caps both at one."""
         if outgoing:
             status = msg["status"]
         else:
@@ -6169,40 +7543,39 @@ class MessageBubble(BoxLayout):
         if not ticks_enabled:
             status = min(status, 1)
         if status <= 0:
-            return 1, COL_TICK_GREY          # queued: one grey tick
-        return min(status, 3), COL_TICK_GOLD
+            return 1, T.tick_grey
+        return min(status, 3), T.tick
 
     def update(self, msg: dict, ticks_enabled: bool) -> None:
-        """Repaint in place after a status/read/star/media change.
-
-        A tick advancing 1/3 -> 2/3 -> 3/3 used to rebuild the entire
-        conversation; it now rewrites one short label.
-        """
+        """Repaint in place after a status/read/star/media/reaction change."""
         outgoing = msg["direction"] == "out"
         self.msg = msg
         self.meta.text = self._stamp_text(msg)
-        self.ticks.set_state(*self._tick_state(msg, outgoing, ticks_enabled))
+        if self.screen.kind != "self":
+            self.ticks.set_state(*self._tick_state(msg, outgoing,
+                                                   ticks_enabled))
         if self.media is not None:
             media = message_ext(msg).get("media")
             if isinstance(media, dict):
                 self.media.media = media
             self.media.refresh(msg)
+        before = {c.emoji: c.label.text for c in self.reactions.chips}
+        self._set_reactions(msg)
         self._draw_star()
         if self._last_width:
             self.layout_for(self._last_width)
+        pending = self.screen.take_pending_pop(msg.get("client_msg_id"))
+        for chip in self.reactions.chips:
+            if chip.emoji == pending or (pending is None and
+                                         before.get(chip.emoji) !=
+                                         chip.label.text and
+                                         chip.emoji not in before):
+                chip.animate_in()
 
     def _body_min_height(self, _w, value: float) -> None:
-        """Safety net for the measured height (desktop's selectable text).
-
-        The TextInput re-wraps a frame after it is given a width. If, AT ITS
-        FINAL WIDTH, it wants more room than measure_text predicted — a font
-        metric rounding apart — grow the bubble rather than clip the text.
-
-        Values reported before then are ignored: a TextInput starts life
-        100px wide, and its first wrap at that width asks for several times
-        the real height. Trusting that reading is what made every bubble
-        balloon in an early v9 build.
-        """
+        """Safety net for desktop's selectable text: if, AT ITS FINAL WIDTH,
+        it wants more room than measured, grow rather than clip. Readings
+        from before then (a TextInput starts 100px wide) are ignored."""
         if self.body is None or not self._last_width or \
                 self.body.width < self._text_w:
             return
@@ -6212,22 +7585,22 @@ class MessageBubble(BoxLayout):
             self.layout_for(self._last_width)
 
     def layout_for(self, available: float) -> None:
-        """Size every part, then the bubble to fit them.
-
-        The widest part decides the content width, capped at 78% of the
-        row; the quote and the meta row stretch to it, the text wraps
-        inside it, and a photo keeps its own aspect-correct size.
-        """
+        """Size every part, then the bubble to fit them: the widest part
+        decides, capped at 80% of the row."""
         self._last_width = available
-        max_w = max(dp(150), available * 0.78 - dp(20))
-        parts = []                                  # (widget, w, h)
-        widest = dp(60)
+        max_w = max(dp(150), available * 0.80 - dp(24))
+        parts = []
+        widest = dp(56)
+        if self.author is not None:
+            self.author.size = (min(max_w, self.author.natural_width),
+                                self.author.height)
+            widest = max(widest, self.author.width)
+            parts.append(self.author.height)
         if self.media is not None:
             mw, mh = self.media.natural_size(max_w)
             self.media.size = (mw, mh)
             widest = max(widest, mw)
             parts.append(mh)
-        text_w = text_h = 0
         if self.body is not None:
             wrap = self.media.width if isinstance(self.media,
                                                   ImageContent) else max_w
@@ -6235,11 +7608,9 @@ class MessageBubble(BoxLayout):
                                           wrap)
             self._text_w, self._text_h = text_w, text_h
             if isinstance(self.body, SelectableText):
-                # +2px of slack: handing a TextInput the exact width of its
-                # widest measured line can tip that line over by a rounding
-                # error and add a wrap. Invisible, and it prevents that.
                 self.body.width = text_w + dp(2)
                 self.body.height = max(text_h, self._body_floor)
+                self.body._unscroll()
             else:
                 self.body.width = text_w
                 self.body.text_size = (text_w + 0.5, None)
@@ -6249,12 +7620,15 @@ class MessageBubble(BoxLayout):
         if self.quote is not None:
             widest = max(widest, min(max_w, self.quote.natural_width()))
         if self.fwd is not None:
-            widest = max(widest, measure_text("Forwarded", sp(11.5),
-                                              dp(300))[0])
+            widest = max(widest, measure_text("Forwarded", fs(14), dp(300),
+                                              italic=True)[0])
+        rw, rh = self.reactions.layout_for(max_w)
+        self._react_row.height = rh
+        widest = max(widest, rw)
         self.meta.texture_update()
-        self.meta.size = (self.meta.texture_size[0], dp(14))
+        self.meta.size = (self.meta.texture_size[0], line_height(12.5))
         meta_w = self.meta.width + self.ticks.width + self.star.width
-        meta_w += dp(4) * (1 + (1 if self.ticks.width else 0))
+        meta_w += dp(5) * (1 + (1 if self.ticks.width else 0))
         self.meta_box.width = meta_w
         widest = max(widest, meta_w)
         if self.quote is not None:
@@ -6263,21 +7637,21 @@ class MessageBubble(BoxLayout):
         if self.fwd is not None:
             self.fwd.width = widest
             parts.append(self.fwd.height)
-        parts.append(dp(14))                        # meta row
+        if self._react_row.parent is not None:
+            parts.append(rh)
+        parts.append(line_height(12.5))             # the meta row
         pad_l, pad_t, pad_r, pad_b = self.padding
         self.width = widest + pad_l + pad_r
-        self.height = (sum(parts) + self.spacing * (len(parts) - 1)
+        self.height = (sum(parts) + self.spacing * (len(self.children) - 1)
                        + pad_t + pad_b)
 
 
 class BubbleRow(AnchorLayout):
     """A full-width row holding one bubble, and the owner of its touches.
 
-    Long-press (or right-click) selects the message — the "highlight mode"
-    the app bar switches into — and while anything is selected a tap
-    toggles a message in or out instead of doing its normal thing. A
-    selected row is washed in gold across the whole width, which also makes
-    multi-select obvious.
+    Long-press (or right-click) selects the message — the app bar switches
+    to its actions and the reaction strip rises over it; while anything is
+    selected a tap toggles a message in or out instead.
     """
 
     LONG_PRESS = 0.42                     # seconds
@@ -6285,13 +7659,13 @@ class BubbleRow(AnchorLayout):
     def __init__(self, bubble: MessageBubble, outgoing: bool, screen, **kw):
         kw.setdefault("size_hint_y", None)
         kw.setdefault("height", dp(48))
-        kw.setdefault("padding", [dp(10), dp(3), dp(10), dp(3)])
+        kw.setdefault("padding", [dp(12), dp(3), dp(12), dp(3)])
         super().__init__(anchor_x="right" if outgoing else "left",
                          anchor_y="center", **kw)
         self.bubble, self.screen = bubble, screen
         self.msg_id = bubble.msg["id"]
         with self.canvas.before:
-            self._tint = Color(*COL_SELECT_RGBA)
+            self._tint = Color(*T.select)
             self._wash = Rectangle()
         self._tint.a = 0
         self.bind(pos=self._sync, size=self._sync)
@@ -6304,9 +7678,8 @@ class BubbleRow(AnchorLayout):
         self._wash.pos, self._wash.size = self.pos, self.size
 
     def set_selected(self, selected: bool) -> None:
-        self._tint.a = COL_SELECT_RGBA[3] if selected else 0
+        self._tint.a = T.select[3] if selected else 0
 
-    # ---- touches -------------------------------------------------------------
     def on_touch_down(self, touch):
         if not self.collide_point(*touch.pos) or touch.is_mouse_scrolling:
             return super().on_touch_down(touch)
@@ -6319,7 +7692,7 @@ class BubbleRow(AnchorLayout):
         touch.grab(self)
         self._press = (touch.uid, touch.pos, Clock.schedule_once(
             lambda _dt: self._long_press(touch), self.LONG_PRESS))
-        super().on_touch_down(touch)       # children: links, play, text drag
+        super().on_touch_down(touch)       # children: quote, play, chips
         return True
 
     def _long_press(self, touch):
@@ -6348,76 +7721,81 @@ class BubbleRow(AnchorLayout):
         return super().on_touch_up(touch)
 
 
-class DayDivider(AnchorLayout):
-    """Soft date pill between days — the familiar messenger rhythm."""
+class EventRow(BoxLayout):
+    """A line in the margin of a group's history: who joined, who left,
+    what it is now called. Italic, centred, not a message."""
+
+    def __init__(self, msg: dict, **kw):
+        kw.setdefault("size_hint_y", None)
+        kw.setdefault("padding", [dp(40), dp(6), dp(40), dp(6)])
+        super().__init__(**kw)
+        self.msg = msg
+        self.label = InfoLabel(msg["body"], color=T.text_3, italic=True,
+                               font_size=fs(15), halign="center")
+        self.add_widget(self.label)
+        self.label.bind(height=lambda _w, v: setattr(self, "height",
+                                                     v + dp(12)))
+
+
+class DayDivider(BoxLayout):
+    """A date set in capitals between hairlines — the rhythm of days."""
 
     def __init__(self, text: str, **kw):
         kw.setdefault("size_hint_y", None)
-        kw.setdefault("height", dp(40))
+        kw.setdefault("height", dp(46))
+        kw.setdefault("padding", [dp(28), 0])
+        kw.setdefault("spacing", dp(12))
         super().__init__(**kw)
-        pill = AnchorLayout(size_hint=(None, None), size=(dp(90), dp(24)))
-        paint_round(pill, COL_CARD, radius=dp(12))
-        label = Label(text=text, font_size=sp(11), color=C(COL_TEXT_DIM),
-                      size_hint=(None, None), height=dp(24))
-        label.bind(texture_size=lambda w, v: (
-            setattr(w, "width", v[0]),
-            setattr(pill, "width", v[0] + dp(26))))
-        label.texture_update()
-        pill.add_widget(label)
-        self.add_widget(pill)
+        self.add_widget(Rule(pos_hint={"center_y": .5}))
+        caps = CapsLabel(text, size=10.5, color=T.text_3, tracking=0.18,
+                         halign="center", size_hint=(None, None),
+                         pos_hint={"center_y": .5})
+        caps.width = caps.natural_width + dp(2)
+        self.add_widget(caps)
+        self.add_widget(Rule(pos_hint={"center_y": .5}))
 
 
 class JumpToBottomButton(ButtonBehavior, Widget):
-    """Floating "back to the latest message" pill.
-
-    Appears whenever the view is scrolled away from the bottom. When
-    messages arrived while the user was reading history it carries a count,
-    so a new message is announced WITHOUT yanking the scroll position — the
-    old behaviour snapped every reader to the bottom mid-sentence.
-    """
+    """'Back to the latest' — appears when scrolled away from the bottom,
+    with a count of what arrived meanwhile (the view is never yanked)."""
 
     def __init__(self, on_tap=None, **kw):
         kw.setdefault("size_hint", (None, None))
-        kw.setdefault("size", (dp(40), dp(40)))
+        kw.setdefault("size", (TOUCH, TOUCH))
         super().__init__(**kw)
         self._count = 0
         self.opacity = 0
         self.disabled = True
-        with self.canvas.before:
-            self._shadow_col = Color(*C(COL_CARD_EDGE))
-            self._shadow = Ellipse()
-            self._bg_col = Color(*C(COL_CARD))
-            self._bg = Ellipse()
-        self.bind(pos=self._sync, size=self._sync, state=self._on_state)
+        self.bind(pos=self._sync, size=self._sync, state=self._sync)
         if on_tap is not None:
             self.bind(on_release=lambda _w: on_tap())
-        self._badge = Label(text="", bold=True, font_size=sp(10),
-                            color=C("#FFFFFF"), size_hint=(None, None),
-                            size=(dp(18), dp(18)), opacity=0)
+        self._badge = Label(text="", bold=True, font_size=fs(12),
+                            color=C(T.on_alert), size_hint=(None, None),
+                            size=(dp(20), dp(20)), opacity=0)
         self.add_widget(self._badge)
         self._sync()
 
-    def _on_state(self, _w, state):
-        self._bg_col.rgba = C(COL_PRESSED if state == "down" else COL_CARD)
-
     def _sync(self, *_a):
-        self._shadow.pos = (self.x - dp(1), self.y - dp(1.5))
-        self._shadow.size = (self.width + dp(2), self.height + dp(2))
-        self._bg.pos, self._bg.size = self.pos, self.size
-        self._badge.center = (self.center_x + dp(13), self.center_y + dp(13))
-        self.canvas.after.clear()
-        cx, cy = self.center_x, self.center_y
-        r = self.width * 0.19
-        with self.canvas.after:
-            Color(*C(COL_ACCENT_DARK))
-            # downward chevron
-            Line(points=[cx - r, cy + r * 0.55, cx, cy - r * 0.5,
-                         cx + r, cy + r * 0.55],
-                 width=dp(1.6), cap="round", joint="round")
+        self.canvas.before.clear()
+        d = dp(42)
+        x, y = (self.x + self.width / 2) - d / 2, (self.y + self.height / 2) - d / 2
+        with self.canvas.before:
+            Color(*C(T.press if self.state == "down" else T.surface_hi))
+            Ellipse(pos=(x, y), size=(d, d))
+            Color(*C(T.rule_strong))
+            Line(circle=((self.x + self.width / 2), (self.y + self.height / 2), d / 2 - .5),
+                 width=dp(1) / 2.0)
+            cx, cy = (self.x + self.width / 2), (self.y + self.height / 2)
+            r = d * 0.18
+            Color(*C(T.text_2))
+            Line(points=[cx - r, cy + r * 0.5, cx, cy - r * 0.5,
+                         cx + r, cy + r * 0.5],
+                 width=dp(1.4), cap="round", joint="round")
             if self._count > 0:
-                Color(*C(COL_ACCENT))
-                Ellipse(pos=(self.center_x + dp(4), self.center_y + dp(4)),
-                        size=(dp(18), dp(18)))
+                Color(*C(T.alert))
+                Ellipse(pos=((self.x + self.width / 2) + dp(6), (self.y + self.height / 2) + dp(6)),
+                        size=(dp(20), dp(20)))
+        self._badge.center = ((self.x + self.width / 2) + dp(16), (self.y + self.height / 2) + dp(16))
 
     def set_visible(self, visible: bool) -> None:
         target = 1.0 if visible else 0.0
@@ -6425,7 +7803,10 @@ class JumpToBottomButton(ButtonBehavior, Widget):
         if abs(self.opacity - target) < 0.01:
             return
         Animation.cancel_all(self, "opacity")
-        Animation(opacity=target, d=0.15).start(self)
+        if motion(1):
+            Animation(opacity=target, d=0.15).start(self)
+        else:
+            self.opacity = target
 
     def set_count(self, count: int) -> None:
         count = max(0, int(count))
@@ -6437,68 +7818,317 @@ class JumpToBottomButton(ButtonBehavior, Widget):
         self._sync()
 
 
+EMOJI_SETS = (
+    ("Faces",
+     "😀😃😄😁😆😅🤣😂🙂🙃😉😊😇🥰😍🤩😘😗😚😙😋😛😜🤪"
+     "😝🤑🤗🤭🤫🤔🤐🤨😐😑😶😏😒🙄😬😌😔😪🤤😴😷🤒🤕🤢"
+     "🤮🥵🥶🥴😵🤯🤠🥳😎🤓🧐😕😟🙁😮😯😲😳🥺😦😧😨😰😥"
+     "😢😭😱😖😣😞😓😩😫🥱😤😡😠🤬😈👿💀💩🤡👻👽🤖"),
+    ("People",
+     "👋🤚🖐✋🖖👌🤌🤏✌🤞🤟🤘🤙👈👉👆🖕👇☝👍👎✊👊🤛"
+     "🤜👏🙌👐🤲🤝🙏✍💅🤳💪🦾🦵🦶👂🦻👃🧠🫀🫁🦷🦴👀👁"
+     "👅👄💋🩸👶🧒👦👧🧑👱👨🧔👩🧓👴👵🙍🙎🙅🙆💁🙋🧏🙇"
+     "🤦🤷👮🕵💂🥷👷🤴👸👳👲🧕🤵👰🤰🤱👼🎅🤶🦸🦹🧙🧚🧛"
+     "🧜🧝🧞🧟💆💇🚶🧍🧎🏃💃🕺👯🧖🧗🤺🏇⛷🏂🏌🏄🚣🏊⛹"
+     "🏋🚴🚵🤸🤼🤽🤾🤹🧘"),
+    ("Nature",
+     "🐶🐱🐭🐹🐰🦊🐻🐼🐨🐯🦁🐮🐷🐸🐵🙈🙉🙊🐒🐔🐧🐦🐤🦆"
+     "🦅🦉🦇🐺🐗🐴🦄🐝🐛🦋🐌🐞🐜🕷🦂🐢🐍🦎🐙🦑🦀🐡🐠🐟"
+     "🐬🐳🐋🦈🐊🐅🐆🦓🦍🐘🦏🐪🐫🦒🐃🐂🐄🐎🐖🐏🐑🦙🐐🦌"
+     "🐕🐩🐈🐓🦃🦚🦜🦢🕊🐇🦝🦨🦡🦦🦥🐁🐀🐿🦔🐾🐉🐲🌵🎄"
+     "🌲🌳🌴🌱🌿☘🍀🎍🎋🍃🍂🍁🍄🐚🌾💐🌷🌹🥀🌺🌸🌼🌻🌞"
+     "🌝🌛🌜🌚🌕🌖🌗🌘🌑🌒🌓🌔🌙🌎🌍🌏🪐💫⭐🌟✨⚡☄💥"
+     "🔥🌪🌈☀🌤⛅🌥☁🌦🌧⛈🌩🌨❄☃⛄🌬💨💧💦☔☂🌊🌫"),
+    ("Food",
+     "🍏🍎🍐🍊🍋🍌🍉🍇🍓🫐🍈🍒🍑🥭🍍🥥🥝🍅🍆🥑🥦🥬🥒🌶"
+     "🫑🌽🥕🧄🧅🥔🍠🥐🥯🍞🥖🥨🧀🥚🍳🧈🥞🧇🥓🥩🍗🍖🌭🍔"
+     "🍟🍕🥪🥙🧆🌮🌯🥗🥘🥫🍝🍜🍲🍛🍣🍱🥟🍤🍙🍚🍘🍥🥠🥮"
+     "🍢🍡🍧🍨🍦🥧🧁🍰🎂🍮🍭🍬🍫🍿🍩🍪🌰🥜🍯🥛🍼☕🍵🧃"
+     "🥤🍶🍺🍻🥂🍷🥃🍸🍹🧉🍾🧊🥄🍴🍽🥣🥡🥢🧂"),
+    ("Things",
+     "⌚📱💻⌨🖥🖨🖱💽💾💿📀📷📸📹🎥📞☎📺📻🎙⏱⏰⌛⏳"
+     "📡🔋🔌💡🔦🕯💸💵💴💶💷💰💳💎⚖🧰🔧🔨⚒🛠⛏🔩⚙🧱"
+     "⛓🧲🔫💣🧨🔪🗡⚔🛡🔮📿🧿💈⚗🔭🔬🩺💊💉🧬🦠🧪🌡🧹"
+     "🧺🧻🚽🛁🔑🗝🚪🛋🛏🧸🖼🛍🛒🎁🎈🎏🎀🎊🎉🎎🏮🎐🧧✉"
+     "📩📨📧💌📥📤📦🏷📪📫📬📭📮📯📜📃📄📑🧾📊📈📉🗒🗓"
+     "📆📅📇🗃🗳🗄📋📁📂🗂🗞📰📓📔📒📕📗📘📙📚📖🔖🧷🔗"
+     "📎🖇📐📏🧮📌"),
+    ("Signs",
+     "❤🧡💛💚💙💜🖤🤍🤎💔❣💕💞💓💗💖💘💝💟☮✝☪🕉☸"
+     "✡🔯🕎☯☦🛐⛎♈♉♊♋♌♍♎♏♐♑♒♓🆔⚛☢☣📴"
+     "📳🈶🈚🈸🈺🈷✴🆚💮🉐㊙㊗🈴🈵🈹🈲🅰🅱🆎🆑🅾🆘❌⭕"
+     "🛑⛔📛🚫💯💢♨🚷🚯🚳🚱🔞📵🚭❗❕❓❔‼⁉🔅🔆〽⚠"
+     "🚸🔱⚜🔰♻✅🈯💹❇✳❎🌐💠Ⓜ🌀💤🏧🚾♿🅿🈳🈂🛂🛃"),
+)
+RECENT_EMOJI_MAX = 24
+
+
+class EmojiKey(ButtonBehavior, Label):
+    def __init__(self, emoji: str, on_pick, **kw):
+        if "size" in kw:
+            kw.setdefault("size_hint", (None, None))
+        super().__init__(text=emoji, font_size=sp(25), color=C(T.text),
+                         **kw)
+        with self.canvas.before:
+            self._press = Color(0, 0, 0, 0)
+            self._disc = Ellipse()
+        self.bind(pos=self._sync, size=self._sync,
+                  state=lambda _w, s: setattr(
+                      self._press, "rgba", C(T.press) if s == "down"
+                      else (0, 0, 0, 0)),
+                  on_release=lambda _w: on_pick(emoji))
+
+    def _sync(self, *_a):
+        d = dp(42)
+        self._disc.pos = ((self.x + self.width / 2) - d / 2, (self.y + self.height / 2) - d / 2)
+        self._disc.size = (d, d)
+
+
+class EmojiPanel(BoxLayout):
+    """Emoji, by kind, where the keyboard was: capitals tabs over a grid.
+    Picks go into the message being written, or — opened from the
+    reaction strip — become a reaction."""
+
+    HEIGHT = dp(292)
+
+    def __init__(self, on_pick: Callable[[str], None], **kw):
+        kw.setdefault("orientation", "vertical")
+        kw.setdefault("size_hint_y", None)
+        kw.setdefault("height", 0)
+        super().__init__(**kw)
+        self.on_pick = on_pick
+        self.opacity, self.disabled = 0, True
+        paint_round(self, T.surface, radius=0)
+        hairline(self, "top")
+        recent = [e for e in load_prefs().get("recent_emoji", [])
+                  if isinstance(e, str) and sanitize_emoji(e)]
+        self._recent = recent[:RECENT_EMOJI_MAX]
+        options = ([("Recent", "Recent")] if self._recent else []) + \
+            [(name, name) for name, _set in EMOJI_SETS]
+        self._sets = dict(EMOJI_SETS)
+        tab_scroll = ScrollView(size_hint_y=None, height=TOUCH,
+                                do_scroll_y=False, bar_width=0)
+        self.tabs = Segmented(options, options[0][0], self._show,
+                              size_hint_x=None)
+        self.tabs.width = max(dp(84) * len(options), Window.width)
+        tab_scroll.add_widget(self.tabs)
+        self.add_widget(tab_scroll)
+        self.grid_scroll = ScrollView(do_scroll_x=False, bar_width=dp(3))
+        self.add_widget(self.grid_scroll)
+        self._grids: dict = {}
+        self._show(options[0][0])
+
+    def _show(self, name: str) -> None:
+        grid = self._grids.get(name)
+        if grid is None or name == "Recent":
+            items = self._recent if name == "Recent" else self._sets[name]
+            grid = GridLayout(cols=7, size_hint=(1, None),
+                              padding=[dp(4), dp(4)],
+                              row_default_height=TOUCH,
+                              row_force_default=True)
+            grid.bind(minimum_height=grid.setter("height"),
+                      width=self._reflow)
+            for emoji in items:
+                grid.add_widget(EmojiKey(emoji, self._pick))
+            self._grids[name] = grid
+        self.grid_scroll.clear_widgets()
+        if grid.parent is not None:
+            grid.parent.remove_widget(grid)
+        self.grid_scroll.add_widget(grid)
+        self._reflow(grid, grid.width)
+        self.grid_scroll.scroll_y = 1
+
+    @staticmethod
+    def _reflow(grid, width) -> None:
+        """As many 48dp keys a row as fit, the slack spread between them."""
+        cols = max(5, int((width - dp(8)) / TOUCH))
+        if grid.cols != cols:
+            grid.cols = cols
+
+    def _pick(self, emoji: str) -> None:
+        recent = [emoji] + [e for e in self._recent if e != emoji]
+        self._recent = recent[:RECENT_EMOJI_MAX]
+        save_pref("recent_emoji", self._recent)
+        self.on_pick(emoji)
+
+    def set_open(self, on: bool) -> None:
+        self.height = self.HEIGHT if on else 0
+        self.opacity = 1 if on else 0
+        self.disabled = not on
+
+    @property
+    def is_open(self) -> bool:
+        return self.height > 0
+
+
+class ReactionStrip(BoxLayout):
+    """The quick reactions, floating over the message you held: tap one to
+    react (tap yours again to take it back); + opens every emoji."""
+
+    def __init__(self, on_pick: Callable[[str], None],
+                 on_more: Callable[[], None], **kw):
+        kw.setdefault("size_hint", (None, None))
+        kw.setdefault("height", dp(54))
+        kw.setdefault("padding", [dp(6), dp(3)])
+        super().__init__(**kw)
+        self.keys = {}
+        for emoji in QUICK_REACTIONS:
+            key = EmojiKey(emoji, on_pick, size=(dp(46), dp(48)))
+            key.font_size = sp(24)
+            self.keys[emoji] = key
+            self.add_widget(key)
+        self.add_widget(IconButton("plus", label="More reactions",
+                                   size=(dp(46), dp(48)),
+                                   on_release=lambda _w: on_more()))
+        self.width = dp(46) * (len(QUICK_REACTIONS) + 1) + dp(12)
+        with self.canvas.before:
+            Color(0, 0, 0, .30 if T.dark else .10)
+            self._shadow = RoundedRectangle(radius=[dp(27)])
+            Color(*C(T.surface_hi))
+            self._bg = RoundedRectangle(radius=[dp(27)])
+            self._mine_col = Color(0, 0, 0, 0)
+            self._mine = Ellipse()
+        with self.canvas.after:
+            Color(*C(T.rule_strong))
+            self._edge = Line(width=dp(1) / 2.0)
+        self.bind(pos=self._sync, size=self._sync)
+        self.opacity, self.disabled = 0, True
+        self._current = ""
+
+    def _sync(self, *_a):
+        self._shadow.pos = (self.x, self.y - dp(2))
+        self._shadow.size = self.size
+        self._bg.pos, self._bg.size = self.pos, self.size
+        self._edge.rounded_rectangle = (self.x + .5, self.y + .5,
+                                        self.width - 1, self.height - 1,
+                                        dp(27))
+        key = self.keys.get(self._current)
+        if key is not None:
+            d = dp(40)
+            self._mine_col.rgba = C(mix(T.accent, T.surface_hi, .70))
+            self._mine.pos = ((key.x + key.width / 2) - d / 2, (key.y + key.height / 2) - d / 2)
+            self._mine.size = (d, d)
+        else:
+            self._mine_col.rgba = (0, 0, 0, 0)
+
+    def show(self, current: str) -> None:
+        self._current = current or ""
+        self.disabled = False
+        self._sync()
+        Animation.cancel_all(self, "opacity")
+        if motion(1):
+            self.opacity = 0
+            Animation(opacity=1, d=0.14).start(self)
+        else:
+            self.opacity = 1
+
+    def hide(self) -> None:
+        self.disabled = True
+        Animation.cancel_all(self, "opacity")
+        self.opacity = 0
+
+
+class ComposerInput(BoxLayout):
+    """The message field: a soft pill on the page, the serif inside."""
+
+    def __init__(self, hint="Message", on_enter=None, **kw):
+        kw.setdefault("padding", [dp(16), 0, dp(12), 0])
+        super().__init__(**kw)
+        paint_round(self, T.surface_hi, radius=dp(22))
+        self.input = TextInput(
+            hint_text=hint, multiline=False, background_normal="",
+            background_active="", background_color=(0, 0, 0, 0),
+            foreground_color=C(T.text), hint_text_color=C(T.text_3),
+            cursor_color=C(T.accent), selection_color=C(T.accent)[:3] + [.3],
+            font_size=fs(17), write_tab=False,
+            padding=[0, 0, 0, 0], size_hint_y=None,
+            height=round(fs(17) * 1.4), pos_hint={"center_y": .5})
+        if on_enter is not None:
+            self.input.bind(on_text_validate=lambda _w: on_enter())
+        holder = AnchorLayout(anchor_y="center")
+        holder.add_widget(self.input)
+        self.add_widget(holder)
+
+    @property
+    def text(self) -> str:
+        return self.input.text
+
+    @text.setter
+    def text(self, value: str) -> None:
+        # A single-line TextInput keeps its horizontal scroll across text
+        # changes: switching from a chat with a long draft to an empty one
+        # left the hint scrolled half out of view.
+        self.input.text = value
+        self.input.scroll_x = 0
+        self.input.cursor = self.input.get_cursor_from_index(len(value))
+
+
 class ConversationScreen(Screen):
-    """The chat itself: the app bar with the peer, the chat background,
-    bubbles, and a rounded composer pinned to the bottom."""
+    """A conversation: its head (or, while messages are held, their
+    actions), the messages bottom-anchored over the page, the reaction strip
+    over a held message, and the composer — with the emoji panel beneath
+    it. Direct chats, groups and notes to self all live here."""
 
     def __init__(self, app: "FextApp", **kw):
         super().__init__(name="conversation", **kw)
         self.app = app
         # ---- incremental-render bookkeeping ---------------------------------
         self._bubbles: dict = {}          # message id -> MessageBubble
-        self._rendered_ids: list = []     # ids currently on screen, in order
-        self._rendered_sigs: dict = {}    # id -> (status, read, body)
+        self._rendered_ids: list = []
+        self._rendered_sigs: dict = {}
         self._rendered_peer: Optional[str] = None
         self._rendered_ticks: Optional[bool] = None
         self._last_day: Optional[str] = None
-        self._unseen = 0                  # arrived while reading history
-        self._scroll_trigger = None       # pending deferred scroll, if any
-        self._stick_to_bottom = True      # follow new content?
-        self._last_content_h = 0.0        # for preserving the read position
-        self.has_older = False            # more history available to page in
-        self._more_button = CozyButton(
-            "Load earlier messages", bg=COL_CARD, fg=COL_ACCENT_DARK,
-            outline=COL_CARD_EDGE, size_hint_y=None, height=dp(38),
-            font_size=sp(12.5), pressed=COL_PRESSED,
-            on_release=lambda _w: self.app.load_older_messages())
+        self._unseen = 0
+        self._scroll_trigger = None
+        self._stick_to_bottom = True
+        self._last_content_h = 0.0
+        self.has_older = False
+        self._more_button = Btn("Earlier messages", kind="text",
+                                size_hint_y=None,
+                                on_release=lambda _w:
+                                self.app.load_older_messages())
         self.selected: dict = {}          # local id -> message, highlighted
         self._rows: dict = {}             # local id -> BubbleRow
+        self._pending_pop: dict = {}      # cid -> emoji to animate in
         self.reply_to: Optional[dict] = None
-        self.recorder = None              # VoiceRecorder while recording
+        self.recorder = None
         self._rec_tick = None
         self.peer: Optional[str] = None
+        self.kind = "dm"
+        self.group: Optional[dict] = None
         self.peer_name_text = ""
+        self._emoji_target: Optional[int] = None   # react via the panel
+        self._drafts: dict = {}                    # peer -> unsent text
         root = BoxLayout(orientation="vertical")
-        paint_round(root, COL_BG, radius=dp(0))
+        paint_round(root, T.bg, radius=0)
         self.add_widget(root)
 
         # ---- app bar: normal mode and highlight (selection) mode -------------
-        # Two complete bars swapped in one slot, rather than one bar whose
-        # buttons come and go: each mode lays out exactly once, so nothing
-        # shifts sideways when the mode changes.
-        self.bar = FloatLayout(size_hint_y=None, height=dp(56))
-        paint_round(self.bar, COL_APPBAR, radius=dp(0))
+        self.bar = FloatLayout(size_hint_y=None,
+                               height=max(dp(62), line_height(19) +
+                                          line_height(14) + dp(14)))
+        hairline(self.bar, "bottom")
         root.add_widget(self.bar)
-
-        self.normal_bar = BoxLayout(padding=[dp(2), 0, dp(4), 0],
-                                    spacing=dp(2), size_hint=(1, 1),
+        self.normal_bar = BoxLayout(padding=[dp(2), 0, dp(2), 0],
+                                    spacing=dp(4), size_hint=(1, 1),
                                     pos_hint={"x": 0, "y": 0})
         self.normal_bar.add_widget(IconButton(
-            "back", size=(dp(44), dp(56)),
+            "back", label="Back", pos_hint={"center_y": .5},
             on_release=lambda _w: self.app.go_back_to_chats()))
-        self.peer_avatar_holder = AnchorLayout(size_hint_x=None, width=dp(40))
+        self.peer_avatar_holder = AnchorLayout(size_hint_x=None, width=dp(42))
         self.normal_bar.add_widget(self.peer_avatar_holder)
         titles = TappableBox(on_tap=lambda: self.app.open_chat_info(),
-                             padding=[dp(8), dp(8), 0, dp(8)])
-        self.peer_name = single_line("", sp(16.5), COL_APPBAR_TEXT, bold=True,
-                                     size_hint_y=None, height=dp(22))
-        self.peer_sub = single_line("", sp(12), COL_APPBAR_DIM,
-                                    size_hint_y=None, height=dp(18))
+                             padding=[dp(10), dp(8), 0, dp(8)])
+        self.peer_name = single_line("", fs(19), T.text, bold=True,
+                                     size_hint_y=None, height=line_height(19))
+        self.peer_sub = single_line("", fs(14), T.text_3, italic=True,
+                                    size_hint_y=None, height=line_height(14))
         titles.add_widget(self.peer_name)
         titles.add_widget(self.peer_sub)
         self.normal_bar.add_widget(titles)
         self.more_button = IconButton(
-            "more", size=(dp(44), dp(56)),
+            "more", label="More", pos_hint={"center_y": .5},
             on_release=lambda w: self.open_menu(w))
         self.normal_bar.add_widget(self.more_button)
 
@@ -6506,38 +8136,39 @@ class ConversationScreen(Screen):
                                     size_hint=(1, 1),
                                     pos_hint={"x": 0, "y": 0})
         self.select_bar.add_widget(IconButton(
-            "close", size=(dp(44), dp(56)),
+            "close", label="Cancel selection", pos_hint={"center_y": .5},
             on_release=lambda _w: self.clear_selection()))
-        self.select_count = Label(text="1", bold=True, font_size=sp(18),
-                                  color=C(COL_APPBAR_TEXT), halign="left",
+        self.select_count = Label(text="1", font_size=fs(20),
+                                  color=C(T.text), halign="left",
                                   valign="middle", size_hint_x=None,
-                                  width=dp(34))
+                                  width=dp(36))
         self.select_count.bind(size=lambda w, v: setattr(w, "text_size", v))
         self.select_bar.add_widget(self.select_count)
         self.select_bar.add_widget(Widget())
         self.actions: dict = {}
-        for name, handler in (("reply", self._act_reply),
-                              ("copy", self._act_copy),
-                              ("star", self._act_star),
-                              ("forward", self._act_forward),
-                              ("share", self._act_share),
-                              ("delete", self._act_delete)):
-            button = IconButton(name, size=(dp(42), dp(56)),
+        for name, handler, label in (
+                ("reply", self._act_reply, "Reply"),
+                ("copy", self._act_copy, "Copy"),
+                ("star", self._act_star, "Star"),
+                ("forward", self._act_forward, "Forward"),
+                ("share", self._act_share, "Share"),
+                ("delete", self._act_delete, "Delete")):
+            button = IconButton(name, label=label, size=(dp(42), TOUCH),
+                                pos_hint={"center_y": .5},
                                 on_release=lambda _w, h=handler: h())
             self.actions[name] = button
             self.select_bar.add_widget(button)
         self.bar.add_widget(self.normal_bar)
 
         # ---- messages --------------------------------------------------------
-        stack = FloatLayout()
+        self.stack = FloatLayout()
         self.scroll = ScrollView(bar_width=dp(3), size_hint=(1, 1),
-                                 pos_hint={"x": 0, "y": 0})
+                                 pos_hint={"x": 0, "y": 0}, do_scroll_x=False)
         self.messages = BoxLayout(orientation="vertical", size_hint_y=None,
-                                  padding=[0, dp(10), 0, dp(10)],
+                                  padding=[0, dp(10), 0, dp(12)],
                                   spacing=dp(2))
-        # Keeps short conversations sitting on the composer instead of flying
-        # up under the app bar — see _sync_filler. Always the FIRST child, so
-        # it pads above every bubble.
+        # Keeps a short conversation resting on the composer instead of up
+        # under the app bar — see _sync_filler. Always the FIRST child.
         self._filler = Widget(size_hint_y=None, height=0)
         self._syncing_filler = False
         self.messages.add_widget(self._filler)
@@ -6546,137 +8177,178 @@ class ConversationScreen(Screen):
         self.messages.bind(minimum_height=lambda *_a: self._sync_filler())
         self.scroll.bind(height=lambda *_a: self._sync_filler())
         self.scroll.add_widget(self.messages)
-        stack.add_widget(self.scroll)
+        self.stack.add_widget(self.scroll)
         self.jump_button = JumpToBottomButton(on_tap=self.jump_to_latest,
-                                              pos_hint={"right": 0.965,
+                                              pos_hint={"right": 0.97,
                                                         "y": 0.02})
-        stack.add_widget(self.jump_button)
+        self.stack.add_widget(self.jump_button)
+        self.strip = ReactionStrip(self._strip_pick, self._strip_more)
+        self.stack.add_widget(self.strip)
         self.scroll.bind(scroll_y=lambda *_a: self._on_scrolled())
-        root.add_widget(stack)
+        self.scroll.bind(scroll_y=lambda *_a: self._place_strip(),
+                         size=lambda *_a: self._place_strip())
+        root.add_widget(self.stack)
 
-        # ---- reply preview (shown while composing a reply) -------------------
+        # ---- reply preview (while composing a reply) -------------------------
         self.reply_bar = BoxLayout(size_hint_y=None, height=0, opacity=0,
                                    disabled=True,
-                                   padding=[dp(14), dp(6), dp(4), dp(6)],
-                                   spacing=dp(10))
-        paint_round(self.reply_bar, COL_BG_LIST, radius=dp(0))
+                                   padding=[dp(16), dp(6), dp(4), dp(6)],
+                                   spacing=dp(12))
+        hairline(self.reply_bar, "top")
         reply_icon = Widget(size_hint_x=None, width=dp(22))
         reply_icon.bind(pos=lambda w, *_a: self._paint_reply_icon(w),
                         size=lambda w, *_a: self._paint_reply_icon(w))
         self.reply_bar.add_widget(reply_icon)
-        self.reply_bar.bind(pos=lambda *_a: self._paint_reply_icon(reply_icon),
-                            size=lambda *_a: self._paint_reply_icon(
-                                reply_icon))
-        texts = BoxLayout(orientation="vertical")
+        texts = BoxLayout(orientation="vertical", padding=[dp(10), dp(2)])
         with texts.canvas.before:
-            Color(*C(COL_ACCENT))
+            Color(*C(T.accent))
             self._reply_accent = Rectangle()
         texts.bind(pos=lambda w, *_a: self._sync_reply_accent(w),
                    size=lambda w, *_a: self._sync_reply_accent(w))
-        self.reply_author = single_line("", sp(13), COL_ACCENT_DARK, bold=True,
-                                        padding=[dp(10), 0])
-        self.reply_snip = single_line("", sp(13), COL_TEXT_DIM,
-                                      padding=[dp(10), 0])
+        self.reply_author = CapsLabel("", size=10.5, color=T.accent)
+        self.reply_snip = single_line("", fs(15), T.text_2, italic=True)
         texts.add_widget(self.reply_author)
         texts.add_widget(self.reply_snip)
         self.reply_bar.add_widget(texts)
         self.reply_bar.add_widget(IconButton(
-            "close", tint=COL_TEXT_DIM, press="#E9DFCF",
-            size=(dp(40), dp(40)), pos_hint={"center_y": .5},
+            "close", label="Cancel reply", pos_hint={"center_y": .5},
             on_release=lambda _w: self.cancel_reply()))
         root.add_widget(self.reply_bar)
 
-        # ---- composer ----------------------------------------------------------
-        self.composer = BoxLayout(size_hint_y=None, height=dp(60),
+        # ---- composer --------------------------------------------------------
+        self.composer = BoxLayout(size_hint_y=None,
+                                  height=max(dp(64), line_height(17) +
+                                             dp(30)),
                                   padding=[dp(4), dp(8), dp(8), dp(8)],
-                                  spacing=dp(4))
-        paint_round(self.composer, COL_BG_LIST, radius=dp(0))
-        with self.composer.canvas.before:
-            Color(*C(COL_DIVIDER))
-            self._composer_rule = Rectangle()
-        self.composer.bind(pos=self._sync_rule, size=self._sync_rule)
+                                  spacing=dp(2))
+        hairline(self.composer, "top")
+        self.emoji_button = IconButton(
+            "smile", label="Emoji", pos_hint={"center_y": .5},
+            on_release=lambda _w: self.toggle_emoji())
+        self.entry = ComposerInput(on_enter=self.app.send_current)
         self.attach_button = IconButton(
-            "image", tint=COL_TEXT_DIM, press="#E9DFCF",
-            size=(dp(44), dp(44)), pos_hint={"center_y": .5},
+            "attach", label="Attach a photo", pos_hint={"center_y": .5},
             on_release=lambda _w: self.pick_image())
-        self.entry = CozyInput(hint="Message", radius=dp(22), height=dp(44),
-                               on_enter=self.app.send_current)
         self.action_button = IconButton(
-            "send", bg=COL_ACCENT, tint="#FFFFFF", size=(dp(44), dp(44)),
+            "send", bg=T.accent, tint=T.on_accent, label="Send",
             pos_hint={"center_y": .5},
             on_release=lambda _w: self._on_action_button())
-        self.entry.input.bind(text=lambda *_a: self._sync_action_button())
-        self.composer_parts = (self.attach_button, self.entry,
-                               self.action_button)
+        self.entry.input.bind(text=lambda *_a: self._sync_action_button(),
+                              focus=self._on_entry_focus)
+        self.composer_parts = (self.emoji_button, self.entry,
+                               self.attach_button, self.action_button)
         for part in self.composer_parts:
             self.composer.add_widget(part)
-        # The recording strip that replaces the composer while recording.
+        # Shown instead of the composer when you can no longer write here.
+        self.closed_note = InfoLabel("", color=T.text_3, italic=True,
+                                     font_size=fs(15), halign="center",
+                                     pos_hint={"center_y": .5})
+        # The strip that replaces the composer while recording.
         self.rec_cancel = IconButton(
-            "delete", tint=COL_DANGER, press="#E9DFCF",
-            size=(dp(44), dp(44)), pos_hint={"center_y": .5},
+            "delete", tint=T.alert, label="Discard recording",
+            pos_hint={"center_y": .5},
             on_release=lambda _w: self.cancel_recording())
-        self.rec_label = Label(text="", font_size=sp(14), color=C(COL_TEXT),
+        self.rec_label = Label(text="", font_size=fs(16), color=C(T.text),
                                halign="left", valign="middle", markup=True)
         self.rec_label.bind(size=lambda w, v: setattr(w, "text_size", v))
         self.rec_send = IconButton(
-            "send", bg=COL_ACCENT, tint="#FFFFFF", size=(dp(44), dp(44)),
+            "send", bg=T.accent, tint=T.on_accent, label="Send recording",
             pos_hint={"center_y": .5},
             on_release=lambda _w: self.finish_recording())
         root.add_widget(self.composer)
+        self.emoji_panel = EmojiPanel(self._emoji_picked)
+        root.add_widget(self.emoji_panel)
         self._sync_action_button()
 
     # ---- header --------------------------------------------------------------
-    def set_peer(self, peer: str, contact: dict, unread_count: int) -> None:
+    def set_peer(self, peer: str, contact: dict, unread_count: int,
+                 kind: str = "dm", group: Optional[dict] = None) -> None:
         if peer != self.peer:
             self.clear_selection()
             self.cancel_reply()
             self.cancel_recording()
-        self.peer = peer
-        name = contact.get("username") or short_addr(peer, 14)
+            self.close_emoji()
+            if self.peer is not None:
+                self._drafts[self.peer] = self.entry.text
+            self.entry.text = self._drafts.pop(peer, "")
+        self.peer, self.kind, self.group = peer, kind, group
+        if kind == "self":
+            name = "Notes to self"
+        elif kind == "group":
+            name = (group or {}).get("name") or "Group"
+        else:
+            name = contact.get("username") or short_addr(peer, 14)
         self.peer_name_text = name
         self.peer_avatar_holder.clear_widgets()
-        self.peer_avatar_holder.add_widget(Avatar(peer, name, diameter=dp(38)))
+        self.peer_avatar_holder.add_widget(Avatar(
+            peer, name, diameter=dp(38), kind=kind,
+            pos_hint={"center_y": .5}))
         self.peer_name.text = name
-        bits = [short_addr(peer, 12)]
-        if not contact.get("notify", 1):
-            bits.append("muted")
-        if unread_count and not contact.get("auto_read", 1):
+        bits = []
+        if kind == "self":
+            bits.append("kept on this device")
+        elif kind == "group":
+            members = (group or {}).get("members") or []
+            me = self.app.keys.address
+            names = ["you"] + [self.author_name(m["a"]) for m in members
+                               if m["a"] != me]
+            bits.append(", ".join(names) if len(names) <= 4
+                        else f"{len(members)} members")
+            muted = not (group or {}).get("notify", 1)
+            if muted:
+                bits.append("muted")
+        else:
+            bits.append(short_addr(peer, 12))
+            if not contact.get("notify", 1):
+                bits.append("muted")
+        if unread_count and kind != "group" and not contact.get("auto_read",
+                                                                1):
             bits.append(f"{unread_count} unread")
-        self.peer_sub.text = "  ·  ".join(bits)
+        self.peer_sub.text = " · ".join(bits)
+        self._sync_closed()
+
+    def _sync_closed(self) -> None:
+        """A group you left (or were removed from, or not yet joined) is
+        read-only: the composer gives way to a note saying why."""
+        note = ""
+        if self.kind == "group":
+            state = (self.group or {}).get("state")
+            note = {"left": "You left this group.",
+                    "removed": "You are no longer a member of this group.",
+                    "pending": "This group's invitation has not arrived "
+                               "yet."}.get(state, "")
+        closed = bool(note)
+        showing = self.closed_note.parent is not None
+        if closed and not showing:
+            self.close_emoji()
+            self.composer.clear_widgets()
+            self.closed_note.text = note
+            self.composer.add_widget(self.closed_note)
+        elif closed:
+            self.closed_note.text = note
+        elif showing:
+            self.composer.clear_widgets()
+            for part in self.composer_parts:
+                self.composer.add_widget(part)
+        self.more_button.disabled = False
 
     # ---- bubbles -------------------------------------------------------------
     def render(self, messages: list, ticks_enabled: bool,
                on_tap_unread: Callable, peer: Optional[str] = None) -> None:
-        """Incremental render.
-
-        The naive version cleared the whole box and rebuilt every widget on
-        every refresh — and a refresh fires on each inbound message, each
-        tick receipt and each send. That is O(history) work per event: at
-        1000 messages a single arriving message cost seconds of widget
-        construction, most of it re-creating bubbles that had not changed.
-
-        Now the common cases are O(changed):
-          * new messages appended      -> build only the new bubbles
-          * tick/read status changed   -> repaint that bubble's meta line
-          * nothing changed            -> no work at all
-        A full rebuild still happens when the shape of the list changes in a
-        way appending cannot express (peer switch, history paged in, an
-        import inserting older rows, messages deleted).
-        """
+        """Incremental render: new messages append, changed ones repaint in
+        place, nothing changed costs nothing. A full rebuild only when the
+        list's shape changes in a way appending cannot express (another
+        chat, history paged in, rows deleted or imported)."""
         signatures = {m["id"]: self._signature(m) for m in messages}
         ids = [m["id"] for m in messages]
-
         rebuild = (peer != self._rendered_peer
                    or ticks_enabled != self._rendered_ticks
                    or not self._rendered_ids
                    or len(ids) < len(self._rendered_ids)
                    or ids[:len(self._rendered_ids)] != self._rendered_ids)
-
         if rebuild:
             self._full_render(messages, ticks_enabled, on_tap_unread, peer)
             return
-
-        # 1) in-place updates for rows whose status/read/body moved
         for msg in messages:
             mid = msg["id"]
             previous = self._rendered_sigs.get(mid)
@@ -6685,11 +8357,8 @@ class ConversationScreen(Screen):
             bubble = self._bubbles.get(mid)
             if bubble is not None:
                 bubble.update(msg, ticks_enabled)
-
-        # 2) append whatever is genuinely new.
-        #    Capture the scroll position BEFORE adding widgets: appending
-        #    changes the content height, which changes what "at the bottom"
-        #    means.
+                if mid in self.selected:
+                    self.selected[mid] = msg
         was_at_bottom = self.at_bottom()
         appended = 0
         sent_by_me = False
@@ -6698,22 +8367,19 @@ class ConversationScreen(Screen):
             appended += 1
             if msg["direction"] == "out":
                 sent_by_me = True
-
         self._rendered_ids = ids
         self._rendered_sigs = signatures
         if appended:
             if sent_by_me or was_at_bottom:
-                # Following your own message down is expected; so is staying
-                # pinned to the bottom if that is where you already were.
                 self.scroll_to_bottom()
             else:
-                # You were reading history — say so, do NOT drag the view.
                 self.note_new_messages(appended)
+        self._place_strip()
 
     def _full_render(self, messages: list, ticks_enabled: bool,
                      on_tap_unread: Callable, peer: Optional[str]) -> None:
         self.messages.clear_widgets()
-        self.messages.add_widget(self._filler)     # stays the topmost child
+        self.messages.add_widget(self._filler)
         self._bubbles.clear()
         self._rows.clear()
         self._last_day = None
@@ -6737,7 +8403,8 @@ class ConversationScreen(Screen):
     def _signature(msg: dict) -> tuple:
         """Everything that, if it changes, means a bubble must repaint."""
         return (msg["status"], msg["read"], msg["body"], msg.get("starred"),
-                msg.get("media_state"), msg.get("media_path"), msg.get("ext"))
+                msg.get("media_state"), msg.get("media_path"), msg.get("ext"),
+                tuple(msg.get("reactions") or ()))
 
     def _append_bubble(self, msg: dict, ticks_enabled: bool,
                        on_tap_unread: Callable) -> None:
@@ -6745,6 +8412,9 @@ class ConversationScreen(Screen):
         if day and day != self._last_day:
             self._last_day = day
             self.messages.add_widget(DayDivider(self._day_text(day)))
+        if msg.get("kind") == "event":
+            self.messages.add_widget(EventRow(msg))
+            return
         outgoing = msg["direction"] == "out"
         bubble = MessageBubble(msg, ticks_enabled, self)
         self._bubbles[msg["id"]] = bubble
@@ -6752,6 +8422,73 @@ class ConversationScreen(Screen):
         row.set_selected(msg["id"] in self.selected)
         self._rows[msg["id"]] = row
         self.messages.add_widget(row)
+        pending = self.take_pending_pop(msg.get("client_msg_id"))
+        if pending:
+            chip = bubble.reactions.chip_for(pending)
+            if chip is not None:
+                chip.animate_in()
+
+    # =========================================================================
+    #  Reactions
+    # =========================================================================
+    def take_pending_pop(self, cid: Optional[str]) -> Optional[str]:
+        return self._pending_pop.pop(cid, None) if cid else None
+
+    def note_reaction(self, cid: str, reactor: str, emoji: str) -> None:
+        """A reaction changed: make it pop, now if its chip is on screen,
+        or as soon as it is drawn."""
+        if not emoji:
+            return
+        for bubble in self._bubbles.values():
+            if bubble.msg.get("client_msg_id") == cid:
+                chip = bubble.reactions.chip_for(emoji)
+                if chip is not None:
+                    chip.animate_in()
+                    return
+        self._pending_pop[cid] = emoji
+
+    def on_reaction_tap(self, msg: dict, emoji: str) -> None:
+        if self.selecting:
+            return
+        self.app.react(msg["id"], emoji)
+
+    def _reactable(self, msg: dict) -> bool:
+        return bool(msg.get("client_msg_id")) and msg.get("kind") != "event" \
+            and self.closed_note.parent is None
+
+    def _strip_pick(self, emoji: str) -> None:
+        msgs = list(self.selected.values())
+        self.clear_selection()
+        if len(msgs) == 1:
+            self.app.react(msgs[0]["id"], emoji)
+
+    def _strip_more(self) -> None:
+        msgs = list(self.selected.values())
+        if len(msgs) != 1:
+            return
+        self._emoji_target = msgs[0]["id"]
+        self.clear_selection()
+        self.open_emoji()
+
+    def _place_strip(self, *_a) -> None:
+        """Float the strip just above the held message, inside the view."""
+        if self.strip.disabled or len(self.selected) != 1:
+            return
+        row = self._rows.get(next(iter(self.selected)))
+        if row is None:
+            return
+        bubble = row.bubble
+        bx, by = bubble.to_window(bubble.x, bubble.top)
+        x, y = self.stack.to_widget(bx, by)
+        sx = min(max(dp(8), x + bubble.width / 2 - self.strip.width / 2),
+                 self.stack.width - self.strip.width - dp(8))
+        sy = y + dp(6)
+        top = self.stack.top - self.strip.height - dp(6)
+        if sy > top:                          # no room above: sit below it
+            bx, by = bubble.to_window(bubble.x, bubble.y)
+            sy = self.stack.to_widget(bx, by)[1] - self.strip.height - dp(6)
+        self.strip.pos = (self.stack.x + sx,
+                          max(self.stack.y + dp(6), min(sy, top)))
 
     # =========================================================================
     #  Highlight (selection) mode
@@ -6791,7 +8528,8 @@ class ConversationScreen(Screen):
         self._sync_selection()
 
     def _sync_selection(self) -> None:
-        """Swap the app bar and enable only the actions that apply."""
+        """Swap the app bar, enable only the actions that apply, and raise
+        the reaction strip over a single held message."""
         on = bool(self.selected)
         if on and self.select_bar.parent is None:
             self.bar.remove_widget(self.normal_bar)
@@ -6799,12 +8537,20 @@ class ConversationScreen(Screen):
         elif not on and self.normal_bar.parent is None:
             self.bar.remove_widget(self.select_bar)
             self.bar.add_widget(self.normal_bar)
+        msgs = list(self.selected.values())
+        if len(msgs) == 1 and self._reactable(msgs[0]):
+            self.strip.show(self.app.store.reaction_of(
+                msgs[0]["peer"], msgs[0]["client_msg_id"],
+                self.app.keys.address) if self.app.store else "")
+            self._place_strip()
+        else:
+            self.strip.hide()
         if not on:
             return
-        msgs = list(self.selected.values())
         self.select_count.text = str(len(msgs))
         has_text = any(self._text_of(m) for m in msgs)
-        self.actions["reply"].disabled = len(msgs) != 1
+        self.actions["reply"].disabled = len(msgs) != 1 or \
+            self.closed_note.parent is not None
         self.actions["copy"].disabled = not has_text
         self.actions["star"].set_icon(
             "star_filled" if all(m.get("starred") for m in msgs) else "star")
@@ -6812,7 +8558,8 @@ class ConversationScreen(Screen):
             m.get("kind") == "image" and m.get("media_path") for m in msgs))
         self.actions["forward"].disabled = any(
             m.get("kind") in ("image", "voice") and not
-            (message_ext(m).get("media") or {}).get("blob") for m in msgs)
+            ((message_ext(m).get("media") or {}).get("blob") or
+             m.get("media_path")) for m in msgs)
 
     @staticmethod
     def _text_of(msg: dict) -> str:
@@ -6856,7 +8603,7 @@ class ConversationScreen(Screen):
         self.clear_selection()
         self.app.star_messages(ids, star)
         self.app._set_status("Starred" if star else "Removed from starred",
-                             COL_OK)
+                             T.ok)
 
     def _act_forward(self) -> None:
         ForwardModal(self.app, [m["id"] for m in self._ordered()],
@@ -6871,22 +8618,30 @@ class ConversationScreen(Screen):
         DeleteModal(self.app, self._ordered(),
                     on_done=self.clear_selection).open()
 
-    # ---- replies ---------------------------------------------------------------
+    # ---- names and replies ---------------------------------------------------
     def _author_of(self, msg: dict) -> str:
-        return self.app.keys.address if msg["direction"] == "out" \
-            else msg["peer"]
+        if msg["direction"] == "out":
+            return self.app.keys.address
+        return msg.get("author") or msg["peer"]
 
     def author_name(self, address: Optional[str],
                     outgoing_bubble: bool = False) -> str:
+        """Who someone is, as this phone knows them: You, the contact's
+        name, their name in a group, or their address."""
         if not address:
             return "Message"
         if address == self.app.keys.address:
             return "You"
-        if address == self.peer:
+        if address == self.peer and self.kind == "dm":
             return self.peer_name_text or short_addr(address, 12)
-        contact = self.app.store.get_contact(address) if self.app.store \
-            else None
-        return (contact or {}).get("username") or short_addr(address, 12)
+        store = self.app.store
+        contact = store.get_contact(address) if store else None
+        if contact and contact.get("username"):
+            return contact["username"]
+        for member in (self.group or {}).get("members") or []:
+            if member.get("a") == address and member.get("u"):
+                return member["u"]
+        return short_addr(address, 10)
 
     def set_reply(self, msg: dict) -> None:
         kind = msg.get("kind") or "text"
@@ -6899,7 +8654,8 @@ class ConversationScreen(Screen):
         self.reply_to = reply
         self.reply_author.text = self.author_name(reply["from"])
         self.reply_snip.text = snip
-        self.reply_bar.height, self.reply_bar.opacity = dp(52), 1
+        self.reply_bar.height, self.reply_bar.opacity = max(
+            dp(56), self.reply_author.height + line_height(15) + dp(14)), 1
         self.reply_bar.disabled = False
         self.entry.input.focus = True
 
@@ -6923,13 +8679,14 @@ class ConversationScreen(Screen):
                 if row is None:
                     return
                 self._stick_to_bottom = False
-                self.scroll.scroll_to(row, padding=dp(60), animate=True)
+                self.scroll.scroll_to(row, padding=dp(60),
+                                      animate=bool(motion(1)))
                 row.set_selected(True)
                 Clock.schedule_once(
                     lambda _dt: row.set_selected(mid in self.selected), 0.9)
                 return
-        self.app._set_status("That message is further back — tap 'Load "
-                             "earlier messages' to find it", COL_TEXT_DIM)
+        self.app._set_status("That message is further back — open "
+                             "‘Earlier messages’ to find it", T.text_3)
 
     # ---- taps ------------------------------------------------------------------
     def on_bubble_tap(self, msg_id: int) -> None:
@@ -6942,7 +8699,7 @@ class ConversationScreen(Screen):
 
     def on_media_tap(self, msg: dict) -> None:
         if self.selecting:
-            return                       # a long-press just selected it
+            return
         msg = self.app.store.message(msg["id"]) or msg
         state = msg.get("media_state") or ""
         path = msg.get("media_path")
@@ -6962,8 +8719,8 @@ class ConversationScreen(Screen):
                     self.app.voice.toggle(path)
                 except Exception:
                     log.exception("could not play voice note")
-                    self.app._set_status("Couldn't play that voice note",
-                                         COL_DANGER)
+                    self.app._set_status("Couldn't play that voice message",
+                                         T.alert)
                 self.refresh_voice_buttons()
 
     def refresh_voice_buttons(self) -> None:
@@ -6981,47 +8738,103 @@ class ConversationScreen(Screen):
         self.on_voice_progress(path, 0.0)
         self.refresh_voice_buttons()
 
-    # ---- the ⋮ menu (what used to sit behind the title tap) --------------------
-    def open_menu(self, anchor) -> None:
+    # ---- the ⋮ menu ------------------------------------------------------------
+    def open_menu(self, _anchor=None) -> None:
         if self.peer is None or self.app.store is None:
             return
-        peer = self.peer
-        contact = self.app.store.get_contact(peer) or {}
+        peer, app = self.peer, self.app
         items = []
         if self.app.store.unread_for(peer):
-            items.append(("Mark all as read",
-                          lambda: self.app.mark_peer_read(peer)))
-        items.append(("Chat info", self.app.open_chat_info))
-        items.append(("Starred messages",
-                      lambda: StarredModal(self.app, peer).open()))
-        items.append(("Mute notifications" if contact.get("notify", 1)
-                      else "Unmute notifications",
-                      lambda: self.app.toggle_notify(peer)))
-        items.append(("Ticks, read & export", self.app.open_contact_settings))
-        DropMenu(items).open_below(anchor)
+            items.append(("check", "Mark all as read",
+                          lambda: app.mark_peer_read(peer)))
+        if self.kind == "group":
+            gid = gid_of(peer)
+            items.append(("group", "Group info", app.open_chat_info))
+            items.append(("star", "Starred messages",
+                          lambda: StarredModal(app, peer).open()))
+            on = (self.group or {}).get("notify", 1)
+            items.append(("bell_off" if on else "bell",
+                          "Mute notifications" if on else
+                          "Unmute notifications",
+                          lambda: app.set_group_notify(gid, not on)))
+            items.append(("share", "Export or import",
+                          lambda: ChatHistorySheet(app, peer).open()))
+            if (self.group or {}).get("state") == "active":
+                items.append(("leave", "Leave group",
+                              lambda: app.confirm_leave_group(gid), True))
+        elif self.kind == "self":
+            items.append(("star", "Starred notes",
+                          lambda: StarredModal(app, peer).open()))
+            items.append(("share", "Export or import",
+                          lambda: ChatHistorySheet(app, peer).open()))
+        else:
+            contact = self.app.store.get_contact(peer) or {}
+            items.append(("info", "Chat info", app.open_chat_info))
+            items.append(("star", "Starred messages",
+                          lambda: StarredModal(app, peer).open()))
+            on = contact.get("notify", 1)
+            items.append(("bell_off" if on else "bell",
+                          "Mute notifications" if on else
+                          "Unmute notifications",
+                          lambda: app.toggle_notify(peer)))
+            items.append(("share", "Export or import",
+                          lambda: ChatHistorySheet(app, peer).open()))
+        MenuSheet(items).open()
+
+    # ---- emoji -----------------------------------------------------------------
+    def toggle_emoji(self) -> None:
+        if self.emoji_panel.is_open:
+            self.close_emoji()
+            self.entry.input.focus = True
+        else:
+            self._emoji_target = None
+            self.open_emoji()
+
+    def open_emoji(self) -> None:
+        self.entry.input.focus = False
+        self.emoji_panel.set_open(True)
+        self.emoji_button.set_icon("keyboard")
+        self.emoji_button.label = "Keyboard"
+
+    def close_emoji(self) -> None:
+        if self.emoji_panel.is_open:
+            self.emoji_panel.set_open(False)
+        self._emoji_target = None
+        self.emoji_button.set_icon("smile")
+        self.emoji_button.label = "Emoji"
+
+    def _emoji_picked(self, emoji: str) -> None:
+        if self._emoji_target is not None:
+            target, self._emoji_target = self._emoji_target, None
+            self.close_emoji()
+            self.app.react(target, emoji)
+            return
+        self.entry.input.insert_text(emoji)
+
+    def _on_entry_focus(self, _w, focused: bool) -> None:
+        if focused and self.emoji_panel.is_open and IS_MOBILE:
+            self.close_emoji()
 
     # ---- composer: photo, voice, send ------------------------------------------
     def _paint_reply_icon(self, widget) -> None:
         widget.canvas.clear()
         with widget.canvas:
-            draw_icon("reply", widget.center_x, self.reply_bar.center_y,
-                      dp(20), C(COL_ACCENT))
+            draw_icon("reply", (widget.x + widget.width / 2), (self.reply_bar.y + self.reply_bar.height / 2),
+                      dp(20), C(T.accent))
 
     def _sync_reply_accent(self, widget) -> None:
         self._reply_accent.pos = (widget.x, widget.y + dp(3))
-        self._reply_accent.size = (dp(2.5), max(0, widget.height - dp(6)))
-
-    def _sync_rule(self, *_a) -> None:
-        self._composer_rule.pos = (self.composer.x, self.composer.top - dp(1))
-        self._composer_rule.size = (self.composer.width, dp(1))
+        self._reply_accent.size = (dp(2), max(0, widget.height - dp(6)))
 
     def _voice_possible(self) -> bool:
         return IS_ANDROID
 
     def _sync_action_button(self) -> None:
         typing = bool(self.entry.input.text.strip())
-        self.action_button.set_icon(
-            "send" if typing or not self._voice_possible() else "mic")
+        voice = not typing and self._voice_possible()
+        self.action_button.set_icon("mic" if voice else "send")
+        self.action_button.label = "Record a voice message" if voice \
+            else "Send"
 
     def _on_action_button(self) -> None:
         if self.entry.input.text.strip() or not self._voice_possible():
@@ -7030,10 +8843,10 @@ class ConversationScreen(Screen):
             self.start_recording()
 
     def pick_image(self) -> None:
-        if not self.app.media_available():
-            self.app._set_status("Photos and voice notes need the v9 relay — "
-                                 "this one can't carry them yet",
-                                 COL_TICK_GOLD)
+        if self.kind != "self" and not self.app.media_available():
+            self.app._set_status("Photos and voice messages need the v9 "
+                                 "relay — this one can't carry them yet",
+                                 T.accent)
             return
         if IS_ANDROID:
             try:
@@ -7041,7 +8854,7 @@ class ConversationScreen(Screen):
             except Exception:
                 log.exception("photo picker failed")
                 self.app._set_status("Couldn't open the photo picker",
-                                     COL_DANGER)
+                                     T.alert)
         else:
             ImageChooserModal(self._picked).open()
 
@@ -7049,9 +8862,9 @@ class ConversationScreen(Screen):
         AttachPreviewModal(self.app, path).open()
 
     def start_recording(self) -> None:
-        if not self.app.media_available():
-            self.app._set_status("Voice notes need the v9 relay — this one "
-                                 "can't carry them yet", COL_TICK_GOLD)
+        if self.kind != "self" and not self.app.media_available():
+            self.app._set_status("Voice messages need the v9 relay — this "
+                                 "one can't carry them yet", T.accent)
             return
         if not android_has_permission("android.permission.RECORD_AUDIO"):
             android_request_permissions(
@@ -7064,8 +8877,9 @@ class ConversationScreen(Screen):
         except Exception:
             log.exception("could not start recording")
             self.recorder = None
-            self.app._set_status("Couldn't start recording", COL_DANGER)
+            self.app._set_status("Couldn't start recording", T.alert)
             return
+        self.close_emoji()
         self.composer.clear_widgets()
         for part in (self.rec_cancel, self._rec_dot_widget(), self.rec_label,
                      self.rec_send):
@@ -7077,17 +8891,17 @@ class ConversationScreen(Screen):
         if granted:
             self.start_recording()
         else:
-            self.app._set_status("Microphone permission is needed for voice "
-                                 "notes", COL_TICK_GOLD)
+            self.app._set_status("Voice messages need the microphone "
+                                 "permission", T.accent)
 
     def _rec_dot_widget(self) -> Widget:
-        dot = Widget(size_hint_x=None, width=dp(14))
+        dot = Widget(size_hint_x=None, width=dp(16))
 
         def paint(*_a):
             dot.canvas.clear()
             with dot.canvas:
-                Color(*C(COL_DANGER))
-                Ellipse(pos=(dot.center_x - dp(5), dot.center_y - dp(5)),
+                Color(*C(T.alert))
+                Ellipse(pos=((dot.x + dot.width / 2) - dp(5), (dot.y + dot.height / 2) - dp(5)),
                         size=(dp(10), dp(10)))
         dot.bind(pos=paint, size=paint)
         return dot
@@ -7096,7 +8910,7 @@ class ConversationScreen(Screen):
         if self.recorder is None:
             return
         sec = self.recorder.elapsed_ms // 1000
-        self.rec_label.text = f"{sec // 60}:{sec % 60:02d}    Recording…"
+        self.rec_label.text = f"{sec // 60}:{sec % 60:02d}   [i]Recording…[/i]"
         if sec >= MAX_VOICE_SECONDS:
             self.finish_recording()
 
@@ -7118,11 +8932,11 @@ class ConversationScreen(Screen):
             path, duration, wave = recorder.stop()
         except Exception:
             log.exception("recording failed")
-            self.app._set_status("Recording failed", COL_DANGER)
+            self.app._set_status("Recording failed", T.alert)
             return
         if duration < 700:
             discard_media_file(path)
-            self.app._set_status("That was too short to send", COL_TEXT_DIM)
+            self.app._set_status("That was too short to send", T.text_3)
             return
         self.app.send_voice(path, duration, wave)
 
@@ -7135,32 +8949,21 @@ class ConversationScreen(Screen):
 
     # ---- bottom alignment ----------------------------------------------------
     def content_height(self) -> float:
-        """Height of the real messages, with the bottom-align filler removed."""
+        """Height of the real messages, without the bottom-align filler."""
         return self.messages.minimum_height - self._filler.height
 
     def _sync_filler(self) -> None:
         """Pin a short conversation to the BOTTOM of the viewport.
 
-        Kivy lays a ScrollView's content out from the TOP whenever it is
-        shorter than the viewport (scrollview.py: `y = self.top - vp.height`),
-        and because always_overscroll defaults to True the very same branch
-        runs for ANY scroll_y above zero. So one stray touch was enough to
-        lift a two-message chat up under the app bar and leave a screenful of
-        background beneath it — the reported "messages scroll all the way to the
-        top". It was never a scroll: it was the layout Kivy falls back to,
-        which is also why nothing pulled the view back down. at_bottom() read
-        True the entire time, quite correctly, since the newest message WAS
-        on screen.
-
-        Instead of fighting the ScrollView we make the short case impossible:
-        pad the TOP until the content is at least viewport-tall. Every render
-        then takes the ordinary scrolling branch, scroll_y == 0 means "newest
-        message resting on the composer" in both states, and a conversation
-        that genuinely overflows is untouched — the filler collapses to zero
-        and this method stops mattering.
+        Kivy lays a ScrollView's content out from the TOP when it is shorter
+        than the viewport, and with always_overscroll the same branch runs
+        for ANY scroll_y above zero — so one stray touch lifted a two-line
+        chat up under the app bar. Padding the top until the content is at
+        least viewport-tall makes that case impossible; a chat that really
+        overflows is untouched (the filler collapses to zero).
         """
         if self._syncing_filler:
-            return          # setting the height below re-enters us via bind
+            return
         self._syncing_filler = True
         try:
             want = max(0.0, self.scroll.height - self.content_height())
@@ -7170,46 +8973,31 @@ class ConversationScreen(Screen):
             self._syncing_filler = False
 
     # ---- scroll position -----------------------------------------------------
-    BOTTOM_EPSILON = 0.02        # within 2% of the end counts as "at bottom"
+    BOTTOM_EPSILON = 0.02
 
     def at_bottom(self) -> bool:
-        """True when the latest message is already on screen.
-
-        A conversation that does not fill the viewport is always showing its
-        newest message, whatever scroll_y happens to say; treating that as
-        at-bottom keeps the jump pill from appearing over a two-line chat.
-        The comparison uses content_height(), NOT messages.height, because
-        the filler pads the latter up to the viewport by design.
-        """
+        """True when the newest message is on screen. A conversation that
+        does not fill the viewport always is."""
         if self.content_height() <= self.scroll.height:
             return True
         return self.scroll.scroll_y <= self.BOTTOM_EPSILON
 
     def scroll_to_bottom(self, animate: bool = True) -> None:
-        """Bring the newest message into view.
-
-        v7: this used to fire two hard `scroll_y = 0` assignments 30ms and
-        120ms apart. Because bubbles wrap (and therefore resize) after the
-        first assignment, the list visibly jumped twice — the "everything
-        shoots to the top" effect. Now the position settles once, on the
-        frame after layout, and eases instead of snapping.
-        """
+        """Bring the newest message into view, once, on the frame after
+        layout — one pending settle at a time."""
         self._stick_to_bottom = True
 
         def _apply(_dt):
             self._scroll_trigger = None
             Animation.cancel_all(self.scroll, "scroll_y")
-            if not animate or self.content_height() <= self.scroll.height:
+            if not animate or not motion(1) or \
+                    self.content_height() <= self.scroll.height:
                 self.scroll.scroll_y = 0
             else:
                 Animation(scroll_y=0, d=0.22, t="out_quad").start(self.scroll)
             self._unseen = 0
             self._sync_jump_button()
 
-        # One pending settle at a time. A single user action can trigger
-        # several refreshes (mark-read, chat repaint, list repaint), and
-        # each used to queue its own deferred scroll — so the view could be
-        # dragged back to the bottom a beat AFTER the user had scrolled away.
         if self._scroll_trigger is not None:
             self._scroll_trigger.cancel()
         self._scroll_trigger = Clock.schedule_once(_apply, 0.02)
@@ -7219,20 +9007,8 @@ class ConversationScreen(Screen):
         self.scroll_to_bottom(animate=True)
 
     def _on_content_height(self) -> None:
-        """Keep the view stable while the content height changes.
-
-        Bubbles wrap AFTER they are added, so the list grows over the frames
-        following a render — the original code papered over this by slamming
-        scroll_y to 0 twice, 30ms and 120ms apart, which is what made the
-        whole conversation visibly jump. Reacting to the height itself is
-        both exact and cheap:
-
-          * following the conversation -> stay pinned to the newest message
-          * reading history            -> hold the CURRENT reading position
-            by converting the old pixel offset into the new proportion, so
-            appending a message below does not shove the text you are
-            reading up the screen
-        """
+        """Following the conversation: stay pinned to the newest message.
+        Reading history: hold the reading position as the content grows."""
         old_h, new_h = self._last_content_h, self.messages.height
         self._last_content_h = new_h
         view = self.scroll.height
@@ -7246,8 +9022,6 @@ class ConversationScreen(Screen):
             self.scroll.scroll_y = max(0.0, min(1.0, offset_px / new_span))
 
     def _on_scrolled(self) -> None:
-        """Reaching the bottom by hand clears the unseen counter, and moving
-        away from it means the user is reading — stop following."""
         if self.at_bottom():
             self._unseen = 0
             self._stick_to_bottom = True
@@ -7256,13 +9030,8 @@ class ConversationScreen(Screen):
         self._sync_jump_button()
 
     def cancel_pending_scroll(self) -> None:
-        """Hand scroll control back to the user.
-
-        Cancels the queued settle, any in-flight easing, AND the residual
-        momentum of Kivy's damped overscroll effect — without that last part
-        a fling can keep dragging the view for several frames after the user
-        has grabbed it, which reads as the app fighting them.
-        """
+        """Hand scroll control back to the user: the queued settle, any
+        easing, and the damped overscroll's residual momentum."""
         if self._scroll_trigger is not None:
             self._scroll_trigger.cancel()
             self._scroll_trigger = None
@@ -7274,7 +9043,7 @@ class ConversationScreen(Screen):
                 effect.velocity = 0
                 effect.stop(effect.value)
             except Exception:
-                pass          # effect internals vary; momentum is cosmetic
+                pass
 
     def _sync_jump_button(self) -> None:
         self.jump_button.set_count(self._unseen)
@@ -7282,8 +9051,7 @@ class ConversationScreen(Screen):
                                      self._unseen > 0)
 
     def note_new_messages(self, count: int) -> None:
-        """Announce arrivals that landed while the user was reading history.
-        Deliberately does NOT move the view — that is the whole point."""
+        """Announce arrivals while reading history — without moving."""
         if count > 0:
             self._unseen += count
         self._stick_to_bottom = False
@@ -7300,33 +9068,543 @@ class ConversationScreen(Screen):
             return "Today"
         if delta == 1:
             return "Yesterday"
-        return date.strftime("%d %B %Y")
+        if 1 < delta < 7:
+            return date.strftime("%A")
+        if date.year == datetime.now().year:
+            return f"{date.day} {date.strftime('%B')}"
+        return f"{date.day} {date.strftime('%B %Y')}"
 
     def _empty_state(self) -> BoxLayout:
+        if self.kind == "self":
+            text = ("Notes to self. Whatever you write, forward or photograph "
+                    "here stays on this device and goes nowhere.")
+        elif self.kind == "group":
+            text = ("The beginning of the group. Each message is sealed "
+                    "separately for every member before it leaves.")
+        else:
+            text = ("The beginning of your correspondence. Messages are "
+                    "sealed on this device before they leave it.")
         box = BoxLayout(orientation="vertical", size_hint_y=None,
-                        height=dp(120), padding=[dp(30), dp(30), dp(30), 0])
-        box.add_widget(InfoLabel(
-            "This is the beginning of your encrypted chat.\nMessages are "
-            "sealed on this device before they leave it.",
-            color=COL_TEXT_DIM, font_size=sp(13), halign="center"))
+                        padding=[dp(36), dp(28), dp(36), dp(8)],
+                        spacing=dp(10))
+        box.bind(minimum_height=box.setter("height"))
+        box.add_widget(InfoLabel(FLEURON, color=T.accent, font_size=fs(26),
+                                 halign="center"))
+        box.add_widget(InfoLabel(text, color=T.text_3, italic=True,
+                                 font_size=fs(15.5), halign="center"))
         return box
 
 
+# =============================================================================
+#  Info, groups, settings
+# =============================================================================
+class PageScreen(Screen):
+    """A titled page: app bar with back, and a scrolling column."""
 
-# =============================================================================
-#  FextApp — the Kivy application controller
-# =============================================================================
+    def __init__(self, app: "FextApp", name: str, title: str,
+                 on_back: Callable, **kw):
+        super().__init__(name=name, **kw)
+        self.app = app
+        root = BoxLayout(orientation="vertical")
+        paint_round(root, T.bg, radius=0)
+        self.add_widget(root)
+        self.appbar = AppBar(title, on_back=on_back)
+        root.add_widget(self.appbar)
+        self.scroll = ScrollView(bar_width=dp(3), do_scroll_x=False)
+        self.body = BoxLayout(orientation="vertical", size_hint_y=None,
+                              padding=[0, 0, 0, dp(28)])
+        self.body.bind(minimum_height=self.body.setter("height"))
+        self.scroll.add_widget(self.body)
+        root.add_widget(self.scroll)
+        self.root_box = root
+
+    def paragraph(self, text: str, italic: bool = False) -> InfoLabel:
+        label = InfoLabel(text, color=T.text_3, font_size=fs(15),
+                          italic=italic, padding=[dp(20), dp(8)])
+        self.body.add_widget(label)
+        return label
+
+    def hero(self, seed: str, name: str, kind: str, sub: str = "",
+             on_sub: Optional[Callable] = None, on_name=None) -> None:
+        """The big disc, the name, and a line beneath (tap to copy)."""
+        head = BoxLayout(orientation="vertical", size_hint_y=None,
+                         padding=[dp(20), dp(26), dp(20), dp(16)],
+                         spacing=dp(8))
+        head.bind(minimum_height=head.setter("height"))
+        holder = AnchorLayout(size_hint_y=None, height=dp(96))
+        holder.add_widget(Avatar(seed, name, diameter=dp(92), kind=kind))
+        head.add_widget(holder)
+        title = InfoLabel(name, font_size=fs(25), halign="center")
+        if on_name is not None:
+            box = TappableBox(on_tap=on_name, size_hint_y=None,
+                              padding=[0, dp(6)])
+            box.bind(minimum_height=lambda w, v: setattr(
+                w, "height", max(TOUCH, v)))
+            box.add_widget(title)
+            head.add_widget(box)
+        else:
+            head.add_widget(title)
+        if sub:
+            line = TappableBox(on_tap=on_sub, size_hint_y=None, height=TOUCH)
+            label = single_line(sub, fs(15), T.text_3, italic=True,
+                                halign="center")
+            line.add_widget(label)
+            if on_sub is not None:
+                line.bind(state=lambda _w, s: setattr(
+                    label, "color", C(T.accent if s == "down" else T.text_3)))
+            head.add_widget(line)
+        self.body.add_widget(head)
+        self.body.add_widget(Rule())
+
+
+class ChatInfoScreen(PageScreen):
+    """A direct chat's (or notes to self's) page: who this is, and the
+    switches for it — notifications, ticks, auto-read — starred messages
+    and export. A group's page is GroupInfoScreen."""
+
+    def __init__(self, app: "FextApp", **kw):
+        super().__init__(app, "info", "About this chat",
+                         lambda: app.close_chat_info(), **kw)
+        self.peer: Optional[str] = None
+
+    def show(self, peer: str) -> None:
+        self.peer = peer
+        store = self.app.store
+        self.body.clear_widgets()
+        kind = self.app.conversation_kind(peer)
+        if kind == "self":
+            self.appbar.title.text = "Notes to self"
+            self.hero(peer, "Notes to self", "self",
+                      "Kept on this device only")
+            starred = len(store.starred(peer))
+            self.body.add_widget(rows_card([
+                ListRow("star", "Starred notes",
+                        f"{starred} note{'s' if starred != 1 else ''}",
+                        chevron=True,
+                        on_tap=lambda: StarredModal(self.app, peer).open()),
+                ListRow("share", "Export or import",
+                        "Plaintext copies, kept on this device",
+                        chevron=True,
+                        on_tap=lambda: ChatHistorySheet(self.app,
+                                                        peer).open())]))
+            self.paragraph("Nothing written here is sent anywhere. Photos "
+                           "and voice messages stay on this phone too; "
+                           "forwarding one to a chat sends it then.",
+                           italic=True)
+            return
+        self.appbar.title.text = "About this chat"
+        contact = store.get_contact(peer) or {}
+        name = contact.get("username") or short_addr(peer, 14)
+        self.hero(peer, name, "dm", short_addr(peer, 22),
+                  on_sub=lambda: self.app.copy_text(peer))
+        self.body.add_widget(SectionHead("This chat"))
+        self.body.add_widget(rows_card([
+            ListRow("bell", "Notifications",
+                    "Alerts for new messages in this chat",
+                    control=ToggleSwitch(contact.get("notify", 1),
+                                         lambda on: self.app.set_notify(peer,
+                                                                        on))),
+            ListRow("check", "Delivery and read ticks",
+                    "Off on either side caps both at one tick",
+                    control=ToggleSwitch(contact.get("ticks_enabled", 1),
+                                         lambda on: self.app.set_ticks(peer,
+                                                                       on))),
+            ListRow("info", "Mark as read automatically",
+                    "When off, tap a message to mark it read",
+                    control=ToggleSwitch(contact.get("auto_read", 1),
+                                         lambda on: self.app.set_auto_read(
+                                             peer, on))),
+        ]))
+        starred = len(store.starred(peer))
+        self.body.add_widget(SectionHead("Kept here"))
+        self.body.add_widget(rows_card([
+            ListRow("star", "Starred messages",
+                    f"{starred} message{'s' if starred != 1 else ''}",
+                    chevron=True,
+                    on_tap=lambda: StarredModal(self.app, peer).open()),
+            ListRow("share", "Export or import",
+                    "Plaintext copies, kept on this device", chevron=True,
+                    on_tap=lambda: ChatHistorySheet(self.app, peer).open()),
+        ]))
+        caps = contact.get("caps", 0) & LocalStore.CAP_V9
+        self.paragraph(
+            "Sealed end to end. " +
+            ("They run Ferritext 9 or later: replies, photos, voice "
+             "messages, reactions and delete-for-both all reach them."
+             if caps else
+             "Replies, photos, voice messages, reactions and "
+             "delete-for-both reach them fully once they run Ferritext 9."),
+            italic=True)
+
+
+class NewGroupScreen(PageScreen):
+    """Name a group and choose who is in it."""
+
+    def __init__(self, app: "FextApp", **kw):
+        super().__init__(app, "new_group", "New group",
+                         lambda: app.go_back_to_chats(), **kw)
+        self.rows: list = []
+
+    def show(self) -> None:
+        self.body.clear_widgets()
+        box = BoxLayout(orientation="vertical", size_hint_y=None,
+                        padding=[dp(20), dp(18), dp(20), dp(6)])
+        box.bind(minimum_height=box.setter("height"))
+        self.name_field = Field(hint="What is it called?", label="Group name",
+                                on_enter=lambda: None)
+        self.name_field.input.bind(text=lambda *_a: self._sync())
+        box.add_widget(self.name_field)
+        self.body.add_widget(box)
+        self.count = SectionHead("Members")
+        self.body.add_widget(self.count)
+        contacts = self.app.store.contacts() if self.app.store else []
+        self.rows = [ContactPickRow(c, on_change=lambda _r: self._sync())
+                     for c in contacts]
+        if self.rows:
+            self.body.add_widget(rows_card(self.rows, inset=dp(74)))
+        else:
+            self.paragraph("Add contacts first — a group is made of people "
+                           "you already know.", italic=True)
+        holder = BoxLayout(size_hint_y=None, height=TOUCH + dp(36),
+                           padding=[dp(20), dp(18), dp(20), dp(0)])
+        self.create = Btn("Create group", on_release=lambda _w: self._go())
+        holder.add_widget(self.create)
+        self.body.add_widget(holder)
+        self.status = self.paragraph("", italic=True)
+        self._sync()
+
+    def _sync(self) -> None:
+        n = sum(1 for r in self.rows if r.picked)
+        room = MAX_GROUP_MEMBERS - 1
+        self.count.caps.text = f"Members · {n} of up to {room}"
+        self.create.disabled = not (self.name_field.text.strip() and
+                                    1 <= n <= room)
+
+    def _go(self) -> None:
+        members = [r.address for r in self.rows if r.picked]
+        peer = self.app.create_group(self.name_field.text, members)
+        if peer is None:
+            self.status.text = "Choose a name and at least one member."
+            return
+        self.app.open_conversation(peer)
+
+
+class GroupInfoScreen(PageScreen):
+    """A group's page: its name (the admin may change it), its members
+    (the admin may add and remove them), notifications, starred messages,
+    and leaving."""
+
+    def __init__(self, app: "FextApp", **kw):
+        super().__init__(app, "group_info", "Group",
+                         lambda: app.close_chat_info(), **kw)
+        self.gid: Optional[str] = None
+
+    def show(self, gid: str) -> None:
+        self.gid = gid
+        app, store = self.app, self.app.store
+        group = store.group(gid) or {"name": "Group", "members": [],
+                                     "admin": "", "state": "pending"}
+        me = app.keys.address
+        admin = group.get("admin") == me and group.get("state") == "active"
+        peer = group_peer(gid)
+        self.body.clear_widgets()
+        members = group.get("members") or []
+        self.hero(peer, group.get("name") or "Group", "group",
+                  f"{len(members)} member{'s' if len(members) != 1 else ''}",
+                  on_name=(lambda: self._rename(group)) if admin else None)
+        state = group.get("state")
+        if state != "active":
+            self.paragraph({"left": "You left this group. Its history stays "
+                                    "here, read-only.",
+                            "removed": "You were removed from this group. "
+                                       "Its history stays here, read-only.",
+                            "pending": "Messages arrived for this group "
+                                       "before its invitation; they will "
+                                       "join it when that arrives."
+                            }.get(state, ""), italic=True)
+        self.body.add_widget(SectionHead("This group"))
+        rows = [ListRow("bell", "Notifications",
+                        "Alerts for new messages here",
+                        control=ToggleSwitch(group.get("notify", 1),
+                                             lambda on: app.set_group_notify(
+                                                 gid, on)))]
+        if admin:
+            rows.append(ListRow("edit", "Rename the group",
+                                group.get("name") or "", chevron=True,
+                                on_tap=lambda: self._rename(group)))
+        starred = len(store.starred(peer))
+        rows.append(ListRow("star", "Starred messages",
+                            f"{starred} message{'s' if starred != 1 else ''}",
+                            chevron=True,
+                            on_tap=lambda: StarredModal(app, peer).open()))
+        self.body.add_widget(rows_card(rows))
+        head = SectionHead(f"Members · {len(members)}")
+        self.body.add_widget(head)
+        member_rows = []
+        if admin and len(members) < MAX_GROUP_MEMBERS:
+            member_rows.append(ListRow("person_add", "Add members",
+                                       "From your contacts",
+                                       on_tap=lambda: AddMembersSheet(
+                                           app, gid).open()))
+        for m in sorted(members, key=lambda m: (m["a"] != me,
+                                                m["a"] != group.get("admin"),
+                                                (m.get("u") or "").lower())):
+            address = m["a"]
+            name = "You" if address == me else \
+                app.conversation_screen.author_name(address) \
+                if app.conversation_screen.peer == peer else \
+                (store.get_contact(address) or {}).get("username") or \
+                m.get("u") or short_addr(address, 12)
+            tags = BoxLayout(size_hint=(None, None), height=dp(20),
+                             spacing=dp(8))
+            width = 0
+            if address == group.get("admin"):
+                tag = caps_tag("Admin")
+                tags.add_widget(tag)
+                width += tag.width
+            tags.width = width
+            tap = None
+            if admin and address != me:
+                tap = (lambda a=address, n=name: self._member_menu(a, n))
+            elif address != me:
+                tap = (lambda a=address, n=name: self._member_menu(a, n,
+                                                                   False))
+            member_rows.append(PersonRow(address, name,
+                                         short_addr(address, 18), on_tap=tap,
+                                         trailing=tags if width else None,
+                                         initial_from=m.get("u") or name))
+        self.body.add_widget(rows_card(member_rows, inset=dp(76)))
+        if state == "active":
+            self.body.add_widget(Rule())
+            self.body.add_widget(rows_card([ListRow(
+                "leave", "Leave group", "Your copy of its history stays",
+                danger=True,
+                on_tap=lambda: app.confirm_leave_group(gid))]))
+        self.paragraph("Each message is sealed separately for every member "
+                       "and signed by its author, so no one — the relay "
+                       "included — can forge or read it. Groups hold up to "
+                       f"{MAX_GROUP_MEMBERS} people.", italic=True)
+
+    def _rename(self, group: dict) -> None:
+        gid = group["gid"]
+        TextPromptSheet("Rename group", "Group name", group.get("name", ""),
+                        "Every member sees the new name.",
+                        lambda name: self._renamed(gid, name),
+                        limit=MAX_GROUP_NAME).open()
+
+    def _renamed(self, gid: str, name: str) -> bool:
+        self.app.rename_group(gid, name)
+        self.show(gid)
+        return True
+
+    def _member_menu(self, address: str, name: str, admin: bool = True):
+        items = []
+        if self.app.store.get_contact(address) and \
+                (self.app.store.get_contact(address) or {}).get("listed", 1):
+            items.append(("send", f"Message {name}",
+                          lambda: self.app.open_conversation(address)))
+        else:
+            items.append(("person_add", f"Add {name} to your contacts",
+                          lambda: self.app.list_contact(address)))
+        if admin:
+            items.append(("delete", f"Remove {name} from the group",
+                          lambda: self._remove(address), True))
+        MenuSheet(items, title=name).open()
+
+    def _remove(self, address: str) -> None:
+        if self.app.remove_group_member(self.gid, address):
+            self.show(self.gid)
+
+
+class AddMembersSheet(Sheet):
+    """The admin adds contacts to a group."""
+
+    def __init__(self, app: "FextApp", gid: str) -> None:
+        super().__init__("Add members")
+        self.app, self.gid = app, gid
+        self.card.padding = [0, dp(8), 0, dp(18)]
+        self.title_label.padding = [dp(22), 0]
+        group = app.store.group(gid) or {"members": []}
+        have = {m["a"] for m in group["members"]}
+        self.room = MAX_GROUP_MEMBERS - len(have)
+        self.rows = [ContactPickRow(c, on_change=lambda _r: self._sync())
+                     for c in app.store.contacts() if c["address"] not in have]
+        if self.rows:
+            self.add(rows_card(self.rows, inset=dp(74)))
+        else:
+            self.add(InfoLabel("Everyone in your contacts is already here.",
+                               color=T.text_3, italic=True, font_size=fs(15),
+                               padding=[dp(22), 0]))
+        holder = BoxLayout(size_hint_y=None, height=TOUCH,
+                           padding=[dp(22), 0])
+        self.button = Btn("Add", on_release=lambda _w: self._go())
+        holder.add_widget(self.button)
+        self.add(holder)
+        self._sync()
+
+    def _sync(self) -> None:
+        n = sum(1 for r in self.rows if r.picked)
+        self.button.disabled = not 1 <= n <= self.room
+        self.button.text = "Add" if n <= 1 else f"Add {n} people"
+
+    def _go(self) -> None:
+        picked = [r.address for r in self.rows if r.picked]
+        self.dismiss()
+        if self.app.add_group_members(self.gid, picked):
+            self.app.group_info_screen.show(self.gid)
+
+
+class SettingsScreen(PageScreen):
+    """Settings: how the app looks and reads, notifications, and this
+    identity's keys."""
+
+    def __init__(self, app: "FextApp", **kw):
+        super().__init__(app, "settings", "Settings",
+                         lambda: app.close_settings(), **kw)
+        self._revealed = False
+
+    def show(self) -> None:
+        self.body.clear_widgets()
+        app = self.app
+        self.body.add_widget(SectionHead("Appearance"))
+        pad = BoxLayout(orientation="vertical", size_hint_y=None,
+                        padding=[dp(20), dp(4), dp(20), dp(8)],
+                        spacing=dp(4))
+        pad.bind(minimum_height=pad.setter("height"))
+        pad.add_widget(CapsLabel("Theme", size=10.5, color=T.text_3))
+        pad.add_widget(Segmented(THEME_CHOICES, APPEARANCE.mode,
+                                 lambda v: app.set_appearance(theme=v)))
+        sys_dark = system_prefers_dark()
+        pad.add_widget(InfoLabel(
+            "System follows your phone's setting" +
+            ("" if sys_dark is None else
+             f" (now {'dark' if sys_dark else 'light'})") + ".",
+            color=T.text_3, italic=True, font_size=fs(14.5)))
+        pad.add_widget(Widget(size_hint_y=None, height=dp(10)))
+        pad.add_widget(CapsLabel("Text size", size=10.5, color=T.text_3))
+        current = next((k for k, _l, s in TEXT_SCALES
+                        if abs(s - APPEARANCE.scale) < .01), "default")
+        pad.add_widget(Segmented([(k, label) for k, label, _s in TEXT_SCALES],
+                                 current,
+                                 lambda v: app.set_appearance(text_size=v)))
+        pad.add_widget(InfoLabel(
+            "“See you at nine?” — a sample at this size, 14:05 👍",
+            font_size=fs(17), padding=[0, dp(6)]))
+        self.body.add_widget(pad)
+        self.body.add_widget(rows_card([ListRow(
+            None, "Reduce motion",
+            "Sheets, reactions and scrolling move without animation",
+            control=ToggleSwitch(APPEARANCE.reduce_motion,
+                                 lambda on: app.set_appearance(
+                                     reduce_motion=on)))]))
+        if IS_ANDROID or os.environ.get("FEXT_SHOW_ANDROID_SETTINGS"):
+            self.body.add_widget(SectionHead("Notifications"))
+            self.body.add_widget(rows_card([ListRow(
+                "bell", "Receive messages while closed",
+                "A small service keeps listening after Android closes the "
+                "app; Android shows it as running. Off saves battery — you "
+                "are then only notified while Ferritext is open.",
+                control=ToggleSwitch(background_delivery_enabled(),
+                                     self._on_delivery))]))
+        self._identity()
+        self.body.add_widget(SectionHead("About"))
+        self.paragraph(
+            f"{APP_NAME} {APP_VERSION}. Set in EB Garamond, with Noto Emoji "
+            "and Titillium Web, under the SIL Open Font License.",
+            italic=True)
+
+    def _on_delivery(self, on: bool) -> None:
+        save_pref("background_delivery", bool(on))
+        self.app._sync_background_service()
+
+    def _qr(self, data: str, side=dp(184)) -> AnchorLayout:
+        holder = AnchorLayout(size_hint_y=None, height=side + dp(20))
+        plate = AnchorLayout(size_hint=(None, None),
+                             size=(side + dp(16), side + dp(16)))
+        paint_round(plate, T.plate, radius=dp(6))
+        img = KivyImage(size_hint=(None, None), size=(side, side),
+                        allow_stretch=True)
+        img.texture = qr_texture(data)
+        plate.add_widget(img)
+        holder.add_widget(plate)
+        return holder
+
+    def _identity(self) -> None:
+        keys, app = self.app.keys, self.app
+        if not keys.has_identity:
+            return
+        self.body.add_widget(SectionHead("This identity"))
+        self.body.add_widget(rows_card([
+            ListRow("person", keys.label,
+                    f"@{keys.username or 'not registered'}", chevron=True,
+                    on_tap=lambda: RenameIdentityModal(app,
+                                                       keys.address).open()),
+            ListRow("copy", "Copy address", keys.address,
+                    on_tap=lambda: app.copy_text(keys.address)),
+        ] + ([ListRow("share", "Open the key folder", str(DATA_DIR),
+                      on_tap=lambda: open_folder_in_explorer(DATA_DIR))]
+             if not IS_MOBILE else [])))
+        self.body.add_widget(self._qr(keys.address))
+        self.body.add_widget(InfoLabel(
+            "Scan for the address alone", color=T.text_3, italic=True,
+            font_size=fs(14), halign="center"))
+        self.paragraph(
+            "The address is the HASH160 of your public key in Base58Check "
+            "(version 0x24), as Bitcoin builds one. Its “Fec” prefix is the "
+            "network's proof of work.", italic=True)
+        bundle = json.dumps(keys.public_bundle(), indent=2)
+        self.body.add_widget(SectionHead("Public bundle · safe to share"))
+        self.body.add_widget(rows_card([ListRow(
+            "copy", "Copy the public bundle", "Username, address and key",
+            on_tap=lambda: app.copy_text(bundle))]))
+        self.body.add_widget(self._qr(json.dumps(keys.public_bundle(),
+                                                 separators=(",", ":")),
+                                      side=dp(200)))
+        self.body.add_widget(SectionHead("Private key · never share it"))
+        self.private_label = InfoLabel(
+            "Hidden", color=T.alert, font_size=fs(14), italic=True,
+            padding=[dp(20), dp(4)])
+        self.reveal_row = ListRow(
+            "key", "Reveal the private key", "As raw hex and as WIF",
+            on_tap=self._toggle_private)
+        self.body.add_widget(rows_card([
+            self.reveal_row,
+            ListRow("copy", "Copy WIF", "Imports into FEXT Core",
+                    on_tap=self._copy_wif)]))
+        self.body.add_widget(self.private_label)
+
+    def _toggle_private(self) -> None:
+        self._revealed = not self._revealed
+        self.private_label.text = (self.app.keys.private_export()
+                                   if self._revealed else "Hidden")
+        self.private_label.italic = not self._revealed
+        self.reveal_row.title.text = ("Hide the private key" if
+                                      self._revealed else
+                                      "Reveal the private key")
+
+    def _copy_wif(self) -> None:
+        data = json.loads(self.app.keys.private_export())
+        Clipboard.copy(data["private_key_wif"])
+        self.app._set_status("Private key copied — keep it safe", T.accent)
+
+
+class SettingsModal:
+    """Pre-9.1 entry point: Settings is a page now."""
+
+    def __init__(self, app: "FextApp") -> None:
+        self.app = app
+
+    def open(self) -> None:
+        self.app.open_settings()
+
+
 class SplashOverlay(FloatLayout):
-    """The loading screen: the mark above the wordmark, on the app's cream.
+    """The loading screen: the mark above the wordmark, on white.
 
-    It covers the first paint — the ScreenManager building its two screens,
-    the identity being read off disk, the transport probe going out — and
-    then fades so the chat list does not simply snap into existence.
-
-    It is a widget in the tree rather than a ModalView on purpose. The
-    first-run dialog IS a ModalView, and a ModalView attaches to the Window
-    above everything, so raising it while this was still up would show it
-    through the loading screen. _post_build therefore waits for the fade.
+    It covers the first paint (the screens being built, the identity read
+    off disk, the transport probe going out) and then fades. It is a widget
+    in the tree, not a ModalView, so the first-run sheet cannot show
+    through it; _post_build waits for the fade.
     """
 
     FADE = 0.1          # seconds of fade-out
@@ -7334,208 +9612,228 @@ class SplashOverlay(FloatLayout):
 
     def __init__(self, **kw):
         super().__init__(**kw)
-        # White, as specified — the same ground as the launcher icon and
-        # the platform presplash, so the three hand over seamlessly.
-        paint_round(self, "#FFFFFF", radius=dp(0))
-        column = BoxLayout(orientation="vertical", spacing=dp(22),
+        # White, as specified — the ground of the launcher icon and the
+        # platform presplash, so the three hand over seamlessly.
+        paint_round(self, "#FFFFFF", radius=0)
+        column = BoxLayout(orientation="vertical", spacing=dp(18),
                            size_hint=(None, None), width=dp(280),
-                           height=dp(300),
+                           height=dp(320),
                            pos_hint={"center_x": 0.5, "center_y": 0.5})
         if LOGO_FILE.exists():
             column.add_widget(KivyImage(source=str(LOGO_FILE),
                                         allow_stretch=True, keep_ratio=True,
-                                        size_hint_y=None, height=dp(190)))
+                                        size_hint_y=None, height=dp(180)))
         wordmark = Label(
-            text=("[b]Ferrite Text[/b]\n[b]Messenger[/b]\n"
-                  "[size=%d][color=%s]by koh-gt[/color][/size]"
-                  % (int(sp(12.5)), COL_TEXT_DIM.lstrip("#"))),
-            markup=True, halign="center", valign="top", font_size=sp(21),
-            color=C(COL_TEXT), line_height=1.25,
-            size_hint_y=None, height=dp(100))
+            text="Ferrite Text\nMessenger", halign="center", valign="top",
+            font_size=sp(26), color=C("#1B1915"), line_height=1.1,
+            size_hint_y=None, height=dp(74))
         wordmark.bind(size=lambda w, v: setattr(w, "text_size", v))
         column.add_widget(wordmark)
+        byline = Label(text="by koh-gt", italic=True, font_size=sp(15),
+                       color=C("#6F685C"), size_hint_y=None, height=dp(24))
+        column.add_widget(byline)
         self.add_widget(column)
 
 
-class ToggleSwitch(ButtonBehavior, Widget):
-    """A pill switch, drawn (no glyphs), gold when on."""
+class MessagingMixin:
+    """Everything that turns a message into envelopes on the relay.
 
-    def __init__(self, active: bool = False,
-                 on_change: Optional[Callable[[bool], None]] = None, **kw):
-        kw.setdefault("size_hint", (None, None))
-        kw.setdefault("size", (dp(44), dp(26)))
-        super().__init__(**kw)
-        self.active, self._on_change = bool(active), on_change
-        self.bind(pos=self._paint, size=self._paint,
-                  on_release=lambda _w: self.flip())
-        self._paint()
+    Shared, unchanged, by the app and the background service (HeadlessApp):
+    a re-upload asked for while the app is closed, or the group state an
+    admin must publish when someone leaves, goes out through the very same
+    code. Needs `keys`, `crypto`, `api`, `store` and `ui_queue`.
 
-    def flip(self) -> None:
-        self.set_active(not self.active)
-        if self._on_change:
-            self._on_change(self.active)
+    A conversation key (`peer`) is one of:
+      * an address               a direct chat
+      * GROUP_PREFIX + gid       a group: one envelope per other member
+      * our own address          notes to self: stored here, sent nowhere
+    """
 
-    def set_active(self, active: bool) -> None:
-        self.active = bool(active)
-        self._paint()
+    def conversation_kind(self, peer: Optional[str]) -> str:
+        if not peer:
+            return "none"
+        if peer.startswith(GROUP_PREFIX):
+            return "group"
+        if peer == self.keys.address:
+            return "self"
+        return "dm"
 
-    def _paint(self, *_a) -> None:
-        self.canvas.clear()
-        h = self.height
-        with self.canvas:
-            Color(*C(COL_ACCENT if self.active else "#D8CBB8"))
-            RoundedRectangle(pos=self.pos, size=self.size, radius=[h / 2])
-            Color(*C("#FFFFFF"))
-            knob = h - dp(6)
-            x = self.right - knob - dp(3) if self.active else self.x + dp(3)
-            Ellipse(pos=(x, self.y + dp(3)), size=(knob, knob))
+    def group_recipients(self, gid: str) -> list:
+        """[(address, public key), …] of the OTHER members, if we are in."""
+        group = self.store.group(gid) if self.store else None
+        if group is None or group["state"] != "active":
+            return []
+        return [(m["a"], m["k"]) for m in group["members"]
+                if m["a"] != self.keys.address]
+
+    def _send_worker(self, local_id: Optional[int], peer: str, peer_pub: str,
+                     body: str, client_msg_id: str, x: Optional[dict] = None,
+                     group: Optional[str] = None) -> bool:
+        """SIGN → ENCRYPT → SEND one envelope to one address (`peer`), then
+        record the relay's receipt (1/3).
+
+        `group` set: this is one member's copy of group message `local_id`,
+        recorded per member. `local_id` None: a control, nothing recorded.
+
+        Every failure here has to end at the UI: a message must never sit at
+        0/3 with no reason given anywhere.
+        """
+        me = MessageFlowLog.who(self.keys.address, self.keys.username)
+        contact = self.store.get_contact(peer) or {}
+        them = MessageFlowLog.who(peer, contact.get("username"))
+        try:
+            envelope, _sent_at = self.crypto.build_envelope(
+                body, peer_pub, x=x, recipient=peer, cid=client_msg_id)
+        except Exception as exc:
+            log.exception("could not build envelope for %s", peer)
+            MessageFlowLog.failed(me, them, f"encryption failed: {exc}")
+            self.ui_queue.put(("status", f"Could not encrypt: {exc}",
+                               COL_DANGER))
+            return False
+
+        fragment = MessageFlowLog.fragment(envelope)
+        try:
+            result = self.api.send_message(peer, envelope, client_msg_id)
+        except (requests.RequestException, ApiClient.ApiError,
+                ValueError) as exc:
+            MessageFlowLog.failed(me, them, str(exc), fragment)
+            self.ui_queue.put(("status", f"Send failed: {exc}", COL_DANGER))
+            return False
+        except Exception as exc:                     # never lose the thread
+            log.exception("unexpected error sending to %s", peer)
+            MessageFlowLog.failed(me, them, f"unexpected: {exc}", fragment)
+            self.ui_queue.put(("status", f"Send failed: {exc}", COL_DANGER))
+            return False
+
+        if local_id is None:                         # a control: no row
+            return True
+        server_id = result.get("server_id")
+        recorded = (self.store.group_send_sent(local_id, peer, server_id)
+                    if group else self.store.mark_sent(local_id, server_id))
+        if not recorded:
+            # The relay HAS the message; we merely failed to write that
+            # down. Say so rather than leaving a grey tick and no reason.
+            MessageFlowLog.failed(
+                me, them, f"relay accepted it as #{server_id} but the local "
+                          f"store could not record that", fragment)
+            self.ui_queue.put(
+                ("status", "Sent, but this device could not record it — "
+                 "the tick may be wrong", COL_DANGER))
+            return False
+        MessageFlowLog.tick(1, server_id, me, them, fragment)
+        self.ui_queue.put(("message_stored",
+                           group_peer(group) if group else peer))
+        return True
+
+    def _send_copies(self, local_id: Optional[int], peer: str, body: str,
+                     cid: str, x: dict) -> bool:
+        """Deliver one message (or control) to every recipient of a
+        conversation. True only if every copy reached the relay."""
+        kind = self.conversation_kind(peer)
+        if kind == "self":
+            return True
+        if kind == "dm":
+            contact = self.store.get_contact(peer)
+            if contact is None:
+                return False
+            return self._send_worker(local_id, peer, contact["public_key"],
+                                     body, cid, x)
+        gid = gid_of(peer)
+        group = self.store.group(gid) if gid else None
+        if group is None:
+            return False
+        if x.get("k") == "ctl":
+            x = dict(x, ctl=dict(x["ctl"], grp=gid))
+        else:
+            x = dict(x, grp={"id": gid, "v": group["version"]})
+        ok = True
+        for address, pub in self.group_recipients(gid):
+            ok = self._send_worker(local_id, address, pub, body, cid, x,
+                                   group=gid if local_id else None) and ok
+        return ok
+
+    def _send_control(self, peer: str, op: dict, fallback: str) -> bool:
+        """Send a control to a whole conversation, synchronously (call from
+        a worker thread). `fallback` is the body: what a pre-v9 client
+        shows, since it cannot act on the instruction."""
+        return self._send_copies(None, peer, fallback, uuid.uuid4().hex,
+                                 {"k": "ctl", "ctl": op})
+
+    def _send_control_to(self, address: str, op: dict, fallback: str,
+                         pub: Optional[str] = None) -> bool:
+        """A control for ONE person, whatever conversation it concerns (in a
+        group: asking the author of a photo to send it again)."""
+        if pub is None:
+            contact = self.store.get_contact(address)
+            if contact is None:
+                return False
+            pub = contact["public_key"]
+        return self._send_worker(None, address, pub, fallback,
+                                 uuid.uuid4().hex, {"k": "ctl", "ctl": op})
+
+    def _group_state(self, gid: str) -> Optional[dict]:
+        group = self.store.group(gid)
+        if group is None:
+            return None
+        return {"id": gid, "name": group["name"], "v": group["version"],
+                "admin": group["admin"], "members": group["members"]}
+
+    def _publish_group_state(self, gid: str, also=(), fallback: str = "",
+                             bump: bool = True) -> bool:
+        """As the admin: bump the version and send the group's state to every
+        member (and to `also`: people just removed, so they learn it)."""
+        group = self.store.group(gid)
+        if group is None or group["admin"] != self.keys.address:
+            return False
+        state = self._group_state(gid)
+        if bump:
+            state["v"] += 1
+            self.store.save_group(state, group["state"])
+        body = fallback or f"Group \u201c{state['name']}\u201d updated"
+        ok = True
+        targets = [(m["a"], m["k"]) for m in state["members"]
+                   if m["a"] != self.keys.address] + list(also)
+        for address, pub in targets:
+            ok = self._send_control_to(address, {"op": "group", "g": state},
+                                       body, pub=pub) and ok
+        return ok
+
+    def _on_resend_request(self, peer: str, cid: str,
+                           gid: Optional[str] = None) -> None:
+        """They asked for a file the relay no longer has: upload our copy
+        again and point THEIR existing message at it (no duplicate). In a
+        group only the person who asked is sent the new reference."""
+        conversation = group_peer(gid) if gid else peer
+        row = self.store.message_by_cid(conversation, cid, "out")
+        if not row or not row.get("media_path") or \
+                not Path(row["media_path"]).is_file():
+            log.info("resend requested for %s but no local copy remains", cid)
+            return
+        ext = json.loads(row.get("ext") or "{}")
+
+        def work():
+            try:
+                data = Path(row["media_path"]).read_bytes()
+                blob, key, sha = seal_media(data)
+                blob_id = self.api.upload_blob(blob).get("blob", "")
+                if not _TOKEN_RE.match(blob_id or ""):
+                    raise ValueError("relay returned no media id")
+            except (OSError, ValueError, requests.RequestException,
+                    ApiClient.ApiError) as exc:
+                log.warning("re-upload for %s failed: %s", cid, exc)
+                return
+            media = dict(ext.get("media") or {}, blob=blob_id, key=key,
+                         sha=sha)
+            ext["media"] = media
+            self.store.set_media(row["id"], ext=ext)
+            op = {"op": "remedia", "cid": cid, "media": media}
+            if gid:
+                op["grp"] = gid
+            self._send_control_to(peer, op, row["body"])
+        threading.Thread(target=work, daemon=True).start()
 
 
-class SettingRow(ButtonBehavior, BoxLayout):
-    """Icon · title (+ hint) · control. The whole row is the tap target."""
-
-    def __init__(self, icon: str, title: str, hint: str = "",
-                 control: Optional[Widget] = None,
-                 on_tap: Optional[Callable] = None, **kw):
-        kw.setdefault("size_hint_y", None)
-        kw.setdefault("height", dp(64) if hint else dp(52))
-        kw.setdefault("padding", [dp(16), dp(6), dp(16), dp(6)])
-        kw.setdefault("spacing", dp(16))
-        super().__init__(**kw)
-        glyph = Widget(size_hint_x=None, width=dp(24))
-        glyph.bind(pos=lambda w, *_a: self._glyph(w, icon),
-                   size=lambda w, *_a: self._glyph(w, icon))
-        self.add_widget(glyph)
-        texts = BoxLayout(orientation="vertical")
-        texts.add_widget(single_line(title, sp(15.5), COL_TEXT))
-        if hint:
-            self.hint = single_line(hint, sp(12.5), COL_TEXT_DIM)
-            texts.add_widget(self.hint)
-        self.add_widget(texts)
-        if control is not None:
-            holder = AnchorLayout(size_hint_x=None, width=control.width,
-                                  anchor_x="right")
-            holder.add_widget(control)
-            self.add_widget(holder)
-        self._bg_col, _ = paint_round(self, COL_CARD, radius=dp(0))
-        self.bind(state=lambda _w, st: setattr(
-            self._bg_col, "rgba", C(COL_PRESSED if st == "down"
-                                    else COL_CARD)))
-        if on_tap is not None:
-            self.bind(on_release=lambda _w: on_tap())
-
-    @staticmethod
-    def _glyph(widget, icon: str) -> None:
-        widget.canvas.clear()
-        with widget.canvas:
-            draw_icon(icon, widget.center_x, widget.center_y, dp(22),
-                      C(COL_TEXT_DIM))
-
-
-class ChatInfoScreen(Screen):
-    """Tap the name in a chat: who this is, and the switches for this chat
-    (notifications, ticks, auto-read), starred messages and export."""
-
-    def __init__(self, app: "FextApp", **kw):
-        super().__init__(name="info", **kw)
-        self.app = app
-        self.peer: Optional[str] = None
-        root = BoxLayout(orientation="vertical")
-        paint_round(root, COL_BG_LIST, radius=dp(0))
-        self.add_widget(root)
-        bar = BoxLayout(size_hint_y=None, height=dp(56),
-                        padding=[dp(2), 0, dp(12), 0], spacing=dp(6))
-        paint_round(bar, COL_APPBAR, radius=dp(0))
-        bar.add_widget(IconButton("back", size=(dp(44), dp(56)),
-                                  on_release=lambda _w:
-                                  self.app.close_chat_info()))
-        bar.add_widget(single_line("Chat info", sp(18), COL_APPBAR_TEXT,
-                                   bold=True))
-        root.add_widget(bar)
-        scroll = ScrollView(bar_width=dp(3))
-        self.body = BoxLayout(orientation="vertical", size_hint_y=None,
-                              spacing=dp(10), padding=[0, 0, 0, dp(16)])
-        self.body.bind(minimum_height=self.body.setter("height"))
-        scroll.add_widget(self.body)
-        root.add_widget(scroll)
-
-    def show(self, peer: str) -> None:
-        self.peer = peer
-        store = self.app.store
-        contact = store.get_contact(peer) or {}
-        name = contact.get("username") or short_addr(peer, 14)
-        self.body.clear_widgets()
-
-        head = BoxLayout(orientation="vertical", size_hint_y=None,
-                         height=dp(196), padding=[dp(16), dp(20), dp(16),
-                                                  dp(14)], spacing=dp(6))
-        paint_round(head, COL_CARD, radius=dp(0))
-        holder = AnchorLayout(size_hint_y=None, height=dp(92))
-        holder.add_widget(Avatar(peer, name, diameter=dp(88)))
-        head.add_widget(holder)
-        title = single_line(name, sp(21), COL_TEXT, bold=True,
-                            size_hint_y=None, height=dp(30))
-        title.halign = "center"
-        head.add_widget(title)
-        address = CozyButton(peer, bg=COL_CARD, fg=COL_TEXT_DIM, bold=False,
-                             font_size=sp(11.5), height=dp(26),
-                             pressed=COL_PRESSED, shorten=True,
-                             shorten_from="center", halign="center",
-                             valign="middle")
-        address.bind(size=lambda w, v: setattr(w, "text_size", v))
-        address.bind(on_release=lambda _w: self.app.copy_text(peer))
-        head.add_widget(address)
-        self.body.add_widget(head)
-
-        caps = contact.get("caps", 0) & LocalStore.CAP_V9
-        rows = [
-            SettingRow("bell", "Notifications",
-                       "Alerts for new messages in this chat",
-                       ToggleSwitch(contact.get("notify", 1),
-                                    lambda on: self.app.set_notify(peer, on))),
-            SettingRow("check", "Delivery & read ticks",
-                       "Off for either of you caps both at one tick",
-                       ToggleSwitch(contact.get("ticks_enabled", 1),
-                                    lambda on: self.app.set_ticks(peer, on))),
-            SettingRow("info", "Mark as read automatically",
-                       "When off, tap messages to mark them read",
-                       ToggleSwitch(contact.get("auto_read", 1),
-                                    lambda on: self.app.set_auto_read(peer,
-                                                                      on))),
-        ]
-        self.body.add_widget(self._card(rows))
-        starred = len(store.starred(peer))
-        self.body.add_widget(self._card([
-            SettingRow("star", "Starred messages",
-                       f"{starred} message{'s' if starred != 1 else ''}",
-                       on_tap=lambda: StarredModal(self.app, peer).open()),
-            SettingRow("share", "Export or import chat",
-                       "Plaintext copies, kept on this device",
-                       on_tap=lambda: ContactSettingsModal(self.app,
-                                                           peer).open()),
-        ]))
-        self.body.add_widget(InfoLabel(
-            "End-to-end encrypted. " +
-            ("This contact runs Ferritext 9: replies, photos, voice notes "
-             "and delete-for-both all reach them." if caps else
-             "Replies, photos, voice notes and delete-for-both reach this "
-             "contact fully once they are on Ferritext 9."),
-            color=COL_TEXT_DIM, font_size=sp(12.5), padding=[dp(18), 0]))
-
-    @staticmethod
-    def _card(rows: list) -> BoxLayout:
-        card = BoxLayout(orientation="vertical", size_hint_y=None)
-        card.bind(minimum_height=card.setter("height"))
-        for i, row in enumerate(rows):
-            if i:
-                rule = Widget(size_hint_y=None, height=dp(1))
-                paint_round(rule, COL_DIVIDER, radius=dp(0))
-                card.add_widget(rule)
-            card.add_widget(row)
-        return card
-
-
-class FextApp(App):
+class FextApp(MessagingMixin, App):
     """Owns the identity lifecycle, the two screens and the UI-queue pump.
 
     Threading contract (unchanged from v2): ALL network + crypto work happens
@@ -7555,7 +9853,7 @@ class FextApp(App):
         self.worker: Optional[SyncWorker] = None
         self.ui_queue: "queue.Queue" = queue.Queue()
         self.current_peer: Optional[str] = None
-        self._pending_status = ("Starting…", COL_TEXT_DIM)
+        self._pending_status = ("Starting…", T.text_3)
         self._chat_anchor: Optional[int] = None  # oldest id shown in the chat
         self._dirty_chat = False               # coalesced refresh flags
         self._dirty_list = False
@@ -7565,43 +9863,147 @@ class FextApp(App):
 
     # ---- lifecycle -----------------------------------------------------------
     def build(self):
-        Window.clearcolor = C(COL_BG_LIST)
+        apply_theme(APPEARANCE.resolve())
+        self._theme_name = T.name
+        Window.clearcolor = C(T.bg)
         if IS_MOBILE:
-            # Without this the Android/iOS soft keyboard covers the composer
-            # you are typing into; 'below_target' pans the view just enough
-            # to keep the focused input visible.
+            # Without this the soft keyboard covers the composer you are
+            # typing into; 'below_target' pans just enough to keep it seen.
             Window.softinput_mode = "below_target"
         else:
             # Phone-shaped by default on desktop so the layout is exercised
-            # the same way it will be on a handset; still freely resizable.
+            # the way it will be on a handset; still freely resizable.
             Window.size = (dp(420), dp(820))
-        self.manager = ScreenManager(transition=SlideTransition(
-            duration=0.18, direction="left"))
-        self.chats_screen = ChatsScreen(self)
-        self.conversation_screen = ConversationScreen(self)
-        self.chat_info_screen = ChatInfoScreen(self)
-        self.manager.add_widget(self.chats_screen)
-        self.manager.add_widget(self.conversation_screen)
-        self.manager.add_widget(self.chat_info_screen)
+        self.manager = ScreenManager(transition=NoTransition())
         self.voice = VoicePlayer()
-        self.voice.on_progress = self.conversation_screen.on_voice_progress
-        self.voice.on_stop = self.conversation_screen.on_voice_stop
+        self._build_screens()
         Window.bind(on_keyboard=self._on_keyboard)     # Android back button
         Clock.schedule_interval(self._drain_ui_queue, 0.15)
+        Clock.schedule_interval(self._watch_system_theme, 4.0)
         self._bind_notification_taps()
+        android_style_system_bars()
         # The loading screen sits over the whole app until it fades, so the
-        # root has to be something that can stack widgets. Nothing else
-        # reaches for App.root; the rest of the app talks to self.manager.
+        # root is something that can stack widgets; the rest of the app
+        # talks to self.manager.
         root = FloatLayout()
         root.add_widget(self.manager)
         self.splash = SplashOverlay()
         root.add_widget(self.splash)
-        # The probe still goes out immediately — it is a background thread,
-        # and starting it behind the loading screen is exactly the overlap
-        # _probe_transport was written for.
         Clock.schedule_once(lambda _dt: self._probe_transport(), 0.05)
         Clock.schedule_once(self._dismiss_splash, SplashOverlay.HOLD)
         return root
+
+    def _build_screens(self) -> None:
+        """Every screen, built in the current theme and text size."""
+        self.chats_screen = ChatsScreen(self)
+        self.conversation_screen = ConversationScreen(self)
+        self.chat_info_screen = ChatInfoScreen(self)
+        self.group_info_screen = GroupInfoScreen(self)
+        self.new_group_screen = NewGroupScreen(self)
+        self.settings_screen = SettingsScreen(self)
+        for screen in (self.chats_screen, self.conversation_screen,
+                       self.chat_info_screen, self.group_info_screen,
+                       self.new_group_screen, self.settings_screen):
+            self.manager.add_widget(screen)
+        self.voice.on_progress = self.conversation_screen.on_voice_progress
+        self.voice.on_stop = self.conversation_screen.on_voice_stop
+
+    def _navigate(self, name: str, direction: Optional[str] = "left") -> None:
+        """Show screen `name`, sliding (unless motion is reduced)."""
+        if direction is None or not motion(1) or \
+                self.manager.current == name:
+            self.manager.transition = NoTransition()
+        else:
+            self.manager.transition = SlideTransition(duration=0.18,
+                                                      direction=direction)
+        self.manager.current = name
+
+    # =========================================================================
+    #  Appearance: theme, text size, motion
+    # =========================================================================
+    def set_appearance(self, theme: Optional[str] = None,
+                       text_size: Optional[str] = None,
+                       reduce_motion: Optional[bool] = None) -> None:
+        if theme is not None:
+            save_pref("theme", theme)
+        if text_size is not None:
+            save_pref("text_size", text_size)
+        if reduce_motion is not None:
+            save_pref("reduce_motion", bool(reduce_motion))
+        self.apply_appearance(force=text_size is not None)
+
+    def apply_appearance(self, force: bool = False) -> None:
+        """Re-read the preferences (and the system's theme); rebuild the
+        interface if anything visible changed."""
+        old = (T.name, APPEARANCE.scale)
+        name = APPEARANCE.resolve()
+        if force or (name, APPEARANCE.scale) != old:
+            self._rebuild_ui(name)
+
+    def _watch_system_theme(self, _dt) -> None:
+        """Follow the phone's dark/light switch while the app is open. The
+        check can take a subprocess on a desktop, so it runs off the UI
+        thread and only hops back when the answer differs."""
+        if APPEARANCE.mode != "system" or getattr(self, "_theme_probe", 0):
+            return
+        if IS_ANDROID:
+            # A cheap JNI read, and pyjnius must not be used from a thread
+            # that is never detached from the JVM — so on the UI thread.
+            dark = system_prefers_dark()
+            if ("light" if dark is False else "dark") != T.name:
+                self.apply_appearance()
+            return
+        self._theme_probe = 1
+
+        def probe():
+            try:
+                dark = system_prefers_dark()
+                want = "light" if dark is False else "dark"
+                if want != T.name:
+                    run_on_ui(self.apply_appearance)
+            finally:
+                self._theme_probe = 0
+        threading.Thread(target=probe, daemon=True).start()
+
+    def _rebuild_ui(self, name: str) -> None:
+        """Build every screen again in the new theme, and put the user back
+        exactly where they were: same screen, same chat, same draft."""
+        current = self.manager.current
+        peer = self.current_peer
+        screen = self.conversation_screen
+        draft = screen.entry.text
+        reply = screen.reply_to
+        screen.cancel_recording()
+        self.voice.stop()
+        for view in list(Window.children):
+            if isinstance(view, ModalView):
+                view.dismiss(animation=False)
+        apply_theme(name)
+        self._theme_name = name
+        Window.clearcolor = C(T.bg)
+        for old in list(self.manager.screens):
+            self.manager.remove_widget(old)
+        self._build_screens()
+        android_style_system_bars()
+        self.chats_screen.refresh_header()
+        self.refresh_sidebar()
+        self.chats_screen.set_status(*self._pending_status)
+        if peer is not None and self.store is not None:
+            self._chat_anchor = None
+            self.refresh_chat(peer)
+            self.conversation_screen.entry.text = draft
+            if reply:
+                self.conversation_screen.reply_to = reply
+        if current == "info" and peer:
+            self.chat_info_screen.show(peer)
+        elif current == "group_info" and peer and gid_of(peer):
+            self.group_info_screen.show(gid_of(peer))
+        elif current == "new_group":
+            self.new_group_screen.show()
+        elif current == "settings":
+            self.settings_screen.show()
+        if current in self.manager.screen_names:
+            self._navigate(current, None)
 
     def _probe_transport(self) -> None:
         """Work out the relay's transport in the background at startup.
@@ -7649,24 +10051,40 @@ class FextApp(App):
             self.store.close()
 
     def _on_keyboard(self, _window, key, *_args) -> bool:
-        """Android/Esc back, innermost first: highlight mode, a recording, a
-        pending reply, chat info, the chat — and only then the app."""
-        if key in (27, 1001):
-            current = self.manager.current
-            if current == "info":
-                self.close_chat_info()
-                return True
-            if current == "conversation":
-                screen = self.conversation_screen
-                if screen.selecting:
-                    screen.clear_selection()
-                elif screen.recorder is not None:
-                    screen.cancel_recording()
-                elif screen.reply_to is not None:
-                    screen.cancel_reply()
-                else:
-                    self.go_back_to_chats()
-                return True
+        """Android/Esc back, innermost first: an open sheet, highlight mode,
+        the emoji panel, a recording, a pending reply, a page — and only
+        then the app."""
+        if key not in (27, 1001):
+            return False
+        sheets = [v for v in Window.children if isinstance(v, ModalView)]
+        if sheets:
+            top = sheets[0]
+            if getattr(top, "dismissable", True) and top.auto_dismiss:
+                top.dismiss()
+            return True
+        current = self.manager.current
+        if current in ("info", "group_info"):
+            self.close_chat_info()
+            return True
+        if current == "settings":
+            self.close_settings()
+            return True
+        if current == "new_group":
+            self.go_back_to_chats()
+            return True
+        if current == "conversation":
+            screen = self.conversation_screen
+            if screen.selecting:
+                screen.clear_selection()
+            elif screen.emoji_panel.is_open:
+                screen.close_emoji()
+            elif screen.recorder is not None:
+                screen.cancel_recording()
+            elif screen.reply_to is not None:
+                screen.cancel_reply()
+            else:
+                self.go_back_to_chats()
+            return True
         return False
 
     # =========================================================================
@@ -7686,9 +10104,7 @@ class FextApp(App):
         self.api = ApiClient(self.keys)
         self.store = LocalStore(self.keys.store_path())
         self.current_peer = None
-        self.manager.transition = NoTransition()
-        self.manager.current = "chats"
-        self.manager.transition = SlideTransition(duration=0.18)
+        self._navigate("chats", None)
         self.chats_screen.refresh_header()
         self.refresh_sidebar()
         if self.keys.username:
@@ -7696,7 +10112,7 @@ class FextApp(App):
             self._ask_notification_permission()
             self._sync_background_service()
             peer = self._launch_peer()
-            if peer and self.store.get_contact(peer):
+            if peer and self._known_conversation(peer):
                 self.open_conversation(peer)
         else:
             self._set_status("Pick a username to start chatting",
@@ -7754,9 +10170,7 @@ class FextApp(App):
             self.current_peer = None
             self.chats_screen.refresh_header()
             self.chats_screen.refresh_list([])
-            self.manager.transition = NoTransition()
-            self.manager.current = "chats"
-            self.manager.transition = SlideTransition(duration=0.18)
+            self._navigate("chats", None)
             self._set_status(f"No identities on this device{note}",
                              COL_TICK_GOLD)
             NewIdentityModal(self, first_run=True).open()
@@ -7771,16 +10185,31 @@ class FextApp(App):
     # =========================================================================
     #  Navigation
     # =========================================================================
+    def _known_conversation(self, peer: str) -> bool:
+        if self.store is None:
+            return False
+        kind = self.conversation_kind(peer)
+        if kind == "self":
+            return True
+        if kind == "group":
+            return self.store.group(gid_of(peer)) is not None
+        return self.store.get_contact(peer) is not None
+
+    def _auto_read(self, peer: str) -> bool:
+        if self.conversation_kind(peer) != "dm":
+            return True
+        return bool((self.store.get_contact(peer) or {}).get("auto_read", 1))
+
     def open_conversation(self, peer: str) -> None:
+        if self.store is None:
+            return
         if IS_ANDROID:
             android_clear_notification(peer)
         self.current_peer = peer
         self._chat_anchor = None                # fresh window per chat
-        contact = self.store.get_contact(peer) or {}
-        if contact.get("auto_read", 1):
+        if self._auto_read(peer):
             self.mark_peer_read(peer, refresh=False)
-        self.manager.transition.direction = "left"
-        self.manager.current = "conversation"
+        self._navigate("conversation", "left")
         self.refresh_chat(peer)
         self.refresh_sidebar()
 
@@ -7788,10 +10217,10 @@ class FextApp(App):
         screen = self.conversation_screen
         screen.clear_selection()
         screen.cancel_recording()
+        screen.close_emoji()
         self.voice.stop()
         self.current_peer = None
-        self.manager.transition.direction = "right"
-        self.manager.current = "chats"
+        self._navigate("chats", "right")
         self.refresh_sidebar()
 
     # =========================================================================
@@ -7801,37 +10230,43 @@ class FextApp(App):
         """Repaint the conversation list (name kept from v2 for continuity)."""
         if self.store is None:
             return
-        self.chats_screen.refresh_list(self.store.conversations())
+        self.chats_screen.refresh_list(
+            self.store.conversations(me=self.keys.address))
 
     def refresh_chat(self, peer: Optional[str]) -> None:
         """Repaint the open conversation from the local store.
 
         Only the most recent CHAT_PAGE_SIZE messages are materialised; older
-        ones are paged in on demand. Combined with the incremental renderer
-        this makes the cost of an arriving message independent of how long
-        the conversation is.
+        ones are paged in on demand. With the incremental renderer the cost
+        of an arriving message is independent of the conversation's length.
         """
         if peer is None or peer != self.current_peer or self.store is None:
             return
-        contact = self.store.get_contact(peer) or {}
+        kind = self.conversation_kind(peer)
+        contact = (self.store.get_contact(peer) or {}) if kind == "dm" else {}
+        group = self.store.group(gid_of(peer)) if kind == "group" else None
         unread = self.store.unread_for(peer)
-        self.conversation_screen.set_peer(peer, contact, len(unread))
-
+        self.conversation_screen.set_peer(peer, contact, len(unread), kind,
+                                          group)
         if self._chat_anchor is None:            # cold open: newest page
             messages = self.store.messages_for(peer, limit=CHAT_PAGE_SIZE)
             self._chat_anchor = messages[0]["id"] if messages else None
         else:                                    # anchored: list only grows
             messages = self.store.messages_for(peer,
                                                from_id=self._chat_anchor)
+        reactions = self.store.reactions_for(
+            peer, [m.get("client_msg_id") for m in messages])
+        for msg in messages:
+            msg["reactions"] = reactions.get(msg.get("client_msg_id"), [])
         self.conversation_screen.has_older = bool(
             self._chat_anchor is not None
             and self.store.has_messages_before(peer, self._chat_anchor))
-        self.conversation_screen.render(
-            messages, bool(contact.get("ticks_enabled", 1)),
-            self._mark_single_read, peer=peer)
+        ticks = bool(contact.get("ticks_enabled", 1)) if kind == "dm" \
+            else True
+        self.conversation_screen.render(messages, ticks,
+                                        self._mark_single_read, peer=peer)
         # Photos/voice notes that arrived while the background service was
-        # syncing were never downloaded (it has no screen to show them on);
-        # fetch them now that someone is looking.
+        # syncing were never downloaded; fetch them now someone is looking.
         for msg in messages:
             if msg["direction"] == "in" and msg.get("media_state") == "pending":
                 self.fetch_media(msg["id"])
@@ -7885,6 +10320,8 @@ class FextApp(App):
         if self.store is None or self.current_peer is None:
             return
         screen = self.conversation_screen
+        if screen.closed_note.parent is not None:
+            return
         body = sanitize_text(screen.entry.text)
         if not body:
             return
@@ -7914,22 +10351,40 @@ class FextApp(App):
                        media_state: str = "",
                        on_local_row: Optional[Callable] = None
                        ) -> Optional[int]:
-        """Record an outgoing message at 0/3 and send it in the background."""
+        """Record an outgoing message at 0/3 and send it in the background.
+
+        Notes to self are recorded and go nowhere. A group message records
+        one delivery row per member, then goes out to each of them.
+        """
         if self.store is None:
             return None
-        contact = self.store.get_contact(peer)
-        if contact is None:
-            self._set_status("Unknown contact", COL_DANGER)
-            return None
+        conv = self.conversation_kind(peer)
+        recipients = None
+        if conv == "dm":
+            contact = self.store.get_contact(peer)
+            if contact is None:
+                self._set_status("Unknown contact", COL_DANGER)
+                return None
+            label = contact.get("username")
+        elif conv == "group":
+            recipients = [a for a, _k in self.group_recipients(gid_of(peer))]
+            if not recipients:
+                self._set_status("You are no longer a member of this group",
+                                 COL_TICK_GOLD)
+                return None
+            label = (self.store.group(gid_of(peer)) or {}).get("name")
+        else:
+            label = "notes to self"
         client_msg_id = uuid.uuid4().hex
         # 0/3 immediately: the grey tick means "not yet on the server".
         local_id = self.store.add_out(peer, body, now_iso(), client_msg_id,
                                       kind=kind, ext=ext or None,
                                       media_path=media_path,
-                                      media_state=media_state)
+                                      media_state=media_state,
+                                      recipients=recipients)
         MessageFlowLog.tick(
             0, None, MessageFlowLog.who(self.keys.address, self.keys.username),
-            MessageFlowLog.who(peer, contact.get("username")),
+            label or MessageFlowLog.who(peer),
             f"[local id {local_id}, client_msg_id {client_msg_id[:8]}…]")
         if on_local_row is not None:
             on_local_row(local_id, client_msg_id)
@@ -7939,81 +10394,12 @@ class FextApp(App):
             self._dirty_list = True
         else:                         # media pipeline: repaint via the queue
             self.ui_queue.put(("message_stored", peer))
-        if media_state != "uploading":
+        if media_state != "uploading" and conv != "self":
             threading.Thread(
-                target=self._send_worker,
-                args=(local_id, peer, contact["public_key"], body,
-                      client_msg_id, x),
+                target=self._send_copies,
+                args=(local_id, peer, body, client_msg_id, x),
                 daemon=True).start()
         return local_id
-
-    def _send_worker(self, local_id: int, peer: str, peer_pub: str,
-                     body: str, client_msg_id: str,
-                     x: Optional[dict] = None) -> bool:
-        """SIGN → ENCRYPT → SEND, then record the server receipt (1/3).
-
-        Every failure here has to end at the UI. The previous version caught
-        three exception types and let everything else kill the thread — and
-        one of the things it let through, sqlite3.IntegrityError from
-        mark_sent, was reachable in ordinary use. When it fired the message
-        sat at 0/3 forever with no error anywhere, which is precisely the
-        class of silent failure this release exists to remove.
-        """
-        me = MessageFlowLog.who(self.keys.address, self.keys.username)
-        contact = self.store.get_contact(peer) or {}
-        them = MessageFlowLog.who(peer, contact.get("username"))
-        try:
-            envelope, _sent_at = self.crypto.build_envelope(
-                body, peer_pub, x=x, recipient=peer, cid=client_msg_id)
-        except Exception as exc:
-            log.exception("could not build envelope for %s", peer)
-            MessageFlowLog.failed(me, them, f"encryption failed: {exc}")
-            self.ui_queue.put(("status", f"Could not encrypt: {exc}",
-                               COL_DANGER))
-            return False
-
-        fragment = MessageFlowLog.fragment(envelope)
-        try:
-            result = self.api.send_message(peer, envelope, client_msg_id)
-        except (requests.RequestException, ApiClient.ApiError,
-                ValueError) as exc:
-            MessageFlowLog.failed(me, them, str(exc), fragment)
-            self.ui_queue.put(("status", f"Send failed: {exc}", COL_DANGER))
-            return False
-        except Exception as exc:                     # never lose the thread
-            log.exception("unexpected error sending to %s", peer)
-            MessageFlowLog.failed(me, them, f"unexpected: {exc}", fragment)
-            self.ui_queue.put(("status", f"Send failed: {exc}", COL_DANGER))
-            return False
-
-        if local_id is None:                         # a control: no row
-            return True
-        server_id = result.get("server_id")
-        if not self.store.mark_sent(local_id, server_id):
-            # The relay HAS the message; we merely failed to write that
-            # down. Say so rather than leaving a grey tick and no reason.
-            MessageFlowLog.failed(
-                me, them, f"relay accepted it as #{server_id} but the local "
-                          f"store could not record that", fragment)
-            self.ui_queue.put(
-                ("status", "Sent, but this device could not record it — "
-                 "the tick may be wrong", COL_DANGER))
-            return False
-        MessageFlowLog.tick(1, server_id, me, them, fragment)
-        self.ui_queue.put(("message_stored", peer))
-        return True
-
-    def _send_control(self, peer: str, op: dict, fallback: str) -> bool:
-        """Send a control message synchronously (call from a worker thread).
-
-        `fallback` is the body: what a pre-v9 client will display, since it
-        cannot act on the instruction. Returns True once the relay has it.
-        """
-        contact = self.store.get_contact(peer) if self.store else None
-        if contact is None:
-            return False
-        return self._send_worker(None, peer, contact["public_key"], fallback,
-                                 uuid.uuid4().hex, {"k": "ctl", "ctl": op})
 
     # =========================================================================
     #  Message actions (v9): star, delete, forward, share, copy
@@ -8047,6 +10433,10 @@ class FextApp(App):
                              "everyone", COL_TICK_GOLD)
             return
 
+        if self.conversation_kind(peer) == "self":
+            self._finish_delete_for_everyone(own, True)
+            return
+
         def work():
             ok = self._send_control(
                 peer, {"op": "delete",
@@ -8070,25 +10460,203 @@ class FextApp(App):
         """Send copies to other contacts of this identity. Photos and voice
         notes are forwarded by REFERENCE — the sealed blob already on the
         relay, with its key — so nothing is uploaded again."""
-        rows = self.store.messages_by_ids(local_ids)
+        rows = [r for r in self.store.messages_by_ids(local_ids)
+                if r.get("kind") != "event"]
         sent = 0
         for target in targets:
+            to_self = self.conversation_kind(target) == "self"
             for row in rows:
                 ext = json.loads(row.get("ext") or "{}")
                 media = ext.get("media")
-                if row["kind"] in ("image", "voice") and media and \
-                        media.get("blob"):
+                local = row.get("media_path") and Path(
+                    row["media_path"]).is_file()
+                if row["kind"] in ("image", "voice") and media and (
+                        media.get("blob") or to_self):
+                    # By REFERENCE: the sealed blob already on the relay.
                     self._queue_message(
                         target, row["body"],
                         {"k": "media", "media": media, "fwd": 1}, row["kind"],
                         {"media": media, "fwd": 1},
                         media_path=row.get("media_path"),
-                        media_state="ready" if row.get("media_path") else "")
+                        media_state="ready" if local or to_self else "")
+                elif row["kind"] in ("image", "voice") and media and local:
+                    # Kept only here (a note to self): upload it now.
+                    extra = {k: v for k, v in media.items()
+                             if k in ("w", "h", "thumb", "dur", "wave", "cap")}
+                    data = Path(row["media_path"]).read_bytes()
+                    threading.Thread(target=self._send_media, args=(
+                        target, row["kind"], data,
+                        media.get("mime", "application/octet-stream"), extra,
+                        row["body"], None,
+                        Path(row["media_path"]).suffix.lstrip(".") or "bin"),
+                        daemon=True).start()
                 else:
                     self.send_text(target, row["body"], forwarded=True)
                 sent += 1
         self.refresh_sidebar()
         return sent
+
+    # =========================================================================
+    #  Reactions (v9.1)
+    # =========================================================================
+    def react(self, local_id: int, emoji: str) -> None:
+        """React to a message, or take the reaction back: choosing the
+        reaction you already gave removes it. One per person per message.
+        Recorded here at once; the others hear about it in the background."""
+        row = self.store.message(local_id) if self.store else None
+        if not row or not row.get("client_msg_id") or \
+                row.get("kind") == "event":
+            return
+        peer, cid, me = row["peer"], row["client_msg_id"], self.keys.address
+        current = self.store.reaction_of(peer, cid, me)
+        emoji = "" if emoji == current else (sanitize_emoji(emoji) or "")
+        if not self.store.set_reaction(peer, cid, me, emoji):
+            return
+        self.ui_queue.put(("reaction", peer, cid, me, emoji))
+        self.refresh_chat(self.current_peer)
+        if self.conversation_kind(peer) == "self":
+            return
+        snip = single_line_text(message_text(row) or {
+            "image": "a photo", "voice": "a voice message"}.get(
+                row.get("kind"), "a message"), 40)
+        fallback = (f"Reacted {emoji} to \u201c{snip}\u201d" if emoji
+                    else "Removed a reaction")
+
+        def work():
+            if not self._send_control(peer, {"op": "react", "cid": cid,
+                                             "e": emoji}, fallback):
+                self.ui_queue.put(("status", "Couldn't send that reaction — "
+                                   "it shows here only", COL_TICK_GOLD))
+        threading.Thread(target=work, daemon=True).start()
+
+    # =========================================================================
+    #  Groups (v9.1)
+    # =========================================================================
+    def create_group(self, name: str, addresses: list) -> Optional[str]:
+        """Create a group of us + `addresses` (contacts), with us as admin,
+        and send each member the invitation. Returns the conversation key."""
+        name = sanitize_text(name)[:MAX_GROUP_NAME].strip()
+        members = [{"a": self.keys.address, "k": self.keys.public_key_hex,
+                    **({"u": self.keys.username} if self.keys.username
+                       else {})}]
+        for address in dict.fromkeys(addresses):
+            contact = self.store.get_contact(address)
+            if contact is None or address == self.keys.address:
+                continue
+            entry = {"a": address, "k": contact["public_key"]}
+            if contact.get("username"):
+                entry["u"] = contact["username"]
+            members.append(entry)
+        if not name or len(members) < 2 or len(members) > MAX_GROUP_MEMBERS:
+            return None
+        gid = os.urandom(16).hex()
+        state = {"id": gid, "name": name, "v": 1,
+                 "admin": self.keys.address, "members": members}
+        self.store.save_group(state, "active")
+        peer = group_peer(gid)
+        self.store.add_event(peer, f"You created \u201c{name}\u201d")
+        threading.Thread(target=self._announce_group, args=(
+            gid, (), f"{self.keys.username or 'Someone'} added you to the "
+                     f"group \u201c{name}\u201d", False), daemon=True).start()
+        self.refresh_sidebar()
+        return peer
+
+    def _announce_group(self, gid: str, also=(), fallback: str = "",
+                        bump: bool = True) -> None:
+        if not self._publish_group_state(gid, also, fallback, bump):
+            self.ui_queue.put(("status", "Not every member could be reached "
+                               "yet — they'll get the group when they "
+                               "next receive a message", COL_TICK_GOLD))
+        self.ui_queue.put(("message_stored", group_peer(gid)))
+
+    def rename_group(self, gid: str, name: str) -> bool:
+        group = self.store.group(gid)
+        name = sanitize_text(name)[:MAX_GROUP_NAME].strip()
+        if not group or group["admin"] != self.keys.address or not name \
+                or name == group["name"]:
+            return False
+        state = self._group_state(gid)
+        state["name"] = name
+        self.store.save_group(state, group["state"])
+        self.store.add_event(group_peer(gid), f"You renamed the group "
+                                              f"\u201c{name}\u201d")
+        threading.Thread(target=self._announce_group, args=(gid,),
+                         daemon=True).start()
+        self.refresh_chat(self.current_peer)
+        self.refresh_sidebar()
+        return True
+
+    def add_group_members(self, gid: str, addresses: list) -> int:
+        group = self.store.group(gid)
+        if not group or group["admin"] != self.keys.address:
+            return 0
+        state = self._group_state(gid)
+        have = {m["a"] for m in state["members"]}
+        added = []
+        for address in addresses:
+            contact = self.store.get_contact(address)
+            if contact is None or address in have or \
+                    len(state["members"]) >= MAX_GROUP_MEMBERS:
+                continue
+            entry = {"a": address, "k": contact["public_key"]}
+            if contact.get("username"):
+                entry["u"] = contact["username"]
+            state["members"].append(entry)
+            added.append(contact.get("username") or short_addr(address, 10))
+        if not added:
+            return 0
+        self.store.save_group(state, group["state"])
+        self.store.add_event(group_peer(gid), "You added " + ", ".join(added))
+        threading.Thread(target=self._announce_group, args=(gid,),
+                         daemon=True).start()
+        self.refresh_chat(self.current_peer)
+        return len(added)
+
+    def remove_group_member(self, gid: str, address: str) -> bool:
+        group = self.store.group(gid)
+        if not group or group["admin"] != self.keys.address or \
+                address == self.keys.address:
+            return False
+        gone = [m for m in group["members"] if m["a"] == address]
+        if not gone:
+            return False
+        state = self._group_state(gid)
+        state["members"] = [m for m in state["members"] if m["a"] != address]
+        if len(state["members"]) < 2:
+            return False
+        self.store.save_group(state, group["state"])
+        self.store.add_event(group_peer(gid), "You removed " + (
+            gone[0].get("u") or short_addr(address, 10)))
+        threading.Thread(target=self._announce_group, args=(
+            gid, [(address, gone[0]["k"])]), daemon=True).start()
+        self.refresh_chat(self.current_peer)
+        return True
+
+    def leave_group(self, gid: str) -> None:
+        """Tell every member, then keep the history read-only here."""
+        group = self.store.group(gid)
+        if not group or group["state"] != "active":
+            return
+        recipients = self.group_recipients(gid)
+        self.store.set_group_state(gid, "left")
+        self.store.add_event(group_peer(gid), "You left the group")
+
+        def work():
+            for address, pub in recipients:
+                self._send_control_to(address, {"op": "leave", "grp": gid},
+                                      f"{self.keys.username or 'A member'} "
+                                      f"left \u201c{group['name']}\u201d",
+                                      pub=pub)
+            self.ui_queue.put(("message_stored", group_peer(gid)))
+        threading.Thread(target=work, daemon=True).start()
+        self.refresh_chat(self.current_peer)
+        self.refresh_sidebar()
+
+    def set_group_notify(self, gid: str, on: bool) -> None:
+        self.store.set_group_notify(gid, on)
+        if not on and IS_ANDROID:
+            android_clear_notification(group_peer(gid))
+        self.refresh_chat(self.current_peer)
 
     def copy_text(self, text: str) -> None:
         Clipboard.copy(text)
@@ -8166,8 +10734,12 @@ class FextApp(App):
     def _send_media(self, peer, kind, data, mime, extra, body, reply,
                     suffix) -> None:
         """Worker thread: keep a local copy, seal, upload, then send the
-        reference. The bubble appears at once, marked 'uploading'."""
-        if not (self.api is not None and self.api.features().get("blobs")):
+        reference. The bubble appears at once, marked 'uploading'. A note to
+        self keeps the file here and uploads nothing; a group's members all
+        share one upload."""
+        to_self = self.conversation_kind(peer) == "self"
+        if not to_self and not (self.api is not None and
+                                self.api.features().get("blobs")):
             self.ui_queue.put((
                 "status", "This relay can't carry photos or voice notes "
                 "yet — it needs the v9 relay", COL_TICK_GOLD))
@@ -8191,10 +10763,10 @@ class FextApp(App):
         rows = {}
         self._queue_message(
             peer, body, {}, kind, ext, media_path=str(local_path),
-            media_state="uploading",
+            media_state="ready" if to_self else "uploading",
             on_local_row=lambda lid, cid: rows.update(id=lid, cid=cid))
         local_id, cid = rows.get("id"), rows.get("cid")
-        if local_id is None:
+        if local_id is None or to_self:
             return
         try:
             blob, key, sha = seal_media(data)
@@ -8212,10 +10784,7 @@ class FextApp(App):
         media = dict(media, blob=blob_id, key=key, sha=sha)
         ext["media"] = media
         self.store.set_media(local_id, state="ready", ext=ext)
-        contact = self.store.get_contact(peer) or {}
-        x = dict(ext, k="media")
-        self._send_worker(local_id, peer, contact.get("public_key", ""),
-                          body, cid, x)
+        self._send_copies(local_id, peer, body, cid, dict(ext, k="media"))
         self.ui_queue.put(("message_stored", peer))
 
     def retry_media(self, local_id: int) -> None:
@@ -8291,41 +10860,20 @@ class FextApp(App):
         what = "voice message" if row["kind"] == "voice" else "photo"
         self.store.set_media(local_id, state="requested")
         self.refresh_chat(self.current_peer)
+        gid = gid_of(peer)
 
         def work():
-            ok = self._send_control(
-                peer, {"op": "resend", "cid": row["client_msg_id"]},
-                f"Please send that {what} again")
+            op = {"op": "resend", "cid": row["client_msg_id"]}
+            if gid:
+                op["grp"] = gid
+                ok = self._send_control_to(row.get("author") or "", op,
+                                           f"Please send that {what} again")
+            else:
+                ok = self._send_control(peer, op,
+                                        f"Please send that {what} again")
             if not ok:
                 self.store.set_media(local_id, state="expired")
                 self.ui_queue.put(("message_stored", peer))
-        threading.Thread(target=work, daemon=True).start()
-
-    def _on_resend_request(self, peer: str, cid: str) -> None:
-        """They asked for a file the relay no longer has: upload our copy
-        again and point their existing message at it (no duplicate)."""
-        row = self.store.message_by_cid(peer, cid, "out")
-        if not row or not row.get("media_path") or \
-                not Path(row["media_path"]).is_file():
-            log.info("resend requested for %s but no local copy remains", cid)
-            return
-        ext = json.loads(row.get("ext") or "{}")
-
-        def work():
-            try:
-                data = Path(row["media_path"]).read_bytes()
-                blob, key, sha = seal_media(data)
-                blob_id = self.api.upload_blob(blob).get("blob", "")
-            except (OSError, requests.RequestException,
-                    ApiClient.ApiError) as exc:
-                log.warning("re-upload for %s failed: %s", cid, exc)
-                return
-            media = dict(ext.get("media") or {}, blob=blob_id, key=key,
-                         sha=sha)
-            ext["media"] = media
-            self.store.set_media(row["id"], ext=ext)
-            self._send_control(peer, {"op": "remedia", "cid": cid,
-                                      "media": media}, row["body"])
         threading.Thread(target=work, daemon=True).start()
 
     # =========================================================================
@@ -8349,19 +10897,25 @@ class FextApp(App):
                 elif kind == "message_stored":
                     peer = event[1]
                     if peer == self.current_peer and self.store is not None:
-                        contact = self.store.get_contact(peer) or {}
-                        if contact.get("auto_read", 1) and self.foreground:
+                        if self._auto_read(peer) and self.foreground and \
+                                self.manager.current == "conversation":
                             self.mark_peer_read(peer, refresh=False)
                         self._dirty_chat = True
                     self._dirty_list = True
                 elif kind == "incoming":
-                    self._notify_incoming(event[1], event[2], event[3])
+                    self._notify_incoming(*event[1:5])
                 elif kind == "media_pending" and self.store is not None:
                     row = self.store.message_by_cid(event[1], event[2], "in")
                     if row is not None:
                         self.fetch_media(row["id"])
                 elif kind == "resend_request" and self.store is not None:
-                    self._on_resend_request(event[1], event[2])
+                    self._on_resend_request(*event[1:4])
+                elif kind == "reaction":
+                    if event[1] == self.current_peer:
+                        self.conversation_screen.note_reaction(*event[2:5])
+                elif kind == "group_publish" and self.store is not None:
+                    threading.Thread(target=self._announce_group,
+                                     args=(event[1],), daemon=True).start()
         except queue.Empty:
             pass
         if self._dirty_chat:
@@ -8374,7 +10928,8 @@ class FextApp(App):
     # =========================================================================
     #  Notifications
     # =========================================================================
-    def _notify_incoming(self, peer: str, body: str, kind: str) -> None:
+    def _notify_incoming(self, peer: str, body: str, kind: str,
+                         author: Optional[str] = None) -> None:
         """Raise a notification for a new message — unless the user is
         looking at that very chat, or has muted it."""
         if self.store is None:
@@ -8382,12 +10937,10 @@ class FextApp(App):
         if (self.foreground and peer == self.current_peer
                 and self.manager.current == "conversation"):
             return
-        contact = self.store.get_contact(peer) or {}
-        if not contact.get("notify", 1):
+        name, preview, muted = notification_text(self.store, peer, body,
+                                                 kind, author)
+        if muted:
             return
-        name = contact.get("username") or short_addr(peer, 12)
-        preview = body if kind == "text" else (
-            "Photo" if kind == "image" else body)
         if IS_ANDROID:
             try:
                 android_notify(peer, name, preview[:160])
@@ -8437,7 +10990,7 @@ class FextApp(App):
             run_on_ui(self._open_from_notification, str(peer))
 
     def _open_from_notification(self, peer: str) -> None:
-        if self.store is not None and self.store.get_contact(peer):
+        if self._known_conversation(peer):
             self.open_conversation(peer)
 
     def _launch_peer(self) -> Optional[str]:
@@ -8515,10 +11068,13 @@ class FextApp(App):
                 self.manager.current == "conversation":
             if IS_ANDROID:
                 android_clear_notification(peer)
-            if (self.store.get_contact(peer) or {}).get("auto_read", 1):
+            if self._auto_read(peer):
                 self.mark_peer_read(peer)
+        android_style_system_bars()
+        self._watch_system_theme(0)
 
-    def _set_status(self, text: str, color: str = COL_TEXT_DIM) -> None:
+    def _set_status(self, text: str, color: Optional[str] = None) -> None:
+        color = retint(color) if color else T.text_3
         self._pending_status = (text, color)
         self.chats_screen.set_status(text, color)
 
@@ -8533,19 +11089,88 @@ class FextApp(App):
 
     def open_contact_settings(self) -> None:
         if self.current_peer is not None:
-            ContactSettingsModal(self, self.current_peer).open()
+            ChatHistorySheet(self, self.current_peer).open()
 
     def open_chat_info(self) -> None:
-        if self.current_peer is None or self.store is None:
+        peer = self.current_peer
+        if peer is None or self.store is None:
             return
-        self.chat_info_screen.show(self.current_peer)
-        self.manager.transition.direction = "left"
-        self.manager.current = "info"
+        if self.conversation_kind(peer) == "group":
+            self.group_info_screen.show(gid_of(peer))
+            self._navigate("group_info", "left")
+        else:
+            self.chat_info_screen.show(peer)
+            self._navigate("info", "left")
 
     def close_chat_info(self) -> None:
-        self.manager.transition.direction = "right"
-        self.manager.current = "conversation"
+        self._navigate("conversation", "right")
         self.refresh_chat(self.current_peer)
+
+    def open_settings(self) -> None:
+        self._settings_from = self.manager.current
+        self.settings_screen.show()
+        self._navigate("settings", "left")
+
+    def close_settings(self) -> None:
+        back = getattr(self, "_settings_from", "chats")
+        if back not in self.manager.screen_names or back == "settings":
+            back = "chats"
+        self._navigate(back, "right")
+        if back == "chats":
+            self.refresh_sidebar()
+            self.chats_screen.refresh_header()
+
+    def open_compose(self) -> None:
+        if self.store is not None and self.keys.username:
+            ComposeSheet(self).open()
+        else:
+            self._set_status("Register this identity first", T.accent)
+
+    def open_new_group(self) -> None:
+        if self.store is None or not self.keys.username:
+            self._set_status("Register this identity first", T.accent)
+            return
+        self.new_group_screen.show()
+        self._navigate("new_group", "left")
+
+    def confirm_leave_group(self, gid: str) -> None:
+        group = self.store.group(gid) if self.store else None
+        if not group:
+            return
+        sheet = Sheet(f"Leave “{group['name']}”?")
+        sheet.add(hint("The others are told you left. Your copy of the "
+                       "history stays on this device, read-only; only the "
+                       "admin can add you back."))
+
+        def leave(_w):
+            sheet.dismiss()
+            self.leave_group(gid)
+            if self.manager.current == "group_info":
+                self.group_info_screen.show(gid)
+        sheet.add(button_row(Btn("Stay", kind="quiet",
+                                 on_release=lambda _w: sheet.dismiss()),
+                             Btn("Leave", kind="solid_danger",
+                                 on_release=leave)))
+        sheet.open()
+
+    def list_contact(self, address: str) -> None:
+        """Put someone known only from a group into the chat list."""
+        if self.store is None:
+            return
+        contact = self.store.get_contact(address)
+        if contact is None:
+            peer = self.current_peer or ""
+            group = self.store.group(gid_of(peer)) if gid_of(peer) else None
+            member = next((m for m in (group or {}).get("members", [])
+                           if m["a"] == address), None)
+            if member is None:
+                return
+            self.store.upsert_contact(address, member.get("u"), member["k"])
+        else:
+            self.store.upsert_contact(address, contact.get("username"),
+                                      contact["public_key"], listed=True)
+        self.refresh_sidebar()
+        self.open_conversation(address)
 
     # ---- per-chat switches (chat info and the ⋮ menu) ------------------------
     def set_notify(self, peer: str, on: bool) -> None:
@@ -8584,18 +11209,13 @@ class FextApp(App):
 # =============================================================================
 #  Background sync service (Android) — runs in its own process
 # =============================================================================
-class HeadlessApp:
+class HeadlessApp(MessagingMixin):
     """Everything SyncWorker and the media/send helpers need from an app,
-    with no UI: the background service's stand-in for FextApp."""
+    with no UI: the background service's stand-in for FextApp. Its send
+    paths are MessagingMixin's — the very same code the app runs."""
 
     foreground = False
     current_peer = None
-
-    # The very same code paths the app uses, not copies of them: sending a
-    # control, and answering a 'resend' request by uploading the file again.
-    _send_worker = FextApp._send_worker
-    _send_control = FextApp._send_control
-    _on_resend_request = FextApp._on_resend_request
 
     def __init__(self, keys: "IdentityManager") -> None:
         self.keys = keys
@@ -8608,20 +11228,40 @@ class HeadlessApp:
         self.store.close()
 
 
+def notification_text(store: "LocalStore", peer: str, body: str, kind: str,
+                      author: Optional[str] = None) -> tuple:
+    """(title, text, muted) for a new message. A group's notification is
+    titled with the group and names who wrote."""
+    preview = "Photo" if kind == "image" else body
+    gid = gid_of(peer)
+    if gid:
+        group = store.group(gid) or {}
+        who = (store.get_contact(author or "") or {}).get("username") or \
+            short_addr(author or "", 10)
+        return (group.get("name") or "Group", f"{who}: {preview}",
+                not group.get("notify", 1))
+    contact = store.get_contact(peer) or {}
+    return (contact.get("username") or short_addr(peer, 12), preview,
+            not contact.get("notify", 1))
+
+
 def _service_handle(app: HeadlessApp, event: tuple) -> None:
     kind = event[0]
     if kind == "incoming":
         peer, body, msg_kind = event[1], event[2], event[3]
-        contact = app.store.get_contact(peer) or {}
-        if contact.get("notify", 1):
-            name = contact.get("username") or short_addr(peer, 12)
-            text = "Photo" if msg_kind == "image" else body
+        name, text, muted = notification_text(app.store, peer, body, msg_kind,
+                                              event[4] if len(event) > 4
+                                              else None)
+        if not muted:
             try:
                 android_notify(peer, name, text[:160])
             except Exception:
                 log.exception("service: notification failed")
     elif kind == "resend_request":
-        app._on_resend_request(event[1], event[2])
+        app._on_resend_request(*event[1:4])
+    elif kind == "group_publish":
+        threading.Thread(target=app._publish_group_state, args=(event[1],),
+                         daemon=True).start()
     # Everything else (status lines, repaint hints, media downloads) is for
     # a screen; the app catches up from the database when it next opens.
 
