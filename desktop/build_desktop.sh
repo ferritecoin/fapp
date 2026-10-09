@@ -33,6 +33,14 @@ fi
 MODE=(--standalone)
 [ "${ONEFILE:-0}" = "1" ] && MODE=(--onefile)
 
+# The Ferritext mark on the executable itself (Explorer, a pinned taskbar
+# button, the Dock); the running window sets its own from data/ as well.
+ICON=()
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) ICON=(--windows-icon-from-ico="$ROOT/data/icon_desktop.ico") ;;
+  Darwin)               ICON=(--macos-app-icon="$ROOT/data/icon_desktop.png") ;;
+esac
+
 exec "$PY" -m nuitka \
   "${MODE[@]}" \
   --enable-plugin=kivy \
@@ -42,10 +50,11 @@ exec "$PY" -m nuitka \
   `# builds fine and then cannot open a secure connection at runtime.` \
   --include-package-data=certifi \
   \
-  `# The Ferritext mark, loaded by the in-app loading screen from` \
-  `# ASSET_DIR (main.py resolves it next to __file__). Nuitka cannot see` \
-  `# a path built at runtime, so the folder has to be named explicitly.` \
+  `# The fonts (the serif carries the emoji), the mark and the window icons,` \
+  `# which main.py finds in data/ next to __file__. Nuitka cannot see a path` \
+  `# built at runtime, so the folder has to be named explicitly.` \
   --include-data-dir="$ROOT/data=data" \
+  ${ICON[@]+"${ICON[@]}"} \
   \
   `# qrcode picks its image backend by dynamic import at call time, so` \
   `# Nuitka cannot see it from static analysis. The Settings screen renders` \
@@ -65,9 +74,9 @@ exec "$PY" -m nuitka \
   --output-dir="$OUT" \
   --output-filename="$NAME" \
   --company-name=FEXT \
-  --product-name="FEXT Messenger" \
+  --product-name="Ferritext" \
   --product-version="$VER" \
-  --file-description="FEXT end-to-end encrypted messenger" \
+  --file-description="Ferritext end-to-end encrypted messenger" \
   --assume-yes-for-downloads \
   --remove-output \
   "$SRC"

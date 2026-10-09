@@ -112,7 +112,7 @@ os.utime(M2._beat_path("app"))
 (M2._beat_path("app")).write_text("1")
 check("a stale heartbeat means gone", not M2.heartbeat_fresh("app"))
 
-print("\nAndroid 14 manifest hook")
+print("\nManifest hook: service type (Android 14), camera FileProvider")
 hook_spec = importlib.util.spec_from_file_location(
     "p4a_hook", ROOT / "tools" / "p4a_hook.py")
 hook = importlib.util.module_from_spec(hook_spec)
@@ -140,6 +140,20 @@ check("declares foregroundServiceType on OUR service only",
       once.count('foregroundServiceType="dataSync"') == 1 and
       'ServiceFextsync" android:foregroundServiceType' in once)
 check("running the hook twice changes nothing", once == twice)
+inside = once[once.index("<application>"):once.index("</application>")]
+check("declares the camera's FileProvider once, inside <application>",
+      once.count("androidx.core.content.FileProvider") == 1 and
+      "androidx.core.content.FileProvider" in inside and
+      'android:authorities="${applicationId}.fileprovider"' in inside and
+      'android:exported="false"' in inside and
+      'android:resource="@xml/fext_file_paths"' in inside)
+paths = (ROOT / "src" / "android" / "res" / "xml" /
+         "fext_file_paths.xml").read_text()
+spec_text = (ROOT / "buildozer.spec").read_text()
+check("...whose one folder ships, with the class it names",
+      '<cache-path name="camera" path="camera/" />' in paths and
+      "xml/fext_file_paths.xml" in spec_text and
+      "androidx.core:core:" in spec_text)
 manifest.write_text("<manifest><application></application></manifest>")
 os.chdir(work)
 try:

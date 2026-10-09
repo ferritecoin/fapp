@@ -119,6 +119,29 @@ flow_log = logging.getLogger("fext.flow")
 # ---- Kivy (import AFTER env hints; window is created on import) -------------
 os.environ.setdefault("KIVY_NO_ARGS", "1")     # our argv is not kivy's argv
 
+from kivy.config import Config                 # noqa: E402
+from kivy.utils import platform as kivy_platform  # noqa: E402
+
+if kivy_platform not in ("android", "ios"):
+    # A right-click must not leave Kivy's multitouch-emulation marker behind
+    # (a red dot that stays on screen until clicked again); and edges are
+    # smoothed by the GPU where it can (4 samples is Kivy's maximum) —
+    # unless the environment sets either (KCFG_INPUT_MOUSE,
+    # KCFG_GRAPHICS_MULTISAMPLES).
+    if "KCFG_INPUT_MOUSE" not in os.environ:
+        Config.set("input", "mouse", "mouse,disable_multitouch")
+    if "KCFG_GRAPHICS_MULTISAMPLES" not in os.environ:
+        Config.set("graphics", "multisamples", "4")
+    if platform.system() == "Windows":
+        # Its own taskbar entry, with its own icon, rather than Python's —
+        # this has to happen before the first window appears.
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "Ferritext.Messenger")
+        except Exception:
+            pass
+
 from kivy.animation import Animation
 from kivy.app import App
 from kivy.clock import Clock
@@ -126,8 +149,10 @@ from kivy.core.clipboard import Clipboard
 from kivy.core.image import Image as CoreImage
 from kivy.core.text import Label as CoreLabel, LabelBase
 from kivy.core.window import Window
-from kivy.graphics import Color, Ellipse, Line, Mesh, PopMatrix, \
-    PushMatrix, Rectangle, RoundedRectangle, Scale, Triangle
+from kivy.graphics import ClearBuffers, ClearColor, Color, Ellipse, Fbo, \
+    Line, Mesh, PopMatrix, PushMatrix, Rectangle, RoundedRectangle, Scale, \
+    SmoothEllipse, SmoothLine, SmoothRoundedRectangle, Triangle
+from kivy.graphics.texture import Texture
 from kivy.metrics import dp, sp
 from kivy.properties import NumericProperty
 from kivy.uix.anchorlayout import AnchorLayout
@@ -145,7 +170,6 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 from kivy.utils import get_color_from_hex
-from kivy.utils import platform as kivy_platform
 
 # =============================================================================
 #  FEXT crypto core — Bitcoin-compatible secp256k1 + Base58Check (pure Python)
@@ -852,17 +876,12 @@ REQUIRE_TLS = _os.environ.get("FEXT_REQUIRE_TLS", "") not in ("", "0", "false")
 
 APP_NAME = "Ferritext"
 #: Must equal `version` in buildozer.spec — CI refuses to build if not.
-APP_VERSION = "9.1.0"
+APP_VERSION = "9.1.1"
 
 # The identity/QR payload keeps carrying the ORIGINAL tag. It is wire data
 # that older clients already produce and consume, so renaming the app must
 # not rename it — the brand changed, the protocol did not.
 WIRE_APP_TAG = "FEXT"
-
-# Bundled artwork. Absent on a stripped-down checkout, so every use is
-# guarded: the loading screen simply drops the mark rather than failing.
-ASSET_DIR = Path(__file__).resolve().parent / "data"
-LOGO_FILE = ASSET_DIR / "ferritext_logo.png"
 
 IS_ANDROID = kivy_platform == "android"
 IS_IOS = kivy_platform == "ios"
@@ -885,6 +904,78 @@ def _resolve_data_dir() -> Path:
 
 
 DATA_DIR = _resolve_data_dir()             # keys + local DBs live ONLY here
+
+# ---- bundled type and artwork --------------------------------------------------
+# In the source tree and the APK they sit in data/ beside this file. The
+# single-file desktop release carries them inside itself instead, as comment
+# lines after the code (tools/bundle_desktop.py writes them): a manifest
+# line, then base64 of one xz stream. They are unpacked once, into
+# DATA_DIR/assets/<digest>, and every file is checked against its SHA-256
+# on each start. Absent altogether (a stripped-down checkout), every use is
+# guarded: Kivy's own font stands in, the loading screen drops the mark.
+_BUNDLE_MARK = "# FERRITEXT-ASSETS "
+
+
+def _file_matches(path: Path, size: int, sha: str) -> bool:
+    try:
+        return path.stat().st_size == size and \
+            hashlib.sha256(path.read_bytes()).hexdigest() == sha
+    except OSError:
+        return False
+
+
+def _unpack_bundled_assets(source: Path) -> Optional[Path]:
+    import lzma
+    try:
+        text = source.read_text("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    at = text.rfind("\n" + _BUNDLE_MARK)
+    if at < 0:
+        return None
+    lines = text[at + 1:].splitlines()
+    try:
+        manifest = json.loads(lines[0][len(_BUNDLE_MARK):])
+        files = [(str(rel), int(size), str(sha))
+                 for rel, size, sha in manifest["files"]]
+        target = DATA_DIR / "assets" / re.sub(r"[^0-9a-f]", "",
+                                              manifest["digest"])[:16]
+        for rel, _size, _sha in files:
+            if rel.startswith(("/", "\\")) or ".." in Path(rel).parts:
+                raise ValueError(f"unsafe path {rel!r}")
+        if all(_file_matches(target / rel, size, sha)
+               for rel, size, sha in files):
+            return target
+        data = lzma.decompress(base64.b64decode("".join(
+            line[2:] for line in lines[1:] if line.startswith("# "))))
+        pos = 0
+        for rel, size, sha in files:
+            chunk, pos = data[pos:pos + size], pos + size
+            if len(chunk) != size or hashlib.sha256(chunk).hexdigest() != sha:
+                raise ValueError(f"{rel} does not match its checksum")
+            path = target / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            part = path.with_name(path.name + ".part")
+            part.write_bytes(chunk)
+            os.replace(part, path)
+        log.info("unpacked the bundled fonts and icons into %s", target)
+        return target
+    except Exception:
+        log.exception("could not unpack the bundled fonts and icons")
+        return None
+
+
+def _resolve_asset_dir() -> Path:
+    here = Path(__file__).resolve().parent / "data"
+    if (here / "fonts").is_dir():
+        return here
+    return _unpack_bundled_assets(Path(__file__).resolve()) or here
+
+
+ASSET_DIR = _resolve_asset_dir()
+LOGO_FILE = ASSET_DIR / "ferritext_logo.png"
+DESKTOP_ICON = ASSET_DIR / "icon_desktop.png"      # title bar, taskbar, dock
+DESKTOP_ICO = ASSET_DIR / "icon_desktop.ico"       # Windows' own sizes
 IDENTITIES_PATH = DATA_DIR / "identities.json"
 EXPORT_DIR = DATA_DIR / "exports"          # plaintext chat exports live here
 
@@ -1478,6 +1569,18 @@ def open_media(blob: bytes, key_b64: str, sha_hex: str) -> bytes:
         raise ValueError("media could not be decrypted")
 
 
+def media_suffix(kind: str, mime: Optional[str]) -> str:
+    """The file extension a received photo or voice note is saved under —
+    by its type, so a desktop opens it with the right program."""
+    if kind == "image":
+        return "jpg"
+    if kind == "voice":
+        return {"audio/wav": "wav", "audio/ogg": "ogg", "audio/aac": "aac",
+                "audio/3gpp": "3gp", "audio/amr": "amr"}.get(mime or "",
+                                                              "m4a")
+    return "bin"
+
+
 def discard_media_file(path: Optional[str]) -> None:
     """Delete a decrypted media file — but only one inside MEDIA_DIR, so a
     corrupted database row can never point this at anything else."""
@@ -1620,6 +1723,7 @@ def run_on_ui(fn: Callable, *args) -> None:
 # and turns it into a status line. None of it may take the app down.
 
 REQ_PICK_IMAGE = 4711
+REQ_TAKE_PHOTO = 4712
 NOTIFY_CHANNEL = "messages"
 
 
@@ -1799,6 +1903,62 @@ def android_pick_image(callback: Callable[[str], None]) -> None:
         REQ_PICK_IMAGE)
 
 
+def android_take_photo(callback: Callable[[str], None]) -> None:
+    """Open the camera app; `callback(path)` gets the photo it took.
+
+    The camera writes the picture through a FileProvider grant straight
+    into this app's private cache — never the gallery, never storage another
+    app can read — and it is moved into the media folder from there. The
+    provider is declared by tools/p4a_hook.py. Asking for no CAMERA
+    permission is deliberate: the camera app holds its own, and an app that
+    declares it without being granted it may not use this intent at all.
+    """
+    autoclass, cast = _jni()
+    from android import activity
+    ctx = android_context()
+    File = autoclass("java.io.File")
+    folder = File(ctx.getCacheDir(), "camera")
+    folder.mkdirs()
+    shot = File(folder, f"shot_{uuid.uuid4().hex}.jpg")
+    path = shot.getAbsolutePath()
+    uri = autoclass("androidx.core.content.FileProvider").getUriForFile(
+        ctx, ctx.getPackageName() + ".fileprovider", shot)
+
+    def on_result(request, result, _data):
+        if request != REQ_TAKE_PHOTO:
+            return
+        activity.unbind(on_activity_result=on_result)
+        try:
+            if result != -1 or not os.path.getsize(path):    # -1: RESULT_OK
+                raise OSError("no photo")
+            MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+            target = MEDIA_DIR / f"shot_{uuid.uuid4().hex}.jpg"
+            shutil.move(path, target)
+        except OSError:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return
+        run_on_ui(callback, str(target))
+
+    activity.bind(on_activity_result=on_result)
+    Intent = autoclass("android.content.Intent")
+    MediaStore = autoclass("android.provider.MediaStore")
+    intent = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
+    intent.putExtra(MediaStore.EXTRA_OUTPUT, cast("android.os.Parcelable", uri))
+    # Camera apps differ in where they look for the grant; give it both ways.
+    intent.setClipData(autoclass("android.content.ClipData").newRawUri(
+        _charseq("photo"), uri))
+    intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION |
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    try:
+        ctx.startActivityForResult(intent, REQ_TAKE_PHOTO)
+    except Exception:
+        activity.unbind(on_activity_result=on_result)
+        raise
+
+
 # ---- background delivery (Android) ------------------------------------------
 # Notifications only reach someone if something is listening for messages.
 # While the app's process is alive, its own SyncWorker does that. Android
@@ -1890,6 +2050,32 @@ def android_style_system_bars() -> None:
     apply()
 
 
+def windows_window_icons(ico_path: str) -> None:
+    """Hand Windows the .ico's own small and large frames for the title bar,
+    taskbar and Alt-Tab, at the sizes it asks for — rather than letting it
+    shrink one picture to 16 pixels itself."""
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        user32.LoadImageW.restype = ctypes.c_void_p
+        user32.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                                      ctypes.c_uint, ctypes.c_int,
+                                      ctypes.c_int, ctypes.c_uint]
+        user32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                        ctypes.c_size_t, ctypes.c_size_t]
+        hwnd = Window.get_window_info().window
+        for which, w_metric, h_metric in ((0, 49, 50), (1, 11, 12)):
+            # ICON_SMALL: SM_CXSMICON/SM_CYSMICON; ICON_BIG: SM_CXICON/...
+            icon = user32.LoadImageW(None, ico_path, 1,             # ICON
+                                     user32.GetSystemMetrics(w_metric),
+                                     user32.GetSystemMetrics(h_metric),
+                                     0x10)                  # LOADFROMFILE
+            if icon:
+                user32.SendMessageW(hwnd, 0x80, which, icon)  # WM_SETICON
+    except Exception:
+        log.exception("could not set the window's icons")
+
+
 def android_service(start: bool) -> None:
     """Start or stop the background sync service (Android only)."""
     autoclass, _ = _jni()
@@ -1958,6 +2144,324 @@ class VoiceRecorder:
         duration = self.elapsed_ms
         self._halt()
         return self.path, duration, waveform_b64(self.levels)
+
+    def cancel(self) -> None:
+        try:
+            self._halt()
+        except Exception:
+            pass
+        discard_media_file(self.path)
+
+
+# ---- voice notes on a computer -----------------------------------------------
+# A computer records plain 16 kHz mono PCM and keeps it as WAV: no encoder is
+# needed, and Android and every desktop player open it. It is ten times the
+# size of a phone's AAC, so a computer's notes are capped at four minutes,
+# which keeps them under the media limit.
+PCM_RATE = 16000
+PCM_BYTES_PER_SECOND = PCM_RATE * 2
+MAX_PCM_SECONDS = min(MAX_VOICE_SECONDS, 240)
+_PCM_CHUNK = PCM_BYTES_PER_SECOND // 10            # 100 ms
+
+
+class _SoundDeviceCapture:
+    """The `sounddevice` package (PortAudio), wherever it is installed."""
+
+    name = "sounddevice"
+
+    def __init__(self, feed: Callable[[bytes], None]) -> None:
+        import sounddevice                                 # type: ignore
+        self.failed = False
+
+        def callback(indata, _frames, _time, _status):
+            feed(bytes(indata))
+        self._stream = sounddevice.RawInputStream(
+            samplerate=PCM_RATE, channels=1, dtype="int16",
+            blocksize=_PCM_CHUNK // 2, callback=callback)
+        self._stream.start()
+
+    def stop(self) -> None:
+        try:
+            self._stream.stop()
+        finally:
+            self._stream.close()
+
+
+class _WinMMCapture:
+    """Windows' own wave-in API (winmm.dll), through ctypes: present on
+    every Windows machine, so recording needs nothing installed.
+
+    Eight 100 ms buffers are queued with the driver; a thread hands each
+    one over as it fills (WHDR_DONE) and queues it again.
+    """
+
+    name = "winmm"
+    WHDR_DONE = 0x00000001
+    WAVE_MAPPER = 0xFFFFFFFF
+
+    def __init__(self, feed: Callable[[bytes], None]) -> None:
+        import ctypes
+        from ctypes import wintypes
+        self._ct, self.failed = ctypes, False
+        self._feed = feed
+
+        class WAVEFORMATEX(ctypes.Structure):
+            _fields_ = [("wFormatTag", wintypes.WORD),
+                        ("nChannels", wintypes.WORD),
+                        ("nSamplesPerSec", wintypes.DWORD),
+                        ("nAvgBytesPerSec", wintypes.DWORD),
+                        ("nBlockAlign", wintypes.WORD),
+                        ("wBitsPerSample", wintypes.WORD),
+                        ("cbSize", wintypes.WORD)]
+
+        class WAVEHDR(ctypes.Structure):
+            pass
+        WAVEHDR._fields_ = [("lpData", ctypes.c_void_p),
+                            ("dwBufferLength", wintypes.DWORD),
+                            ("dwBytesRecorded", wintypes.DWORD),
+                            ("dwUser", ctypes.c_size_t),
+                            ("dwFlags", wintypes.DWORD),
+                            ("dwLoops", wintypes.DWORD),
+                            ("lpNext", ctypes.POINTER(WAVEHDR)),
+                            ("reserved", ctypes.c_size_t)]
+        self._hdr_size = ctypes.sizeof(WAVEHDR)
+        mm = ctypes.WinDLL("winmm")
+        handle_p = ctypes.POINTER(ctypes.c_void_p)
+        hdr_p = ctypes.POINTER(WAVEHDR)
+        mm.waveInOpen.argtypes = [handle_p, wintypes.UINT,
+                                  ctypes.POINTER(WAVEFORMATEX),
+                                  ctypes.c_size_t, ctypes.c_size_t,
+                                  wintypes.DWORD]
+        for fn in ("waveInPrepareHeader", "waveInAddBuffer",
+                   "waveInUnprepareHeader"):
+            getattr(mm, fn).argtypes = [ctypes.c_void_p, hdr_p, wintypes.UINT]
+        for fn in ("waveInStart", "waveInStop", "waveInReset", "waveInClose"):
+            getattr(mm, fn).argtypes = [ctypes.c_void_p]
+        for fn in ("waveInOpen", "waveInPrepareHeader", "waveInAddBuffer",
+                   "waveInUnprepareHeader", "waveInStart", "waveInStop",
+                   "waveInReset", "waveInClose"):
+            getattr(mm, fn).restype = wintypes.UINT
+        self._mm = mm
+        fmt = WAVEFORMATEX(1, 1, PCM_RATE, PCM_BYTES_PER_SECOND, 2, 16, 0)
+        self._handle = ctypes.c_void_p()
+        rc = mm.waveInOpen(ctypes.byref(self._handle), self.WAVE_MAPPER,
+                           ctypes.byref(fmt), 0, 0, 0)       # CALLBACK_NULL
+        if rc != 0:
+            raise OSError(f"no microphone (waveInOpen returned {rc})")
+        self._buffers = [ctypes.create_string_buffer(_PCM_CHUNK)
+                         for _ in range(8)]
+        self._headers = [WAVEHDR(ctypes.cast(b, ctypes.c_void_p), _PCM_CHUNK,
+                                 0, 0, 0, 0, None, 0) for b in self._buffers]
+        for hdr in self._headers:
+            mm.waveInPrepareHeader(self._handle, ctypes.byref(hdr),
+                                   self._hdr_size)
+            mm.waveInAddBuffer(self._handle, ctypes.byref(hdr),
+                               self._hdr_size)
+        if mm.waveInStart(self._handle) != 0:
+            mm.waveInReset(self._handle)          # hand the buffers back
+            self._close()
+            raise OSError("the microphone would not start")
+        self._running = True
+        self._next = 0
+        self._thread = threading.Thread(target=self._pump, daemon=True)
+        self._thread.start()
+
+    def _take(self, requeue: bool) -> bool:
+        """Hand over the next buffer if the driver has filled it."""
+        hdr = self._headers[self._next]
+        if not hdr.dwFlags & self.WHDR_DONE:
+            return False
+        if hdr.dwBytesRecorded:
+            self._feed(self._ct.string_at(hdr.lpData, hdr.dwBytesRecorded))
+        hdr.dwFlags &= ~self.WHDR_DONE
+        hdr.dwBytesRecorded = 0
+        if requeue:
+            self._mm.waveInAddBuffer(self._handle, self._ct.byref(hdr),
+                                     self._hdr_size)
+        self._next = (self._next + 1) % len(self._headers)
+        return True
+
+    def _pump(self) -> None:
+        while self._running:
+            if not self._take(requeue=True):
+                time.sleep(0.02)
+
+    def _close(self) -> None:
+        for hdr in self._headers:
+            self._mm.waveInUnprepareHeader(self._handle, self._ct.byref(hdr),
+                                           self._hdr_size)
+        self._mm.waveInClose(self._handle)
+
+    def stop(self) -> None:
+        self._running = False
+        self._thread.join(timeout=1.0)
+        # Reset returns every queued buffer, the half-filled one included.
+        self._mm.waveInReset(self._handle)
+        for _ in range(len(self._headers)):
+            if not self._take(requeue=False):
+                break
+        self._close()
+
+
+class _ProcessCapture:
+    """A command-line recorder writing raw PCM to its standard output:
+    arecord (ALSA) or parec (PulseAudio, PipeWire) on Linux, ffmpeg or
+    SoX's rec wherever they are installed."""
+
+    name = "process"
+
+    def __init__(self, feed: Callable[[bytes], None], argv: list) -> None:
+        self.name, self.failed = os.path.basename(argv[0]), False
+        self._proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                                      stdout=subprocess.PIPE,
+                                      stderr=subprocess.DEVNULL)
+
+        def pump():
+            got = False
+            while True:
+                data = self._proc.stdout.read(_PCM_CHUNK)
+                if not data:
+                    break
+                got = True
+                feed(data)
+            if not got:
+                self.failed = True               # exited at once: no device
+        self._thread = threading.Thread(target=pump, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._proc.poll() is None:
+            self._proc.terminate()
+        try:
+            self._proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+        self._thread.join(timeout=1.0)
+
+
+def _capture_commands() -> list:
+    system = platform.system()
+    rate = str(PCM_RATE)
+    raw_out = ["-ac", "1", "-ar", rate, "-f", "s16le", "-"]
+    candidates = []
+    if system == "Linux":
+        candidates += [
+            ["arecord", "-q", "-t", "raw", "-f", "S16_LE", "-r", rate,
+             "-c", "1"],
+            ["parec", "--raw", "--format=s16le", f"--rate={rate}",
+             "--channels=1"],
+            ["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "pulse",
+             "-i", "default"] + raw_out]
+    elif system == "Darwin":
+        candidates += [["ffmpeg", "-nostdin", "-loglevel", "error", "-f",
+                        "avfoundation", "-i", ":0"] + raw_out]
+    if system != "Windows":
+        candidates += [["rec", "-q", "-t", "raw", "-b", "16", "-e",
+                        "signed-integer", "-r", rate, "-c", "1", "-"]]
+    found = []
+    for argv in candidates:
+        exe = shutil.which(argv[0])
+        if exe:
+            found.append([exe] + argv[1:])
+    return found
+
+
+def _capture_routes() -> list:
+    """Ways this computer can record, best first, as factories of feed."""
+    routes = []
+    try:
+        import importlib.util
+        if importlib.util.find_spec("sounddevice") is not None:
+            routes.append(_SoundDeviceCapture)
+    except (ImportError, ValueError):
+        pass
+    if platform.system() == "Windows":
+        routes.append(_WinMMCapture)
+    for argv in _capture_commands():
+        routes.append(lambda feed, argv=argv: _ProcessCapture(feed, argv))
+    return routes
+
+
+def desktop_recording_available() -> bool:
+    return not IS_MOBILE and bool(_capture_routes())
+
+
+class PcmRecorder:
+    """Records a voice note on a computer, through the first capture route
+    that opens; same interface as VoiceRecorder.
+
+    The level meter (and so the waveform) comes from the samples
+    themselves: the loudest of every 100 ms.
+    """
+
+    max_seconds = MAX_PCM_SECONDS
+
+    def __init__(self) -> None:
+        import array
+        self._array = array.array
+        self._lock = threading.Lock()
+        self._pcm = bytearray()
+        self._pending = b""
+        self.levels: list = []
+        MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        self.path = str(MEDIA_DIR / f"rec_{uuid.uuid4().hex}.wav")
+        self._source = None
+        errors = []
+        for route in _capture_routes():
+            try:
+                self._source = route(self._feed)
+                break
+            except Exception as exc:
+                errors.append(str(exc) or type(exc).__name__)
+        if self._source is None:
+            raise OSError("no way to record here" + (
+                f" ({'; '.join(errors)})" if errors else ""))
+        log.info("recording through %s", self._source.name)
+
+    def _feed(self, data: bytes) -> None:
+        with self._lock:
+            room = self.max_seconds * PCM_BYTES_PER_SECOND - len(self._pcm)
+            if room <= 0:
+                return
+            data = data[:room]
+            self._pcm.extend(data)
+            buf = self._pending + data
+            whole = len(buf) - len(buf) % _PCM_CHUNK
+            for i in range(0, whole, _PCM_CHUNK):
+                samples = self._array("h", buf[i:i + _PCM_CHUNK])
+                if sys.byteorder == "big":
+                    samples.byteswap()
+                self.levels.append(max(max(samples), -min(samples)))
+            self._pending = buf[whole:]
+
+    @property
+    def failed(self) -> bool:
+        return bool(getattr(self._source, "failed", False)) and not self._pcm
+
+    @property
+    def elapsed_ms(self) -> int:
+        with self._lock:
+            return len(self._pcm) * 1000 // PCM_BYTES_PER_SECOND
+
+    def _halt(self) -> None:
+        source, self._source = self._source, None
+        if source is not None:
+            source.stop()
+
+    def stop(self) -> tuple:
+        """Returns (path, duration_ms, waveform_b64)."""
+        self._halt()
+        import wave
+        with self._lock:
+            pcm = bytes(self._pcm)
+            levels = list(self.levels)
+        with wave.open(self.path, "wb") as out:
+            out.setnchannels(1)
+            out.setsampwidth(2)
+            out.setframerate(PCM_RATE)
+            out.writeframes(pcm)
+        return (self.path, len(pcm) * 1000 // PCM_BYTES_PER_SECOND,
+                waveform_b64(levels))
 
     def cancel(self) -> None:
         try:
@@ -4671,17 +5175,26 @@ TOUCH = dp(48)                     # the smallest tap target anywhere
 
 def paint_round(widget, hex_color: str, radius=None, corners=None):
     """A rounded ground behind a widget. Returns (Color, shape) so callers
-    can retint it (press feedback, selection)."""
+    can retint it (press feedback, selection).
+
+    Curves are drawn anti-aliased. Kivy's smooth shapes need an opaque
+    colour (a translucent one shows a darker rim), which every ground is.
+    """
+    radii = list(corners) if corners is not None else [
+        radius if radius is not None else dp(6)]
+    curved = any(r > 0 for r in radii)
     with widget.canvas.before:
         col = Color(*C(hex_color))
-        rect = RoundedRectangle(
-            pos=widget.pos, size=widget.size,
-            radius=corners if corners is not None else [radius if radius
-                                                        is not None else
-                                                        dp(6)])
+        rect = (SmoothRoundedRectangle if curved else RoundedRectangle)(
+            pos=widget.pos, size=widget.size, radius=radii)
 
     def _sync(*_a):
         rect.pos, rect.size = widget.pos, widget.size
+        if curved:
+            # The smooth shape does not clamp a corner larger than half
+            # the side the way the plain one does.
+            cap = max(0.0, min(widget.width, widget.height) / 2.0)
+            rect.radius = [min(r, cap) for r in radii]
     widget.bind(pos=_sync, size=_sync)
     return col, rect
 
@@ -4690,7 +5203,7 @@ def paint_border(widget, hex_color: str, radius=None, width=1.0):
     radius = dp(6) if radius is None else radius
     with widget.canvas.after:
         col = Color(*C(hex_color))
-        line = Line(width=dp(width) / 2.0, rounded_rectangle=(
+        line = SmoothLine(width=max(1.0, dp(width) / 2.0), rounded_rectangle=(
             widget.x, widget.y, widget.width, widget.height, radius))
 
     def _sync(*_a):
@@ -4703,7 +5216,7 @@ def paint_border(widget, hex_color: str, radius=None, width=1.0):
 def paint_circle(widget, hex_color: str):
     with widget.canvas.before:
         col = Color(*C(hex_color))
-        circ = Ellipse(pos=widget.pos, size=widget.size)
+        circ = SmoothEllipse(pos=widget.pos, size=widget.size)
 
     def _sync(*_a):
         circ.pos, circ.size = widget.pos, widget.size
@@ -4963,18 +5476,139 @@ def button_row(*buttons, spacing=None) -> BoxLayout:
     return ButtonRow(buttons, spacing=spacing)
 
 
+#: Icons are geometry, rendered once offscreen at ICON_SUPERSAMPLE times
+#: their size and filtered down, so their edges are smooth whatever the GPU
+#: offers — many desktops run without multisampling, and lines drawn
+#: straight onto the window came out jagged there. Cached per icon and size,
+#: drawn white and tinted when used.
+ICON_SUPERSAMPLE = 4
+_OFFSCREEN: dict = {}
+_offscreen_ok = True
+_DOWNSAMPLE_FS = """
+$HEADER$
+uniform vec2 texel;
+void main(void) {
+    /* four bilinear taps, each the mean of a 2x2 block: a 4x4 box filter */
+    gl_FragColor = 0.25 * (
+        texture2D(texture0, tex_coord0 + vec2(-texel.x, -texel.y)) +
+        texture2D(texture0, tex_coord0 + vec2( texel.x, -texel.y)) +
+        texture2D(texture0, tex_coord0 + vec2(-texel.x,  texel.y)) +
+        texture2D(texture0, tex_coord0 + vec2( texel.x,  texel.y)));
+}
+"""
+
+
+def offscreen_texture(key, width_px: int, height_px: int,
+                      paint: Callable[[int], None]):
+    """A white-on-clear texture of `paint(k)`'s drawing, made at k times the
+    size and box-filtered down; None where offscreen drawing fails (the
+    caller then draws directly). `key` caches it."""
+    global _offscreen_ok
+    tex = _OFFSCREEN.get(key)
+    if tex is not None or not _offscreen_ok:
+        return tex
+    k = ICON_SUPERSAMPLE
+    try:
+        big = Fbo(size=(width_px * k, height_px * k), noadd=True)
+        with big:
+            ClearColor(1, 1, 1, 0)
+            ClearBuffers()
+            Color(1, 1, 1, 1)
+            paint(k)
+        big.draw()
+        small = Fbo(size=(width_px, height_px), fs=_DOWNSAMPLE_FS,
+                    noadd=True)
+        if not small.shader.success:
+            raise RuntimeError("the downsampling shader did not compile")
+        small["texel"] = (1.0 / (width_px * k), 1.0 / (height_px * k))
+        with small:
+            ClearColor(1, 1, 1, 0)
+            ClearBuffers()
+            Color(1, 1, 1, 1)
+            Rectangle(texture=big.texture, size=(width_px, height_px))
+        small.draw()
+        pixels = small.pixels
+        tex = Texture.create(size=(width_px, height_px), colorfmt="rgba")
+        tex.blit_buffer(pixels, colorfmt="rgba", bufferfmt="ubyte")
+        # Kept so the texture can be refilled if the GL context is lost.
+        tex.add_reload_observer(lambda t, px=pixels: t.blit_buffer(
+            px, colorfmt="rgba", bufferfmt="ubyte"))
+    except Exception:
+        log.exception("offscreen drawing unavailable — drawing icons "
+                      "directly")
+        _offscreen_ok = False
+        return None
+    _OFFSCREEN[key] = tex
+    return tex
+
+
 def draw_icon(name: str, cx: float, cy: float, size: float, rgba,
-              width: Optional[float] = None) -> None:
-    """Draw one line icon into the CURRENT canvas context.
+              width: Optional[float] = None, scale: float = 1.0) -> None:
+    """Draw one icon into the CURRENT canvas context: it fits a `size`
+    square centred on (cx, cy), tinted `rgba`. `scale` shrinks the drawing
+    (an animation) without rendering the icon again at every step.
 
     Icons are drawn, not typed: no font has the whole set, and drawing keeps
-    them crisp at any density. Each fits a `size` square centred on
-    (cx, cy), in thin even strokes.
+    them crisp at any density.
+    """
+    # Kivy's Line width is HALF the stroke: this draws one 1/16 of the icon
+    # thick (1.5 units of the 24-unit grid), never thinner than 1.2dp.
+    w = width or max(dp(0.6), size * 0.031)
+    side = int(math.ceil(size * 1.25)) + 4
+    tex = offscreen_texture(
+        ("icon", name, round(size, 2), round(w, 3)), side, side,
+        lambda k: icon_geometry(name, side * k / 2.0, side * k / 2.0,
+                                size * k, (1, 1, 1, 1), w * k, dp(1) * k))
+    Color(*rgba)
+    if tex is None:
+        icon_geometry(name, cx, cy, size * scale, rgba, w * scale, dp(1))
+        return
+    if scale == 1.0:
+        Rectangle(texture=tex, size=(side, side),
+                  pos=(round(cx - side / 2.0), round(cy - side / 2.0)))
+    else:
+        d = side * scale
+        Rectangle(texture=tex, size=(d, d), pos=(cx - d / 2.0, cy - d / 2.0))
+
+
+def icon_geometry(name: str, cx: float, cy: float, size: float, rgba,
+                  w: float, u: float) -> None:
+    """The geometry of one icon, in the current colour and canvas: it fits a
+    `size` square centred on (cx, cy), stroked `w` wide; `u` is one dp.
+
+    The newer icons are laid out on a 24-unit grid with y running down, as
+    icon artwork usually is; `G` maps grid points onto the canvas.
     """
     h = size / 2.0
-    w = width or max(dp(1.2), size * 0.072)
-    Color(*rgba)
+    s = size / 24.0
     line = dict(width=w, cap="round", joint="round")
+
+    def G(*xy) -> list:
+        out = []
+        for i in range(0, len(xy), 2):
+            out += [cx + (xy[i] - 12) * s, cy + (12 - xy[i + 1]) * s]
+        return out
+
+    def arc(x0, y0, r, a0, a1) -> list:
+        """Grid-space arc; angles in degrees, clockwise on screen."""
+        n = max(8, int(abs(a1 - a0) / 5))
+        pts = []
+        for i in range(n + 1):
+            a = math.radians(a0 + (a1 - a0) * i / n)
+            pts += G(x0 + r * math.cos(a), y0 + r * math.sin(a))
+        return pts
+
+    def fill(pts) -> None:
+        """A convex polygon (canvas points), as a triangle fan."""
+        verts = []
+        for i in range(0, len(pts), 2):
+            verts += [pts[i], pts[i + 1], 0, 0]
+        Mesh(vertices=verts, indices=list(range(len(verts) // 4)),
+             mode="triangle_fan")
+
+    def dot(x, y, r) -> None:
+        px, py = G(x, y)
+        Ellipse(pos=(px - r * s, py - r * s), size=(2 * r * s, 2 * r * s))
     if name == "back":
         Line(points=[cx + h * .28, cy + h * .60, cx - h * .32, cy,
                      cx + h * .28, cy - h * .60], **line)
@@ -4986,18 +5620,22 @@ def draw_icon(name: str, cx: float, cy: float, size: float, rgba,
         Line(points=[cx - k, cy - k, cx + k, cy + k], **line)
         Line(points=[cx - k, cy + k, cx + k, cy - k], **line)
     elif name == "more":                       # vertical ellipsis
-        r = max(dp(1.6), size * .085)
+        r = max(1.6 * u, size * .085)
         for dy in (-h * .56, 0, h * .56):
             Ellipse(pos=(cx - r, cy + dy - r), size=(2 * r, 2 * r))
     elif name == "plus":
         k = h * .58
         Line(points=[cx - k, cy, cx + k, cy], **line)
         Line(points=[cx, cy - k, cx, cy + k], **line)
-    elif name == "send":                       # a paper plane, arrow-like
-        Line(points=[cx - h * .70, cy + h * .62, cx + h * .76, cy,
-                     cx - h * .70, cy - h * .62, cx - h * .40, cy,
-                     cx - h * .70, cy + h * .62], **line)
-        Line(points=[cx - h * .40, cy, cx + h * .76, cy], **line)
+    elif name == "send":
+        # A folded paper plane: the near wing solid, the far one a tone
+        # lighter, so the fold reads even at the size of a thumb.
+        nose, top, notch, low = (21.0, 11.1), (2.9, 4.4), (8.6, 12.6), \
+            (6.2, 19.9)
+        fill(G(*notch, *nose, *top))
+        Color(rgba[0], rgba[1], rgba[2], rgba[3] * .58)
+        fill(G(*notch, *low, *nose))
+        Color(*rgba)
     elif name in ("reply", "forward"):
         d = -1 if name == "reply" else 1
         tip = (cx + d * h * .70, cy + h * .22)
@@ -5067,12 +5705,21 @@ def draw_icon(name: str, cx: float, cy: float, size: float, rgba,
                      cx + h * .12, cy - h * .26, cx + h * .38, cy - h * .04,
                      cx + h * .78, cy - h * .46], **line)
     elif name == "mic":
-        Line(rounded_rectangle=(cx - h * .26, cy - h * .04, h * .52, h * .90,
-                                h * .26), width=w)
-        Line(circle=(cx, cy + h * .14, h * .50, 90, 270), width=w)
-        Line(points=[cx, cy - h * .36, cx, cy - h * .72], **line)
-        Line(points=[cx - h * .30, cy - h * .72, cx + h * .30, cy - h * .72],
-             **line)
+        # Capsule with a grille, its cradle, stand and foot.
+        Line(rounded_rectangle=(*G(8.9, 14.8), 6.2 * s, 12.4 * s, 3.1 * s),
+             width=w)
+        for gy in (6.5, 9.3):
+            Line(points=G(12.4, gy, 15.1, gy), width=w * .8, cap="round")
+        Line(points=arc(12, 10.4, 6.9, 0, 180), **line)
+        Line(points=G(12, 17.3, 12, 20.8), **line)
+        Line(points=G(8.4, 20.8, 15.6, 20.8), **line)
+    elif name == "camera":
+        # Body, the viewfinder's hump, the lens, the lamp.
+        Line(rounded_rectangle=(*G(2.6, 19.4), 18.8 * s, 12.2 * s, 2.6 * s),
+             width=w)
+        Line(points=G(7.8, 7.2, 9.4, 4.6, 14.6, 4.6, 16.2, 7.2), **line)
+        Line(circle=(*G(12, 13.3), 3.7 * s), width=w)
+        dot(18.0, 10.2, .85)
     elif name == "play":
         Triangle(points=[cx - h * .36, cy + h * .56, cx - h * .36, cy - h * .56,
                          cx + h * .60, cy])
@@ -5118,21 +5765,23 @@ def draw_icon(name: str, cx: float, cy: float, size: float, rgba,
         r = size * .07
         Ellipse(pos=(cx - r, cy + h * .36 - r), size=(2 * r, 2 * r))
     elif name == "smile":
-        Line(circle=(cx, cy, h * .80), width=w)
-        r = size * .065
-        for dx in (-h * .30, h * .30):
-            Ellipse(pos=(cx + dx - r, cy + h * .22 - r), size=(2 * r, 2 * r))
-        Line(circle=(cx, cy + h * .05, h * .44, 120, 240), width=w)
+        Line(circle=(*G(12, 12), 9.5 * s), width=w)
+        for ex in (8.8, 15.2):
+            px, py = G(ex, 9.5)
+            Ellipse(pos=(px - 1.15 * s, py - 1.45 * s),
+                    size=(2.3 * s, 2.9 * s))
+        Line(points=arc(12, 12.2, 5.2, 26, 154), **line)
     elif name == "keyboard":
-        Line(rounded_rectangle=(cx - h * .82, cy - h * .52, h * 1.64, h * 1.04,
-                                size * .07), width=w)
-        r = size * .045
-        for row, y in enumerate((cy + h * .20, cy - h * .06)):
-            for i in range(5 - row):
-                x = cx - h * .54 + i * h * .27 + row * h * .135
-                Ellipse(pos=(x - r, y - r), size=(2 * r, 2 * r))
-        Line(points=[cx - h * .36, cy - h * .30, cx + h * .36, cy - h * .30],
-             **line)
+        Line(rounded_rectangle=(*G(2.4, 18.4), 19.2 * s, 12.8 * s, 2.4 * s),
+             width=w)
+        for y, xs in ((9.4, (6.2, 9.4, 12.6, 15.8)),
+                      (12.4, (7.8, 11.0, 14.2, 17.4))):
+            for x in xs:
+                dot(x, y, 1.0)
+        dot(17.8, 9.4, 1.0)
+        Line(points=G(8.6, 15.5, 15.4, 15.5), **line)
+    elif name == "down":
+        Line(points=G(6.8, 9.4, 12, 14.6, 17.2, 9.4), **line)
     elif name in ("person", "person_add"):
         hx = cx - (h * .18 if name == "person_add" else 0)
         Line(circle=(hx, cy + h * .30, h * .30), width=w)
@@ -5161,7 +5810,6 @@ def draw_icon(name: str, cx: float, cy: float, size: float, rgba,
                                     (cy - h * .52, -.06))):
             Line(points=[cx - h * .78, y, cx + h * .78, y], **line)
             r = size * .12
-            Color(*rgba)
             Ellipse(pos=(cx + k * h * 1.4 - r, y - r), size=(2 * r, 2 * r))
     elif name == "key":
         Line(circle=(cx - h * .38, cy + h * .02, h * .30), width=w)
@@ -5178,15 +5826,31 @@ def draw_icon(name: str, cx: float, cy: float, size: float, rgba,
         Line(points=[cx - h * .18, cy, cx + h * .78, cy], **line)
         Line(points=[cx + h * .46, cy + h * .32, cx + h * .78, cy,
                      cx + h * .46, cy - h * .32], **line)
-    elif name == "attach":                     # a paperclip
-        Line(points=[cx + h * .36, cy + h * .30, cx + h * .36, cy - h * .46],
-             **line)
-        Line(circle=(cx + h * .02, cy - h * .46, h * .34, 90, 270), width=w)
-        Line(points=[cx - h * .32, cy - h * .46, cx - h * .32, cy + h * .52],
-             **line)
-        Line(circle=(cx - h * .06, cy + h * .52, h * .26, 270, 450), width=w)
-        Line(points=[cx + h * .20, cy + h * .52, cx + h * .20, cy - h * .28],
-             **line)
+    elif name == "attach":
+        # A paperclip: one wire turned back on itself three times, laid
+        # along a diagonal. Built in the clip's own frame (u along it, v
+        # across: legs at v = +-1.2 and +-3.6) and turned onto the grid.
+        k = math.sqrt(.5)
+
+        def uv(u, v):
+            return (12.0 + (u + v) * k, 12.4 + (v - u) * k)
+
+        def turn(u0, v0, r, a0, a1):
+            pts = []
+            for i in range(21):
+                a = math.radians(a0 + (a1 - a0) * i / 20)
+                pts += uv(u0 + r * math.cos(a), v0 + r * math.sin(a))
+            return pts
+
+        wire = list(uv(2.4, -1.2)) + list(uv(-3.4, -1.2))
+        wire += turn(-3.4, 0.0, 1.2, 270, 90)
+        wire += list(uv(5.6, 1.2))
+        wire += turn(5.6, -1.2, 2.4, 90, -90)
+        wire += list(uv(-5.6, -3.6))
+        wire += turn(-5.6, 0.0, 3.6, 270, 90)
+        wire += list(uv(3.6, 3.6))
+        Line(points=G(*wire), **line)
+
 
 
 class IconButton(ButtonBehavior, Widget):
@@ -5198,6 +5862,10 @@ class IconButton(ButtonBehavior, Widget):
     every control named for when it can, and the tests use it.
     """
 
+    #: Scales the icon alone (not the disc): `morph` swaps one icon for
+    #: another by shrinking the old away and springing the new one in.
+    icon_scale = NumericProperty(1.0)
+
     def __init__(self, icon: str, tint: Optional[str] = None,
                  bg: Optional[str] = None, icon_size=None, press=None,
                  label: str = "", **kw):
@@ -5206,17 +5874,46 @@ class IconButton(ButtonBehavior, Widget):
         super().__init__(**kw)
         self._icon, self._tint, self._bg_hex = icon, tint or T.text_2, bg
         self._icon_size = icon_size
+        self._morph_to: Optional[str] = None
         self.label = label or icon
         self._press_hex = press
         self.bind(pos=self._redraw, size=self._redraw, state=self._redraw,
-                  disabled=self._redraw)
+                  disabled=self._redraw, icon_scale=self._redraw)
         self._redraw()
+
+    @property
+    def icon(self) -> str:
+        return self._icon
 
     def set_icon(self, icon: str, tint: Optional[str] = None) -> None:
         self._icon = icon
         if tint is not None:
             self._tint = tint
         self._redraw()
+
+    def show_icon(self, icon: str) -> None:
+        """Change the icon at once, ending any morph under way."""
+        Animation.cancel_all(self, "icon_scale")
+        self._morph_to = None
+        self.icon_scale = 1.0
+        self.set_icon(icon)
+
+    def morph(self, icon: str) -> None:
+        """Change the icon with a short shrink-and-spring. Asked again for
+        the same icon while one is under way (a keystroke each), it lets
+        that one finish rather than starting over."""
+        if icon == (self._morph_to or self._icon):
+            return
+        if not motion(1):
+            self.show_icon(icon)
+            return
+        Animation.cancel_all(self, "icon_scale")
+        self._morph_to = icon
+        out = Animation(icon_scale=0.3, d=0.07, t="in_quad")
+        out.bind(on_complete=lambda *_a: self.set_icon(icon))
+        back = Animation(icon_scale=1.0, d=0.16, t="out_back")
+        back.bind(on_complete=lambda *_a: setattr(self, "_morph_to", None))
+        (out + back).start(self)
 
     def _redraw(self, *_a):
         self.canvas.clear()
@@ -5226,17 +5923,22 @@ class IconButton(ButtonBehavior, Widget):
             if self._bg_hex is not None:
                 Color(*C(T.accent_press if self.state == "down" and
                          self._bg_hex == T.accent else self._bg_hex))
-                Ellipse(pos=((self.x + self.width / 2) - disc / 2,
-                             (self.y + self.height / 2) - disc / 2), size=(disc, disc))
+                SmoothEllipse(pos=((self.x + self.width / 2) - disc / 2,
+                                   (self.y + self.height / 2) - disc / 2),
+                              size=(disc, disc))
             elif self.state == "down":
                 Color(*C(self._press_hex or T.press))
-                Ellipse(pos=((self.x + self.width / 2) - disc / 2,
-                             (self.y + self.height / 2) - disc / 2), size=(disc, disc))
+                SmoothEllipse(pos=((self.x + self.width / 2) - disc / 2,
+                                   (self.y + self.height / 2) - disc / 2),
+                              size=(disc, disc))
             rgba = C(self._tint)
             if self.disabled:
                 rgba = rgba[:3] + [rgba[3] * .35]
-            draw_icon(self._icon, (self.x + self.width / 2), (self.y + self.height / 2),
-                      self._icon_size or dp(22), rgba)
+            if self.icon_scale > 0.05:
+                draw_icon(self._icon, (self.x + self.width / 2),
+                          (self.y + self.height / 2),
+                          self._icon_size or dp(22), rgba,
+                          scale=self.icon_scale)
 
 
 class TickMarks(Widget):
@@ -5271,19 +5973,31 @@ class TickMarks(Widget):
         self.width = self._width_for(count)
         self._redraw()
 
+    def _paint_marks(self, x0: float, y0: float, k: float) -> None:
+        h, w = self._mark * k, max(dp(.7), self._mark * .08) * k
+        for i in range(self._count):
+            x = x0 + i * self._step * k
+            Line(points=[x, y0 + h * 0.45, x + h * 0.34, y0 + h * 0.06,
+                         x + h * 0.92, y0 + h * 0.82],
+                 width=w, cap="round", joint="round")
+
     def _redraw(self, *_a):
         self.canvas.clear()
         if self._count <= 0:
             return
-        h = self._mark
+        pad = int(math.ceil(dp(2)))
+        tw = int(math.ceil(self._width_for(self._count))) + 2 * pad
+        th = int(math.ceil(self._mark)) + 2 * pad
+        tex = offscreen_texture(
+            ("ticks", self._count, round(self._mark, 2)), tw, th,
+            lambda k: self._paint_marks(pad * k, pad * k, k))
         with self.canvas:
             Color(*C(self._tint))
-            for i in range(self._count):
-                x = self.x + i * self._step
-                y = self.y
-                Line(points=[x, y + h * 0.45, x + h * 0.34, y + h * 0.06,
-                             x + h * 0.92, y + h * 0.82],
-                     width=dp(1.1), cap="round", joint="round")
+            if tex is None:
+                self._paint_marks(self.x, self.y, 1)
+            else:
+                Rectangle(texture=tex, size=(tw, th),
+                          pos=(round(self.x - pad), round(self.y - pad)))
 
 
 class Avatar(Widget):
@@ -5315,15 +6029,16 @@ class Avatar(Widget):
         x, y = (self.x + self.width / 2) - d / 2, (self.y + self.height / 2) - d / 2
         with self.canvas.before:
             Color(*C(self._fill))
-            Ellipse(pos=(x, y), size=(d, d))
+            SmoothEllipse(pos=(x, y), size=(d, d))
             if self.kind == "group":
                 Color(1, 1, 1, .55)
                 inset = max(dp(2.5), d * .07)
-                Line(circle=((self.x + self.width / 2), (self.y + self.height / 2), d / 2 - inset),
-                     width=dp(.9))
+                SmoothLine(circle=((self.x + self.width / 2),
+                                   (self.y + self.height / 2), d / 2 - inset),
+                           width=max(1.0, dp(.9)))
             if self.kind == "self":
                 draw_icon("bookmark", (self.x + self.width / 2), (self.y + self.height / 2), d * .46,
-                          C(T.on_accent), width=max(dp(1.3), d * .04))
+                          C(T.on_accent), width=max(dp(.8), d * .022))
         if self._initial is not None:
             self._initial.size = (d, d)
             # Garamond's capitals sit high in their line box; nudge them to
@@ -5423,16 +6138,18 @@ class ToggleSwitch(ButtonBehavior, Widget):
         with self.canvas:
             if self.active:
                 Color(*C(T.accent))
-                RoundedRectangle(pos=self.pos, size=self.size, radius=[h / 2])
+                SmoothRoundedRectangle(pos=self.pos, size=self.size,
+                                       radius=[h / 2])
             else:
                 Color(*C(T.rule_strong))
-                Line(rounded_rectangle=(self.x + .5, self.y + .5,
-                                        self.width - 1, h - 1, h / 2 - .5),
-                     width=dp(1.1))
+                SmoothLine(rounded_rectangle=(self.x + .5, self.y + .5,
+                                              self.width - 1, h - 1,
+                                              h / 2 - .5),
+                           width=max(1.0, dp(1.1)))
             knob = h - dp(8)
             x = self.right - knob - dp(4) if self.active else self.x + dp(4)
             Color(*C(T.on_accent if self.active else T.text_3))
-            Ellipse(pos=(x, self.y + dp(4)), size=(knob, knob))
+            SmoothEllipse(pos=(x, self.y + dp(4)), size=(knob, knob))
 
 
 Toggle = ToggleSwitch
@@ -5622,7 +6339,7 @@ class UnreadBadge(Label):
                          height=max(dp(22), round(fs(13) * 1.6)), **kw)
         with self.canvas.before:
             Color(*C(T.text_3 if muted else T.alert))
-            self._pill = RoundedRectangle(radius=[self.height / 2])
+            self._pill = SmoothRoundedRectangle(radius=[self.height / 2])
         self.bind(pos=self._sync, size=self._sync,
                   texture_size=lambda w, v: setattr(
                       w, "width", max(self.height, v[0] + dp(12))))
@@ -5631,6 +6348,42 @@ class UnreadBadge(Label):
     def _sync(self, *_a):
         self._pill.pos, self._pill.size = self.pos, self.size
         self._pill.radius = [self.height / 2]
+
+
+class Concealable:
+    """A part that comes and goes: the emoji panel, the reply preview, the
+    reaction strip, the jump-to-latest button.
+
+    Kivy lets a DISABLED widget swallow every touch that lands on it — at
+    opacity 0, and even when it overhangs a parent that is 0 high — so a
+    hidden part has to step aside explicitly. Without this the closed emoji
+    panel sat over the composer and ate every click on the message field.
+    """
+
+    concealed = False
+
+    def conceal(self, hidden: bool) -> None:
+        self.concealed = bool(hidden)
+        self.disabled = bool(hidden)
+
+    def on_touch_down(self, touch):
+        if self.concealed:
+            return False
+        return super().on_touch_down(touch)
+
+    def on_touch_move(self, touch):
+        if self.concealed and touch.grab_current is not self:
+            return False
+        return super().on_touch_move(touch)
+
+    def on_touch_up(self, touch):
+        if self.concealed and touch.grab_current is not self:
+            return False
+        return super().on_touch_up(touch)
+
+
+class ConcealableBox(Concealable, BoxLayout):
+    pass
 
 
 class Sheet(ModalView):
@@ -5657,7 +6410,7 @@ class Sheet(ModalView):
         if not T.dark:
             with self.card.canvas.after:
                 Color(*C(T.rule))
-                self._edge = Line(width=dp(1) / 2.0)
+                self._edge = SmoothLine(width=1.0)
             self.card.bind(pos=self._sync_edge, size=self._sync_edge)
         handle = AnchorLayout(size_hint_y=None, height=dp(14))
         grip = Widget(size_hint=(None, None), size=(dp(36), dp(4)))
@@ -6087,14 +6840,15 @@ class ContactPickRow(ButtonBehavior, BoxLayout):
         with t.canvas:
             if self.picked:
                 Color(*C(T.accent))
-                Ellipse(pos=((t.x + t.width / 2) - r, (t.y + t.height / 2) - r), size=(2 * r,
-                                                                    2 * r))
+                SmoothEllipse(pos=((t.x + t.width / 2) - r,
+                                   (t.y + t.height / 2) - r),
+                              size=(2 * r, 2 * r))
                 draw_icon("check", (t.x + t.width / 2), (t.y + t.height / 2), dp(13),
-                          C(T.on_accent), width=dp(1.7))
+                          C(T.on_accent), width=dp(1.0))
             else:
                 Color(*C(T.rule_strong))
-                Line(circle=((t.x + t.width / 2), (t.y + t.height / 2), r - dp(.5)),
-                     width=dp(1.1))
+                SmoothLine(circle=((t.x + t.width / 2), (t.y + t.height / 2),
+                                   r - dp(.5)), width=max(1.0, dp(1.1)))
 
 
 def conversation_title(app, peer: str) -> tuple:
@@ -6281,11 +7035,18 @@ class ImageChooserModal(Sheet):
 
 
 class AttachPreviewModal(Sheet):
-    """See the photo and add a caption before it is compressed and sent."""
+    """See the photo and add a caption before it is compressed and sent.
+    A `temporary` photo (a copy this app made) is deleted once it has been
+    sent, or set aside."""
 
-    def __init__(self, app: "FextApp", path: str) -> None:
+    def __init__(self, app: "FextApp", path: str,
+                 temporary: bool = False) -> None:
         super().__init__("Send photo")
-        self.app, self.path = app, path
+        self.app, self.path, self.temporary = app, path, temporary
+        self._sent = False
+        if temporary:
+            self.bind(on_dismiss=lambda *_a: None if self._sent
+                      else discard_media_file(self.path))
         self.add(KivyImage(source=path, allow_stretch=True, keep_ratio=True,
                            size_hint_y=None,
                            height=min(dp(300), Window.height * 0.4)))
@@ -6298,8 +7059,93 @@ class AttachPreviewModal(Sheet):
                             Btn("Send", on_release=lambda _w: self._send())))
 
     def _send(self) -> None:
+        self._sent = True
         self.dismiss()
-        self.app.send_image(self.path, sanitize_text(self.caption.text))
+        self.app.send_image(self.path, sanitize_text(self.caption.text),
+                            temporary=self.temporary)
+
+
+class CameraSheet(Sheet):
+    """A photo from the computer's camera: what it sees, and a shutter."""
+
+    def __init__(self, on_photo: Callable[[str], None]) -> None:
+        super().__init__("Take a photo")
+        from kivy.uix.camera import Camera as CameraView
+        self.on_photo = on_photo
+        self.view = CameraView(play=True, resolution=(1280, 720),
+                               allow_stretch=True, keep_ratio=True,
+                               size_hint_y=None,
+                               height=min(dp(320), Window.height * 0.45))
+        self.add(self.view)
+        self.add(button_row(Btn("Cancel", kind="quiet",
+                                on_release=lambda _w: self.dismiss()),
+                            Btn("Take photo",
+                                on_release=lambda _w: self._shoot())))
+        self.bind(on_dismiss=lambda *_a: setattr(self.view, "play", False))
+
+    def _shoot(self) -> None:
+        texture = self.view.texture
+        if texture is None:
+            return
+        MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        path = str(MEDIA_DIR / f"shot_{uuid.uuid4().hex}.png")
+        try:
+            # Texture.save writes the texture's rows as they are stored.
+            # A camera stores the picture's top row first and flips the
+            # texture only for display (a negative height in its uvs); a
+            # texture drawn by GL holds its bottom row first. Either way the
+            # file must come out the way the picture is seen.
+            texture.save(path, flipped=texture.uvsize[1] >= 0)
+        except Exception:
+            log.exception("could not save the camera's picture")
+            return
+        self.dismiss()
+        self.on_photo(path)
+
+
+class NoCameraSheet(Sheet):
+    """Said when the computer has no camera this app can open."""
+
+    def __init__(self, on_choose: Optional[Callable[[], None]]) -> None:
+        super().__init__("No camera found")
+        how = ("Ferritext opens a computer's camera through OpenCV. To use "
+               "one, install it and restart:  pip install opencv-python")
+        self.add(InfoLabel(how, color=T.text_2, font_size=fs(16)))
+
+        def choose(_w):
+            self.dismiss()
+            if on_choose is not None:
+                on_choose()
+        self.add(button_row(Btn("Close", kind="quiet",
+                                on_release=lambda _w: self.dismiss()),
+                            Btn("Choose a photo", on_release=choose)))
+
+
+_desktop_camera: Optional[bool] = None
+
+
+def desktop_camera_available() -> bool:
+    """Whether Kivy found a camera provider (OpenCV, GStreamer, the Mac's
+    own). Asked once, on first use: looking costs a second or so."""
+    global _desktop_camera
+    if _desktop_camera is None:
+        try:
+            from kivy.core.camera import Camera as CoreCamera
+            _desktop_camera = CoreCamera is not None
+        except Exception:
+            _desktop_camera = False
+    return _desktop_camera
+
+
+def open_desktop_camera(on_photo: Callable[[str], None],
+                        on_choose: Optional[Callable[[], None]] = None) -> None:
+    if desktop_camera_available():
+        try:
+            CameraSheet(on_photo).open()
+            return
+        except Exception:
+            log.exception("the camera would not open")
+    NoCameraSheet(on_choose).open()
 
 
 class TextPromptSheet(Sheet):
@@ -6808,10 +7654,11 @@ class FabButton(IconButton):
             Ellipse(pos=((self.x + self.width / 2) - d / 2, (self.y + self.height / 2) - d / 2 -
                          dp(2)), size=(d, d))
             Color(*C(T.accent_press if self.state == "down" else T.accent))
-            Ellipse(pos=((self.x + self.width / 2) - d / 2, (self.y + self.height / 2) - d / 2),
-                    size=(d, d))
+            SmoothEllipse(pos=((self.x + self.width / 2) - d / 2,
+                               (self.y + self.height / 2) - d / 2),
+                          size=(d, d))
             draw_icon(self._icon, (self.x + self.width / 2), (self.y + self.height / 2), dp(24),
-                      C(T.on_accent), width=dp(1.6))
+                      C(T.on_accent), width=dp(1.0))
 
 
 class ChatsScreen(Screen):
@@ -7100,7 +7947,7 @@ class QuoteBlock(ButtonBehavior, BoxLayout):
         super().__init__(**kw)
         with self.canvas.before:
             Color(*C(T.quote_own if outgoing else T.quote_peer))
-            self._bg = RoundedRectangle(radius=[dp(4)])
+            self._bg = SmoothRoundedRectangle(radius=[dp(4)])
             Color(*C(T.accent))
             self._bar = Rectangle()
         self.bind(pos=self._sync, size=self._sync)
@@ -7151,7 +7998,7 @@ class ImageContent(ButtonBehavior, FloatLayout):
         self.msg, self.media, self.screen = msg, media, screen
         with self.canvas.before:
             Color(*C(T.surface_hi))
-            self._ground = RoundedRectangle(radius=[dp(6)])
+            self._ground = SmoothRoundedRectangle(radius=[dp(6)])
         self.bind(pos=self._sync, size=self._sync)
         self.picture = KivyImage(allow_stretch=True, keep_ratio=True,
                                  size_hint=(1, 1),
@@ -7298,9 +8145,9 @@ class ReactionChip(ButtonBehavior, Widget):
             ground = T.bg if T.dark else T.surface_hi
             self._ground_col = Color(*C(mix(T.accent, ground, .80) if mine
                                         else ground))
-            self._ground = RoundedRectangle(radius=[dp(15)])
+            self._ground = SmoothRoundedRectangle(radius=[dp(15)])
             Color(*C(T.accent if mine else T.rule_strong))
-            self._edge = Line(width=dp(1) / 2.0)
+            self._edge = SmoothLine(width=1.0)
         with self.canvas.after:
             PopMatrix()
         self.bind(pos=self._sync, size=self._sync, pop=self._sync,
@@ -7755,7 +8602,7 @@ class DayDivider(BoxLayout):
         self.add_widget(Rule(pos_hint={"center_y": .5}))
 
 
-class JumpToBottomButton(ButtonBehavior, Widget):
+class JumpToBottomButton(Concealable, ButtonBehavior, Widget):
     """'Back to the latest' — appears when scrolled away from the bottom,
     with a count of what arrived meanwhile (the view is never yanked)."""
 
@@ -7765,7 +8612,7 @@ class JumpToBottomButton(ButtonBehavior, Widget):
         super().__init__(**kw)
         self._count = 0
         self.opacity = 0
-        self.disabled = True
+        self.conceal(True)
         self.bind(pos=self._sync, size=self._sync, state=self._sync)
         if on_tap is not None:
             self.bind(on_release=lambda _w: on_tap())
@@ -7778,28 +8625,22 @@ class JumpToBottomButton(ButtonBehavior, Widget):
     def _sync(self, *_a):
         self.canvas.before.clear()
         d = dp(42)
-        x, y = (self.x + self.width / 2) - d / 2, (self.y + self.height / 2) - d / 2
+        cx, cy = self.x + self.width / 2, self.y + self.height / 2
         with self.canvas.before:
             Color(*C(T.press if self.state == "down" else T.surface_hi))
-            Ellipse(pos=(x, y), size=(d, d))
+            SmoothEllipse(pos=(cx - d / 2, cy - d / 2), size=(d, d))
             Color(*C(T.rule_strong))
-            Line(circle=((self.x + self.width / 2), (self.y + self.height / 2), d / 2 - .5),
-                 width=dp(1) / 2.0)
-            cx, cy = (self.x + self.width / 2), (self.y + self.height / 2)
-            r = d * 0.18
-            Color(*C(T.text_2))
-            Line(points=[cx - r, cy + r * 0.5, cx, cy - r * 0.5,
-                         cx + r, cy + r * 0.5],
-                 width=dp(1.4), cap="round", joint="round")
+            SmoothLine(circle=(cx, cy, d / 2 - .5), width=1.0)
+            draw_icon("down", cx, cy, d * .5, C(T.text_2), width=dp(.9))
             if self._count > 0:
                 Color(*C(T.alert))
-                Ellipse(pos=((self.x + self.width / 2) + dp(6), (self.y + self.height / 2) + dp(6)),
-                        size=(dp(20), dp(20)))
-        self._badge.center = ((self.x + self.width / 2) + dp(16), (self.y + self.height / 2) + dp(16))
+                SmoothEllipse(pos=(cx + dp(6), cy + dp(6)),
+                              size=(dp(20), dp(20)))
+        self._badge.center = (cx + dp(16), cy + dp(16))
 
     def set_visible(self, visible: bool) -> None:
         target = 1.0 if visible else 0.0
-        self.disabled = not visible
+        self.conceal(not visible)
         if abs(self.opacity - target) < 0.01:
             return
         Animation.cancel_all(self, "opacity")
@@ -7871,7 +8712,7 @@ class EmojiKey(ButtonBehavior, Label):
                          **kw)
         with self.canvas.before:
             self._press = Color(0, 0, 0, 0)
-            self._disc = Ellipse()
+            self._disc = SmoothEllipse()
         self.bind(pos=self._sync, size=self._sync,
                   state=lambda _w, s: setattr(
                       self._press, "rgba", C(T.press) if s == "down"
@@ -7884,7 +8725,7 @@ class EmojiKey(ButtonBehavior, Label):
         self._disc.size = (d, d)
 
 
-class EmojiPanel(BoxLayout):
+class EmojiPanel(Concealable, BoxLayout):
     """Emoji, by kind, where the keyboard was: capitals tabs over a grid.
     Picks go into the message being written, or — opened from the
     reaction strip — become a reaction."""
@@ -7897,7 +8738,8 @@ class EmojiPanel(BoxLayout):
         kw.setdefault("height", 0)
         super().__init__(**kw)
         self.on_pick = on_pick
-        self.opacity, self.disabled = 0, True
+        self.opacity = 0
+        self.conceal(True)
         paint_round(self, T.surface, radius=0)
         hairline(self, "top")
         recent = [e for e in load_prefs().get("recent_emoji", [])
@@ -7954,14 +8796,14 @@ class EmojiPanel(BoxLayout):
     def set_open(self, on: bool) -> None:
         self.height = self.HEIGHT if on else 0
         self.opacity = 1 if on else 0
-        self.disabled = not on
+        self.conceal(not on)
 
     @property
     def is_open(self) -> bool:
         return self.height > 0
 
 
-class ReactionStrip(BoxLayout):
+class ReactionStrip(Concealable, BoxLayout):
     """The quick reactions, floating over the message you held: tap one to
     react (tap yours again to take it back); + opens every emoji."""
 
@@ -7985,14 +8827,15 @@ class ReactionStrip(BoxLayout):
             Color(0, 0, 0, .30 if T.dark else .10)
             self._shadow = RoundedRectangle(radius=[dp(27)])
             Color(*C(T.surface_hi))
-            self._bg = RoundedRectangle(radius=[dp(27)])
+            self._bg = SmoothRoundedRectangle(radius=[dp(27)])
             self._mine_col = Color(0, 0, 0, 0)
-            self._mine = Ellipse()
+            self._mine = SmoothEllipse()
         with self.canvas.after:
             Color(*C(T.rule_strong))
-            self._edge = Line(width=dp(1) / 2.0)
+            self._edge = SmoothLine(width=1.0)
         self.bind(pos=self._sync, size=self._sync)
-        self.opacity, self.disabled = 0, True
+        self.opacity = 0
+        self.conceal(True)
         self._current = ""
 
     def _sync(self, *_a):
@@ -8013,7 +8856,7 @@ class ReactionStrip(BoxLayout):
 
     def show(self, current: str) -> None:
         self._current = current or ""
-        self.disabled = False
+        self.conceal(False)
         self._sync()
         Animation.cancel_all(self, "opacity")
         if motion(1):
@@ -8023,31 +8866,66 @@ class ReactionStrip(BoxLayout):
             self.opacity = 1
 
     def hide(self) -> None:
-        self.disabled = True
+        self.conceal(True)
         Animation.cancel_all(self, "opacity")
         self.opacity = 0
 
 
-class ComposerInput(BoxLayout):
-    """The message field: a soft pill on the page, the serif inside."""
+def fold(widget, shown: bool, width: float, animate: bool = True) -> None:
+    """Show a part of a row, or fold it away: its width runs to nothing
+    (its neighbours slide over) as it fades."""
+    Animation.cancel_all(widget, "width", "opacity")
+    w, o = (width, 1.0) if shown else (0.0, 0.0)
+    d = motion(0.18) if animate else 0
+    if not d or (abs(widget.width - w) < .5 and abs(widget.opacity - o) < .01):
+        widget.width, widget.opacity = w, o
+        return
+    Animation(width=w, opacity=o, d=d, t="out_cubic").start(widget)
 
-    def __init__(self, hint="Message", on_enter=None, **kw):
-        kw.setdefault("padding", [dp(16), 0, dp(12), 0])
+
+class ComposerInput(BoxLayout):
+    """The message field: a pill holding the emoji key, the text and the
+    paperclip — and the camera, while nothing is written.
+
+    The text fills the pill's whole height, so a click anywhere on it that
+    is not one of its keys puts the cursor in the text.
+    """
+
+    KEY = dp(44)
+
+    def __init__(self, hint="Message", on_enter=None, on_emoji=None,
+                 on_attach=None, on_camera=None, **kw):
+        kw.setdefault("padding", [dp(2), 0, dp(2), 0])
         super().__init__(**kw)
-        paint_round(self, T.surface_hi, radius=dp(22))
+        paint_round(self, T.surface_hi, radius=dp(24))
+
+        def key(icon, label, action):
+            return IconButton(icon, label=label, size=(self.KEY, TOUCH),
+                              pos_hint={"center_y": .5},
+                              on_release=lambda _w: action and action())
+        self.emoji_button = key("smile", "Emoji", on_emoji)
         self.input = TextInput(
             hint_text=hint, multiline=False, background_normal="",
             background_active="", background_color=(0, 0, 0, 0),
             foreground_color=C(T.text), hint_text_color=C(T.text_3),
             cursor_color=C(T.accent), selection_color=C(T.accent)[:3] + [.3],
-            font_size=fs(17), write_tab=False,
-            padding=[0, 0, 0, 0], size_hint_y=None,
-            height=round(fs(17) * 1.4), pos_hint={"center_y": .5})
+            font_size=fs(17), write_tab=False, text_validate_unfocus=False,
+            padding=[dp(4), 0, dp(4), 0])
+        self.input.bind(size=self._centre_text)
         if on_enter is not None:
             self.input.bind(on_text_validate=lambda _w: on_enter())
-        holder = AnchorLayout(anchor_y="center")
-        holder.add_widget(self.input)
-        self.add_widget(holder)
+        self.attach_button = key("attach", "Attach a photo", on_attach)
+        self.camera_button = key("camera", "Take a photo", on_camera)
+        for part in (self.emoji_button, self.input, self.attach_button,
+                     self.camera_button):
+            self.add_widget(part)
+
+    def _centre_text(self, *_a) -> None:
+        pad = max(0.0, (self.input.height - self.input.line_height) / 2.0)
+        self.input.padding = [dp(4), pad, dp(4), pad]
+
+    def show_camera(self, shown: bool, animate: bool = True) -> None:
+        fold(self.camera_button, shown, self.KEY, animate)
 
     @property
     def text(self) -> str:
@@ -8061,6 +8939,35 @@ class ComposerInput(BoxLayout):
         self.input.text = value
         self.input.scroll_x = 0
         self.input.cursor = self.input.get_cursor_from_index(len(value))
+
+
+class LiveLevels(Widget):
+    """The microphone's level while recording: the latest readings as bars
+    running in from the right."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self._levels: list = []
+        self.bind(pos=self._redraw, size=self._redraw)
+
+    def update(self, levels: list) -> None:
+        self._levels = levels
+        self._redraw()
+
+    def _redraw(self, *_a) -> None:
+        self.canvas.clear()
+        step, bar = dp(3.5), dp(1.5)
+        bars = max(1, int(self.width / step))
+        recent = self._levels[-bars:]
+        peak = max([1500] + recent)
+        with self.canvas:
+            Color(*C(T.accent))
+            x = self.right - len(recent) * step
+            for level in recent:
+                h = max(dp(2), self.height * .7 * min(1.0, .08 + level / peak))
+                Rectangle(pos=(x, self.y + (self.height - h) / 2),
+                          size=(bar, h))
+                x += step
 
 
 class ConversationScreen(Screen):
@@ -8190,10 +9097,11 @@ class ConversationScreen(Screen):
         root.add_widget(self.stack)
 
         # ---- reply preview (while composing a reply) -------------------------
-        self.reply_bar = BoxLayout(size_hint_y=None, height=0, opacity=0,
-                                   disabled=True,
-                                   padding=[dp(16), dp(6), dp(4), dp(6)],
-                                   spacing=dp(12))
+        self.reply_bar = ConcealableBox(size_hint_y=None, height=0,
+                                        opacity=0,
+                                        padding=[dp(16), dp(6), dp(4), dp(6)],
+                                        spacing=dp(12))
+        self.reply_bar.conceal(True)
         hairline(self.reply_bar, "top")
         reply_icon = Widget(size_hint_x=None, width=dp(22))
         reply_icon.bind(pos=lambda w, *_a: self._paint_reply_icon(w),
@@ -8216,49 +9124,58 @@ class ConversationScreen(Screen):
         root.add_widget(self.reply_bar)
 
         # ---- composer --------------------------------------------------------
+        # Nothing written: [you] ( ☺  Message   📎 📷 ) [mic]
+        # Writing:              ( ☺  the text…      📎 ) [send]
+        # The avatar and the camera fold away, and the microphone turns
+        # into the send button.
         self.composer = BoxLayout(size_hint_y=None,
                                   height=max(dp(64), line_height(17) +
                                              dp(30)),
-                                  padding=[dp(4), dp(8), dp(8), dp(8)],
-                                  spacing=dp(2))
+                                  padding=[dp(4), dp(8), dp(4), dp(8)])
         hairline(self.composer, "top")
-        self.emoji_button = IconButton(
-            "smile", label="Emoji", pos_hint={"center_y": .5},
-            on_release=lambda _w: self.toggle_emoji())
-        self.entry = ComposerInput(on_enter=self.app.send_current)
-        self.attach_button = IconButton(
-            "attach", label="Attach a photo", pos_hint={"center_y": .5},
-            on_release=lambda _w: self.pick_image())
+        self.me_holder = AnchorLayout(size_hint_x=None, width=TOUCH)
+        self.entry = ComposerInput(on_enter=self.app.send_current,
+                                   on_emoji=self.toggle_emoji,
+                                   on_attach=self.pick_image,
+                                   on_camera=self.take_photo)
+        self.emoji_button = self.entry.emoji_button
+        self.attach_button = self.entry.attach_button
+        self.camera_button = self.entry.camera_button
+        self.action_holder = AnchorLayout(size_hint_x=None, width=dp(56))
         self.action_button = IconButton(
             "send", bg=T.accent, tint=T.on_accent, label="Send",
-            pos_hint={"center_y": .5},
-            on_release=lambda _w: self._on_action_button())
-        self.entry.input.bind(text=lambda *_a: self._sync_action_button(),
+            icon_size=dp(23), on_release=lambda _w: self._on_action_button())
+        self.action_holder.add_widget(self.action_button)
+        self.entry.input.bind(text=lambda *_a: self._sync_composer(),
                               focus=self._on_entry_focus)
-        self.composer_parts = (self.emoji_button, self.entry,
-                               self.attach_button, self.action_button)
+        self.composer_parts = (self.me_holder, self.entry, self.action_holder)
         for part in self.composer_parts:
             self.composer.add_widget(part)
         # Shown instead of the composer when you can no longer write here.
         self.closed_note = InfoLabel("", color=T.text_3, italic=True,
                                      font_size=fs(15), halign="center",
                                      pos_hint={"center_y": .5})
-        # The strip that replaces the composer while recording.
+        # What the composer becomes while recording: discard, the time and
+        # the microphone's level, send.
         self.rec_cancel = IconButton(
             "delete", tint=T.alert, label="Discard recording",
             pos_hint={"center_y": .5},
             on_release=lambda _w: self.cancel_recording())
+        self.rec_dot = Widget(size_hint_x=None, width=dp(18))
+        self.rec_dot.bind(pos=self._paint_rec_dot, size=self._paint_rec_dot)
         self.rec_label = Label(text="", font_size=fs(16), color=C(T.text),
-                               halign="left", valign="middle", markup=True)
+                               halign="left", valign="middle",
+                               size_hint_x=None, width=dp(58))
         self.rec_label.bind(size=lambda w, v: setattr(w, "text_size", v))
+        self.rec_levels = LiveLevels()
         self.rec_send = IconButton(
             "send", bg=T.accent, tint=T.on_accent, label="Send recording",
-            pos_hint={"center_y": .5},
+            icon_size=dp(23), pos_hint={"center_y": .5},
             on_release=lambda _w: self.finish_recording())
         root.add_widget(self.composer)
         self.emoji_panel = EmojiPanel(self._emoji_picked)
         root.add_widget(self.emoji_panel)
-        self._sync_action_button()
+        self._sync_composer(animate=False)
 
     # ---- header --------------------------------------------------------------
     def set_peer(self, peer: str, contact: dict, unread_count: int,
@@ -8271,6 +9188,8 @@ class ConversationScreen(Screen):
             if self.peer is not None:
                 self._drafts[self.peer] = self.entry.text
             self.entry.text = self._drafts.pop(peer, "")
+            self._sync_composer(animate=False)
+        self._refresh_me()
         self.peer, self.kind, self.group = peer, kind, group
         if kind == "self":
             name = "Notes to self"
@@ -8330,6 +9249,7 @@ class ConversationScreen(Screen):
             self.composer.clear_widgets()
             for part in self.composer_parts:
                 self.composer.add_widget(part)
+            self._sync_composer(animate=False)
         self.more_button.disabled = False
 
     # ---- bubbles -------------------------------------------------------------
@@ -8472,7 +9392,7 @@ class ConversationScreen(Screen):
 
     def _place_strip(self, *_a) -> None:
         """Float the strip just above the held message, inside the view."""
-        if self.strip.disabled or len(self.selected) != 1:
+        if self.strip.concealed or len(self.selected) != 1:
             return
         row = self._rows.get(next(iter(self.selected)))
         if row is None:
@@ -8656,7 +9576,7 @@ class ConversationScreen(Screen):
         self.reply_snip.text = snip
         self.reply_bar.height, self.reply_bar.opacity = max(
             dp(56), self.reply_author.height + line_height(15) + dp(14)), 1
-        self.reply_bar.disabled = False
+        self.reply_bar.conceal(False)
         self.entry.input.focus = True
 
     def take_reply(self) -> Optional[dict]:
@@ -8667,7 +9587,7 @@ class ConversationScreen(Screen):
     def cancel_reply(self) -> None:
         self.reply_to = None
         self.reply_bar.height, self.reply_bar.opacity = 0, 0
-        self.reply_bar.disabled = True
+        self.reply_bar.conceal(True)
 
     def jump_to_cid(self, cid: Optional[str]) -> None:
         """Tap on a quote: scroll to the quoted message and flash it."""
@@ -8826,13 +9746,44 @@ class ConversationScreen(Screen):
         self._reply_accent.pos = (widget.x, widget.y + dp(3))
         self._reply_accent.size = (dp(2), max(0, widget.height - dp(6)))
 
-    def _voice_possible(self) -> bool:
-        return IS_ANDROID
+    _can_record: Optional[bool] = None
 
-    def _sync_action_button(self) -> None:
-        typing = bool(self.entry.input.text.strip())
-        voice = not typing and self._voice_possible()
-        self.action_button.set_icon("mic" if voice else "send")
+    def _voice_possible(self) -> bool:
+        if IS_ANDROID:
+            return True
+        if ConversationScreen._can_record is None:
+            ConversationScreen._can_record = desktop_recording_available()
+        return ConversationScreen._can_record
+
+    def _refresh_me(self) -> None:
+        """The disc of the identity you are writing as, left of the field."""
+        keys = self.app.keys
+        mine = (keys.address, keys.username, keys.label) \
+            if keys.has_identity else None
+        if mine == getattr(self, "_me_shown", False):
+            return
+        self._me_shown = mine
+        self.me_holder.clear_widgets()
+        if mine is None:
+            return
+        name = keys.username or keys.label
+        me = AvatarButton(keys.address, name, diameter=dp(34),
+                          pos_hint={"center_x": .5, "center_y": .5})
+        me.label = f"Writing as {'@' + keys.username if keys.username else name}"
+        me.bind(on_release=lambda _w: IdentitySheet(self.app).open())
+        self.me_holder.add_widget(me)
+
+    def _sync_composer(self, animate: bool = True) -> None:
+        """Fit the composer to what is in it (see its layout above)."""
+        quiet = not self.entry.input.text.strip()
+        fold(self.me_holder, quiet, TOUCH, animate)
+        self.entry.show_camera(quiet, animate)
+        voice = quiet and self._voice_possible()
+        icon = "mic" if voice else "send"
+        if animate:
+            self.action_button.morph(icon)
+        else:
+            self.action_button.show_icon(icon)
         self.action_button.label = "Record a voice message" if voice \
             else "Send"
 
@@ -8842,49 +9793,75 @@ class ConversationScreen(Screen):
         else:
             self.start_recording()
 
-    def pick_image(self) -> None:
+    def _media_refused(self, what: str) -> bool:
         if self.kind != "self" and not self.app.media_available():
-            self.app._set_status("Photos and voice messages need the v9 "
-                                 "relay — this one can't carry them yet",
-                                 T.accent)
+            self.app._set_status(f"{what} need the v9 relay — this one can't "
+                                 "carry them yet", T.accent)
+            return True
+        return False
+
+    def pick_image(self) -> None:
+        if self._media_refused("Photos and voice messages"):
             return
         if IS_ANDROID:
             try:
-                android_pick_image(self._picked)
+                android_pick_image(lambda path: self._picked(path, True))
             except Exception:
                 log.exception("photo picker failed")
                 self.app._set_status("Couldn't open the photo picker",
                                      T.alert)
         else:
-            ImageChooserModal(self._picked).open()
+            ImageChooserModal(lambda path: self._picked(path, False)).open()
 
-    def _picked(self, path: str) -> None:
-        AttachPreviewModal(self.app, path).open()
+    def take_photo(self) -> None:
+        if self._media_refused("Photos"):
+            return
+        if IS_ANDROID:
+            try:
+                android_take_photo(lambda path: self._picked(path, True))
+            except Exception:
+                log.exception("camera failed")
+                self.app._set_status("Couldn't open the camera", T.alert)
+        else:
+            open_desktop_camera(lambda path: self._picked(path, True),
+                                on_choose=self.pick_image)
+
+    def _picked(self, path: str, temporary: bool = False) -> None:
+        """A photo to send. `temporary`: a copy this app made (a picked or
+        camera photo), deleted once it is sent or set aside."""
+        AttachPreviewModal(self.app, path, temporary=temporary).open()
 
     def start_recording(self) -> None:
-        if self.kind != "self" and not self.app.media_available():
-            self.app._set_status("Voice messages need the v9 relay — this "
-                                 "one can't carry them yet", T.accent)
+        if self._media_refused("Voice messages"):
             return
-        if not android_has_permission("android.permission.RECORD_AUDIO"):
+        if IS_ANDROID and not android_has_permission(
+                "android.permission.RECORD_AUDIO"):
             android_request_permissions(
                 ["android.permission.RECORD_AUDIO"],
                 lambda _p, grants: run_on_ui(
                     self._after_mic_permission, bool(grants) and all(grants)))
             return
         try:
-            self.recorder = VoiceRecorder()
-        except Exception:
-            log.exception("could not start recording")
+            self.recorder = VoiceRecorder() if IS_ANDROID else PcmRecorder()
+        except Exception as exc:
+            log.warning("could not start recording: %s", exc)
             self.recorder = None
-            self.app._set_status("Couldn't start recording", T.alert)
+            self.app._set_status("Couldn't start recording — is a "
+                                 "microphone connected?", T.alert)
             return
         self.close_emoji()
         self.composer.clear_widgets()
-        for part in (self.rec_cancel, self._rec_dot_widget(), self.rec_label,
-                     self.rec_send):
+        for part in (self.rec_cancel, self.rec_dot, self.rec_label,
+                     self.rec_levels, self.rec_send):
             self.composer.add_widget(part)
-        self._rec_tick = Clock.schedule_interval(self._update_rec_label, 0.2)
+        Animation.cancel_all(self.rec_dot, "opacity")
+        self.rec_dot.opacity = 1
+        if motion(1):
+            pulse = Animation(opacity=.25, d=.6, t="in_out_sine") + \
+                Animation(opacity=1, d=.6, t="in_out_sine")
+            pulse.repeat = True
+            pulse.start(self.rec_dot)
+        self._rec_tick = Clock.schedule_interval(self._update_rec_label, 0.1)
         self._update_rec_label(0)
 
     def _after_mic_permission(self, granted: bool) -> None:
@@ -8894,34 +9871,39 @@ class ConversationScreen(Screen):
             self.app._set_status("Voice messages need the microphone "
                                  "permission", T.accent)
 
-    def _rec_dot_widget(self) -> Widget:
-        dot = Widget(size_hint_x=None, width=dp(16))
-
-        def paint(*_a):
-            dot.canvas.clear()
-            with dot.canvas:
-                Color(*C(T.alert))
-                Ellipse(pos=((dot.x + dot.width / 2) - dp(5), (dot.y + dot.height / 2) - dp(5)),
-                        size=(dp(10), dp(10)))
-        dot.bind(pos=paint, size=paint)
-        return dot
+    def _paint_rec_dot(self, dot, *_a) -> None:
+        dot.canvas.clear()
+        r = dp(5)
+        with dot.canvas:
+            Color(*C(T.alert))
+            SmoothEllipse(pos=(dot.x + dot.width / 2 - r,
+                               dot.y + dot.height / 2 - r),
+                          size=(2 * r, 2 * r))
 
     def _update_rec_label(self, _dt) -> None:
-        if self.recorder is None:
+        recorder = self.recorder
+        if recorder is None:
             return
-        sec = self.recorder.elapsed_ms // 1000
-        self.rec_label.text = f"{sec // 60}:{sec % 60:02d}   [i]Recording…[/i]"
-        if sec >= MAX_VOICE_SECONDS:
+        if getattr(recorder, "failed", False) and recorder.elapsed_ms == 0:
+            self.cancel_recording()
+            self.app._set_status("No sound came from the microphone",
+                                 T.alert)
+            return
+        sec = recorder.elapsed_ms // 1000
+        self.rec_label.text = f"{sec // 60}:{sec % 60:02d}"
+        self.rec_levels.update(list(recorder.levels))
+        if sec >= getattr(recorder, "max_seconds", MAX_VOICE_SECONDS):
             self.finish_recording()
 
     def _end_recording_ui(self) -> None:
         if self._rec_tick is not None:
             self._rec_tick.cancel()
             self._rec_tick = None
+        Animation.cancel_all(self.rec_dot, "opacity")
         self.composer.clear_widgets()
         for part in self.composer_parts:
             self.composer.add_widget(part)
-        self._sync_action_button()
+        self._sync_composer(animate=False)
 
     def finish_recording(self) -> None:
         recorder, self.recorder = self.recorder, None
@@ -9874,6 +10856,9 @@ class FextApp(MessagingMixin, App):
             # Phone-shaped by default on desktop so the layout is exercised
             # the way it will be on a handset; still freely resizable.
             Window.size = (dp(420), dp(820))
+            # The mark, not Kivy's, on the title bar, taskbar and dock.
+            if DESKTOP_ICON.is_file():
+                self.icon = str(DESKTOP_ICON)
         self.manager = ScreenManager(transition=NoTransition())
         self.voice = VoicePlayer()
         self._build_screens()
@@ -10686,16 +11671,18 @@ class FextApp(MessagingMixin, App):
     # =========================================================================
     #  Media (v9): photos and voice notes
     # =========================================================================
-    def send_image(self, path: str, caption: str = "") -> None:
+    def send_image(self, path: str, caption: str = "",
+                   temporary: bool = False) -> None:
         peer = self.current_peer
         if peer is None:
             return
         reply = self.conversation_screen.take_reply()
         threading.Thread(target=self._prepare_image,
-                         args=(peer, path, caption, reply),
+                         args=(peer, path, caption, reply, temporary),
                          daemon=True).start()
 
-    def _prepare_image(self, peer, path, caption, reply) -> None:
+    def _prepare_image(self, peer, path, caption, reply,
+                       temporary: bool = False) -> None:
         try:
             data, width, height, thumb = compress_image(path)
         except Exception as exc:
@@ -10703,6 +11690,11 @@ class FextApp(MessagingMixin, App):
             self.ui_queue.put(("status", "That file isn't an image this "
                                "app can read", COL_DANGER))
             return
+        finally:
+            # The full-size original (with its camera details) is not kept:
+            # what is sent, and stays, is the compressed copy.
+            if temporary:
+                discard_media_file(path)
         extra = {"w": width, "h": height, "thumb": thumb}
         if caption:
             extra["cap"] = caption
@@ -10727,8 +11719,12 @@ class FextApp(MessagingMixin, App):
             extra = {"dur": int(duration_ms)}
             if wave:
                 extra["wave"] = wave
-            self._send_media(peer, "voice", data, "audio/mp4", extra,
-                             voice_label(duration_ms), reply, "m4a")
+            # A phone records AAC (.m4a); a computer, WAV.
+            wav = path.lower().endswith(".wav")
+            self._send_media(peer, "voice", data,
+                             "audio/wav" if wav else "audio/mp4", extra,
+                             voice_label(duration_ms), reply,
+                             "wav" if wav else "m4a")
         threading.Thread(target=work, daemon=True).start()
 
     def _send_media(self, peer, kind, data, mime, extra, body, reply,
@@ -10835,8 +11831,7 @@ class FextApp(MessagingMixin, App):
                 blob = self.api.download_blob(media["blob"])
                 data = open_media(blob, media["key"], media["sha"])
                 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
-                suffix = {"image": "jpg", "voice": "m4a"}.get(row["kind"],
-                                                             "bin")
+                suffix = media_suffix(row["kind"], media.get("mime"))
                 target = MEDIA_DIR / f"{row.get('client_msg_id') or uuid.uuid4().hex}.{suffix}"
                 target.write_bytes(data)
                 self.store.set_media(local_id, path=str(target),
@@ -11043,6 +12038,11 @@ class FextApp(MessagingMixin, App):
             self._set_status("Reconnecting…", COL_TEXT_DIM)
         elif self.keys.has_identity and self.keys.username:
             self._start_worker()
+
+    def on_start(self) -> None:
+        if platform.system() == "Windows" and DESKTOP_ICO.is_file():
+            Clock.schedule_once(
+                lambda _dt: windows_window_icons(str(DESKTOP_ICO)), 0)
 
     def on_pause(self) -> bool:
         self.foreground = False          # background: back off politely

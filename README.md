@@ -19,17 +19,44 @@ same key (see [Release signing](#release-signing)).
 
 ## Downloads
 
-Every push is tested, built and published to a GitHub Release. Open the
-**Releases** page (or the **`v9.1.0`** tag) and take:
+Every push to the default branch is tested, built and published to a GitHub
+Release. Open the **Releases** page (or the **`v9.1.1`** tag) and take:
 
 | Asset | For |
 | --- | --- |
-| `Ferritext-9.1.0.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r` |
-| `Ferritext-9.1.0-desktop.zip` | Windows / macOS / Linux — unzip, then run `python3 ferritext.py` (Python 3.11+). It carries the fonts the client draws with. |
-| `Ferritext-9.1.0-desktop.py` | The same client as a single file, to package with [`desktop/`](desktop/README.md). On its own it falls back to Kivy's font: no emoji, no serif. |
+| `Ferritext-9.1.1.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r` |
+| `Ferritext-9.1.1-desktop.py` | Windows / macOS / Linux — one file with its fonts and icons inside. Run it with Python 3.11+ after `pip install kivy requests websocket-client cryptography qrcode pillow`. |
 
-All three are also attached to each Actions run as the **`ferritext-release`**
-artifact.
+Both are also attached to each Actions run as the **`ferritext-release`**
+artifact. Pushes to other branches are tested and built, but publish nothing.
+
+## What's in 9.1.1
+
+- **The composer, redone.** With nothing written it shows who you are writing
+  as (tap your initial to switch identity), the emoji key, the paperclip, a
+  camera, and a microphone in place of the send button. Once you start
+  typing, your initial and the camera fold away and the microphone turns
+  into the send button.
+- **Take a photo** from the composer. On Android the phone's camera app takes
+  it and hands it straight to Ferritext's private storage — it never passes
+  through the gallery. On a computer, a webcam through OpenCV when that is
+  installed.
+- **Voice notes from a computer**, as WAV: built in on Windows; on Linux and
+  macOS through `arecord`, `parec`, `ffmpeg` or the `sounddevice` package.
+  Recording shows the time and the microphone's level as it goes.
+- **More detailed icons**, drawn finer and smoothed whatever the graphics
+  card offers — so are the avatars, buttons and message shapes, which were
+  jagged on computers without multisampling.
+- **Clicking the message field works on a computer.** The closed emoji panel
+  (and other hidden parts) no longer swallow clicks and taps meant for what
+  lies underneath them.
+- **The desktop download is one file** that carries its fonts — emoji and the
+  serif now appear on a computer — and the Ferritext mark for the title bar,
+  taskbar and dock, in place of Kivy's.
+- A right-click on a computer no longer leaves a red dot behind.
+- A photo you pick or take is deleted once its compressed copy is sent (or
+  you decide not to send it), and received voice notes keep their own file
+  type.
 
 ## What's in 9.1
 
@@ -108,6 +135,10 @@ member still on an older release still receives it.
 | A group message | in the group, under its author's name | as a direct message from its author | as a direct message from its author |
 | Invitation, rename, add, remove, leave | updates the group | not shown (9.0 ignores instructions it does not know) | shown as text, e.g. "ann added you to the group …" |
 | A reaction | under the message | not shown | shown as text, e.g. "Reacted 👍 to …" |
+
+**Voice notes recorded on a computer** are WAV. Every 9.x phone plays them;
+on a computer, 9.1.0 and earlier save them under an `.m4a` name, which some
+players refuse — 9.1.1 keeps each note's own file type.
 
 **On the wire.** v9 features travel in an extension block inside the
 encrypted payload, with its own signature that also names the recipient and
@@ -192,7 +223,10 @@ the app is open.
 Android 14 requires such a service to declare its type, which
 python-for-android's manifest template cannot express;
 `tools/p4a_hook.py` adds it during the build (and fails the build, rather than
-the phone, if it cannot).
+the phone, if it cannot). The same hook declares the FileProvider through
+which the camera app hands over a photo (its one folder is
+`src/android/res/xml/fext_file_paths.xml`; the class comes from
+`androidx.core`).
 
 ## What's in here
 
@@ -201,12 +235,13 @@ the phone, if it cannot).
 | `main.py` | The complete client (Buildozer's entry point **must** be `main.py`). |
 | `service.py` | Android background sync service (imports `main.py`, no UI). |
 | `buildozer.spec` | Android packaging: requirements, permissions, service, icons. |
-| `data/` | The Ferrite Text Messenger mark (`ferritext_logo.svg`, as supplied) and the PNGs rendered from it. |
+| `data/` | The Ferrite Text Messenger mark (`ferritext_logo.svg`, as supplied) and the images rendered from it, including the desktop window icons (`icon_desktop.png`, `.ico`). |
 | `data/fonts/` | Ferritext Serif (four styles), the capitals face `ui.ttf`, and their licences. |
-| `tools/make_logo.py` | Renders every PNG in `data/` from the SVG — no dependency beyond Pillow. |
+| `tools/make_logo.py` | Renders every image in `data/` from the SVG — no dependency beyond Pillow. |
 | `tools/build_fonts.py` | Rebuilds Ferritext Serif from EB Garamond and Noto Emoji (needs fontTools). |
-| `tools/p4a_hook.py` | Build hook declaring the service type Android 14 requires. |
-| `src/android/res/` | Android resources: cleartext policy for the relay, status-bar icon. |
+| `tools/bundle_desktop.py` | Builds the single-file desktop release, and `--verify` checks one against the source. |
+| `tools/p4a_hook.py` | Build hook: the service type Android 14 requires, and the camera's FileProvider. |
+| `src/android/res/` | Android resources: cleartext policy for the relay, status-bar icon, the camera's folder. |
 | `desktop/` | Desktop packaging (Nuitka) and the headless test suites. |
 | `.github/workflows/build-apk.yml` | Tests → signed APK → GitHub Release with both deliverables. |
 
@@ -220,6 +255,8 @@ python3 desktop/test_service.py main.py                  # no display at all
 xvfb-run -a python3 desktop/test_core.py  main.py old.py # old.py: previous release
 xvfb-run -a python3 desktop/test_flows.py main.py
 xvfb-run -a python3 desktop/test_design.py main.py
+xvfb-run -a python3 desktop/test_composer.py main.py
+xvfb-run -a python3 desktop/test_bundle.py main.py
 xvfb-run -a python3 desktop/smoke_desktop.py main.py
 xvfb-run -a python3 desktop/smoke_chat.py main.py
 ```
@@ -229,11 +266,13 @@ xvfb-run -a python3 desktop/smoke_chat.py main.py
 | `test_core.py` | Envelope extension (incl. replay/tamper refusal), wire compatibility with the previous release, migrations both ways, delete-for-both authorisation, tombstones, extension sanitising, group membership rules (who may invite, change and remove), per-member receipts, reactions |
 | `test_flows.py` | Three real app controllers over an in-memory relay: replies, forwards, stars, delete for both, photos (EXIF stripping, rotation), expiry → ask again → re-upload, voice notes, notification rules, notes to self, groups (create, write, rename, remove, leave), reactions and taking them back, the reaction strip and emoji panel, switching theme and text size |
 | `test_design.py` | WCAG AA contrast of every text/ground pair in both themes, fonts registered and packaged with their licences, following the system theme, tracked capitals, stacking buttons, Back closing a sheet |
-| `test_service.py` | Headless import as the service runs it, app ⇄ service hand-over, the Android 14 manifest hook |
+| `test_composer.py` | Real mouse clicks reaching the message field and its keys, hidden parts never swallowing a touch, the composer's two states, recording through a capture command into WAV, photos from a camera, icons drawn smooth |
+| `test_bundle.py` | The single-file desktop release: built, verified, run from an empty folder (fonts and icons unpacked, checked, reused, repaired) |
+| `test_service.py` | Headless import as the service runs it, app ⇄ service hand-over, the manifest hook |
 | `smoke_desktop.py` | Launch, branding and loading screen through the real `App.run()` path |
 | `smoke_chat.py` | Bottom-anchored short chats, scrolling, text selection and copy |
 
-To get `old.py`: `git show v9.0.1:main.py > old.py` (or the latest tag before
+To get `old.py`: `git show v9.1.0:main.py > old.py` (or the latest tag before
 the version under test).
 
 ## Building it yourself
@@ -244,10 +283,11 @@ on first run.
 
 ```bash
 python3 -m pip install --user buildozer cython
-buildozer android debug          # produces bin/fext-9.1.0-*-debug.apk
+buildozer android debug          # produces bin/fext-9.1.1-*-debug.apk
 ```
 
-The mark is regenerated with `python3 tools/make_logo.py` (Pillow only).
+The mark and icons are regenerated with `python3 tools/make_logo.py` (Pillow
+only).
 
 ## Release signing
 
@@ -334,4 +374,5 @@ A signing key is **never committed to this repository.**
   delete that file and those two keys, and set `FEXT_REQUIRE_TLS=1`.
 - **Permissions**: internet and network state; notifications (asked on
   Android 13+); microphone (asked the first time you record); the foreground
-  service and its data-sync type (background delivery).
+  service and its data-sync type (background delivery). No camera
+  permission: the phone's camera app takes the photo with its own.

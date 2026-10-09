@@ -4,6 +4,8 @@ name: Build Android APK
 # ubuntu-latest runner (GitHub runners can reach the Android SDK host
 # dl.google.com that Buildozer downloads from), then a GitHub Release that
 # carries both deliverables: the Android APK and the desktop Python client.
+# Every branch is tested and built; only the default branch publishes, so a
+# copy of the code pushed elsewhere never replaces a release's files.
 #
 # Signing:
 #   * If you set the repo secrets FEXT_KEYSTORE_B64 / FEXT_KEYSTORE_PASSWORD /
@@ -71,6 +73,8 @@ jobs:
           xvfb-run -a python desktop/test_core.py main.py $OLD
           xvfb-run -a python desktop/test_flows.py main.py
           xvfb-run -a python desktop/test_design.py main.py
+          xvfb-run -a python desktop/test_composer.py main.py
+          xvfb-run -a python desktop/test_bundle.py main.py
           xvfb-run -a python desktop/smoke_desktop.py main.py
           xvfb-run -a python desktop/smoke_chat.py main.py
 
@@ -192,19 +196,12 @@ jobs:
           TITLE="$(grep -E '^title' buildozer.spec | head -1 | sed -E 's/.*=[[:space:]]*//')"
           mkdir -p release
           cp "$(ls bin/*-release.apk | head -1)" "release/${TITLE}-${VER}.apk"
-          # The desktop client IS main.py; shipped under a versioned name for
-          # people who run it with Python or package it (desktop/README.md).
-          cp main.py "release/${TITLE}-${VER}-desktop.py"
-          # ...and with the folder it draws on — the bundled type (with its
-          # licences) and the mark — since Kivy cannot fall back to another
-          # font: without them, emoji and the serif are lost.
-          STAGE="$RUNNER_TEMP/${TITLE}"
-          rm -rf "$STAGE" && mkdir -p "$STAGE"
-          cp main.py "$STAGE/ferritext.py"
-          cp -r data "$STAGE/data"
-          rm -f "$STAGE/data/ferritext_logo.svg"
-          (cd "$RUNNER_TEMP" && zip -qr "$GITHUB_WORKSPACE/release/${TITLE}-${VER}-desktop.zip" "${TITLE}")
-          unzip -l "release/${TITLE}-${VER}-desktop.zip" | tail -3
+          # The desktop client is main.py with its fonts and window icons
+          # appended (Kivy cannot fall back to another font, so without the
+          # bundled serif a computer shows no emoji) — then checked against
+          # main.py and data/ byte for byte, as anyone can check it.
+          python3 tools/bundle_desktop.py "release/${TITLE}-${VER}-desktop.py"
+          python3 tools/bundle_desktop.py --verify "release/${TITLE}-${VER}-desktop.py"
           ls -la release/
           echo "ver=$VER" >> "$GITHUB_OUTPUT"
           echo "title=$TITLE" >> "$GITHUB_OUTPUT"
@@ -218,7 +215,9 @@ jobs:
           if-no-files-found: error
 
       - name: Publish to a GitHub Release
-        if: success()
+        # Only from the default branch: a mirror branch (main, kept in step
+        # by hand) builds the same tree and must not replace these files.
+        if: success() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         env:
           GH_TOKEN: ${{ github.token }}
           VER: ${{ steps.assets.outputs.ver }}
@@ -226,7 +225,7 @@ jobs:
         run: |
           set -euo pipefail
           TAG="v${VER}"
-          NOTES="${TITLE} ${VER} (CI run #${{ github.run_number }}, commit ${GITHUB_SHA:0:7}). ${TITLE}-${VER}.apk: Android — sideload via 'Install unknown apps'. ${TITLE}-${VER}-desktop.zip: the same client for Windows/macOS/Linux with its fonts — unzip and run ferritext.py with Python 3.11+. ${TITLE}-${VER}-desktop.py: the client file alone (falls back to Kivy's own font), or package it with desktop/build_desktop.sh."
+          NOTES="${TITLE} ${VER} (CI run #${{ github.run_number }}, commit ${GITHUB_SHA:0:7}). ${TITLE}-${VER}.apk: Android — sideload via 'Install unknown apps'. ${TITLE}-${VER}-desktop.py: the same client for Windows, macOS and Linux in one file, with its fonts and icons inside — run it with Python 3.11+ (see the README for the packages it needs)."
           # Create the release if this tag is new; otherwise keep it and just
           # refresh the title/notes, so a rebuild of the same version does not
           # leave stale text (or a stale app name) on the downloads page.
@@ -239,3 +238,26 @@ jobs:
           fi
           gh release upload "$TAG" release/* --repo "$GITHUB_REPOSITORY" --clobber
           echo "Published to release $TAG:"; ls release/
+
+      - name: Keep every release's commit citation on its tag
+        if: success() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Each release's notes name the commit it was built from. Should
+          # history ever be rewritten (tags moved onto rewritten commits),
+          # this points each one at its tag's commit again. Idempotent.
+          gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq '.[] | [.id, .tag_name] | @tsv' |
+          while IFS=$'\t' read -r id tag; do
+            sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha 2>/dev/null | cut -c1-7)" || continue
+            [ -n "$sha" ] || continue
+            body="$(gh api "repos/$GITHUB_REPOSITORY/releases/$id" --jq .body)"
+            new="$(printf '%s' "$body" | sed -E "s/commit [0-9a-f]{7}([^0-9a-f]|$)/commit ${sha}\1/")"
+            if [ "$new" != "$body" ]; then
+              gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$id" \
+                -f body="$new" >/dev/null
+              echo "$tag now cites commit $sha"
+            fi
+          done

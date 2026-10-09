@@ -171,6 +171,34 @@ def mark(size: int, disc: float, ground=None) -> Image.Image:
     return out
 
 
+#: Sizes in the Windows .ico: the title bar, taskbar and Alt-Tab pick from
+#: these (and their 125/150/200% cousins) instead of shrinking one image.
+ICO_SIZES = (16, 20, 24, 32, 40, 48, 64, 128, 256)
+
+
+def desktop_icon(size: int, supersample: int = 4) -> Image.Image:
+    """The window and taskbar icon on a computer: the mark on a white disc a
+    little larger than itself, transparent outside it, so it reads on light
+    and dark title bars alike — the mark's own black disc would vanish into
+    a dark one, and its knocked-out bead with it."""
+    big = size * supersample
+    disc = Image.new("L", (big, big), 0)
+    ImageDraw.Draw(disc).ellipse((0, 0, big - 1, big - 1), fill=255)
+    out = Image.new("RGBA", (size, size), WHITE)
+    out.putalpha(disc.resize((size, size), Image.LANCZOS))
+    out.alpha_composite(mark(size, 0.90))
+    return out
+
+
+def write_desktop_icons(out: Path) -> None:
+    desktop_icon(512).save(out / "icon_desktop.png")
+    frames = {s: desktop_icon(s) for s in ICO_SIZES}
+    frames[256].save(out / "icon_desktop.ico", format="ICO",
+                     sizes=[(s, s) for s in ICO_SIZES],
+                     append_images=[frames[s] for s in ICO_SIZES
+                                    if s != 256])
+
+
 def main(out: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
     # In-app loading screen: transparent, so it sits on whatever the screen
@@ -188,8 +216,11 @@ def main(out: Path) -> None:
     mark(432, 0.58).save(out / "icon_fg.png")
     # Platform presplash, shown before any Python runs: white ground.
     mark(800, 0.40, WHITE).save(out / "presplash.png")
+    # Window, taskbar and dock icon on Windows, macOS and Linux.
+    write_desktop_icons(out)
     for name in ("ferritext_logo.png", "icon.png", "icon_bg.png",
-                 "icon_fg.png", "presplash.png"):
+                 "icon_fg.png", "presplash.png", "icon_desktop.png",
+                 "icon_desktop.ico"):
         print("wrote", out / name)
 
 

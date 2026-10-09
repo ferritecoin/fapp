@@ -32,7 +32,7 @@ source.exclude_dirs = tests, bin, venv, .git, .github, .buildozer, __pycache__, 
 # loads data/ferritext_logo.png at runtime for the loading screen.
 
 # (str) Application versioning (method 1)
-version = 9.1.0
+version = 9.1.1
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy
@@ -86,7 +86,16 @@ android.permissions = INTERNET,ACCESS_NETWORK_STATE,POST_NOTIFICATIONS,RECORD_AU
 # without this the platform refuses the connection before any Python runs and
 # the client-side fallback cannot help. Scoped to the one host in preference
 # to a blanket android:usesCleartextTraffic="true".
-android.add_resources = src/android/res/xml/network_security_config.xml:xml/network_security_config.xml,src/android/res/drawable/ic_stat_ferritext.png:drawable/ic_stat_ferritext.png
+# Also res/xml/fext_file_paths.xml: the one cache folder the camera's
+# FileProvider may hand out (see tools/p4a_hook.py).
+android.add_resources = src/android/res/xml/network_security_config.xml:xml/network_security_config.xml,src/android/res/drawable/ic_stat_ferritext.png:drawable/ic_stat_ferritext.png,src/android/res/xml/fext_file_paths.xml:xml/fext_file_paths.xml
+
+# (list) Gradle dependencies: androidx.core, for its FileProvider — the camera
+# app writes a photo through it straight into the app's private cache, so a
+# photo taken for a chat never passes through the gallery. Pinned to an older,
+# small release: the app needs nothing else from it.
+android.gradle_dependencies = androidx.core:core:1.6.0
+android.enable_androidx = True
 
 # NOTE: the <application> attribute that points at the config above is set via
 # p4a.extra_args at the bottom of this file, NOT via

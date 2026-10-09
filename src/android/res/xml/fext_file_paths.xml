@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The one folder the FileProvider can hand out: the camera's drop box in
+     the app's private cache. Each photo is granted for writing once, moved
+     into the app's media folder, and its cache file removed (see
+     android_take_photo in main.py and tools/p4a_hook.py). -->
+<paths>
+    <cache-path name="camera" path="camera/" />
+</paths>

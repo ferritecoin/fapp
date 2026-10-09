@@ -12,7 +12,8 @@ There is no desktop fork. The client detects its platform at import time
 | Selecting messages | long-press | right-click (or long-press); drag inside a message to highlight part of it |
 | Sharing | Android share sheet | copied to the clipboard |
 | Photos | system photo picker | file chooser |
-| Voice notes | record and play | play (opens in the system's audio player); recording needs a phone |
+| Camera | the phone's camera app, writing straight into private storage | a webcam, through OpenCV when it is installed (`pip install opencv-python`) |
+| Voice notes | recorded as AAC; played in the app | recorded as WAV — built in on Windows; `arecord`, `parec` or `ffmpeg` on Linux; `ffmpeg` on macOS; or the `sounddevice` package anywhere — and played in the system's audio player |
 | Notifications | system notifications, plus a background service | status line while the app is open |
 
 Everything else — the crypto core, the wire protocol, the relay discovery, the
@@ -20,8 +21,13 @@ local SQLite store — is byte-for-byte the same code, which is the point: a
 desktop build can never drift from the phone build.
 
 For distribution, every GitHub Release carries `Ferritext-<version>-desktop.py`:
-simply this file under a versioned name, byte-identical to `main.py` at that
-release's tag.
+`main.py` at that release's tag with the fonts and window icons appended as
+comment lines, so the one file is all a computer needs (Kivy draws each label
+in a single font, so without the bundled serif there would be no emoji). On
+first start they are unpacked into `~/.fext/assets`, and each is checked
+against its SHA-256 on every start. To confirm a download is exactly the
+source, run `python3 tools/bundle_desktop.py --verify Ferritext-<version>-desktop.py`
+from a checkout of the tag.
 
 ## Building
 

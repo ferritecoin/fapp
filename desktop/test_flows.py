@@ -403,9 +403,9 @@ check("...and picking from it reacts and closes the strip",
 deliver(relay, parties)
 screen.open_emoji()
 screen.entry.text = ""
-screen.emoji_panel._pick("🕯")
+screen.emoji_panel._pick("🙂")
 check("the emoji panel writes into the message",
-      screen.entry.text == "🕯" and screen.emoji_panel.is_open)
+      screen.entry.text == "🙂" and screen.emoji_panel.is_open)
 screen.close_emoji()
 screen.entry.text = ""
 

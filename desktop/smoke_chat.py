@@ -52,7 +52,9 @@ BODY = "The quick brown fox jumps over the lazy dog and keeps on running"
 class StubApp:
     """Just enough app for ConversationScreen to wire its callbacks to."""
     current_peer = PEER
-    keys = type("Keys", (), {"address": "FecMe1111111111111111111111111111"})
+    keys = type("Keys", (), {"address": "FecMe1111111111111111111111111111",
+                             "has_identity": True, "username": "me",
+                             "label": "Personal"})
     store = None
 
     def conversation_kind(self, peer):
