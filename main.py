@@ -76,14 +76,22 @@ import os
 import platform
 import queue
 import re
+import select
+import socket
 import sqlite3
 import stat
 import shutil
+import struct
 import subprocess
 import sys
+import tarfile
+import tempfile
 import threading
 import time
+import unicodedata
 import uuid
+import weakref
+from collections import OrderedDict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
@@ -146,12 +154,12 @@ from kivy.animation import Animation
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.clipboard import Clipboard
-from kivy.core.image import Image as CoreImage
 from kivy.core.text import Label as CoreLabel, LabelBase
 from kivy.core.window import Window
-from kivy.graphics import ClearBuffers, ClearColor, Color, Ellipse, Fbo, \
-    Line, Mesh, PopMatrix, PushMatrix, Rectangle, RoundedRectangle, Scale, \
-    SmoothEllipse, SmoothLine, SmoothRoundedRectangle, Triangle
+from kivy.graphics import Canvas, ClearBuffers, ClearColor, Color, Ellipse, \
+    Fbo, InstructionGroup, Line, Mesh, PopMatrix, PushMatrix, Rectangle, \
+    RoundedRectangle, Scale, SmoothEllipse, SmoothLine, \
+    SmoothRoundedRectangle, Translate, Triangle
 from kivy.graphics.texture import Texture
 from kivy.metrics import dp, sp
 from kivy.properties import NumericProperty
@@ -164,12 +172,16 @@ from kivy.uix.gridlayout import GridLayout
 from kivy.uix.image import Image as KivyImage
 from kivy.uix.label import Label
 from kivy.uix.modalview import ModalView
+from kivy.uix.relativelayout import RelativeLayout
+from kivy.uix.scatter import Scatter
 from kivy.uix.screenmanager import NoTransition, Screen, ScreenManager, \
-    SlideTransition
+    TransitionBase
 from kivy.uix.scrollview import ScrollView
+from kivy.uix.stencilview import StencilView
 from kivy.uix.textinput import TextInput
+from kivy.uix.treeview import TreeViewNode
 from kivy.uix.widget import Widget
-from kivy.utils import get_color_from_hex
+from kivy.utils import escape_markup, get_color_from_hex
 
 # =============================================================================
 #  FEXT crypto core — Bitcoin-compatible secp256k1 + Base58Check (pure Python)
@@ -876,7 +888,7 @@ REQUIRE_TLS = _os.environ.get("FEXT_REQUIRE_TLS", "") not in ("", "0", "false")
 
 APP_NAME = "Ferritext"
 #: Must equal `version` in buildozer.spec — CI refuses to build if not.
-APP_VERSION = "9.1.1"
+APP_VERSION = "11.0.0"
 
 # The identity/QR payload keeps carrying the ORIGINAL tag. It is wire data
 # that older clients already produce and consume, so renaming the app must
@@ -991,6 +1003,8 @@ REQUEST_TIMEOUT = 20 if IS_MOBILE else 12
 FOREGROUND_RECONNECT_MAX = 6.0  # backoff cap while the app is on screen
 MAX_MESSAGE_CHARS = 4000        # sanitization cap for outgoing text
 CHAT_PAGE_SIZE = 60             # messages materialised per chat page
+FIRST_PAINT = 14                # ...of which drawn before the chat appears;
+BACKFILL_CHUNK = 5              # the rest follow, this many a frame
 # Mirrors the relay's LEDGER_RETENTION_SECONDS. A read receipt older than
 # this can never be confirmed, because the routing row it needs is gone.
 RECEIPT_RETRY_WINDOW_SECONDS = 7 * 86400
@@ -1015,6 +1029,25 @@ MAX_VOICE_SECONDS = 300
 MEDIA_MIME = {"image": ("image/jpeg", "image/png", "image/webp"),
               "voice": ("audio/mp4", "audio/aac", "audio/ogg",
                         "audio/3gpp", "audio/amr", "audio/wav")}
+
+# ---- v9.1.2 pictures ----------------------------------------------------------
+# A profile picture is small enough to travel inside one ordinary end-to-end
+# message (a 'pic' control), so it needs no relay storage and never expires:
+# it goes to the people you write to, and again only when it changes. A
+# group's picture is the admin's to set ('gpic'). Every v9.1.2 message says
+# which version of its author's picture is current, so a device that missed
+# one — reinstalled, restored from a key — asks for it ('picreq').
+PICTURES_DIR = DATA_DIR / "pictures"
+PICTURE_EDGE = 320                  # pictures are square, this many pixels…
+PICTURE_MAX_BYTES = 30 * 1024       # …and at most this big as a JPEG
+PICTURE_ACCEPT_BYTES = 48 * 1024    # the most we take from someone else
+PICTURE_SOURCE_EDGE = 1600          # a photo is cropped from at most this
+#: x.ft: what the sender's app can do, so nobody is sent what it would
+#: ignore. Bits only ever get added.
+FEATURE_PICTURES = 1
+FEATURE_CALLS = 2
+FEATURE_TIMER = 4                   # v11: honours disappearing messages
+FEATURES = FEATURE_PICTURES | FEATURE_CALLS | FEATURE_TIMER
 
 # =============================================================================
 #  Design system (v9.1): two themes, type, text size, motion
@@ -1208,9 +1241,9 @@ class _Appearance:
             self.mode = "system"
         self.scale = dict((k, s) for k, _l, s in TEXT_SCALES).get(
             prefs.get("text_size", "default"), 1.0)
-        motion = prefs.get("reduce_motion")
-        self.reduce_motion = bool(system_reduces_motion() if motion is None
-                                  else motion)
+        # Motion is on unless it is turned off in Settings: the fades are
+        # what make moving between screens read as instant.
+        self.reduce_motion = bool(prefs.get("reduce_motion", False))
         if self.mode != "system":
             return self.mode
         dark = system_prefers_dark()
@@ -1228,6 +1261,12 @@ def fs(size: float) -> float:
 def motion(duration: float) -> float:
     """An animation's duration, or 0 when the user has asked for less."""
     return 0 if APPEARANCE.reduce_motion else duration
+
+
+#: Screen-to-screen timing (seconds). Short on purpose: a layer appears
+#: almost at once and the fade only smooths the change.
+LAYER_IN, LAYER_OUT, LAYER_FADE = 0.16, 0.13, 0.11
+SHEET_RISE, SHEET_FADE = 0.18, 0.12        # a sheet rising, its card fading in
 
 
 # ---- type -------------------------------------------------------------------
@@ -1376,6 +1415,275 @@ def sanitize_media(media) -> Optional[dict]:
     return out
 
 
+# ---- v11: links -------------------------------------------------------------------
+# Links in messages can be opened (after saying where they lead). Previews
+# are off unless turned on in Settings; then the SENDER's phone fetches a
+# link's page as the message is written — its title, a line about it, its
+# site, a small picture — and the preview travels inside the message, so
+# the person reading never touches the site. Only public addresses are
+# fetched, a little of each page, and nothing is fetched to show one.
+_URL_RE = re.compile(r"https?://[^\s<>\"'`]+", re.IGNORECASE)
+PREVIEW_PAGE_BYTES = 512 * 1024
+PREVIEW_IMAGE_BYTES = 1024 * 1024
+PREVIEW_THUMB_EDGE = 160
+
+
+_OPENS = {")": "(", "]": "[", "}": "{"}
+
+
+def _trim_link(found: str) -> str:
+    """A link without the punctuation after it: 'see https://a.b/c.' ends
+    at c, and a closing bracket stays only if the link opened one."""
+    url = found
+    while url:
+        end = url[-1]
+        if end in ".,;:!?'\">":
+            url = url[:-1]
+        elif end in _OPENS and url.count(end) > url.count(_OPENS[end]):
+            url = url[:-1]
+        else:
+            break
+    return url
+
+
+def link_spans(text: str) -> list:
+    """(start, end, url) for each link in some text, in order."""
+    out = []
+    for found in _URL_RE.finditer(text or ""):
+        url = _trim_link(found.group(0))
+        if len(url) > len("https://"):
+            out.append((found.start(), found.start() + len(url), url))
+    return out[:32]
+
+
+def links_in(text: str) -> list:
+    """The http(s) links in some text, in order, each once."""
+    out = []
+    for _start, _end, url in link_spans(text):
+        if url not in out:
+            out.append(url)
+    return out[:8]
+
+
+def link_host(url: str) -> str:
+    """The site a link leads to, as it really is. A name written in
+    letters borrowed from other alphabets (to pass for another site) shows
+    its plain xn-- form beside it; a site's name put before an @ is not
+    taken for the site, which is the one after it."""
+    from urllib.parse import urlsplit
+    try:
+        host = (urlsplit(url).hostname or "").rstrip(".")
+    except ValueError:
+        host = ""
+    if not host:
+        return url
+    try:
+        plain = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        plain = host
+    try:
+        shown = plain.encode("ascii").decode("idna")
+    except UnicodeError:
+        shown = host
+    return f"{shown}  ({plain})" if shown != plain else plain
+
+
+def link_warning(url: str) -> str:
+    """What to know about a link before opening it ('' if nothing)."""
+    import ipaddress
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+    except ValueError:
+        return "This link is malformed."
+    notes = []
+    if "xn--" in link_host(url):
+        notes.append("Its name is spelled with letters from other alphabets "
+                     "— it may be dressed up as another site.")
+    try:
+        ipaddress.ip_address(host)
+        notes.append("It names no site, only a number.")
+    except ValueError:
+        pass
+    if parts.username is not None:
+        notes.append("Text before an @ in a link is not where it leads.")
+    if parts.scheme == "http":
+        notes.append("Not encrypted: the network on the way can read and "
+                     "change the page.")
+    return " ".join(notes)
+
+
+def link_markup(text: str, spans: list, color: str) -> str:
+    """Text as Kivy markup, each link in `color`, underlined, and a ref
+    (its index in `spans`) that a tap can find."""
+    out, at = [], 0
+    for i, (start, end, _url) in enumerate(spans):
+        out.append(escape_markup(text[at:start]))
+        out.append(f"[ref={i}][color={color}][u]"
+                   f"{escape_markup(text[start:end])}[/u][/color][/ref]")
+        at = end
+    out.append(escape_markup(text[at:]))
+    return "".join(out)
+
+
+def link_previews_enabled() -> bool:
+    return bool(load_prefs().get("link_previews", False))
+
+
+def _public_host(host: str) -> bool:
+    """Whether every address a host name has is a public one: a preview
+    never reaches into the phone's own network."""
+    import ipaddress
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (OSError, UnicodeError):
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        try:
+            if not ipaddress.ip_address(info[4][0].split("%")[0]).is_global:
+                return False
+        except ValueError:
+            return False
+    return True
+
+
+def _fetch_capped(url: str, limit: int, accept: str) -> Optional[tuple]:
+    """(final url, content type, at most `limit` bytes) — following no
+    more than three redirects, each to a public address — or None."""
+    from urllib.parse import urljoin, urlsplit
+    for _hop in range(4):
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https") or not parts.hostname or \
+                not _public_host(parts.hostname):
+            return None
+        try:
+            r = requests.get(url, timeout=(3, 4), allow_redirects=False,
+                             stream=True, headers={
+                                 "User-Agent": "Mozilla/5.0 (link preview)",
+                                 "Accept": accept})
+        except requests.RequestException:
+            return None
+        if r.is_redirect or r.status_code in (301, 302, 303, 307, 308):
+            target = r.headers.get("location", "")
+            r.close()
+            if not target:
+                return None
+            url = urljoin(url, target)
+            continue
+        try:
+            if r.status_code != 200:
+                return None
+            data = r.raw.read(limit, decode_content=True)
+            return url, r.headers.get("content-type", ""), data
+        except Exception:
+            return None
+        finally:
+            r.close()
+    return None
+
+
+def _page_meta(page: str) -> dict:
+    """og: and twitter: properties, and the <title>, of an HTML page."""
+    import html as _html
+    meta = {}
+    for tag in re.findall(r"<meta\b[^>]*>", page, re.IGNORECASE)[:300]:
+        attrs = dict((k.lower(), _html.unescape(v2 or v1))
+                     for k, v1, v2 in re.findall(
+                         r'([a-zA-Z:_-]+)\s*=\s*(?:"([^"]*)"|\'([^\']*)\')',
+                         tag))
+        key = (attrs.get("property") or attrs.get("name") or "").lower()
+        if key and "content" in attrs and key not in meta:
+            meta[key] = attrs["content"].strip()
+    title = re.search(r"<title[^>]*>(.*?)</title>", page,
+                      re.IGNORECASE | re.DOTALL)
+    if title:
+        meta.setdefault("title", _html.unescape(title.group(1)).strip())
+    return meta
+
+
+def fetch_link_preview(url: str) -> Optional[dict]:
+    """{u, t, d, s, i}: a link's title, description, site and a small
+    JPEG (base64) — fetched by the sender's phone, or None."""
+    from urllib.parse import urljoin, urlsplit
+    got = _fetch_capped(url, PREVIEW_PAGE_BYTES, "text/html")
+    if got is None or "html" not in got[1].lower():
+        return None
+    final, ctype, data = got
+    charset = re.search(r"charset=([\w-]+)", ctype)
+    page = data.decode(charset.group(1) if charset else "utf-8", "replace")
+    meta = _page_meta(page)
+    title = meta.get("og:title") or meta.get("twitter:title") or \
+        meta.get("title") or ""
+    if not title:
+        return None
+    out = {"u": url, "t": single_line_text(title, 200),
+           "d": single_line_text(meta.get("og:description") or
+                                 meta.get("description") or "", 300),
+           "s": single_line_text(meta.get("og:site_name") or
+                                 (urlsplit(final).hostname or ""), 80)}
+    image = meta.get("og:image") or meta.get("twitter:image")
+    if image:
+        picture = _fetch_capped(urljoin(final, image), PREVIEW_IMAGE_BYTES,
+                                "image/*")
+        if picture is not None:
+            try:
+                import io as _io
+                from PIL import Image
+                with Image.open(_io.BytesIO(picture[2])) as im:
+                    im = im.convert("RGB")
+                    im.thumbnail((PREVIEW_THUMB_EDGE, PREVIEW_THUMB_EDGE))
+                    buf = _io.BytesIO()
+                    im.save(buf, "JPEG", quality=60, optimize=True)
+                if buf.tell() <= 16 * 1024:
+                    out["i"] = b64e(buf.getvalue())
+            except Exception:
+                pass
+    return out
+
+
+def sanitize_preview(lp, body: str) -> Optional[dict]:
+    """A link preview someone sent, field by field: for a link that is in
+    the message itself, short texts, and a small real JPEG."""
+    if not isinstance(lp, dict):
+        return None
+    url = _str(lp.get("u"), 2000)
+    if not url or url not in links_in(body):
+        return None
+    out = {"u": url}
+    for key, limit in (("t", 200), ("d", 300), ("s", 80)):
+        text = _str(lp.get(key), limit)
+        if text:
+            out[key] = single_line_text(sanitize_text(text), limit)
+    if "t" not in out:
+        return None
+    thumb = _str(lp.get("i"), 24000)
+    if thumb:
+        try:
+            raw = b64d(thumb)
+            if raw[:3] == b"\xff\xd8\xff" and len(raw) <= 16 * 1024:
+                out["i"] = thumb
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def open_url(url: str) -> None:
+    """The phone's or computer's browser, at `url`."""
+    if IS_ANDROID:
+        autoclass, _ = _jni()
+        Intent = autoclass("android.content.Intent")
+        intent = Intent(Intent.ACTION_VIEW,
+                        autoclass("android.net.Uri").parse(url))
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        android_context().startActivity(intent)
+        return
+    import webbrowser
+    webbrowser.open(url)
+
+
 def sanitize_ext(x) -> dict:
     """The parts of a peer's extension block we keep: reply quote, forwarded
     mark, media reference. Routing fields (to/cid/xv/k) are consumed by the
@@ -1404,6 +1712,17 @@ def sanitize_ext(x) -> dict:
     media = sanitize_media(x.get("media"))
     if media:
         out["media"] = media
+    return out
+
+
+def sanitize_ext_with_body(x, body: str) -> dict:
+    """sanitize_ext, plus what can only be checked against the text: a
+    link preview (v11) must be of a link the message holds."""
+    out = sanitize_ext(x)
+    preview = sanitize_preview(x.get("lp"), body) if isinstance(x, dict) \
+        else None
+    if preview:
+        out["lp"] = preview
     return out
 
 
@@ -1500,6 +1819,590 @@ def sanitize_group_state(raw) -> Optional[dict]:
             "members": out}
 
 
+# ---- v11: disappearing messages ------------------------------------------------
+# A chat's timer is set by either side (in a group, by its admin) with a
+# 'timer' control; every message sent while it is on carries its own `ttl`,
+# and each app deletes its copy that long after sending it, or after reading
+# it. Old releases ignore both, so the setting says when someone's app does
+# not take part (contacts.caps & CAP_TIMER).
+TIMER_CHOICES = ((0, "Off"), (300, "5 minutes"), (3600, "1 hour"),
+                 (8 * 3600, "8 hours"), (86400, "1 day"),
+                 (7 * 86400, "1 week"), (28 * 86400, "4 weeks"))
+_TIMER_SECONDS = {seconds for seconds, _label in TIMER_CHOICES}
+
+
+def sanitize_timer(value) -> Optional[int]:
+    """A timer's seconds if they are one of the choices offered, else None."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value in _TIMER_SECONDS else None
+
+
+def timer_label(seconds: int) -> str:
+    return next((label for s, label in TIMER_CHOICES if s == seconds),
+                f"{int(seconds)} seconds")
+
+
+def timer_event(name: str, seconds: int) -> str:
+    """The line in the chat that says who changed the timer, and to what."""
+    if not seconds:
+        return f"{name} turned off disappearing messages"
+    return f"{name} set messages to disappear {timer_label(seconds).lower()}" \
+        f" after they are read"
+
+
+# ---- v11: verifying a contact ---------------------------------------------------
+# Contacts are found through the relay's directory, so a relay that lied
+# could hand out the wrong address for a name. Two people close that by
+# comparing, in person or on a call, a code worked out from both their
+# keys — the same on both phones, and different if either key is not the
+# one its owner holds — or by scanning the QR code on the other's phone.
+def safety_code(pub_a: str, pub_b: str) -> str:
+    """Twelve groups of five digits from two public keys (order does not
+    matter). Hashed many times over, so searching for another key with the
+    same code is slow."""
+    a, b = sorted((bytes.fromhex(pub_a), bytes.fromhex(pub_b)))
+    digest = b"fext.safety.v1|" + a + b
+    for _ in range(5200):
+        digest = hashlib.sha512(digest + a + b).digest()
+    return " ".join(f"{int.from_bytes(digest[i * 5:i * 5 + 5], 'big') % 100000:05d}"
+                    for i in range(12))
+
+
+def address_in_qr(text: str) -> Optional[str]:
+    """The address a scanned Ferritext QR code names: a profile's public
+    bundle (JSON), or the bare address."""
+    text = (text or "").strip()
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return None
+        if isinstance(data, dict) and data.get("app") == WIRE_APP_TAG:
+            text = str(data.get("address") or "")
+    return text if valid_address(text) else None
+
+
+def read_qr_image(path: str) -> Optional[str]:
+    """The text of a QR code in a photo: ZXing on Android
+    (org.fext.qr.QrReader), OpenCV or pyzbar on a computer when one is
+    installed. None: none found, or nothing here can read one."""
+    if IS_ANDROID:
+        try:
+            autoclass, _ = _jni()
+            text = autoclass("org.fext.qr.QrReader").read(path)
+            return str(text) if text else None
+        except Exception:
+            log.exception("could not read a QR code")
+            return None
+    try:
+        import cv2                                        # type: ignore
+        image = cv2.imread(path)
+        if image is not None:
+            detector = cv2.QRCodeDetector()
+            for picture in (image, 255 - image):
+                text, _points, _code = detector.detectAndDecode(picture)
+                if text:
+                    return text
+    except Exception:
+        pass
+    try:
+        from PIL import Image, ImageOps
+        from pyzbar.pyzbar import decode as zbar          # type: ignore
+        with Image.open(path) as picture:
+            gray = picture.convert("L")
+            for candidate in (gray, ImageOps.invert(gray)):
+                for found in zbar(candidate):
+                    return found.data.decode("utf-8", "replace")
+    except Exception:
+        pass
+    return None
+
+
+def can_read_qr() -> bool:
+    if IS_ANDROID:
+        return True
+    import importlib.util as iu
+    return any(iu.find_spec(m) is not None for m in ("cv2", "pyzbar"))
+
+
+# ---- v11: encrypted backup -------------------------------------------------------
+# One file holds what this device keeps for Ferritext: each identity's key
+# and record, its database (chats, contacts, groups), the pictures and,
+# when asked, the photos and voice notes. It is a tar stream sealed in
+# 1 MiB chunks with AES-256-GCM, under a key scrypt derives from a
+# passphrase; the first chunk holds only a known phrase, so a wrong
+# passphrase is told apart from a damaged file. Each chunk's associated
+# data carries its number and whether it is the last, so a file cut
+# short, reordered or altered does not open;
+# the header in front (the format, scrypt's settings, when and by what it
+# was made) is bound to every chunk. Nothing is restored until the whole
+# file has been read and found intact.
+BACKUP_MAGIC = b"FEXTBACKUP\x00\x01"
+BACKUP_SUFFIX = ".fextbackup"
+BACKUP_CHUNK = 1 << 20
+BACKUP_MIN_PASSPHRASE = 8
+_BACKUP_CHECK = b"fext.backup.v1"
+_BACKUP_FINAL = 0x80000000
+_BACKUP_FILE = re.compile(r"^[A-Za-z0-9_.-]{1,96}$")
+_BACKUP_NAME = re.compile(
+    r"^(?:manifest\.json|identities\.json|"
+    r"db/store_[1-9A-HJ-NP-Za-km-z]{25,40}\.db|"
+    r"(?:pictures|media)/[A-Za-z0-9_.-]{1,96})$")
+
+
+class BackupError(Exception):
+    """A backup that cannot be made or opened; the message says why, to
+    the person using the app."""
+
+
+_DAMAGED = "This file is damaged."
+
+
+def _backup_key(passphrase: str, kdf) -> bytes:
+    if not isinstance(kdf, dict) or kdf.get("name") != "scrypt":
+        raise BackupError("This backup was made by a newer Ferritext — "
+                          "update this one first.")
+    try:
+        n, r, p = int(kdf["n"]), int(kdf["r"]), int(kdf["p"])
+        salt = b64d(kdf["salt"])
+    except (KeyError, TypeError, ValueError):
+        raise BackupError(_DAMAGED)
+    # Bounded, so a file made to look like a backup cannot ask for hours of
+    # work or gigabytes of memory.
+    if not (2 ** 10 <= n <= 2 ** 20 and n & (n - 1) == 0 and 1 <= r <= 32
+            and n * r <= 2 ** 21 and 1 <= p <= 4 and len(salt) >= 16):
+        raise BackupError(_DAMAGED)
+    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+    secret = unicodedata.normalize("NFKC", passphrase).encode("utf-8")
+    return Scrypt(salt=salt, length=32, n=n, r=r, p=p,
+                  backend=default_backend()).derive(secret)
+
+
+def _chunk_ad(bound: bytes, index: int, final: bool) -> bytes:
+    return bound + index.to_bytes(4, "big") + (b"\x01" if final else b"\x00")
+
+
+class _SealedWriter:
+    """Where a backup's plaintext is written: it leaves in sealed chunks."""
+
+    def __init__(self, out, key: bytes, bound: bytes):
+        self._out, self._aead, self._bound = out, AESGCM(key), bound
+        self._prefix = os.urandom(8)
+        self._buf = bytearray()
+        self._index = 0
+        self.written = 0
+        self._seal(_BACKUP_CHECK, False)
+
+    def write(self, data) -> int:
+        self._buf += data
+        while len(self._buf) >= BACKUP_CHUNK:
+            self._seal(bytes(self._buf[:BACKUP_CHUNK]), False)
+            del self._buf[:BACKUP_CHUNK]
+        self.written += len(data)
+        return len(data)
+
+    def _seal(self, data: bytes, final: bool) -> None:
+        nonce = self._prefix + self._index.to_bytes(4, "big")
+        sealed = self._aead.encrypt(nonce, data,
+                                    _chunk_ad(self._bound, self._index, final))
+        word = len(sealed) | (_BACKUP_FINAL if final else 0)
+        self._out.write(word.to_bytes(4, "big") + nonce + sealed)
+        self._index += 1
+
+    def finish(self) -> None:
+        self._seal(bytes(self._buf), True)
+        self._buf.clear()
+
+
+class _SealedReader:
+    """A backup's plaintext, read out of its sealed chunks."""
+
+    def __init__(self, src, key: bytes, bound: bytes):
+        self._src, self._aead, self._bound = src, AESGCM(key), bound
+        self._buf = bytearray()
+        self._index = 0
+        self._done = False
+
+    def read(self, size: int = -1) -> bytes:
+        while not self._done and (size < 0 or len(self._buf) < size):
+            self._open_next()
+        size = len(self._buf) if size < 0 else min(size, len(self._buf))
+        out = bytes(self._buf[:size])
+        del self._buf[:size]
+        return out
+
+    def _open_next(self) -> None:
+        from cryptography.exceptions import InvalidTag
+        head = self._src.read(4)
+        if len(head) < 4:
+            raise BackupError("This backup is incomplete — it was cut short "
+                              "when it was made or copied.")
+        word = int.from_bytes(head, "big")
+        final, length = bool(word & _BACKUP_FINAL), word & ~_BACKUP_FINAL
+        if not 16 <= length <= BACKUP_CHUNK + 16:
+            raise BackupError(_DAMAGED)
+        nonce, sealed = self._src.read(12), self._src.read(length)
+        if len(nonce) < 12 or len(sealed) < length:
+            raise BackupError("This backup is incomplete — it was cut short "
+                              "when it was made or copied.")
+        try:
+            plain = self._aead.decrypt(
+                nonce, sealed, _chunk_ad(self._bound, self._index, final))
+        except InvalidTag:
+            raise BackupError("Wrong passphrase." if self._index == 0
+                              else _DAMAGED)
+        if self._index == 0:
+            if plain != _BACKUP_CHECK or final:
+                raise BackupError(_DAMAGED)
+        else:
+            self._buf += plain
+        self._index += 1
+        if final:
+            self._done = True
+            if self._src.read(1):
+                raise BackupError(_DAMAGED)
+
+    def finish(self) -> None:
+        """Read to the end, so all of it is known to be intact."""
+        while not self._done:
+            self._open_next()
+
+
+def _file_name(path) -> str:
+    """The last part of a stored path (of this device, or another's)."""
+    name = re.split(r"[\\/]", str(path or ""))[-1]
+    return name if _BACKUP_FILE.match(name) else ""
+
+
+def default_backup_name() -> str:
+    return f"Ferritext backup {datetime.now().strftime('%Y-%m-%d')}" + \
+        BACKUP_SUFFIX
+
+
+def discard_cache_file(path: Optional[str]) -> None:
+    """Delete a working copy in this app's cache folder (and only there)."""
+    if not path:
+        return
+    try:
+        target = Path(path).resolve()
+        if (DATA_DIR / "cache").resolve() in target.parents and \
+                target.is_file():
+            target.unlink()
+    except OSError:
+        pass
+
+
+def default_backup_dir() -> Path:
+    documents = Path.home() / "Documents"
+    return documents if documents.is_dir() else Path.home()
+
+
+def size_text(n: int) -> str:
+    for unit, step in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+        if n >= step:
+            return f"{n / step:.1f} {unit}"
+    return f"{n} bytes"
+
+
+def backup_media_size(keys: "IdentityManager") -> tuple:
+    """(how many, bytes): the photos and voice notes a backup would hold."""
+    found = {}
+    for ident in keys.identities:
+        db_path = IdentityManager.store_path_for(ident["address"])
+        if not db_path.is_file():
+            continue
+        try:
+            db = sqlite3.connect(str(db_path))
+            try:
+                for (stored,) in db.execute(
+                        "SELECT media_path FROM messages WHERE media_path IS "
+                        "NOT NULL AND media_path != ''"):
+                    here = MEDIA_DIR / _file_name(stored)
+                    if _file_name(stored) and here.is_file():
+                        found[here.name] = here.stat().st_size
+            finally:
+                db.close()
+        except sqlite3.Error:
+            pass
+    return len(found), sum(found.values())
+
+
+def make_backup(keys: "IdentityManager", passphrase: str, out_path,
+                include_media: bool = True,
+                progress: Optional[Callable[[float], None]] = None) -> dict:
+    """Write this device's backup to `out_path`, sealed with `passphrase`.
+    {path, size, identities: [{address, label, username, messages}],
+    media: count}."""
+    out_path = Path(out_path)
+    idents = [dict(i) for i in keys.identities]
+    if not idents:
+        raise BackupError("There is nothing on this device to back up yet.")
+    if len(passphrase) < BACKUP_MIN_PASSPHRASE:
+        raise BackupError(f"Use a passphrase of at least "
+                          f"{BACKUP_MIN_PASSPHRASE} characters.")
+    header = {"v": 1, "made": now_iso(), "by": f"{APP_NAME} {APP_VERSION}",
+              "kdf": {"name": "scrypt", "n": 2 ** 15, "r": 8, "p": 1,
+                      "salt": b64e(os.urandom(16))}}
+    head = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    prefix = BACKUP_MAGIC + len(head).to_bytes(4, "big") + head
+    key = _backup_key(passphrase, header["kdf"])
+    cache = DATA_DIR / "cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix="backup_", dir=str(cache)))
+    part = out_path.with_name(out_path.name + ".part")
+    files, pictures, media, listed = [], {}, {}, []
+    try:
+        for ident in idents:
+            address = ident["address"]
+            db_path = IdentityManager.store_path_for(address)
+            count = 0
+            if db_path.is_file():
+                snap = staging / db_path.name
+                src, dst = sqlite3.connect(str(db_path)), \
+                    sqlite3.connect(str(snap))
+                try:
+                    src.backup(dst)       # a consistent copy, even while open
+                finally:
+                    dst.close()
+                    src.close()
+                files.append((f"db/{db_path.name}", snap))
+                db = sqlite3.connect(str(snap))
+                try:
+                    count = db.execute(
+                        "SELECT COUNT(*) FROM messages WHERE kind IS NULL OR "
+                        "kind != 'event'").fetchone()[0]
+                    for (stored,) in db.execute(
+                            "SELECT path FROM pictures WHERE path IS NOT NULL"):
+                        found = PICTURES_DIR / _file_name(stored)
+                        if _file_name(stored) and found.is_file():
+                            pictures[found.name] = found
+                    if include_media:
+                        for (stored,) in db.execute(
+                                "SELECT media_path FROM messages WHERE "
+                                "media_path IS NOT NULL AND media_path != ''"):
+                            found = MEDIA_DIR / _file_name(stored)
+                            if _file_name(stored) and found.is_file():
+                                media[found.name] = found
+                except sqlite3.Error:
+                    log.warning("backup: %s has no pictures or media tables",
+                                db_path.name)
+                finally:
+                    db.close()
+            own = own_picture_path(address)
+            if own.is_file():
+                pictures[own.name] = own
+            listed.append({"address": address,
+                           "label": ident.get("label") or "",
+                           "username": ident.get("username"),
+                           "messages": count})
+        entries = [
+            ("manifest.json", json.dumps({
+                "v": 1, "made": header["made"], "identities": listed,
+                "media": bool(include_media)}).encode("utf-8")),
+            ("identities.json", json.dumps({"identities": idents}
+                                           ).encode("utf-8"))]
+        files += [(f"pictures/{n}", f) for n, f in sorted(pictures.items())]
+        files += [(f"media/{n}", f) for n, f in sorted(media.items())]
+        total = sum(len(data) for _n, data in entries) + \
+            sum(f.stat().st_size for _n, f in files)
+        with open(part, "wb") as raw:
+            raw.write(prefix)
+            sealed = _SealedWriter(raw, key, hashlib.sha256(prefix).digest())
+            with tarfile.open(fileobj=sealed, mode="w|",
+                              format=tarfile.PAX_FORMAT) as tar:
+                for name, data in entries:
+                    info = tarfile.TarInfo(name)
+                    info.size, info.mtime = len(data), int(time.time())
+                    tar.addfile(info, io.BytesIO(data))
+                for name, found in files:
+                    info = tarfile.TarInfo(name)
+                    with open(found, "rb") as fh:
+                        info.size = os.fstat(fh.fileno()).st_size
+                        info.mtime = int(time.time())
+                        tar.addfile(info, fh)
+                    if progress is not None:
+                        progress(min(1.0, sealed.written / max(1, total)))
+            sealed.finish()
+            raw.flush()
+            os.fsync(raw.fileno())
+        os.replace(part, out_path)
+        if progress is not None:
+            progress(1.0)
+    except OSError as exc:
+        raise BackupError(f"The backup could not be written: "
+                          f"{exc.strerror or exc}.")
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+        if part.exists():
+            try:
+                part.unlink()
+            except OSError:
+                pass
+    return {"path": str(out_path), "size": out_path.stat().st_size,
+            "identities": listed, "media": len(media)}
+
+
+def read_backup_header(path) -> dict:
+    """The clear header of a backup: when and by what it was made."""
+    with open(path, "rb") as raw:
+        return _read_header(raw)[0]
+
+
+def _read_header(raw) -> tuple:
+    if raw.read(len(BACKUP_MAGIC)) != BACKUP_MAGIC:
+        raise BackupError("This is not a Ferritext backup.")
+    word = raw.read(4)
+    length = int.from_bytes(word, "big") if len(word) == 4 else 0
+    if not 2 <= length <= 4096:
+        raise BackupError(_DAMAGED)
+    head = raw.read(length)
+    try:
+        header = json.loads(head.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise BackupError(_DAMAGED)
+    if not isinstance(header, dict):
+        raise BackupError(_DAMAGED)
+    if header.get("v") != 1:
+        raise BackupError("This backup was made by a newer Ferritext — "
+                          "update this one first.")
+    return header, BACKUP_MAGIC + word + head
+
+
+def _store_messages(path: Path) -> int:
+    if not path.is_file():
+        return 0
+    try:
+        db = sqlite3.connect(str(path))
+        try:
+            return db.execute("SELECT COUNT(*) FROM messages WHERE kind IS "
+                              "NULL OR kind != 'event'").fetchone()[0]
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return 0
+
+
+def _place_store(snapshot: Path, target: Path) -> None:
+    """Put a restored database in place, its paths made this device's."""
+    for leftover in (Path(str(target) + "-wal"), Path(str(target) + "-shm")):
+        if leftover.exists():
+            leftover.unlink()
+    db = sqlite3.connect(str(snapshot))
+    try:
+        if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+            raise BackupError(_DAMAGED)
+        for row_id, stored in db.execute(
+                "SELECT id, media_path FROM messages WHERE media_path IS NOT "
+                "NULL AND media_path != ''").fetchall():
+            here = MEDIA_DIR / _file_name(stored)
+            db.execute("UPDATE messages SET media_path = ? WHERE id = ?",
+                       (str(here) if _file_name(stored) and here.is_file()
+                        else None, row_id))
+        for peer, stored in db.execute(
+                "SELECT peer, path FROM pictures WHERE path IS NOT NULL"
+                ).fetchall():
+            here = PICTURES_DIR / _file_name(stored)
+            db.execute("UPDATE pictures SET path = ? WHERE peer = ?",
+                       (str(here) if _file_name(stored) and here.is_file()
+                        else None, peer))
+        db.commit()
+    except sqlite3.Error:
+        raise BackupError(_DAMAGED)
+    finally:
+        db.close()
+    shutil.move(str(snapshot), str(target))
+
+
+def restore_backup(keys: "IdentityManager", path, passphrase: str,
+                   progress: Optional[Callable[[float], None]] = None
+                   ) -> dict:
+    """Add what a backup holds to this device. An identity it does not
+    have arrives with its chats; one it has keeps its own, unless they are
+    empty. {added, replaced, kept: [names], messages: count}. The app's
+    open database must be closed first (see RestoreSheet)."""
+    path = Path(path)
+    total = max(1, path.stat().st_size)
+    cache = DATA_DIR / "cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix="restore_", dir=str(cache)))
+    try:
+        got = {}
+        with open(path, "rb") as raw:
+            header, prefix = _read_header(raw)
+            key = _backup_key(passphrase, header.get("kdf"))
+            reader = _SealedReader(raw, key, hashlib.sha256(prefix).digest())
+            try:
+                with tarfile.open(fileobj=reader, mode="r|") as tar:
+                    for member in tar:
+                        name = member.name
+                        if not member.isfile() or name in got or \
+                                not _BACKUP_NAME.match(name):
+                            continue
+                        dest = staging / name.replace("/", "__")
+                        source = tar.extractfile(member)
+                        with open(dest, "wb") as fh:
+                            shutil.copyfileobj(source, fh, 1 << 20)
+                        got[name] = dest
+                        if progress is not None:
+                            progress(min(0.95, raw.tell() / total))
+            except tarfile.TarError:
+                raise BackupError(_DAMAGED)
+            reader.finish()
+        if "identities.json" not in got:
+            raise BackupError(_DAMAGED)
+        try:
+            records = json.loads(got["identities.json"].read_text("utf-8"))[
+                "identities"]
+            assert isinstance(records, list)
+        except (ValueError, KeyError, TypeError, AssertionError):
+            raise BackupError(_DAMAGED)
+        PICTURES_DIR.mkdir(parents=True, exist_ok=True)
+        MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        for name, staged in got.items():
+            folder = {"pictures": PICTURES_DIR, "media": MEDIA_DIR}.get(
+                name.split("/", 1)[0])
+            if folder is not None and not (folder / name.split("/")[1]
+                                           ).exists():
+                shutil.move(str(staged), str(folder / name.split("/")[1]))
+        summary = {"added": [], "replaced": [], "kept": [], "messages": 0}
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            address = record.get("address")
+            try:
+                priv = int(str(record.get("private_key_hex")), 16)
+                ok = 0 < priv < _N and address == address_from_pub_bytes(
+                    pub_to_compressed(priv_to_pub(priv)))
+            except (TypeError, ValueError):
+                ok = False
+            if not ok:
+                continue
+            name = record.get("label") or record.get("username") or \
+                short_addr(address, 10)
+            snapshot = got.get(f"db/store_{address}.db")
+            target = IdentityManager.store_path_for(address)
+            if keys.find(address) is None:
+                keys.restore_identity(record)
+                summary["added"].append(name)
+            elif snapshot is not None and _store_messages(target) == 0:
+                summary["replaced"].append(name)
+            else:
+                summary["kept"].append(name)
+                continue
+            if snapshot is not None:
+                summary["messages"] += _store_messages(snapshot)
+                _place_store(snapshot, target)
+        if progress is not None:
+            progress(1.0)
+        return summary
+    except OSError as exc:
+        raise BackupError(f"The backup could not be read: "
+                          f"{exc.strerror or exc}.")
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
 MEDIA_AAD = b"fext.media.v1"
 
 
@@ -1592,6 +2495,125 @@ def discard_media_file(path: Optional[str]) -> None:
             target.unlink()
     except OSError:
         log.warning("could not remove media file %s", path)
+
+
+# ---- v9.1.2 pictures: files and pixels -----------------------------------------
+def own_picture_path(address: str) -> Path:
+    """Where an identity on this device keeps its own picture. Named by the
+    address alone, so the menu can show every identity's picture without
+    opening each one's database."""
+    return PICTURES_DIR / f"me_{address}.jpg"
+
+
+def peer_picture_path(owner: str, peer: str) -> Path:
+    """Where identity `owner` keeps the picture `peer` sent it (a contact's
+    own, or a group's). One file per identity and peer: identities on one
+    device keep apart what they were sent, as they do their chats."""
+    tag = hashlib.sha256(f"{owner}|{peer}".encode("utf-8")).hexdigest()[:24]
+    return PICTURES_DIR / f"p_{tag}.jpg"
+
+
+def write_picture(path: Path, data: bytes) -> bool:
+    """Put a picture in place whole: a reader never sees half of one."""
+    try:
+        PICTURES_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        log.warning("could not write picture %s", path.name)
+        return False
+
+
+def discard_picture_file(path) -> None:
+    """Delete a picture — but only one inside PICTURES_DIR."""
+    if not path:
+        return
+    try:
+        target = Path(path).resolve()
+        if PICTURES_DIR.resolve() in target.parents and target.is_file():
+            target.unlink()
+    except OSError:
+        log.warning("could not remove picture %s", path)
+
+
+def next_picture_version(previous: int) -> int:
+    """A picture's version is a time in seconds, and always rises. Set after
+    reinstalling, when the old number is forgotten, a new picture still
+    counts as newer than the one everybody holds."""
+    return max(int(previous or 0) + 1, int(time.time()))
+
+
+def open_picture_source(path: str):
+    """A photo to make a picture from: upright, RGB, and no bigger than
+    cropping needs (a JPEG is decoded at a reduced scale to begin with)."""
+    from PIL import Image, ImageOps
+    with Image.open(path) as source:
+        if source.width * source.height > 64_000_000:
+            raise ValueError("photo too large")
+        source.draft("RGB", (PICTURE_SOURCE_EDGE, PICTURE_SOURCE_EDGE))
+        source.load()
+        try:
+            image = ImageOps.exif_transpose(source)
+        except Exception:                        # malformed EXIF: ignore it
+            image = source.copy()
+    if image.mode in ("RGBA", "LA", "P"):
+        image = image.convert("RGBA")
+        flat = Image.new("RGB", image.size, (255, 255, 255))
+        flat.paste(image, mask=image.split()[-1])
+        image = flat
+    else:
+        image = image.convert("RGB")
+    image.thumbnail((PICTURE_SOURCE_EDGE, PICTURE_SOURCE_EDGE), Image.LANCZOS)
+    return image
+
+
+def picture_jpeg(image, box=None) -> bytes:
+    """A picture to keep and send: the square `box` of `image` (left, top,
+    right, bottom in its pixels; the centre square when None), as a JPEG of
+    PICTURE_EDGE pixels at the best quality that fits PICTURE_MAX_BYTES.
+    It is drawn afresh from the pixels, so nothing else in the original
+    file — camera details, the place it was taken — goes with it."""
+    from PIL import Image
+    import io as _io
+    if box is None:
+        side = min(image.size)
+        left, top = (image.width - side) // 2, (image.height - side) // 2
+        box = (left, top, left + side, top + side)
+    square = image.crop(tuple(int(round(v)) for v in box)).convert("RGB")
+    data = b""
+    # A photo fits at the first size; only something like noise, which a
+    # JPEG cannot squeeze, ever needs a smaller one.
+    for edge in (PICTURE_EDGE, 256, 192, 128):
+        sized = square.resize((edge, edge), Image.LANCZOS)
+        for quality in (86, 80, 72, 64, 56, 48, 40):
+            out = _io.BytesIO()
+            sized.save(out, "JPEG", quality=quality, optimize=True)
+            data = out.getvalue()
+            if len(data) <= PICTURE_MAX_BYTES:
+                return data
+    return data
+
+
+def clean_picture(raw: bytes) -> Optional[bytes]:
+    """Someone else's picture, made safe to keep: refused unless it is a
+    modest JPEG, PNG or WebP, and otherwise decoded and drawn again here,
+    so the file this device keeps is always one it wrote itself."""
+    from PIL import Image
+    import io as _io
+    if not raw or len(raw) > PICTURE_ACCEPT_BYTES:
+        return None
+    try:
+        with Image.open(_io.BytesIO(raw)) as image:
+            if image.format not in ("JPEG", "PNG", "WEBP"):
+                return None
+            if not (16 <= image.width <= 1024 and 16 <= image.height <= 1024):
+                return None
+            image.load()
+            return picture_jpeg(image.convert("RGB"))
+    except Exception:
+        return None
 
 
 def valid_username(name: str) -> bool:
@@ -1687,6 +2709,14 @@ class MessageFlowLog:
                        "(withholding ack so the relay keeps its copy)",
                        server_id if server_id else "-", sender, reason)
 
+    @classmethod
+    def let_go(cls, server_id, sender: str, what: str) -> None:
+        """An INBOUND frame deliberately taken and set aside or refused —
+        acknowledged, so the relay forgets it (v11: from a blocked
+        contact)."""
+        flow_log.info("⏸   in   #%s  from %s  %s (acknowledged)",
+                      server_id if server_id else "-", sender, what)
+
 
 def open_folder_in_explorer(path: Path) -> bool:
     """Reveal `path` in the OS file manager (desktop only). On mobile there
@@ -1724,6 +2754,8 @@ def run_on_ui(fn: Callable, *args) -> None:
 
 REQ_PICK_IMAGE = 4711
 REQ_TAKE_PHOTO = 4712
+REQ_SAVE_FILE = 4713          # v11: where a backup goes
+REQ_OPEN_FILE = 4714          # v11: a backup to restore
 NOTIFY_CHANNEL = "messages"
 
 
@@ -1853,6 +2885,241 @@ def android_notify(peer: str, title: str, text: str) -> None:
     manager.notify(_notification_id(peer), builder.build())
 
 
+# ---- v11: notifications drawn by org.fext.notify.Notifier ---------------------
+# A chat's notification lists its unread messages (MessagingStyle) and can
+# be answered or marked read from the shade; an incoming call rings over the
+# lock screen with Answer and Decline. What is done to one from the shade is
+# written by NotifyReceiver.java as a small file in COMMANDS_DIR, and acted
+# on by whichever sync worker is running (MessagingMixin.run_commands).
+NOTIFY_LINES = 7                   # unread messages a chat's notification shows
+CALL_NOTIFICATION_ID = 900         # the one incoming call (Notifier.java)
+COMMANDS_DIR = DATA_DIR / "commands"
+
+
+def _notifier():
+    """org.fext.notify.Notifier, or None (an APK built without it)."""
+    try:
+        autoclass, _ = _jni()
+        return autoclass("org.fext.notify.Notifier")
+    except Exception:
+        return None
+
+
+def notification_lines(store: "LocalStore", peer: str) -> list:
+    """[(author address or None, text, ms), …]: a chat's unread messages,
+    oldest first, as its notification lists them."""
+    out = []
+    for msg in store.unread_messages(peer, NOTIFY_LINES):
+        kind = msg.get("kind") or "text"
+        text = message_text(msg)
+        if kind == "image":
+            text = f"Photo · {text}" if text else "Photo"
+        elif kind == "voice":
+            text = msg.get("body") or "Voice message"
+        try:
+            at = datetime.fromisoformat(str(msg["created_at"]).replace(
+                "Z", "+00:00")).timestamp()
+        except (TypeError, ValueError):
+            at = time.time()
+        out.append((msg.get("author"), single_line_text(text, 300),
+                    int(at * 1000)))
+    return out
+
+
+def android_message_notification(app, peer: str, title: str,
+                                 fallback: str) -> None:
+    """Post (or update) a chat's notification: its unread messages, with
+    Reply and Mark as read. Falls back to a plain one without Notifier."""
+    notifier = _notifier()
+    lines = notification_lines(app.store, peer) if notifier else []
+    if notifier is None or not lines:
+        android_notify(peer, title, fallback)
+        return
+    group = peer.startswith(GROUP_PREFIX)
+    senders = []
+    for author, _text, _at in lines:
+        if not group:
+            senders.append(title)
+            continue
+        contact = app.store.get_contact(author or "") or {}
+        senders.append(contact.get("username") or short_addr(author or "", 10))
+    count = len(app.store.unread_for(peer))
+    notifier.messages(
+        android_context(), _notification_id(peer), peer, title, group,
+        senders, [t for _a, t, _w in lines], [w for _a, _t, w in lines],
+        not app.store.is_blocked(peer) and app.conversation_kind(peer) !=
+        "self", app.keys.address,
+        f"{count} new message{'s' if count != 1 else ''}")
+
+
+def android_call_notification(app, peer: str, call_id: str,
+                              name: str) -> bool:
+    """Ring for an incoming call while the app is not on screen: over the
+    lock screen where Android allows it, with Answer and Decline."""
+    notifier = _notifier()
+    if notifier is None:
+        return False
+    notifier.incomingCall(android_context(), CALL_NOTIFICATION_ID, peer,
+                          call_id, name, app.keys.address)
+    return True
+
+
+def android_full_screen_allowed() -> bool:
+    """Whether a call may ring over the lock screen (Android 14 asks)."""
+    if not IS_ANDROID:
+        return True
+    notifier = _notifier()
+    try:
+        return notifier is None or bool(notifier.fullScreenAllowed(
+            android_context()))
+    except Exception:
+        return True
+
+
+def android_open_full_screen_settings() -> None:
+    """Android 14's page for letting this app ring over the lock screen."""
+    try:
+        autoclass, _ = _jni()
+        Intent = autoclass("android.content.Intent")
+        Uri = autoclass("android.net.Uri")
+        ctx = android_context()
+        intent = Intent("android.settings.MANAGE_APP_USE_FULL_SCREEN_INTENT",
+                        Uri.parse("package:" + ctx.getPackageName()))
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        ctx.startActivity(intent)
+    except Exception:
+        log.exception("could not open the full-screen setting")
+
+
+def android_cancel_call_notification() -> None:
+    notifier = _notifier()
+    try:
+        if notifier is not None:
+            notifier.cancel(android_context(), CALL_NOTIFICATION_ID)
+    except Exception:
+        log.exception("could not take the call notification away")
+
+
+# ---- v11: notifications on computers -----------------------------------------
+def _applescript_string(text: str) -> str:
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def desktop_notify(title: str, text: str) -> bool:
+    """The operating system's own notification, without waiting for it:
+    notify-send (Linux), Notification Center (macOS) or a tray balloon,
+    shown as a toast (Windows). False if this computer has no way."""
+    title = single_line_text(title, 80) or APP_NAME
+    text = single_line_text(text, 240)
+    system = platform.system()
+    if system == "Windows":
+        threading.Thread(target=_windows_balloon, args=(title, text),
+                         daemon=True).start()
+        return True
+    if system == "Darwin":
+        command = ["osascript", "-e", "display notification " +
+                   _applescript_string(text) + " with title " +
+                   _applescript_string(title)]
+    elif shutil.which("notify-send"):
+        command = ["notify-send", "--app-name", APP_NAME]
+        if DESKTOP_ICON.is_file():
+            command += ["--icon", str(DESKTOP_ICON)]
+        command += ["--", title, text]
+    else:
+        return False
+    try:
+        subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except OSError:
+        return False
+
+
+def _windows_balloon(title: str, text: str) -> None:
+    """A notification-area balloon on this window, which Windows 10 and 11
+    show as a toast; the icon is removed again a few seconds later."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class NOTIFYICONDATAW(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("hWnd", wintypes.HWND),
+                        ("uID", wintypes.UINT), ("uFlags", wintypes.UINT),
+                        ("uCallbackMessage", wintypes.UINT),
+                        ("hIcon", wintypes.HICON),
+                        ("szTip", wintypes.WCHAR * 128),
+                        ("dwState", wintypes.DWORD),
+                        ("dwStateMask", wintypes.DWORD),
+                        ("szInfo", wintypes.WCHAR * 256),
+                        ("uVersion", wintypes.UINT),
+                        ("szInfoTitle", wintypes.WCHAR * 64),
+                        ("dwInfoFlags", wintypes.DWORD),
+                        ("guidItem", ctypes.c_byte * 16),
+                        ("hBalloonIcon", wintypes.HICON)]
+
+        shell32, user32 = ctypes.windll.shell32, ctypes.windll.user32
+        shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD,
+                                              ctypes.POINTER(NOTIFYICONDATAW)]
+        user32.LoadImageW.restype = ctypes.c_void_p
+        user32.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                                      ctypes.c_uint, ctypes.c_int,
+                                      ctypes.c_int, ctypes.c_uint]
+        data = NOTIFYICONDATAW()
+        data.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        data.hWnd = Window.get_window_info().window
+        data.uID = 0xFE11
+        icon = user32.LoadImageW(None, str(DESKTOP_ICO), 1, 16, 16, 0x10) \
+            if DESKTOP_ICO.is_file() else None
+        data.uFlags = 0x10 | 0x04 | (0x02 if icon else 0)   # INFO|TIP|ICON
+        if icon:
+            data.hIcon = icon
+        data.szTip = APP_NAME
+        data.szInfo = text or " "
+        data.szInfoTitle = title
+        data.dwInfoFlags = 0x04 if icon else 0x01      # NIIF_USER / INFO
+        shell32.Shell_NotifyIconW(0, ctypes.byref(data))      # NIM_ADD
+        shell32.Shell_NotifyIconW(1, ctypes.byref(data))      # NIM_MODIFY
+        time.sleep(8)
+        shell32.Shell_NotifyIconW(2, ctypes.byref(data))      # NIM_DELETE
+    except Exception:
+        log.exception("could not show a Windows notification")
+
+
+def desktop_flash_window() -> None:
+    """Make the taskbar button ask for attention (Windows)."""
+    if platform.system() != "Windows":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class FLASHWINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.UINT), ("hwnd", wintypes.HWND),
+                        ("dwFlags", wintypes.DWORD),
+                        ("uCount", wintypes.UINT),
+                        ("dwTimeout", wintypes.DWORD)]
+        info = FLASHWINFO(ctypes.sizeof(FLASHWINFO),
+                          Window.get_window_info().window, 0x02 | 0x0C, 0, 0)
+        ctypes.windll.user32.FlashWindowEx(ctypes.byref(info))
+    except Exception:
+        log.debug("could not flash the taskbar button", exc_info=True)
+
+
+def android_move_to_back() -> bool:
+    """Back on the outermost page: leave for the home screen as Android
+    apps do, keeping the app as it was, rather than quitting it."""
+    if not IS_ANDROID:
+        return False
+    try:
+        autoclass, _ = _jni()
+        autoclass("org.kivy.android.PythonActivity").mActivity \
+            .moveTaskToBack(True)
+        return True
+    except Exception as exc:
+        log.debug("moveTaskToBack failed: %s", exc)
+        return False
+
+
 def android_clear_notification(peer: str) -> None:
     try:
         autoclass, cast = _jni()
@@ -1901,6 +3168,73 @@ def android_pick_image(callback: Callable[[str], None]) -> None:
     android_context().startActivityForResult(
         Intent.createChooser(intent, _charseq("Choose a photo")),
         REQ_PICK_IMAGE)
+
+
+def android_save_document(path: str, name: str,
+                          callback: Callable[[bool], None]) -> None:
+    """The system's Save dialog (this phone, a memory card, a cloud drive,
+    another app): the file at `path` is copied where the person chooses.
+    `callback(saved)`."""
+    autoclass, _ = _jni()
+    from android import activity
+
+    def on_result(request, result, data):
+        if request != REQ_SAVE_FILE:
+            return
+        activity.unbind(on_activity_result=on_result)
+        saved = False
+        if result == -1 and data is not None:         # -1 == RESULT_OK
+            try:
+                resolver = android_context().getContentResolver()
+                fd = resolver.openFileDescriptor(data.getData(), "w") \
+                    .detachFd()
+                with open(path, "rb") as src, os.fdopen(fd, "wb") as dst:
+                    shutil.copyfileobj(src, dst, 1 << 20)
+                saved = True
+            except Exception:
+                log.exception("could not save the file")
+        run_on_ui(callback, saved)
+
+    activity.bind(on_activity_result=on_result)
+    Intent = autoclass("android.content.Intent")
+    intent = Intent(Intent.ACTION_CREATE_DOCUMENT)
+    intent.addCategory(Intent.CATEGORY_OPENABLE)
+    intent.setType("application/octet-stream")
+    intent.putExtra(Intent.EXTRA_TITLE, autoclass("java.lang.String")(name))
+    android_context().startActivityForResult(intent, REQ_SAVE_FILE)
+
+
+def android_open_document(callback: Callable[[str], None]) -> None:
+    """The system's Open dialog, for any file: `callback(path)` gets a
+    private copy of the one chosen."""
+    autoclass, _ = _jni()
+    from android import activity
+
+    def on_result(request, result, data):
+        if request != REQ_OPEN_FILE:
+            return
+        activity.unbind(on_activity_result=on_result)
+        if result != -1 or data is None:
+            return
+        try:
+            resolver = android_context().getContentResolver()
+            fd = resolver.openFileDescriptor(data.getData(), "r").detachFd()
+            folder = DATA_DIR / "cache"
+            folder.mkdir(parents=True, exist_ok=True)
+            target = folder / f"open_{uuid.uuid4().hex}"
+            with os.fdopen(fd, "rb") as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst, 1 << 20)
+        except Exception:
+            log.exception("could not read the chosen file")
+            return
+        run_on_ui(callback, str(target))
+
+    activity.bind(on_activity_result=on_result)
+    Intent = autoclass("android.content.Intent")
+    intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+    intent.addCategory(Intent.CATEGORY_OPENABLE)
+    intent.setType("*/*")
+    android_context().startActivityForResult(intent, REQ_OPEN_FILE)
 
 
 def android_take_photo(callback: Callable[[str], None]) -> None:
@@ -2017,6 +3351,10 @@ def background_delivery_enabled() -> bool:
     return bool(load_prefs().get("background_delivery", True))
 
 
+def desktop_notifications_enabled() -> bool:
+    return bool(load_prefs().get("desktop_notifications", True))
+
+
 def android_style_system_bars() -> None:
     """Paint Android's status and navigation bars in the page colour, with
     dark icons on the light theme and light icons on the dark one."""
@@ -2089,6 +3427,130 @@ def android_service(start: bool) -> None:
         service.stop(ctx)
 
 
+# ---- calls (Android) ---------------------------------------------------------
+CALL_SERVICE_NAME = "fextcall"     # must match `services =` in buildozer.spec
+
+
+def android_call_service(start: bool) -> None:
+    """While a call is on, a small foreground service of the 'microphone'
+    type: Android lets an app keep using the microphone in the background
+    only while it runs one (see call_service.py). It lives as long as the
+    flag file does."""
+    autoclass, _ = _jni()
+    ctx = android_context()
+    service = autoclass(f"{ctx.getPackageName()}.Service"
+                        f"{CALL_SERVICE_NAME.capitalize()}")
+    flag = DATA_DIR / ".call_active"
+    if start:
+        flag.write_text(str(time.time()))
+        service.start(ctx, "ic_stat_ferritext", APP_NAME,
+                      "Call in progress", str(flag))
+    else:
+        try:
+            flag.unlink()
+        except OSError:
+            pass
+        service.stop(ctx)
+
+
+class AndroidRinger:
+    """The phone's ringtone and vibration for an incoming call, as the
+    phone is set: silent, vibrate only, or both."""
+
+    def __init__(self) -> None:
+        self._ring = self._vibrator = None
+
+    def start(self) -> None:
+        autoclass, _ = _jni()
+        ctx = android_context()
+        Context = autoclass("android.content.Context")
+        mode = 2
+        try:
+            mode = ctx.getSystemService(Context.AUDIO_SERVICE).getRingerMode()
+        except Exception:
+            pass
+        if mode == 0:                                   # silent
+            return
+        if mode == 2:                                   # normal
+            try:
+                manager = autoclass("android.media.RingtoneManager")
+                self._ring = manager.getRingtone(
+                    ctx, manager.getDefaultUri(manager.TYPE_RINGTONE))
+                if self._ring is not None:
+                    if android_sdk() >= 28:
+                        self._ring.setLooping(True)
+                    self._ring.play()
+            except Exception:
+                log.exception("no ringtone")
+        try:
+            self._vibrator = ctx.getSystemService(Context.VIBRATOR_SERVICE)
+            self._vibrator.vibrate([0, 800, 1200], 0)
+        except Exception:
+            log.exception("no vibration")
+
+    def stop(self) -> None:
+        for part, how in ((self._ring, "stop"), (self._vibrator, "cancel")):
+            if part is not None:
+                try:
+                    getattr(part, how)()
+                except Exception:
+                    pass
+        self._ring = self._vibrator = None
+
+
+_PROXIMITY_LOCK = None
+
+
+def android_show_over_lock(on: bool) -> None:
+    """Let the app's window show over the lock screen and wake the screen,
+    while a call rings or is on (v11) — what an incoming call's full-screen
+    notification opens it for."""
+    if not IS_ANDROID:
+        return
+    try:
+        from android.runnable import run_on_ui_thread   # type: ignore
+    except Exception:
+        return
+
+    @run_on_ui_thread
+    def apply():
+        try:
+            autoclass, _ = _jni()
+            activity = autoclass("org.kivy.android.PythonActivity").mActivity
+            if android_sdk() >= 27:
+                activity.setShowWhenLocked(bool(on))
+                activity.setTurnScreenOn(bool(on))
+            else:
+                flags = 0x00080000 | 0x00200000   # SHOW_WHEN_LOCKED|TURN_SCREEN_ON
+                window = activity.getWindow()
+                (window.addFlags if on else window.clearFlags)(flags)
+        except Exception:
+            log.exception("could not show over the lock screen")
+    apply()
+
+
+def android_proximity(on: bool) -> None:
+    """The screen goes dark against the ear during a call on the earpiece,
+    so a cheek cannot press anything."""
+    global _PROXIMITY_LOCK
+    try:
+        if on and _PROXIMITY_LOCK is None:
+            autoclass, _ = _jni()
+            power = autoclass("android.os.PowerManager")
+            manager = android_context().getSystemService(
+                autoclass("android.content.Context").POWER_SERVICE)
+            level = power.PROXIMITY_SCREEN_OFF_WAKE_LOCK
+            if manager.isWakeLockLevelSupported(level):
+                _PROXIMITY_LOCK = manager.newWakeLock(level, "fext:call")
+                _PROXIMITY_LOCK.acquire()
+        elif not on and _PROXIMITY_LOCK is not None:
+            lock, _PROXIMITY_LOCK = _PROXIMITY_LOCK, None
+            if lock.isHeld():
+                lock.release()
+    except Exception:
+        log.exception("proximity lock")
+
+
 class VoiceRecorder:
     """Android voice-note recorder (MediaRecorder, AAC in MP4).
 
@@ -2119,10 +3581,37 @@ class VoiceRecorder:
         self._rec.prepare()
         self._rec.start()
         self._started = time.monotonic()
+        self._paused_at: Optional[float] = None
+        self._paused_for = 0.0
         self.levels: list = []
         self._tick = Clock.schedule_interval(self._sample, 0.1)
 
+    #: MediaRecorder.pause() arrived in Android 7 (API 24).
+    @property
+    def can_pause(self) -> bool:
+        try:
+            return android_sdk() >= 24
+        except Exception:
+            return False
+
+    @property
+    def paused(self) -> bool:
+        return self._paused_at is not None
+
+    def pause(self) -> None:
+        if self._paused_at is None and self.can_pause:
+            self._rec.pause()
+            self._paused_at = time.monotonic()
+
+    def resume(self) -> None:
+        if self._paused_at is not None:
+            self._rec.resume()
+            self._paused_for += time.monotonic() - self._paused_at
+            self._paused_at = None
+
     def _sample(self, _dt) -> None:
+        if self._paused_at is not None:
+            return
         try:
             self.levels.append(int(self._rec.getMaxAmplitude()))
         except Exception:
@@ -2130,7 +3619,8 @@ class VoiceRecorder:
 
     @property
     def elapsed_ms(self) -> int:
-        return int((time.monotonic() - self._started) * 1000)
+        now = self._paused_at or time.monotonic()
+        return int((now - self._started - self._paused_for) * 1000)
 
     def _halt(self) -> None:
         self._tick.cancel()
@@ -2169,7 +3659,8 @@ class _SoundDeviceCapture:
 
     name = "sounddevice"
 
-    def __init__(self, feed: Callable[[bytes], None]) -> None:
+    def __init__(self, feed: Callable[[bytes], None],
+                 chunk: int = _PCM_CHUNK) -> None:
         import sounddevice                                 # type: ignore
         self.failed = False
 
@@ -2177,7 +3668,9 @@ class _SoundDeviceCapture:
             feed(bytes(indata))
         self._stream = sounddevice.RawInputStream(
             samplerate=PCM_RATE, channels=1, dtype="int16",
-            blocksize=_PCM_CHUNK // 2, callback=callback)
+            blocksize=chunk // 2, callback=callback,
+            device=_sounddevice_index("input"),
+            latency="low" if chunk < _PCM_CHUNK else "high")
         self._stream.start()
 
     def stop(self) -> None:
@@ -2199,11 +3692,13 @@ class _WinMMCapture:
     WHDR_DONE = 0x00000001
     WAVE_MAPPER = 0xFFFFFFFF
 
-    def __init__(self, feed: Callable[[bytes], None]) -> None:
+    def __init__(self, feed: Callable[[bytes], None],
+                 chunk: int = _PCM_CHUNK, buffers: int = 8) -> None:
         import ctypes
         from ctypes import wintypes
         self._ct, self.failed = ctypes, False
         self._feed = feed
+        self._chunk = chunk
 
         class WAVEFORMATEX(ctypes.Structure):
             _fields_ = [("wFormatTag", wintypes.WORD),
@@ -2248,9 +3743,9 @@ class _WinMMCapture:
                            ctypes.byref(fmt), 0, 0, 0)       # CALLBACK_NULL
         if rc != 0:
             raise OSError(f"no microphone (waveInOpen returned {rc})")
-        self._buffers = [ctypes.create_string_buffer(_PCM_CHUNK)
-                         for _ in range(8)]
-        self._headers = [WAVEHDR(ctypes.cast(b, ctypes.c_void_p), _PCM_CHUNK,
+        self._buffers = [ctypes.create_string_buffer(chunk)
+                         for _ in range(buffers)]
+        self._headers = [WAVEHDR(ctypes.cast(b, ctypes.c_void_p), chunk,
                                  0, 0, 0, 0, None, 0) for b in self._buffers]
         for hdr in self._headers:
             mm.waveInPrepareHeader(self._handle, ctypes.byref(hdr),
@@ -2282,9 +3777,10 @@ class _WinMMCapture:
         return True
 
     def _pump(self) -> None:
+        nap = 0.02 if self._chunk >= _PCM_CHUNK else 0.004
         while self._running:
             if not self._take(requeue=True):
-                time.sleep(0.02)
+                time.sleep(nap)
 
     def _close(self) -> None:
         for hdr in self._headers:
@@ -2310,16 +3806,18 @@ class _ProcessCapture:
 
     name = "process"
 
-    def __init__(self, feed: Callable[[bytes], None], argv: list) -> None:
+    def __init__(self, feed: Callable[[bytes], None], argv: list,
+                 chunk: int = _PCM_CHUNK) -> None:
         self.name, self.failed = os.path.basename(argv[0]), False
         self._proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
                                       stdout=subprocess.PIPE,
-                                      stderr=subprocess.DEVNULL)
+                                      stderr=subprocess.DEVNULL,
+                                      bufsize=0 if chunk < _PCM_CHUNK else -1)
 
         def pump():
             got = False
             while True:
-                data = self._proc.stdout.read(_PCM_CHUNK)
+                data = self._read(chunk)
                 if not data:
                     break
                 got = True
@@ -2328,6 +3826,17 @@ class _ProcessCapture:
                 self.failed = True               # exited at once: no device
         self._thread = threading.Thread(target=pump, daemon=True)
         self._thread.start()
+
+    def _read(self, n: int) -> bytes:
+        """`n` bytes, or what is left when the recorder stops. Unbuffered
+        (for calls) a pipe hands over whatever it has, so read until full."""
+        out = b""
+        while len(out) < n:
+            part = self._proc.stdout.read(n - len(out))
+            if not part:
+                break
+            out += part
+        return out
 
     def stop(self) -> None:
         if self._proc.poll() is None:
@@ -2366,19 +3875,106 @@ def _capture_commands() -> list:
     return found
 
 
-def _capture_routes() -> list:
-    """Ways this computer can record, best first, as factories of feed."""
-    routes = []
+# ---- v11: which microphone and speaker, and the system's echo cancelling ---------
+# A computer has no echo cancelling of its own in Ferritext: it relies on
+# the operating system's or the hardware's. A headset, or a speakerphone
+# that cancels echo itself, can be chosen in Settings (needs `sounddevice`);
+# on Linux, PulseAudio's or PipeWire's echo-cancel source and sink
+# (module-echo-cancel) are used whenever they are there.
+def sound_devices(kind: str) -> list:
+    """Names of the 'input' or 'output' devices sounddevice can open."""
+    if not _has_sounddevice():
+        return []
+    try:
+        import sounddevice                                 # type: ignore
+        names = []
+        for dev in sounddevice.query_devices():
+            if dev.get(f"max_{kind}_channels", 0) > 0 and \
+                    dev["name"] not in names:
+                names.append(dev["name"])
+        return names
+    except Exception:
+        return []
+
+
+def chosen_device(kind: str) -> Optional[str]:
+    """The device picked for 'input' or 'output', or None: the system's."""
+    name = load_prefs().get(f"sound_{kind}")
+    return name if isinstance(name, str) and name else None
+
+
+def _sounddevice_index(kind: str):
+    name = chosen_device(kind)
+    if name is None:
+        return None
+    try:
+        import sounddevice                                 # type: ignore
+        for i, dev in enumerate(sounddevice.query_devices()):
+            if dev["name"] == name and dev.get(f"max_{kind}_channels", 0):
+                return i
+    except Exception:
+        pass
+    return None                     # unplugged since: the system's own
+
+
+_ECHO_CHECKED = False
+
+
+def use_system_echo_cancel() -> Optional[str]:
+    """Linux: point this process's default sound at an echo-cancelled
+    source and sink if PulseAudio or PipeWire offers them (PULSE_SOURCE,
+    PULSE_SINK, which the default device and parec/pacat follow). Returns
+    the source's name, or None."""
+    global _ECHO_CHECKED
+    if platform.system() != "Linux":
+        return None
+    if _ECHO_CHECKED:
+        return os.environ.get("PULSE_SOURCE") or None
+    _ECHO_CHECKED = True
+    if not shutil.which("pactl"):
+        return None
+    found = None
+    for what, var in (("sources", "PULSE_SOURCE"), ("sinks", "PULSE_SINK")):
+        try:
+            out = subprocess.run(["pactl", "list", "short", what],
+                                 capture_output=True, text=True, timeout=3,
+                                 stdin=subprocess.DEVNULL).stdout
+        except Exception:
+            continue
+        for line in out.splitlines():
+            parts = line.split("\t")
+            name = parts[1] if len(parts) > 1 else ""
+            if "echo" in name.lower() and "cancel" in name.lower() and \
+                    not name.endswith(".monitor"):
+                os.environ.setdefault(var, name)
+                if var == "PULSE_SOURCE":
+                    found = name
+                break
+    if found:
+        log.info("calls: echo cancelled by the system (%s)", found)
+    return found
+
+
+def _has_sounddevice() -> bool:
     try:
         import importlib.util
-        if importlib.util.find_spec("sounddevice") is not None:
-            routes.append(_SoundDeviceCapture)
+        return importlib.util.find_spec("sounddevice") is not None
     except (ImportError, ValueError):
-        pass
+        return False
+
+
+def _capture_routes() -> list:
+    """Ways this computer can record, best first, as factories of
+    (feed, chunk): `feed` is handed PCM `chunk` bytes at a time."""
+    routes = []
+    if _has_sounddevice():
+        routes.append(_SoundDeviceCapture)
     if platform.system() == "Windows":
-        routes.append(_WinMMCapture)
+        routes.append(lambda feed, chunk=_PCM_CHUNK: _WinMMCapture(
+            feed, chunk, 8 if chunk >= _PCM_CHUNK else 6))
     for argv in _capture_commands():
-        routes.append(lambda feed, argv=argv: _ProcessCapture(feed, argv))
+        routes.append(lambda feed, chunk=_PCM_CHUNK, argv=argv:
+                      _ProcessCapture(feed, argv, chunk))
     return routes
 
 
@@ -2403,6 +3999,7 @@ class PcmRecorder:
         self._pcm = bytearray()
         self._pending = b""
         self.levels: list = []
+        self.paused = False
         MEDIA_DIR.mkdir(parents=True, exist_ok=True)
         self.path = str(MEDIA_DIR / f"rec_{uuid.uuid4().hex}.wav")
         self._source = None
@@ -2418,8 +4015,21 @@ class PcmRecorder:
                 f" ({'; '.join(errors)})" if errors else ""))
         log.info("recording through %s", self._source.name)
 
+    can_pause = True
+
+    def pause(self) -> None:
+        """The microphone stays open; what it hears is not kept."""
+        with self._lock:
+            self.paused = True
+
+    def resume(self) -> None:
+        with self._lock:
+            self.paused = False
+
     def _feed(self, data: bytes) -> None:
         with self._lock:
+            if self.paused:
+                return
             room = self.max_seconds * PCM_BYTES_PER_SECOND - len(self._pcm)
             if room <= 0:
                 return
@@ -2484,69 +4094,405 @@ def waveform_b64(levels: list, bars: int = 48) -> str:
     return b64e(bytes(out))
 
 
-class VoicePlayer:
-    """Plays one voice note at a time.
+# ---- v11: voice notes at 1×, 1.5× or 2×, and played in the app on computers --
+VOICE_SPEEDS = (1.0, 1.5, 2.0)
 
-    Android: MediaPlayer, polled for progress (no Java listener class needed).
-    Desktop: Kivy's audio stack has no AAC decoder, so the file is handed to
-    the operating system's default player instead.
+
+def voice_speed() -> float:
+    value = load_prefs().get("voice_speed", 1.0)
+    return float(value) if value in VOICE_SPEEDS else 1.0
+
+
+def speed_label(speed: float) -> str:
+    return f"{speed:g}×"
+
+
+def _mono_16k(data: bytes, rate: int, channels: int) -> bytes:
+    """16-bit PCM in, 16 kHz mono out (mixed down, linearly resampled)."""
+    import array
+    samples = array.array("h", data)
+    if sys.byteorder == "big":
+        samples.byteswap()
+    if channels == 2:
+        samples = array.array("h", ((samples[i] + samples[i + 1]) // 2
+                                    for i in range(0, len(samples) - 1, 2)))
+    if rate != PCM_RATE and rate > 0 and samples:
+        step = rate / PCM_RATE
+        count = int(len(samples) / step)
+        last = len(samples) - 1
+        out = array.array("h", bytes(2 * count))
+        for i in range(count):
+            at = i * step
+            k = int(at)
+            frac = at - k
+            nxt = samples[min(k + 1, last)]
+            out[i] = int(samples[k] + (nxt - samples[k]) * frac)
+        samples = out
+    if sys.byteorder == "big":
+        samples.byteswap()
+    return samples.tobytes()
+
+
+def decode_voice_pcm(path: str) -> Optional[bytes]:
+    """A voice note as 16 kHz mono 16-bit PCM, to play in the app on a
+    computer: a WAV (a computer's own recordings) by itself; AAC (a
+    phone's) through PyAV or the ffmpeg program, when either is installed.
+    None: no way to decode it here."""
+    name = str(path)
+    try:
+        import wave
+        with wave.open(name, "rb") as w:
+            if w.getsampwidth() == 2 and w.getnchannels() in (1, 2):
+                return _mono_16k(w.readframes(w.getnframes()),
+                                 w.getframerate(), w.getnchannels())
+    except Exception:
+        pass
+    try:
+        import av                                      # type: ignore
+        chunks = []
+        with av.open(name) as container:
+            stream = next(st for st in container.streams
+                          if st.type == "audio")
+            resampler = av.AudioResampler(format="s16", layout="mono",
+                                          rate=PCM_RATE)
+            for frame in container.decode(stream):
+                for out in resampler.resample(frame):
+                    chunks.append(bytes(out.planes[0])[:out.samples * 2])
+            for out in resampler.resample(None):
+                chunks.append(bytes(out.planes[0])[:out.samples * 2])
+        if chunks:
+            return b"".join(chunks)
+    except Exception:
+        pass
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        try:
+            done = subprocess.run(
+                [ffmpeg, "-v", "quiet", "-i", name, "-f", "s16le", "-ac", "1",
+                 "-ar", str(PCM_RATE), "-"], capture_output=True, timeout=60,
+                stdin=subprocess.DEVNULL)
+            if done.returncode == 0 and done.stdout:
+                return done.stdout
+        except Exception:
+            pass
+    return None
+
+
+def time_stretch(pcm: bytes, speed: float) -> bytes:
+    """Speech `speed` times faster with its pitch kept (WSOLA: overlapping
+    30 ms pieces, each laid where it best continues the last). NumPy when
+    it is installed; plain Python, searching more coarsely, otherwise."""
+    if speed == 1.0 or len(pcm) < 4:
+        return pcm
+    frame = int(PCM_RATE * 0.030)            # 480 samples
+    hop_out = frame // 2
+    hop_in = int(round(hop_out * speed))
+    tol = int(PCM_RATE * 0.006)              # ±6 ms
+    try:
+        import numpy as np                             # type: ignore
+    except ImportError:
+        np = None
+    if np is not None:
+        x = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
+        win = np.hanning(frame).astype(np.float32)
+        out_len = int(len(x) / speed) + 2 * frame
+        y = np.zeros(out_len, np.float32)
+        weight = np.zeros(out_len, np.float32)
+        pin = pout = 0
+        follow = None
+        while pin + frame + tol < len(x) and pout + frame < out_len:
+            shift = 0
+            if follow is not None:
+                lo, hi = max(0, pin - tol), min(len(x) - frame, pin + tol)
+                corr = np.correlate(x[lo:hi + frame:2], follow[::2],
+                                    mode="valid")
+                shift = lo + 2 * int(np.argmax(corr)) - pin
+            piece = x[pin + shift:pin + shift + frame]
+            y[pout:pout + frame] += piece * win
+            weight[pout:pout + frame] += win
+            follow = x[pin + shift + hop_out:pin + shift + hop_out + frame]
+            if len(follow) < frame:
+                break
+            pin += hop_in
+            pout += hop_out
+        y = y[:pout + frame] / np.maximum(weight[:pout + frame], 1e-3)
+        return np.clip(y, -32768, 32767).astype("<i2").tobytes()
+    import array
+    x = array.array("h", pcm)
+    if sys.byteorder == "big":
+        x.byteswap()
+    tri = [min(i + 1, frame - i) / (frame / 2) for i in range(frame)]
+    out_len = int(len(x) / speed) + 2 * frame
+    y = [0.0] * out_len
+    weight = [0.0] * out_len
+    pin = pout = 0
+    follow = None
+    probe = range(0, frame, 8)
+    while pin + frame + tol < len(x) and pout + frame < out_len:
+        shift = 0
+        if follow is not None:
+            best = None
+            for k in range(-tol, tol + 1, 4):
+                at = pin + k
+                if at < 0:
+                    continue
+                score = sum(x[at + i] * follow[i] for i in probe)
+                if best is None or score > best:
+                    best, shift = score, k
+        base = pin + shift
+        for i in range(frame):
+            w = tri[i]
+            y[pout + i] += x[base + i] * w
+            weight[pout + i] += w
+        follow = x[base + hop_out:base + hop_out + frame]
+        if len(follow) < frame:
+            break
+        pin += hop_in
+        pout += hop_out
+    end = pout + frame
+    out = array.array("h", (max(-32768, min(32767, int(y[i] / weight[i])))
+                            if weight[i] > 1e-3 else 0 for i in range(end)))
+    if sys.byteorder == "big":
+        out.byteswap()
+    return out.tobytes()
+
+
+class _DesktopVoice:
+    """One voice note playing on a computer: its sound, decoded; a speaker
+    route; and a place in the note's own time, so the speed can change
+    and the note be moved through as it plays."""
+
+    def __init__(self, pcm: bytes, speed: float) -> None:
+        self.total = len(pcm) // 2
+        self._versions = {1.0: pcm}
+        self._speed = 1.0
+        self._pos = 0.0                       # in the note's own samples
+        self._lock = threading.Lock()
+        self.finished = False
+        self._player = None
+        self.set_speed(speed)
+        for route in _playback_routes():
+            try:
+                self._player = route(self._pull)
+                break
+            except Exception:
+                continue
+        if self._player is None:
+            raise RuntimeError("no way to play sound on this computer")
+
+    def _pull(self) -> Optional[bytes]:
+        with self._lock:
+            if self.finished:
+                return None
+            data, speed = self._versions[self._speed], self._speed
+            at = int(self._pos / speed) * 2
+            piece = data[at:at + CALL_FRAME_BYTES]
+            self._pos += CALL_FRAME_SAMPLES * speed
+            if len(piece) < CALL_FRAME_BYTES:
+                self.finished = True
+                if not piece:
+                    return None
+                piece += bytes(CALL_FRAME_BYTES - len(piece))
+            return piece
+
+    @property
+    def fraction(self) -> float:
+        return min(1.0, self._pos / self.total) if self.total else 1.0
+
+    def seek(self, fraction: float) -> None:
+        with self._lock:
+            self._pos = max(0.0, min(1.0, fraction)) * self.total
+            self.finished = False
+
+    def set_speed(self, speed: float) -> None:
+        """At once if that speed is ready; else as soon as it is (worked
+        out on the side, the note playing on meanwhile)."""
+        if speed in self._versions:
+            with self._lock:
+                self._speed = speed
+            return
+
+        def work():
+            stretched = time_stretch(self._versions[1.0], speed)
+            with self._lock:
+                self._versions[speed] = stretched
+                self._speed = speed
+        threading.Thread(target=work, daemon=True).start()
+
+    def stop(self) -> None:
+        player, self._player = self._player, None
+        if player is not None:
+            try:
+                player.stop()
+            except Exception:
+                pass
+
+
+class VoicePlayer:
+    """Plays one voice note at a time, at 1×, 1.5× or 2× (v11: the choice
+    is remembered), from any point.
+
+    Android: MediaPlayer, polled for progress (no Java listener class
+    needed); its speed keeps the pitch (Android 6+). Computers: decoded and
+    played in the app (_DesktopVoice) — a phone's AAC needs PyAV or ffmpeg
+    for that; without either, the operating system's player opens it.
     """
 
     def __init__(self) -> None:
         self._mp = None
+        self._desk: Optional[_DesktopVoice] = None
         self._poll = None
         self.path: Optional[str] = None
+        self.speed = voice_speed()
         self.on_progress: Optional[Callable] = None   # (path, fraction)
         self.on_stop: Optional[Callable] = None       # (path)
 
     @property
     def playing(self) -> bool:
-        return self._mp is not None
+        return self._mp is not None or self._desk is not None
 
-    def toggle(self, path: str) -> None:
-        if self.path == path and self._mp is not None:
-            self.stop()
+    def toggle(self, path: str, at: Optional[float] = None) -> None:
+        """Play `path` (from `at`, a fraction of it), or stop it if it is
+        the one playing."""
+        if self.path == path and self.playing:
+            if at is None:
+                self.stop()
+            else:
+                self.seek(path, at)
             return
         self.stop()
-        if not IS_ANDROID:
-            open_with_system(path)
-            return
-        autoclass, _ = _jni()
-        mp = autoclass("android.media.MediaPlayer")()
-        mp.setDataSource(path)
-        mp.prepare()
-        mp.start()
-        self._mp, self.path = mp, path
-        self._poll = Clock.schedule_interval(self._check, 0.15)
+        if IS_ANDROID:
+            autoclass, _ = _jni()
+            mp = autoclass("android.media.MediaPlayer")()
+            mp.setDataSource(path)
+            mp.prepare()
+            if at:
+                mp.seekTo(int(at * (mp.getDuration() or 0)))
+            mp.start()
+            self._mp = mp
+            self._apply_speed()
+        else:
+            pcm = decode_voice_pcm(path)
+            if pcm is None:
+                open_with_system(path)
+                return
+            try:
+                self._desk = _DesktopVoice(pcm, self.speed)
+            except RuntimeError:
+                open_with_system(path)
+                return
+            if at:
+                self._desk.seek(at)
+        self.path = path
+        self._poll = Clock.schedule_interval(self._check, 0.1)
 
-    def _check(self, _dt) -> None:
-        mp = self._mp
-        if mp is None:
+    def seek(self, path: str, fraction: float) -> None:
+        """Move through the note playing; start another from there."""
+        if self.path != path or not self.playing:
+            self.toggle(path, at=fraction)
+            return
+        if self._mp is not None:
+            try:
+                self._mp.seekTo(int(fraction * (self._mp.getDuration() or 0)))
+            except Exception:
+                log.exception("could not move through the voice message")
+        elif self._desk is not None:
+            self._desk.seek(fraction)
+
+    def set_speed(self, speed: float) -> None:
+        self.speed = speed if speed in VOICE_SPEEDS else 1.0
+        save_pref("voice_speed", self.speed)
+        if self._mp is not None:
+            self._apply_speed()
+        elif self._desk is not None:
+            self._desk.set_speed(self.speed)
+
+    def _apply_speed(self) -> None:
+        if self._mp is None or android_sdk() < 23:
             return
         try:
-            if not mp.isPlaying():
+            params = self._mp.getPlaybackParams()
+            params.setSpeed(float(self.speed))
+            self._mp.setPlaybackParams(params)
+        except Exception:
+            log.exception("could not change the voice message's speed")
+
+    def _check(self, _dt) -> None:
+        if self._mp is not None:
+            mp = self._mp
+            try:
+                if not mp.isPlaying():
+                    self.stop()
+                    return
+                total = mp.getDuration() or 1
+                fraction = mp.getCurrentPosition() / total
+            except Exception:
                 self.stop()
                 return
-            total = mp.getDuration() or 1
-            if self.on_progress:
-                self.on_progress(self.path, mp.getCurrentPosition() / total)
-        except Exception:
-            self.stop()
+        elif self._desk is not None:
+            if self._desk.finished:
+                self.stop()
+                return
+            fraction = self._desk.fraction
+        else:
+            return
+        if self.on_progress:
+            self.on_progress(self.path, fraction)
 
     def stop(self) -> None:
         if self._poll is not None:
             self._poll.cancel()
             self._poll = None
-        mp, path = self._mp, self.path
-        self._mp, self.path = None, None
+        mp, desk, path = self._mp, self._desk, self.path
+        self._mp, self._desk, self.path = None, None, None
         if mp is not None:
             try:
                 mp.stop()
                 mp.release()
             except Exception:
                 pass
+        if desk is not None:
+            desk.stop()
         if path and self.on_stop:
             self.on_stop(path)
+
+
+def is_image_file(path: str) -> bool:
+    try:
+        from PIL import Image
+        with Image.open(path) as probe:
+            probe.verify()
+        return True
+    except Exception:
+        return False
+
+
+def clipboard_image() -> Optional[tuple]:
+    """An image on a computer's clipboard, as (path, temporary) for the
+    photo preview — a picture is saved as a PNG copy (temporary), a copied
+    image file is used where it is — or None. Pillow reads the clipboard on
+    Windows and macOS, and on Linux through wl-paste or xclip."""
+    try:
+        from PIL import ImageGrab
+        grabbed = ImageGrab.grabclipboard()
+    except Exception:
+        return None
+    if isinstance(grabbed, list):           # files copied in a file manager
+        for name in grabbed:
+            if is_image_file(str(name)):
+                return str(name), False
+        return None
+    if grabbed is None or not hasattr(grabbed, "save"):
+        return None
+    folder = DATA_DIR / "cache"
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"pasted-{uuid.uuid4().hex[:12]}.png"
+        grabbed.save(path, "PNG")
+    except Exception:
+        log.exception("could not keep a pasted image")
+        return None
+    return str(path), True
 
 
 def open_with_system(path: str) -> bool:
@@ -2563,6 +4509,1628 @@ def open_with_system(path: str) -> bool:
     except Exception:
         log.warning("no application to open %s", path)
         return False
+
+
+# =============================================================================
+#  Voice calls (v9.1.2)
+# =============================================================================
+# A call is set up with end-to-end encrypted control messages, like every
+# other instruction between two apps: an offer ('call'), the callee's app
+# saying it rings ('ringing', with its key and addresses), the answer
+# ('answer') and the end ('end'). Each side makes a fresh key pair for the
+# call; the two agree a secret nobody else can learn — the offer and the
+# reply are signed and sealed like messages, so not even the relay can put
+# its own key in between — and from it one key for each direction. They
+# are forgotten when the call ends.
+#
+# The sound goes as small UDP packets, 20 ms of speech each, sealed with
+# those keys: straight between the two devices whenever their networks
+# allow it (each learns its public address from the relay, then both send
+# to each other at once, which opens the way through most home routers);
+# through the relay's UDP port otherwise, which forwards what it cannot
+# read; and over the relay's WebSocket when UDP is blocked altogether.
+# Packets travel the shortest working way, so speech takes the network's
+# own delay plus 20 ms to fill a packet and a short buffer that smooths out
+# uneven arrival.
+#
+# Speech is coded with Opus where both apps have libopus (v11): 16 kHz,
+# about 24 kbit/s, each packet carrying a copy of the one before so a lost
+# one is rebuilt. Otherwise as 16 kHz IMA ADPCM, four bits a sample:
+# wideband, cheap enough to code in Python on a phone, and every packet
+# decodes on its own, so a lost packet costs 20 ms of sound and nothing
+# more. Each side sends the best the other can decode.
+CALL_RATE = 16000
+CALL_FRAME_MS = 20
+CALL_FRAME_SAMPLES = CALL_RATE * CALL_FRAME_MS // 1000        # 320
+CALL_FRAME_BYTES = CALL_FRAME_SAMPLES * 2                     # 640, s16le
+CALL_RING_SECONDS = 45          # unanswered for this long: "No answer"
+CALL_OFFER_MAX_AGE = 40         # an offer older than this is a missed call
+CALL_CONNECT_SECONDS = 15       # answered, but no way found to each other
+CALL_DROP_SECONDS = 20          # nothing heard for this long: the call drops
+#: Every codec a call may use, best first (v11: Opus where libopus is here).
+CALL_CODECS = ("opus16", "ima16")
+#: The codec byte each audio packet carries (0: muted, nothing).
+CODEC_IDS = {"ima16": 1, "opus16": 2}
+CALL_HKDF_INFO = b"fext.call.v1|"
+CALL_MAX_PACKET = 1200
+_CALL_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_CALL_TAG_RE = re.compile(r"^[0-9a-f]{16}$")
+
+#: Packet types, the first byte of every packet. From 0x10 they are the
+#: relay's own (registration), which it reads; the others it only forwards.
+PKT_AUDIO, PKT_PING, PKT_PONG, PKT_BYE = 0x01, 0x02, 0x03, 0x04
+PKT_REG, PKT_REG_OK = 0x10, 0x11
+_PKT_HEAD = struct.Struct("!B8sII")           # type, tag, sequence, time (ms)
+
+# ---- the codec --------------------------------------------------------------
+_IMA_STEP = (
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41,
+    45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190,
+    209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796,
+    876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499,
+    2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845,
+    8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350,
+    22385, 24623, 27086, 29794, 32767)
+_IMA_INDEX = (-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8)
+
+try:                      # in the standard library up to Python 3.12
+    import warnings as _warnings
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore")
+        import audioop as _audioop                    # type: ignore
+except ImportError:
+    _audioop = None
+
+
+def _pcm_samples(pcm: bytes):
+    import array
+    samples = array.array("h", pcm)
+    if sys.byteorder == "big":
+        samples.byteswap()
+    return samples
+
+
+def _ima_encode_py(pcm: bytes, state: tuple) -> tuple:
+    """IMA ADPCM, exactly as CPython's audioop.lin2adpcm codes it."""
+    steps, indices = _IMA_STEP, _IMA_INDEX
+    valpred, index = state
+    step = steps[index]
+    samples = _pcm_samples(pcm)
+    out = bytearray(len(samples) // 2)
+    high = 0
+    for i, val in enumerate(samples):
+        if val < valpred:
+            diff, sign = valpred - val, 8
+        else:
+            diff, sign = val - valpred, 0
+        delta, vpdiff = 0, step >> 3
+        if diff >= step:
+            delta, diff, vpdiff = 4, diff - step, vpdiff + step
+        half = step >> 1
+        if diff >= half:
+            delta, diff, vpdiff = delta | 2, diff - half, vpdiff + half
+        if diff >= half >> 1:
+            delta, vpdiff = delta | 1, vpdiff + (half >> 1)
+        valpred = valpred - vpdiff if sign else valpred + vpdiff
+        if valpred > 32767:
+            valpred = 32767
+        elif valpred < -32768:
+            valpred = -32768
+        delta |= sign
+        index += indices[delta]
+        index = 0 if index < 0 else 88 if index > 88 else index
+        step = steps[index]
+        if i & 1:
+            out[i >> 1] = high | delta
+        else:
+            high = (delta << 4) & 0xF0
+    return bytes(out), (valpred, index)
+
+
+def _ima_decode_py(codes: bytes, state: tuple) -> tuple:
+    """The inverse, exactly as audioop.adpcm2lin decodes it."""
+    import array
+    steps, indices = _IMA_STEP, _IMA_INDEX
+    valpred, index = state
+    step = steps[index]
+    out = array.array("h", bytes(4 * len(codes)))
+    i = 0
+    for byte in codes:
+        for delta in (byte >> 4, byte & 0x0F):
+            index += indices[delta]
+            index = 0 if index < 0 else 88 if index > 88 else index
+            vpdiff = step >> 3
+            if delta & 4:
+                vpdiff += step
+            if delta & 2:
+                vpdiff += step >> 1
+            if delta & 1:
+                vpdiff += step >> 2
+            valpred = valpred - vpdiff if delta & 8 else valpred + vpdiff
+            if valpred > 32767:
+                valpred = 32767
+            elif valpred < -32768:
+                valpred = -32768
+            step = steps[index]
+            out[i] = valpred
+            i += 1
+    if sys.byteorder == "big":
+        out.byteswap()
+    return out.tobytes(), (valpred, index)
+
+
+class ImaCodec:
+    """'ima16': 20 ms of 16 kHz speech as 163 bytes — where the decoder
+    starts (3 bytes) and four bits a sample. Each frame decodes alone."""
+
+    name = "ima16"
+
+    def __init__(self) -> None:
+        self._state = (0, 0)
+
+    def encode(self, pcm: bytes) -> bytes:
+        head = struct.pack("<hB", *self._state)
+        if _audioop is not None:
+            codes, self._state = _audioop.lin2adpcm(pcm, 2, self._state)
+        else:
+            codes, self._state = _ima_encode_py(pcm, self._state)
+        return head + codes
+
+    @staticmethod
+    def decode(frame: bytes) -> Optional[bytes]:
+        if len(frame) != 3 + CALL_FRAME_SAMPLES // 2:
+            return None
+        valpred, index = struct.unpack("<hB", frame[:3])
+        if index > 88:
+            return None
+        if _audioop is not None:
+            return _audioop.adpcm2lin(frame[3:], 2, (valpred, index))[0]
+        return _ima_decode_py(frame[3:], (valpred, index))[0]
+
+
+# ---- v11: Opus ----------------------------------------------------------------
+# 'opus16': the same 20 ms of 16 kHz speech in about 60 bytes (24 kbit/s)
+# rather than 163, with Opus's own concealment of a lost packet and, inside
+# each packet, a rougher copy of the one before (in-band FEC), so a lone
+# loss is all but unheard. libopus is built into the APK (recipes/libopus);
+# a computer uses its own — most Linux systems have it, Homebrew on a Mac,
+# `pip install pyogg` on Windows — or FEXT_OPUS naming the file. Without
+# it calls are 'ima16' as before: each side sends the best the other can
+# decode, so a call with an older app is simply ADPCM.
+OPUS_APPLICATION_VOIP = 2048
+OPUS_SET_BITRATE = 4002
+OPUS_SET_COMPLEXITY = 4010
+OPUS_SET_INBAND_FEC = 4012
+OPUS_SET_PACKET_LOSS_PERC = 4014
+OPUS_SET_SIGNAL = 4024
+OPUS_SIGNAL_VOICE = 3001
+OPUS_BITRATE = 24000
+_OPUS_LIB = None                       # the library once looked for (False: none)
+
+
+def _opus_candidates() -> list:
+    import ctypes.util
+    names = []
+    if os.environ.get("FEXT_OPUS"):
+        names.append(os.environ["FEXT_OPUS"])
+    if IS_ANDROID:
+        return names + ["libopus.so"]
+    found = ctypes.util.find_library("opus")
+    if found:
+        names.append(found)
+    names += ["libopus.so.0", "libopus.so", "/opt/homebrew/lib/libopus.dylib",
+              "/usr/local/lib/libopus.dylib", "libopus.0.dylib",
+              "libopus-0.dll", "opus.dll"]
+    try:                                   # what PyOgg ships (Windows, Mac)
+        import importlib.util as iu
+        spec = iu.find_spec("pyogg")
+        if spec and spec.origin:
+            folder = os.path.dirname(spec.origin)
+            names += [os.path.join(folder, n) for n in
+                      ("opus.dll", "libopus.dll", "libopus.0.dylib",
+                       "libopus.dylib")]
+    except Exception:
+        pass
+    return names
+
+
+def opus_library():
+    """libopus through ctypes, with its few functions typed — or None."""
+    global _OPUS_LIB
+    if _OPUS_LIB is not None:
+        return _OPUS_LIB or None
+    import ctypes
+    lib = None
+    for name in _opus_candidates():
+        try:
+            lib = ctypes.CDLL(name)
+            break
+        except OSError:
+            continue
+    if lib is None:
+        _OPUS_LIB = False
+        return None
+    try:
+        p, i, i32 = ctypes.c_void_p, ctypes.c_int, ctypes.c_int32
+        lib.opus_encoder_create.restype = p
+        lib.opus_encoder_create.argtypes = [i32, i, i, ctypes.POINTER(i)]
+        lib.opus_encode.restype = i32
+        lib.opus_encode.argtypes = [p, ctypes.c_char_p, i, ctypes.c_char_p,
+                                    i32]
+        # Variadic: only the fixed arguments are typed, so ctypes passes the
+        # value as a variadic one where the platform cares (Apple silicon).
+        lib.opus_encoder_ctl.restype = i
+        lib.opus_encoder_ctl.argtypes = [p, i]
+        lib.opus_encoder_destroy.argtypes = [p]
+        lib.opus_decoder_create.restype = p
+        lib.opus_decoder_create.argtypes = [i32, i, ctypes.POINTER(i)]
+        lib.opus_decode.restype = i
+        lib.opus_decode.argtypes = [p, ctypes.c_char_p, i32,
+                                    ctypes.POINTER(ctypes.c_int16), i, i]
+        lib.opus_decoder_destroy.argtypes = [p]
+        lib.opus_get_version_string.restype = ctypes.c_char_p
+        log.info("calls: Opus from %s",
+                 lib.opus_get_version_string().decode("ascii", "replace"))
+    except (AttributeError, OSError):
+        log.warning("calls: that libopus lacks what a call needs")
+        _OPUS_LIB = False
+        return None
+    _OPUS_LIB = lib
+    return lib
+
+
+def call_codecs() -> list:
+    """The codecs this device can decode (and so offer), best first."""
+    return ["opus16", "ima16"] if opus_library() is not None else ["ima16"]
+
+
+def pick_send_codec(theirs) -> str:
+    """The best codec to send: one we can encode that they can decode."""
+    for name in call_codecs():
+        if name in (theirs or ()):
+            return name
+    return "ima16"
+
+
+class OpusCodec:
+    """'opus16': one encoder and one decoder for a call (one thread)."""
+
+    name = "opus16"
+
+    def __init__(self) -> None:
+        import ctypes
+        lib = opus_library()
+        if lib is None:
+            raise RuntimeError("no libopus here")
+        self._lib, self._ct = lib, ctypes
+        err = ctypes.c_int(0)
+        self._enc = lib.opus_encoder_create(CALL_RATE, 1,
+                                            OPUS_APPLICATION_VOIP,
+                                            ctypes.byref(err))
+        if not self._enc or err.value != 0:
+            raise RuntimeError(f"opus encoder: {err.value}")
+        for request, value in ((OPUS_SET_BITRATE, OPUS_BITRATE),
+                               (OPUS_SET_COMPLEXITY, 5),
+                               (OPUS_SET_INBAND_FEC, 1),
+                               (OPUS_SET_PACKET_LOSS_PERC, 10),
+                               (OPUS_SET_SIGNAL, OPUS_SIGNAL_VOICE)):
+            lib.opus_encoder_ctl(self._enc, request, ctypes.c_int(value))
+        self._dec = lib.opus_decoder_create(CALL_RATE, 1, ctypes.byref(err))
+        if not self._dec or err.value != 0:
+            lib.opus_encoder_destroy(self._enc)
+            raise RuntimeError(f"opus decoder: {err.value}")
+        self._out = ctypes.create_string_buffer(400)
+        self._pcm = (ctypes.c_int16 * CALL_FRAME_SAMPLES)()
+
+    def encode(self, pcm: bytes) -> bytes:
+        n = self._lib.opus_encode(self._enc, pcm, CALL_FRAME_SAMPLES,
+                                  self._out, len(self._out))
+        return self._out.raw[:n] if n > 0 else b""
+
+    def decode(self, frame: Optional[bytes], fec: bool = False
+               ) -> Optional[bytes]:
+        """A frame's sound; None decodes nothing heard (concealment); with
+        `fec`, the frame before `frame`, from the copy inside it."""
+        n = self._lib.opus_decode(self._dec, frame, len(frame or b""),
+                                  self._pcm, CALL_FRAME_SAMPLES,
+                                  1 if fec else 0)
+        if n <= 0:
+            return None
+        return self._ct.string_at(self._pcm, n * 2).ljust(
+            CALL_FRAME_BYTES, b"\0")
+
+    def close(self) -> None:
+        if self._enc:
+            self._lib.opus_encoder_destroy(self._enc)
+            self._enc = None
+        if self._dec:
+            self._lib.opus_decoder_destroy(self._dec)
+            self._dec = None
+
+
+def pcm_scaled(pcm: bytes, factor: float) -> bytes:
+    """Speech made quieter (a lost packet's stand-in fades out)."""
+    if _audioop is not None:
+        return _audioop.mul(pcm, 2, factor)
+    import array
+    samples = _pcm_samples(pcm)
+    out = array.array("h", (int(v * factor) for v in samples))
+    if sys.byteorder == "big":
+        out.byteswap()
+    return out.tobytes()
+
+
+def pcm_level(pcm: bytes) -> int:
+    """The loudest sample of a frame (0..32767), for the meter."""
+    if not pcm:
+        return 0
+    if _audioop is not None:
+        return _audioop.max(pcm, 2)
+    samples = _pcm_samples(pcm)
+    return max(max(samples), -min(samples))
+
+
+# ---- the keys ---------------------------------------------------------------
+class CallKeys:
+    """One call's two keys, and the seal on every packet.
+
+    Header: type (1) | tag (8) | sequence (4) | sender's time in ms (4) —
+    sent in the clear, because the relay routes on the tag, and bound to
+    the sealed part as its associated data, so it cannot be altered. The
+    sequence numbers each packet a direction sends, so it is also the
+    nonce (unique per key) and what refuses a packet played back again.
+    """
+
+    WINDOW = 512
+
+    def __init__(self, secret: bytes, call_id: str, tag: bytes,
+                 caller: bool) -> None:
+        okm = HKDF(algorithm=SHA256(), length=64, salt=tag,
+                   info=CALL_HKDF_INFO + call_id.encode("ascii"),
+                   backend=default_backend()).derive(secret)
+        out_key, in_key = (okm[:32], okm[32:]) if caller else \
+            (okm[32:], okm[:32])
+        self._out, self._in = AESGCM(out_key), AESGCM(in_key)
+        self.tag = tag
+        self._seq = 0
+        self._seq_lock = threading.Lock()
+        self._top, self._seen = 0, 0
+
+    def seal(self, ptype: int, payload: bytes, ts_ms: int) -> bytes:
+        with self._seq_lock:
+            self._seq += 1
+            seq = self._seq
+        head = _PKT_HEAD.pack(ptype, self.tag, seq, ts_ms & 0xFFFFFFFF)
+        return head + self._out.encrypt(b"\0" * 8 + head[9:13], payload,
+                                        head)
+
+    def open(self, packet: bytes) -> Optional[tuple]:
+        """(type, sequence, time, payload) of a packet the other side
+        sealed — or None: not this call's, altered, or seen before."""
+        if len(packet) < _PKT_HEAD.size + 16 or \
+                packet[1:9] != self.tag:
+            return None
+        ptype, _tag, seq, ts = _PKT_HEAD.unpack_from(packet)
+        if seq == 0 or not self._fresh(seq):
+            return None
+        try:
+            payload = self._in.decrypt(b"\0" * 8 + packet[9:13],
+                                       packet[_PKT_HEAD.size:],
+                                       packet[:_PKT_HEAD.size])
+        except Exception:
+            return None
+        self._mark(seq)
+        return ptype, seq, ts, payload
+
+    def _fresh(self, seq: int) -> bool:
+        if seq > self._top:
+            return True
+        back = self._top - seq
+        return back < self.WINDOW and not (self._seen >> back) & 1
+
+    def _mark(self, seq: int) -> None:
+        if seq > self._top:
+            shift = seq - self._top
+            self._seen = ((self._seen << shift) | 1) & \
+                ((1 << self.WINDOW) - 1) if shift < self.WINDOW else 1
+            self._top = seq
+        else:
+            self._seen |= 1 << (self._top - seq)
+
+
+def call_secret(own_priv: int, their_pub_hex: str) -> bytes:
+    """The secret both sides of a call arrive at from their own key and
+    the other's (secp256k1, as everything else here)."""
+    return ecdh_shared_secret(own_priv,
+                              compressed_to_pub(bytes.fromhex(their_pub_hex)))
+
+
+def new_call_key() -> tuple:
+    """(private, public hex) for one call."""
+    priv = int.from_bytes(os.urandom(32), "big") % (_N - 1) + 1
+    return priv, pub_to_compressed(priv_to_pub(priv)).hex()
+
+
+# ---- smoothing out arrival --------------------------------------------------
+class JitterBuffer:
+    """Frames by number, handed to the speaker in order, one per 20 ms.
+
+    It waits until `target` frames are in hand before it starts (and again
+    after it runs dry), and grows `target` when the network turns uneven,
+    shrinking it back once it settles — a little delay traded for sound
+    without gaps. A frame that never comes is concealed (CONCEAL); one
+    that comes after its turn is dropped; and if frames pile up it skips
+    ahead, so delay can never build up.
+    """
+
+    CONCEAL = object()
+
+    def __init__(self, target: int = 3, low: int = 2, high: int = 7) -> None:
+        self.target, self.low, self.high = target, low, high
+        self._frames: dict = {}
+        self._next: Optional[int] = None
+        self._playing = False
+        self._dry: deque = deque()
+        self._calm_since = time.monotonic()
+        self._skipped_at = 0.0
+        self.lost = self.late = self.played = 0
+
+    def __len__(self) -> int:
+        return len(self._frames)
+
+    def peek_next(self):
+        """The frame due next, without taking it (or None): after a lost
+        one, an Opus packet carries a copy of it (v11)."""
+        return self._frames.get(self._next) if self._next is not None \
+            else None
+
+    def put(self, number: int, frame) -> None:
+        if self._next is not None and number < self._next:
+            self.late += 1
+            return
+        self._frames.setdefault(number, frame)
+        while len(self._frames) > self.high:
+            self._frames.pop(min(self._frames))
+            self._next = min(self._frames)
+
+    def get(self):
+        """The next frame, CONCEAL for one that is missing, or None while
+        (re)filling."""
+        now = time.monotonic()
+        if not self._playing:
+            if len(self._frames) < self.target:
+                return None
+            self._playing = True
+            self._next = min(self._frames)
+        frame = self._frames.pop(self._next, None)
+        if frame is None:
+            if not self._frames:
+                self._ran_dry(now)
+            else:
+                self.lost += 1
+            self._next += 1
+            return self.CONCEAL
+        self._next += 1
+        self.played += 1
+        # Settled for a while: give back one frame of delay.
+        if now - self._calm_since > 8 and self.target > self.low:
+            self.target -= 1
+            self._calm_since = now
+        if len(self._frames) > self.target + 2 and now - self._skipped_at > 1:
+            self._frames.pop(self._next, None)
+            self._next += 1
+            self._skipped_at = now
+        return frame
+
+    def _ran_dry(self, now: float) -> None:
+        self._playing = False
+        self._dry.append(now)
+        while self._dry and now - self._dry[0] > 5:
+            self._dry.popleft()
+        if len(self._dry) >= 2 and self.target < 6:
+            self.target += 1
+            self._dry.clear()
+        self._calm_since = now
+
+
+# ---- the sound hardware -----------------------------------------------------
+_CALL_SILENCE = bytes(CALL_FRAME_BYTES)
+
+
+class _FrameQueue:
+    """PCM in whatever pieces it comes; 20 ms frames out. Thread-safe."""
+
+    def __init__(self, keep: int = 25) -> None:
+        self._buf = bytearray()
+        self._frames: deque = deque(maxlen=keep)
+        self._lock = threading.Lock()
+
+    def feed(self, data: bytes) -> None:
+        with self._lock:
+            self._buf.extend(data)
+            while len(self._buf) >= CALL_FRAME_BYTES:
+                self._frames.append(bytes(self._buf[:CALL_FRAME_BYTES]))
+                del self._buf[:CALL_FRAME_BYTES]
+
+    def take(self) -> list:
+        with self._lock:
+            out = list(self._frames)
+            self._frames.clear()
+        return out
+
+
+class CallAudio:
+    """What a call needs from the sound hardware: 20 ms frames from the
+    microphone, and a speaker to hand frames to (16 kHz, mono, 16-bit)."""
+
+    name = "none"
+    speaker_option = False        # can switch earpiece / loudspeaker
+
+    def routes(self) -> list:
+        """[(key, label), …]: where the sound can go now (v11) — earpiece
+        or wired headset, speaker, bluetooth. Empty: no choice here."""
+        return []
+
+    def route(self) -> str:
+        return ""
+
+    def set_route(self, key: str) -> bool:
+        return False
+
+    def start(self) -> None:
+        pass
+
+    def read(self) -> list:
+        return []
+
+    def write(self, pcm: bytes) -> None:
+        pass
+
+    def queued(self) -> int:
+        return 0
+
+    def set_speaker(self, on: bool) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+
+class AndroidCallAudio(CallAudio):
+    """The phone's own call audio, through org.fext.call.CallAudio (see
+    src/android/java): the platform's voice-call microphone, with echo
+    cancelling where the phone has it, and the earpiece or loudspeaker.
+    It runs its own two threads, so speech keeps flowing whatever Python
+    is doing; frames cross over as base64 text, which pyjnius hands across
+    in one piece."""
+
+    name = "android"
+    speaker_option = True
+
+    def start(self) -> None:
+        autoclass, _ = _jni()
+        self._j = autoclass("org.fext.call.CallAudio")(android_context())
+        if not self._j.start(CALL_RATE, CALL_FRAME_SAMPLES):
+            raise OSError(self._j.lastError() or "audio would not start")
+
+    def read(self) -> list:
+        out = []
+        for _ in range(25):
+            frame = self._j.readFrame()
+            if not frame:
+                break
+            out.append(base64.b64decode(frame))
+        return out
+
+    def write(self, pcm: bytes) -> None:
+        self._j.writeFrame(b64e(pcm))
+
+    def queued(self) -> int:
+        return int(self._j.queued())
+
+    def set_speaker(self, on: bool) -> None:
+        self._j.setSpeaker(bool(on))
+
+    def routes(self) -> list:
+        out = []
+        for piece in str(self._j.routes() or "").split(";"):
+            key, _sep, label = piece.partition("|")
+            if key in ("earpiece", "speaker", "wired", "bluetooth"):
+                out.append((key, label or key))
+        return out
+
+    def route(self) -> str:
+        return str(self._j.route() or "")
+
+    def set_route(self, key: str) -> bool:
+        return bool(self._j.setRoute(key))
+
+    def stop(self) -> None:
+        try:
+            self._j.stop()
+        except Exception:
+            log.exception("call audio did not stop cleanly")
+
+
+class _SoundDevicePlayback:
+    """A speaker through the `sounddevice` package: it asks for each frame
+    when it needs it, so it sets the pace."""
+
+    name = "sounddevice"
+
+    def __init__(self, pull: Callable[[], Optional[bytes]]) -> None:
+        import sounddevice                                 # type: ignore
+
+        def callback(outdata, _frames, _time, _status):
+            outdata[:] = pull() or _CALL_SILENCE
+        self._stream = sounddevice.RawOutputStream(
+            samplerate=CALL_RATE, channels=1, dtype="int16",
+            blocksize=CALL_FRAME_SAMPLES, latency="low", callback=callback,
+            device=_sounddevice_index("output"))
+        self._stream.start()
+
+    def stop(self) -> None:
+        try:
+            self._stream.stop()
+        finally:
+            self._stream.close()
+
+
+class _WinMMPlayback:
+    """Windows' own wave-out API: four 20 ms buffers queued with the
+    driver, each refilled as soon as it has played."""
+
+    name = "winmm"
+    WHDR_DONE = 0x00000001
+    WAVE_MAPPER = 0xFFFFFFFF
+
+    def __init__(self, pull: Callable[[], Optional[bytes]],
+                 buffers: int = 4) -> None:
+        import ctypes
+        from ctypes import wintypes
+        self._ct, self._pull = ctypes, pull
+
+        class WAVEFORMATEX(ctypes.Structure):
+            _fields_ = [("wFormatTag", wintypes.WORD),
+                        ("nChannels", wintypes.WORD),
+                        ("nSamplesPerSec", wintypes.DWORD),
+                        ("nAvgBytesPerSec", wintypes.DWORD),
+                        ("nBlockAlign", wintypes.WORD),
+                        ("wBitsPerSample", wintypes.WORD),
+                        ("cbSize", wintypes.WORD)]
+
+        class WAVEHDR(ctypes.Structure):
+            pass
+        WAVEHDR._fields_ = [("lpData", ctypes.c_void_p),
+                            ("dwBufferLength", wintypes.DWORD),
+                            ("dwBytesRecorded", wintypes.DWORD),
+                            ("dwUser", ctypes.c_size_t),
+                            ("dwFlags", wintypes.DWORD),
+                            ("dwLoops", wintypes.DWORD),
+                            ("lpNext", ctypes.POINTER(WAVEHDR)),
+                            ("reserved", ctypes.c_size_t)]
+        self._hdr_size = ctypes.sizeof(WAVEHDR)
+        mm = ctypes.WinDLL("winmm")
+        hdr_p = ctypes.POINTER(WAVEHDR)
+        mm.waveOutOpen.argtypes = [ctypes.POINTER(ctypes.c_void_p),
+                                   wintypes.UINT,
+                                   ctypes.POINTER(WAVEFORMATEX),
+                                   ctypes.c_size_t, ctypes.c_size_t,
+                                   wintypes.DWORD]
+        for fn in ("waveOutPrepareHeader", "waveOutWrite",
+                   "waveOutUnprepareHeader"):
+            getattr(mm, fn).argtypes = [ctypes.c_void_p, hdr_p,
+                                        wintypes.UINT]
+        for fn in ("waveOutReset", "waveOutClose"):
+            getattr(mm, fn).argtypes = [ctypes.c_void_p]
+        self._mm = mm
+        fmt = WAVEFORMATEX(1, 1, CALL_RATE, CALL_RATE * 2, 2, 16, 0)
+        self._handle = ctypes.c_void_p()
+        rc = mm.waveOutOpen(ctypes.byref(self._handle), self.WAVE_MAPPER,
+                            ctypes.byref(fmt), 0, 0, 0)
+        if rc != 0:
+            raise OSError(f"no speaker (waveOutOpen returned {rc})")
+        self._buffers = [ctypes.create_string_buffer(CALL_FRAME_BYTES)
+                         for _ in range(buffers)]
+        self._headers = [WAVEHDR(ctypes.cast(b, ctypes.c_void_p),
+                                 CALL_FRAME_BYTES, 0, 0, 0, 0, None, 0)
+                         for b in self._buffers]
+        for hdr in self._headers:
+            mm.waveOutPrepareHeader(self._handle, ctypes.byref(hdr),
+                                    self._hdr_size)
+            hdr.dwFlags |= self.WHDR_DONE           # free to fill
+        self._running = True
+        self._thread = threading.Thread(target=self._pump, daemon=True)
+        self._thread.start()
+
+    def _pump(self) -> None:
+        ct = self._ct
+        while self._running:
+            wrote = False
+            for buf, hdr in zip(self._buffers, self._headers):
+                if hdr.dwFlags & self.WHDR_DONE:
+                    ct.memmove(buf, self._pull() or _CALL_SILENCE,
+                               CALL_FRAME_BYTES)
+                    hdr.dwFlags &= ~self.WHDR_DONE
+                    self._mm.waveOutWrite(self._handle, ct.byref(hdr),
+                                          self._hdr_size)
+                    wrote = True
+            if not wrote:
+                time.sleep(0.004)
+
+    def stop(self) -> None:
+        self._running = False
+        self._thread.join(timeout=1.0)
+        self._mm.waveOutReset(self._handle)
+        for hdr in self._headers:
+            self._mm.waveOutUnprepareHeader(self._handle, self._ct.byref(hdr),
+                                            self._hdr_size)
+        self._mm.waveOutClose(self._handle)
+
+
+class _ProcessPlayback:
+    """A command-line player reading raw PCM from its standard input
+    (aplay, pacat, SoX's play). The pipe is made small where the system
+    allows, so a write waits for the device and delay cannot pile up."""
+
+    name = "process"
+
+    def __init__(self, pull: Callable[[], Optional[bytes]],
+                 argv: list) -> None:
+        self.name = os.path.basename(argv[0])
+        self._proc = subprocess.Popen(argv, stdin=subprocess.PIPE,
+                                      stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL, bufsize=0)
+        try:
+            import fcntl
+            fcntl.fcntl(self._proc.stdin.fileno(), 1031, 4096)  # SETPIPE_SZ
+        except (ImportError, OSError):
+            pass
+        self._pull, self._running = pull, True
+        self._thread = threading.Thread(target=self._pump, daemon=True)
+        self._thread.start()
+
+    def _pump(self) -> None:
+        while self._running and self._proc.poll() is None:
+            try:
+                self._proc.stdin.write(self._pull() or _CALL_SILENCE)
+            except (BrokenPipeError, OSError, ValueError):
+                break
+
+    def stop(self) -> None:
+        self._running = False
+        try:
+            self._proc.stdin.close()
+        except OSError:
+            pass
+        if self._proc.poll() is None:
+            self._proc.terminate()
+        try:
+            self._proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+
+
+def _playback_commands() -> list:
+    system, rate = platform.system(), str(CALL_RATE)
+    candidates = []
+    if system == "Linux":
+        candidates += [
+            ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", rate, "-c", "1",
+             "-B", "80000"],
+            ["pacat", "--playback", "--raw", "--format=s16le",
+             f"--rate={rate}", "--channels=1", "--latency-msec=60"]]
+    if system != "Windows":
+        candidates += [["play", "-q", "-t", "raw", "-b", "16", "-e",
+                        "signed-integer", "-r", rate, "-c", "1", "-"]]
+    found = []
+    for argv in candidates:
+        exe = shutil.which(argv[0])
+        if exe:
+            found.append([exe] + argv[1:])
+    return found
+
+
+def _playback_routes() -> list:
+    """Ways this computer can play a call, best first, as factories of
+    `pull` (which hands over the next frame, or None for silence)."""
+    routes = []
+    if _has_sounddevice():
+        routes.append(_SoundDevicePlayback)
+    if platform.system() == "Windows":
+        routes.append(_WinMMPlayback)
+    for argv in _playback_commands():
+        routes.append(lambda pull, argv=argv: _ProcessPlayback(pull, argv))
+    return routes
+
+
+class DesktopCallAudio(CallAudio):
+    """A computer's microphone and speaker — those chosen in Settings, or
+    the system's — through the first ways that open (_capture_routes,
+    _playback_routes). Echo cancelling is the system's or the hardware's
+    (use_system_echo_cancel); without it, headphones keep the other side
+    from hearing themselves."""
+
+    def __init__(self) -> None:
+        self._mic = _FrameQueue()
+        self._out: deque = deque()
+        self._lock = threading.Lock()
+        self._capture = self._player = None
+
+    def start(self) -> None:
+        errors = []
+        use_system_echo_cancel()
+        for route in _capture_routes():
+            try:
+                self._capture = route(self._mic.feed, CALL_FRAME_BYTES)
+                break
+            except Exception as exc:
+                errors.append(str(exc) or type(exc).__name__)
+        if self._capture is None:
+            raise OSError("no microphone" + (
+                f" ({'; '.join(errors)})" if errors else ""))
+        for route in _playback_routes():
+            try:
+                self._player = route(self._pull)
+                break
+            except Exception as exc:
+                errors.append(str(exc) or type(exc).__name__)
+        if self._player is None:
+            self._capture.stop()
+            raise OSError("no speaker" + (
+                f" ({'; '.join(errors)})" if errors else ""))
+        self.name = f"{self._capture.name}/{self._player.name}"
+        log.info("call audio through %s", self.name)
+
+    def _pull(self) -> Optional[bytes]:
+        with self._lock:
+            return self._out.popleft() if self._out else None
+
+    def read(self) -> list:
+        return self._mic.take()
+
+    def write(self, pcm: bytes) -> None:
+        with self._lock:
+            self._out.append(pcm)
+            while len(self._out) > 8:
+                self._out.popleft()
+
+    def queued(self) -> int:
+        with self._lock:
+            return len(self._out)
+
+    def stop(self) -> None:
+        for part in (self._capture, self._player):
+            if part is not None:
+                try:
+                    part.stop()
+                except Exception:
+                    log.exception("call audio did not stop cleanly")
+        self._capture = self._player = None
+
+
+def call_audio() -> CallAudio:
+    return AndroidCallAudio() if IS_ANDROID else DesktopCallAudio()
+
+
+class DesktopRinger:
+    """A ring on a computer's speaker: two tones together, one second in
+    every three."""
+
+    def __init__(self) -> None:
+        self._player = None
+        self._frame = 0
+        self._tone = None
+
+    def _pull(self) -> Optional[bytes]:
+        i, self._frame = self._frame, self._frame + 1
+        at = (i * CALL_FRAME_MS) % 3000
+        if at >= 1000:
+            return None
+        if self._tone is None:
+            import array
+            amp, n = 0.16 * 32767, CALL_RATE
+            ramp = CALL_RATE // 50                    # 20 ms in, 20 ms out
+            self._tone = array.array("h", (int(
+                amp * min(1.0, k / ramp, (n - k) / ramp) *
+                (math.sin(2 * math.pi * 440 * k / n) +
+                 math.sin(2 * math.pi * 480 * k / n)) / 2) for k in range(n)))
+            if sys.byteorder == "big":
+                self._tone.byteswap()
+        k = (at // CALL_FRAME_MS) * CALL_FRAME_SAMPLES
+        return self._tone[k:k + CALL_FRAME_SAMPLES].tobytes()
+
+    def start(self) -> None:
+        for route in _playback_routes():
+            try:
+                self._player = route(self._pull)
+                return
+            except Exception:
+                continue
+
+    def stop(self) -> None:
+        if self._player is not None:
+            self._player.stop()
+            self._player = None
+
+
+class DesktopRingback(DesktopRinger):
+    """What the caller hears while it rings at the other end (v11): one
+    quiet tone, a second in every five — not the ringer's two."""
+
+    def _pull(self) -> Optional[bytes]:
+        i, self._frame = self._frame, self._frame + 1
+        at = (i * CALL_FRAME_MS) % 5000
+        if at >= 1000:
+            return None
+        if self._tone is None:
+            import array
+            amp, n = 0.10 * 32767, CALL_RATE
+            ramp = CALL_RATE // 50
+            self._tone = array.array("h", (int(
+                amp * min(1.0, k / ramp, (n - k) / ramp) *
+                math.sin(2 * math.pi * 425 * k / n)) for k in range(n)))
+            if sys.byteorder == "big":
+                self._tone.byteswap()
+        k = (at // CALL_FRAME_MS) * CALL_FRAME_SAMPLES
+        return self._tone[k:k + CALL_FRAME_SAMPLES].tobytes()
+
+
+class AndroidRingback:
+    """The ringback tone, as the phone's region plays it (Android's
+    supervisory 'ringing' tone), in the call's earpiece stream."""
+
+    def __init__(self) -> None:
+        self._tones = None
+
+    def start(self) -> None:
+        autoclass, _ = _jni()
+        Tone = autoclass("android.media.ToneGenerator")
+        Manager = autoclass("android.media.AudioManager")
+        self._tones = Tone(Manager.STREAM_VOICE_CALL, 60)
+        self._tones.startTone(Tone.TONE_SUP_RINGTONE)
+
+    def stop(self) -> None:
+        tones, self._tones = self._tones, None
+        if tones is not None:
+            try:
+                tones.stopTone()
+                tones.release()
+            except Exception:
+                pass
+
+
+def calls_possible_here() -> bool:
+    """Can this device take part in a call at all (a microphone and a
+    speaker it can reach)?"""
+    if IS_ANDROID:
+        return True
+    return bool(_capture_routes()) and bool(_playback_routes())
+
+
+def local_ipv4s() -> list:
+    """This device's own IPv4 addresses (not loopback): where a device on
+    the same network can reach it directly."""
+    found = []
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("192.0.2.1", 9))      # TEST-NET: nothing is sent
+            found.append(probe.getsockname()[0])
+        finally:
+            probe.close()
+    except OSError:
+        pass
+    try:
+        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+            if ip not in found:
+                found.append(ip)
+    except OSError:
+        pass
+    loopback = os.environ.get("FEXT_CALL_LOOPBACK") == "1"
+    return [ip for ip in found if loopback or not ip.startswith("127.")][:4]
+
+
+def sanitize_candidates(raw) -> list:
+    """Addresses offered for a call: at most eight IPv4 (address, port)."""
+    import ipaddress
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw[:8]:
+        if not (isinstance(item, list) and len(item) >= 2):
+            continue
+        ip, port = item[0], item[1]
+        try:
+            ip = str(ipaddress.IPv4Address(ip))
+        except (ValueError, TypeError):
+            continue
+        if _int(port, 1, 65535) and not ipaddress.IPv4Address(ip).is_multicast:
+            out.append((ip, port))
+    return out
+
+
+# ---- the call's sound, on its own thread ------------------------------------
+class CallEngine(threading.Thread):
+    """Everything a call does once it is set up, on one thread: one UDP
+    socket, used both with the relay and straight with the other device;
+    the microphone; the speaker.
+
+    It looks for the way to the other device that works best, all at once
+    rather than one after another: it registers with the relay (which tells
+    it its public address), and pings every address the other side gave,
+    and the relay, and the WebSocket. The other device answers on the same
+    way, and every packet that arrives says which way works. Sound then
+    goes the most direct way heard from in the last few seconds — straight,
+    else the relay's UDP, else the WebSocket — and moves the moment that
+    changes.
+
+    `on_event(kind, value)` reports to the app from this thread: 'path',
+    'reflexive' (our public address became known), 'heard', 'quiet' (no
+    sound for a while), 'lost', 'bye' (the other side hung up),
+    'audio_failed'.
+    """
+
+    PING_EARLY, PING_SEARCH, PING_KEEP = 0.1, 0.5, 1.0
+    FRESH = 2.5                           # a way heard from within this works
+    REG_RETRY, REG_KEEP = 0.3, 10.0
+
+    def __init__(self, call_id: str, tag: bytes, role: int,
+                 relay: Optional[tuple], ticket: str,
+                 on_event: Callable[[str, object], None],
+                 send_ws: Optional[Callable[[bytes, int, bytes], bool]] = None,
+                 audio_factory: Optional[Callable[[], CallAudio]] = None):
+        super().__init__(daemon=True, name="fext-call")
+        self.call_id, self.tag, self.role = call_id, tag, role
+        self.relay, self.ticket = relay, ticket
+        self._on_event, self._send_ws = on_event, send_ws
+        self._audio_factory = audio_factory or call_audio
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("0.0.0.0", 0))
+        self.sock.setblocking(False)
+        self.port = self.sock.getsockname()[1]
+        self.keys: Optional[CallKeys] = None
+        self._keys_at = 0.0
+        self._remote: list = []
+        self._direct: Optional[tuple] = None
+        self._rx = {"direct": 0.0, "relay": 0.0, "ws": 0.0}
+        self.relay_ok = False
+        self.reflexive: Optional[tuple] = None
+        self._reg_at, self._reg_tries = 0.0, 0
+        self._pinged = 0.0
+        self._audio: Optional[CallAudio] = None
+        self.audio_on = False
+        self.muted = False
+        self._codec = ImaCodec()
+        # v11: Opus when both sides have it (set_send_codecs); made the
+        # first time it is needed, in this thread.
+        self._opus = None
+        self.send_codec = "ima16"
+        self._heard_codec = 1
+        self._jitter = JitterBuffer()
+        self._frame_no = 0
+        self._last_pcm: Optional[bytes] = None
+        self._concealed = 0
+        self._inbox: "queue.Queue" = queue.Queue()
+        self._jobs: "queue.Queue" = queue.Queue()
+        self._halt = threading.Event()
+        self._t0 = time.monotonic()
+        self.rtt_ms: Optional[float] = None
+        self.path: Optional[str] = None
+        self.last_heard: Optional[float] = None
+        self._quiet = False
+        self.level_in = self.level_out = 0
+        self.sent = self.received = 0
+
+    # ---- from other threads ---------------------------------------------------
+    def candidates(self) -> list:
+        """Where the other device may reach this one: [[ip, port], …]."""
+        out = [[ip, self.port] for ip in local_ipv4s()]
+        if self.reflexive and list(self.reflexive) not in out:
+            out.insert(0, [self.reflexive[0], self.reflexive[1]])
+        return out
+
+    def set_keys(self, keys: CallKeys) -> None:
+        self._jobs.put(lambda: self._set_keys(keys))
+
+    def add_candidates(self, cands: list) -> None:
+        self._jobs.put(lambda: self._add_candidates(cands))
+
+    def start_audio(self) -> None:
+        self._jobs.put(self._start_audio)
+
+    def set_speaker(self, on: bool) -> None:
+        self._jobs.put(lambda: self._audio.set_speaker(on)
+                       if self._audio else None)
+
+    def routes(self) -> list:
+        """Where the call's sound can go now (from any thread)."""
+        audio = self._audio
+        try:
+            return audio.routes() if audio is not None else []
+        except Exception:
+            return []
+
+    def route(self) -> str:
+        audio = self._audio
+        try:
+            return audio.route() if audio is not None else ""
+        except Exception:
+            return ""
+
+    def set_route(self, key: str) -> None:
+        self._jobs.put(lambda: self._audio.set_route(key)
+                       if self._audio else None)
+
+    def set_send_codecs(self, theirs) -> None:
+        """What the other side can decode: from now on, the best of it."""
+        self._jobs.put(lambda: self._choose_codec(theirs))
+
+    def _choose_codec(self, theirs) -> None:
+        name = pick_send_codec(theirs)
+        if name == "opus16" and self._opus_codec() is None:
+            name = "ima16"
+        self.send_codec = name
+
+    def _opus_codec(self) -> Optional["OpusCodec"]:
+        if self._opus is None:
+            try:
+                self._opus = OpusCodec()
+            except Exception as exc:
+                log.warning("call: no Opus here (%s)", exc)
+                self._opus = False
+        return self._opus or None
+
+    def ws_packet(self, data: bytes) -> None:
+        self._inbox.put(data)
+
+    def hangup(self) -> None:
+        """Tell the other side straight away (the 'end' message follows
+        through the relay), then stop."""
+        self._jobs.put(self._bye)
+
+    def stop(self) -> None:
+        self._halt.set()
+
+    # ---- the loop -------------------------------------------------------------
+    def run(self) -> None:
+        tick = time.monotonic()
+        try:
+            while not self._halt.is_set():
+                wait = max(0.0, min(tick - time.monotonic(), 0.02))
+                try:
+                    ready, _w, _x = select.select([self.sock], [], [], wait)
+                except (OSError, ValueError):
+                    break
+                if ready:
+                    self._drain_udp()
+                self._drain_inbox()
+                while not self._jobs.empty():
+                    try:
+                        self._jobs.get_nowait()()
+                    except queue.Empty:
+                        break
+                    except Exception:
+                        log.exception("call: a step failed")
+                now = time.monotonic()
+                if now >= tick:
+                    tick = tick + CALL_FRAME_MS / 1000.0
+                    if now - tick > 0.2:                 # fell far behind
+                        tick = now + CALL_FRAME_MS / 1000.0
+                    self._tick(now)
+        finally:
+            self._close()
+
+    def _close(self) -> None:
+        if self._audio is not None:
+            self._audio.stop()
+            self._audio = None
+        self.audio_on = False
+        if self._opus:
+            self._opus.close()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        if IS_ANDROID:
+            # A thread that used Java must leave the JVM before it ends.
+            try:
+                from jnius import detach
+                detach()
+            except Exception:
+                pass
+
+    def _now_ms(self) -> int:
+        return int((time.monotonic() - self._t0) * 1000)
+
+    def _set_keys(self, keys: CallKeys) -> None:
+        if self.keys is None:
+            self.keys, self._keys_at = keys, time.monotonic()
+
+    def _add_candidates(self, cands: list) -> None:
+        for addr in sanitize_candidates([list(c) for c in cands]):
+            if addr not in self._remote and len(self._remote) < 8:
+                self._remote.append(addr)
+
+    def _start_audio(self) -> None:
+        if self.audio_on:
+            return
+        try:
+            audio = self._audio_factory()
+            audio.start()
+        except Exception as exc:
+            log.warning("call audio failed: %s", exc)
+            self._on_event("audio_failed", str(exc) or type(exc).__name__)
+            return
+        self._audio, self.audio_on = audio, True
+        self._jitter = JitterBuffer()
+
+    def _bye(self) -> None:
+        if self.keys is not None:
+            for _ in range(3):
+                self._send(PKT_BYE, b"")
+        self._halt.set()
+
+    # ---- packets in -----------------------------------------------------------
+    def _drain_udp(self) -> None:
+        for _ in range(64):
+            try:
+                data, src = self.sock.recvfrom(2048)
+            except (BlockingIOError, InterruptedError):
+                return
+            except ConnectionResetError:          # Windows: an ICMP refusal
+                continue
+            except OSError:
+                return
+            if not data:
+                continue
+            if self.relay is not None and src == self.relay:
+                if data[0] == PKT_REG_OK:
+                    self._registered(data)
+                else:
+                    self._packet("relay", data, src)
+            else:
+                self._packet("direct", data, src)
+
+    def _drain_inbox(self) -> None:
+        while True:
+            try:
+                data = self._inbox.get_nowait()
+            except queue.Empty:
+                return
+            self._packet("ws", data, None)
+
+    def _registered(self, data: bytes) -> None:
+        if len(data) < 18 or data[1:9] != self.tag or data[10] != 4:
+            return
+        reflexive = (socket.inet_ntoa(data[11:15]),
+                     struct.unpack("!H", data[15:17])[0])
+        first = not self.relay_ok
+        self.relay_ok = True
+        if reflexive != self.reflexive:
+            self.reflexive = reflexive
+            self._on_event("reflexive", reflexive)
+        elif first:
+            self._on_event("reflexive", reflexive)
+
+    def _packet(self, path: str, data: bytes, src) -> None:
+        if self.keys is None or len(data) > CALL_MAX_PACKET + 64:
+            return
+        got = self.keys.open(data)
+        if got is None:
+            return
+        ptype, _seq, ts, payload = got
+        now = time.monotonic()
+        self._rx[path] = now
+        self.received += 1
+        if path == "direct":
+            self._direct = src          # where they really are (their NAT)
+        if ptype == PKT_PING:
+            self._reply(path, src, PKT_PONG, struct.pack("!I", ts))
+        elif ptype == PKT_PONG:
+            if len(payload) >= 4:
+                rtt = (self._now_ms() - struct.unpack("!I", payload[:4])[0]) \
+                    & 0xFFFFFFFF
+                if rtt < 10000:
+                    self.rtt_ms = rtt if self.rtt_ms is None else \
+                        self.rtt_ms * .7 + rtt * .3
+        elif ptype == PKT_AUDIO:
+            if self.last_heard is None:
+                self._on_event("audio", None)
+            self.last_heard = now
+            if self._quiet:
+                self._quiet = False
+                self._on_event("heard", None)
+            if self.audio_on and len(payload) >= 5:
+                number, codec = struct.unpack("!IB", payload[:5])
+                self._jitter.put(number, (codec, payload[5:]))
+        elif ptype == PKT_BYE:
+            self._on_event("bye", None)
+            self._halt.set()
+
+    # ---- packets out ----------------------------------------------------------
+    def _paths(self, now: float) -> list:
+        fresh = [p for p in ("direct", "relay", "ws")
+                 if now - self._rx[p] < self.FRESH]
+        if "direct" in fresh and self._direct is not None:
+            return ["direct"]
+        if "relay" in fresh and self.relay_ok:
+            return ["relay"]
+        if "ws" in fresh and self._send_ws is not None:
+            return ["ws"]
+        out = []                         # nothing heard lately: every way
+        if self.relay_ok:
+            out.append("relay")
+        if self._send_ws is not None:
+            out.append("ws")
+        if self._direct is not None:
+            out.append("direct")
+        return out
+
+    def _emit(self, path: str, packet: bytes, to=None) -> None:
+        try:
+            if path == "direct":
+                self.sock.sendto(packet, to or self._direct)
+            elif path == "relay":
+                self.sock.sendto(packet, self.relay)
+            elif path == "ws" and self._send_ws is not None:
+                self._send_ws(self.tag, self.role, packet)
+            self.sent += 1
+        except OSError:
+            pass
+
+    def _send(self, ptype: int, payload: bytes) -> None:
+        packet = self.keys.seal(ptype, payload, self._now_ms())
+        for path in self._paths(time.monotonic()):
+            self._emit(path, packet)
+
+    def _reply(self, path: str, src, ptype: int, payload: bytes) -> None:
+        self._emit(path, self.keys.seal(ptype, payload, self._now_ms()),
+                   to=src)
+
+    def _ping(self, now: float) -> None:
+        direct_fresh = now - self._rx["direct"] < self.FRESH
+        early = now - self._keys_at < 4.0
+        every = self.PING_EARLY if early else (
+            self.PING_KEEP if direct_fresh else self.PING_SEARCH)
+        if now - self._pinged < every:
+            return
+        self._pinged = now
+        ping = lambda: self.keys.seal(PKT_PING, b"", self._now_ms())  # noqa
+        targets = list(self._remote)
+        if self._direct is not None and self._direct not in targets:
+            targets.append(self._direct)
+        if not direct_fresh or early:
+            for addr in targets:
+                self._emit("direct", ping(), to=addr)
+        elif self._direct is not None:
+            self._emit("direct", ping(), to=self._direct)
+        if self.relay_ok:
+            self._emit("relay", ping())
+        if self._send_ws is not None and (early or not (
+                direct_fresh or now - self._rx["relay"] < self.FRESH)):
+            self._emit("ws", ping())
+
+    # ---- every 20 ms ----------------------------------------------------------
+    def _tick(self, now: float) -> None:
+        if self.relay is not None and self.ticket:
+            due = self.REG_KEEP if self.relay_ok else (
+                self.REG_RETRY if self._reg_tries < 10 else 2.0)
+            if now - self._reg_at >= due:
+                self._reg_at = now
+                self._reg_tries += 1
+                try:
+                    self.sock.sendto(struct.pack("!B8sB", PKT_REG, self.tag,
+                                                 self.role)
+                                     + self.ticket.encode("ascii"),
+                                     self.relay)
+                except OSError:
+                    pass
+        if self.keys is None:
+            return
+        self._ping(now)
+        path = (self._paths(now) or [None])[0] if \
+            any(now - t < self.FRESH for t in self._rx.values()) else None
+        if path != self.path:
+            self.path = path
+            self._on_event("path", path)
+        if not self.audio_on:
+            return
+        for pcm in self._audio.read():
+            self.level_out = pcm_level(pcm)
+            if self.muted:
+                byte, payload = 0, b""
+            elif self.send_codec == "opus16" and self._opus_codec():
+                byte, payload = CODEC_IDS["opus16"], self._opus.encode(pcm)
+            else:
+                byte, payload = CODEC_IDS["ima16"], self._codec.encode(pcm)
+            head = struct.pack("!IB", self._frame_no & 0xFFFFFFFF, byte)
+            self._frame_no += 1
+            self._send(PKT_AUDIO, head + payload)
+        while self._audio.queued() < 2:
+            item = self._jitter.get()
+            if item is None:
+                break
+            if item is JitterBuffer.CONCEAL:
+                pcm = self._conceal()
+            else:
+                codec, frame = item
+                if codec == CODEC_IDS["opus16"]:
+                    opus = self._opus_codec()
+                    pcm = opus.decode(frame) if opus is not None else None
+                elif codec == CODEC_IDS["ima16"]:
+                    pcm = ImaCodec.decode(frame)
+                else:
+                    pcm = _CALL_SILENCE
+                self._heard_codec = codec
+                pcm = pcm or _CALL_SILENCE
+                self._last_pcm, self._concealed = pcm, 0
+            self.level_in = pcm_level(pcm)
+            self._audio.write(pcm)
+        if self.last_heard is not None:
+            silent = now - self.last_heard
+            if silent > 3.0 and not self._quiet:
+                self._quiet = True
+                self._on_event("quiet", None)
+            if silent > CALL_DROP_SECONDS:
+                self._on_event("lost", None)
+                self._halt.set()
+
+    def _conceal(self) -> bytes:
+        """A missing frame. Opus: rebuilt from the copy inside the next
+        packet if that is here, else Opus's own concealment, for up to a
+        tenth of a second. ADPCM: the last frame again, fading; then
+        silence."""
+        self._concealed += 1
+        if self._heard_codec == CODEC_IDS["opus16"] and self._opus_codec():
+            if self._concealed > 5:
+                return _CALL_SILENCE
+            following = self._jitter.peek_next()
+            if following is not None and \
+                    following[0] == CODEC_IDS["opus16"]:
+                pcm = self._opus.decode(following[1], fec=True)
+            else:
+                pcm = self._opus.decode(None)
+            return pcm or _CALL_SILENCE
+        if self._last_pcm is None or self._concealed > 3:
+            return _CALL_SILENCE
+        return pcm_scaled(self._last_pcm, 0.6 ** self._concealed)
+
+
+# ---- setting a call up ------------------------------------------------------
+CALL_END_REASONS = ("hangup", "declined", "busy", "timeout", "failed",
+                    "unavailable", "cancelled")
+
+
+def sanitize_call_signal(op: str, ctl: dict) -> Optional[dict]:
+    """A call's control message, field by field, or None if any part that
+    matters is wrong.
+
+      call     {id, tag, k, c, codecs, t}   the offer
+      ringing  {id, k, c, codecs}           the callee's app rings
+      answer   {id, k, c, codec, codecs}    picked up
+      cands    {id, c}                      more addresses
+      end      {id, why}                    over (or declined, busy…)
+
+    `k` is the sender's key for this call alone, `c` the addresses it may
+    be reached at, `tag` what the relay knows the call by, `codecs` what
+    the sender's app can decode (v11; an older one's ringing and answer
+    have none: ADPCM).
+    """
+    cid = _str(ctl.get("id"), 32)
+    if not cid or not _CALL_ID_RE.match(cid):
+        return None
+    out = {"op": op, "id": cid}
+    if op == "call":
+        tag = _str(ctl.get("tag"), 16)
+        if not tag or not _CALL_TAG_RE.match(tag):
+            return None
+        out["tag"] = tag
+        out["t"] = _int(ctl.get("t"), 0, 2 ** 40) or 0
+        codecs = ctl.get("codecs")
+        out["codecs"] = [c for c in codecs if c in CALL_CODECS] \
+            if isinstance(codecs, list) else []
+        if not out["codecs"]:
+            return None
+    if op in ("call", "ringing", "answer"):
+        key = (_str(ctl.get("k"), 66) or "").lower()
+        try:
+            compressed_to_pub(bytes.fromhex(key))
+        except ValueError:
+            return None
+        out["k"] = key
+    if op in ("call", "ringing", "answer", "cands"):
+        out["c"] = [list(c) for c in sanitize_candidates(ctl.get("c"))]
+    if op in ("ringing", "answer"):
+        # v11: what the callee's app can decode (an older one says nothing:
+        # ADPCM).
+        codecs = ctl.get("codecs")
+        out["codecs"] = [c for c in codecs if c in CALL_CODECS] \
+            if isinstance(codecs, list) else []
+        out["codecs"] = out["codecs"] or ["ima16"]
+    if op == "answer":
+        out["codec"] = ctl.get("codec") if ctl.get("codec") in CALL_CODECS \
+            else "ima16"
+    if op == "end":
+        why = ctl.get("why")
+        out["why"] = why if why in CALL_END_REASONS else "hangup"
+    return out
+
+
+class Call:
+    """One call, as the app sees it: who, which way, how far along."""
+
+    def __init__(self, peer: str, outgoing: bool,
+                 call_id: Optional[str] = None,
+                 tag: Optional[str] = None) -> None:
+        self.peer, self.outgoing = peer, outgoing
+        self.id = call_id or uuid.uuid4().hex
+        self.tag = tag or os.urandom(8).hex()
+        self.priv, self.pub = new_call_key()
+        self.their_key: Optional[str] = None
+        self.remote_cands: list = []
+        # calling (sent, no word back) | ringing | incoming | connecting
+        # (answered, finding each other) | active | ended
+        self.state = "calling" if outgoing else "incoming"
+        self.engine: Optional[CallEngine] = None
+        self.created = time.monotonic()
+        self.answered_at: Optional[float] = None
+        self.connected_at: Optional[float] = None
+        self.ended = False
+        self.muted = False
+        self.speaker = False
+        self.path: Optional[str] = None
+        self.quiet = False
+        self.signalled = False        # our offer / ringing has gone out
+        self.summary = ""
+        self.their_codecs: list = ["ima16"]   # what their app can decode
+        self.route = ""               # v11: where the sound goes, if chosen
+
+    @property
+    def tag_bytes(self) -> bytes:
+        return bytes.fromhex(self.tag)
+
+    def keys(self) -> CallKeys:
+        return CallKeys(call_secret(self.priv, self.their_key), self.id,
+                        self.tag_bytes, caller=self.outgoing)
+
+    def duration(self) -> int:
+        if self.connected_at is None:
+            return 0
+        return int(time.monotonic() - self.connected_at)
+
+
+def call_clock(seconds: int) -> str:
+    return (f"{seconds // 3600}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
+            if seconds >= 3600 else f"{seconds // 60}:{seconds % 60:02d}")
+
+
+def call_summary(call: "Call", why: str, local: bool) -> str:
+    """The line a finished call leaves in the chat."""
+    if call.connected_at is not None:
+        return (f"{'Outgoing' if call.outgoing else 'Incoming'} call · "
+                f"{call_clock(call.duration())}")
+    if call.outgoing:
+        if local:
+            return {"timeout": "No answer", "failed": "Call failed"}.get(
+                why, "Cancelled call")
+        return {"declined": "Call declined", "busy": "Busy — they are in "
+                "another call", "unavailable": "They can't take calls "
+                "right now", "failed": "Call failed"}.get(why, "Call ended")
+    if local and why == "declined":
+        return "Declined call"
+    if why == "failed":
+        return "Call failed"
+    return "Missed call"
+
+
+def call_path_label(path: Optional[str], rtt) -> str:
+    where = {"direct": "Direct", "relay": "Through the relay",
+             "ws": "Over the message link"}.get(path or "", "")
+    if where and rtt is not None:
+        return f"{where} · {int(rtt)} ms"
+    return where
+
 
 
 _AVATAR_CACHE: dict = {}
@@ -2587,16 +6155,114 @@ def initial_of(name: str) -> str:
     return "?"
 
 
+def texture_from_pil(image):
+    """A Kivy texture for a PIL image that survives Android recreating the
+    GL context on resume: its pixels are kept, and put back by a reload
+    observer (a texture made from memory has no file to reload from)."""
+    from PIL import Image as _PIL
+    image = image.convert("RGBA").transpose(_PIL.FLIP_TOP_BOTTOM)
+    pixels = image.tobytes()
+    tex = Texture.create(size=image.size, colorfmt="rgba")
+    tex.blit_buffer(pixels, colorfmt="rgba", bufferfmt="ubyte")
+    tex.add_reload_observer(lambda t, px=pixels: t.blit_buffer(
+        px, colorfmt="rgba", bufferfmt="ubyte"))
+    return tex
+
+
+_QR_TEXTURES: dict = {}
+
+
 def qr_texture(data: str, fg: str = "#1B1915", bg: str = "#FFFFF8"):
-    """Render a QR code to a Kivy texture (via an in-memory PNG)."""
-    qr = qrcode.QRCode(box_size=8, border=2)
-    qr.add_data(data)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color=fg, back_color=bg).convert("RGB")
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return CoreImage(buf, ext="png").texture
+    """A QR code as a Kivy texture, made once per payload: the settings
+    page shows the same two codes every time it opens."""
+    key = (data, fg, bg)
+    if key not in _QR_TEXTURES:
+        qr = qrcode.QRCode(box_size=8, border=2)
+        qr.add_data(data)
+        qr.make(fit=True)
+        _QR_TEXTURES[key] = texture_from_pil(
+            qr.make_image(fill_color=fg, back_color=bg).convert("RGB"))
+    return _QR_TEXTURES[key]
+
+
+_PICTURE_TEXTURES: "OrderedDict" = OrderedDict()
+_CIRCLE_MASKS: dict = {}
+PICTURE_TEXTURE_SIZES = (96, 160, 256)
+
+
+def picture_texture(path, px: float):
+    """A picture as a round texture with a smooth edge, about `px` pixels
+    across. Made at one of a few sizes, so every disc that size shares it,
+    and keyed by the file's change time, so a new picture is never hidden
+    behind an old texture."""
+    if not path:
+        return None
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    size = next((s for s in PICTURE_TEXTURE_SIZES if s >= px), PICTURE_EDGE)
+    key = (str(path), info.st_mtime_ns, info.st_size, size)
+    tex = _PICTURE_TEXTURES.get(key)
+    if tex is not None:
+        _PICTURE_TEXTURES.move_to_end(key)
+        return tex
+    try:
+        from PIL import Image, ImageDraw
+        mask = _CIRCLE_MASKS.get(size)
+        if mask is None:
+            # Drawn four times over and scaled down: the edge comes out
+            # antialiased, where a disc drawn at size would be stepped.
+            big = Image.new("L", (size * 4, size * 4), 0)
+            ImageDraw.Draw(big).ellipse((0, 0, size * 4 - 1, size * 4 - 1),
+                                        fill=255)
+            mask = _CIRCLE_MASKS[size] = big.resize((size, size),
+                                                    Image.LANCZOS)
+        with Image.open(path) as image:
+            disc = image.convert("RGB").resize((size, size), Image.LANCZOS)
+        disc.putalpha(mask)
+        tex = texture_from_pil(disc)
+    except Exception:
+        log.warning("could not draw picture %s", Path(str(path)).name)
+        return None
+    _PICTURE_TEXTURES[key] = tex
+    while len(_PICTURE_TEXTURES) > 64:
+        _PICTURE_TEXTURES.popitem(last=False)
+    return tex
+
+
+class PictureBook:
+    """Which picture each disc shows, for the identity in use: read from its
+    store when it becomes active, and kept current as pictures arrive.
+    Used from the UI thread only. An identity's own picture is found by its
+    file, so the menu shows the other identities' pictures too."""
+
+    def __init__(self) -> None:
+        self._paths: dict = {}
+        self._own: set = set()
+
+    def load(self, store: Optional["LocalStore"], own=()) -> None:
+        self._paths = {}
+        if store is not None:
+            for peer, path in store.picture_paths().items():
+                self._paths[peer] = path
+        self._own = set(own)
+
+    def set(self, peer: str, path) -> None:
+        if path:
+            self._paths[peer] = str(path)
+        else:
+            self._paths.pop(peer, None)
+
+    def path(self, seed: str) -> Optional[str]:
+        path = self._paths.get(seed)
+        if path is None and seed in self._own:
+            own = own_picture_path(seed)
+            path = str(own) if own.is_file() else None
+        return path
+
+
+PICTURES = PictureBook()
 
 
 def pretty_time(iso: str) -> str:
@@ -2694,6 +6360,30 @@ class IdentityManager:
         self._save()
         return address
 
+    def restore_identity(self, record: dict) -> str:
+        """Add an identity from a backup as it was there (its label and
+        username), without making it the one in use."""
+        priv = int(str(record["private_key_hex"]), 16)
+        pub = pub_to_compressed(priv_to_pub(priv))
+        address = address_from_pub_bytes(pub)
+        if address != record.get("address") or self.find(address):
+            raise ValueError("not an identity this device can add")
+        username = record.get("username")
+        self._data.setdefault("identities", []).append({
+            "label": str(record.get("label") or "")[:64].strip() or
+            short_addr(address),
+            "address": address,
+            "private_key_hex": "%064x" % priv,
+            "public_key_hex": pub.hex(),
+            "username": username if isinstance(username, str) and
+            valid_username(username) else None,
+            "created_at": str(record.get("created_at") or now_iso())[:40],
+        })
+        if not self._data.get("active"):
+            self._data["active"] = address
+        self._save()
+        return address
+
     def remove_identity(self, address: str) -> Optional[str]:
         """Delete an identity from this device. Returns the address that is
         active afterwards, or None when none are left.
@@ -2711,6 +6401,20 @@ class IdentityManager:
             self._data["active"] = (remaining[0]["address"] if remaining
                                     else None)
         self._save()
+        # Its pictures go too: its own, and those it was sent (listed in its
+        # database, which is about to be deleted).
+        discard_picture_file(own_picture_path(address))
+        if self.store_path_for(address).is_file():
+            try:
+                db = sqlite3.connect(self.store_path_for(address))
+                try:
+                    for (path,) in db.execute(
+                            "SELECT path FROM pictures WHERE path IS NOT NULL"):
+                        discard_picture_file(path)
+                finally:
+                    db.close()
+            except sqlite3.Error:
+                pass         # an older database, with no pictures in it
         for path in (self.store_path_for(address),
                      Path(str(self.store_path_for(address)) + "-wal"),
                      Path(str(self.store_path_for(address)) + "-shm")):
@@ -3268,9 +6972,20 @@ class ApiClient:
                 if isinstance(data, dict) else MAX_MEDIA_BYTES,
                 "blob_ttl": int(data.get("blob_ttl") or 0)
                 if isinstance(data, dict) else 0,
+                # v10: voice calls (a UDP port for their sound).
+                "calls": isinstance(feats, list) and "calls" in feats,
+                "call_udp": int(data.get("call_udp") or 0)
+                if isinstance(data, dict) else 0,
                 "version": str(data.get("version", "")) if isinstance(
                     data, dict) else ""}
         return self._features
+
+    def call_ticket(self) -> dict:
+        """A short-lived pass for the relay's call port: {'ticket', 'udp',
+        'ttl'}. It names this identity, so only registered identities can
+        have the relay forward a call's packets."""
+        headers = self._auth_headers("call.ticket")
+        return self._get("/api/calls/ticket", {}, headers)
 
     def upload_blob(self, blob: bytes) -> dict:
         """Store one sealed media file on the relay; returns {'blob': id,
@@ -3389,6 +7104,45 @@ class LocalStore:
         at      TEXT NOT NULL,
         PRIMARY KEY (peer, cid, reactor)
     );
+    -- v9.1.2: how each chat sits in the list, on this device only: pinned
+    -- (when: the latest pin goes first), archived, marked unread by hand,
+    -- blocked (a contact's direct messages are dropped), hidden (deleted
+    -- from the list; it comes back with its next message). Keyed like
+    -- messages.peer.
+    CREATE TABLE IF NOT EXISTS chat_flags (
+        peer          TEXT PRIMARY KEY,
+        pinned        REAL,
+        archived      INTEGER NOT NULL DEFAULT 0,
+        marked_unread INTEGER NOT NULL DEFAULT 0,
+        blocked       INTEGER NOT NULL DEFAULT 0,
+        hidden        INTEGER NOT NULL DEFAULT 0
+    );
+    -- v9.1.2: pictures. A contact's is their own, sent by them; a group's is
+    -- sent by its admin. `version` orders updates; no file is no picture.
+    CREATE TABLE IF NOT EXISTS pictures (
+        peer       TEXT PRIMARY KEY,
+        version    INTEGER NOT NULL,
+        path       TEXT,
+        updated_at TEXT NOT NULL
+    );
+    -- v9.1.2: the version of this identity's own picture each contact (or
+    -- group) has been sent, so it travels once and again only when changed.
+    CREATE TABLE IF NOT EXISTS pictures_sent (
+        peer    TEXT PRIMARY KEY,
+        version INTEGER NOT NULL
+    );
+    -- v11: what a blocked contact sends, kept exactly as the relay handed
+    -- it over — still sealed — until they are unblocked; then each frame is
+    -- received again, in order, as if it had just arrived.
+    CREATE TABLE IF NOT EXISTS held (
+        id      INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender  TEXT NOT NULL,
+        sid     INTEGER,
+        cid     TEXT,
+        frame   TEXT NOT NULL,
+        held_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_held_sender ON held (sender, id);
     """
 
     #: Current schema generation, recorded in PRAGMA user_version.
@@ -3397,7 +7151,12 @@ class LocalStore:
     #:        per-contact notifications and capabilities, tombstones
     #:   3    v9.1.0: group chats (groups, group_sends, messages.author),
     #:        reactions, contacts.listed
-    SCHEMA_VERSION = 3
+    #:   4    v9.1.2: chat_flags (pin, archive, unread, block, hidden),
+    #:        pictures, pictures_sent — new tables only
+    #:   5    v11.0: mute with an end, drafts, disappearing messages (a
+    #:        chat's timer, each message's ttl and expiry), verified
+    #:        contacts, held frames from blocked contacts
+    SCHEMA_VERSION = 5
 
     #: Additive migrations: (table, column, statements). Applied when the
     #: column is missing, decided by inspection rather than by catching the
@@ -3456,17 +7215,60 @@ class LocalStore:
         ("contacts", "listed", (
             "ALTER TABLE contacts ADD COLUMN listed INTEGER NOT NULL "
             "DEFAULT 1",)),
+        # ---- schema 5 (v11.0) -----------------------------------------------
+        # A mute's end (epoch seconds) while notify = 0; 0 is "until turned
+        # back on" — which is what notify = 0 has always meant, so a release
+        # that knows nothing of ends still sees the chat as muted.
+        ("contacts", "mute_until", (
+            "ALTER TABLE contacts ADD COLUMN mute_until REAL NOT NULL "
+            "DEFAULT 0",)),
+        ("groups", "mute_until", (
+            "ALTER TABLE groups ADD COLUMN mute_until REAL NOT NULL "
+            "DEFAULT 0",)),
+        # Their key was compared with them in person (code or QR).
+        ("contacts", "verified", (
+            "ALTER TABLE contacts ADD COLUMN verified INTEGER NOT NULL "
+            "DEFAULT 0",)),
+        # Unsent text, kept across restarts.
+        ("chat_flags", "draft", (
+            "ALTER TABLE chat_flags ADD COLUMN draft TEXT",)),
+        # Disappearing messages: the chat's timer (seconds, 0 off) and when
+        # it was last set, which orders changes made on both sides.
+        ("chat_flags", "timer", (
+            "ALTER TABLE chat_flags ADD COLUMN timer INTEGER NOT NULL "
+            "DEFAULT 0",)),
+        ("chat_flags", "timer_at", (
+            "ALTER TABLE chat_flags ADD COLUMN timer_at REAL NOT NULL "
+            "DEFAULT 0",)),
+        # A message's own timer, and when it goes: sent ones from sending,
+        # received ones from being read. 0: never.
+        ("messages", "ttl", (
+            "ALTER TABLE messages ADD COLUMN ttl INTEGER NOT NULL "
+            "DEFAULT 0",)),
+        ("messages", "expires_at", (
+            "ALTER TABLE messages ADD COLUMN expires_at REAL NOT NULL "
+            "DEFAULT 0",
+            "CREATE INDEX IF NOT EXISTS idx_msgs_expiry ON messages "
+            "(expires_at) WHERE expires_at > 0")),
     )
 
     #: contacts.caps bit: this peer has sent us a valid v9 extension block,
     #: so it understands delete-for-both, replies and media references.
     CAP_V9 = 1
+    #: v9.1.2, from the x.ft a peer sends: it keeps pictures; it takes calls.
+    CAP_PIC = 2
+    CAP_CALL = 4
+    #: v11: deletes disappearing messages when their time is up.
+    CAP_TIMER = 8
 
     def __init__(self, path: Path) -> None:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
+        # SQLite's LIKE folds ASCII only; search folds every script.
+        self._db.create_function("fx_fold", 1, lambda s: s.casefold()
+                                 if isinstance(s, str) else s)
         with self._lock:
             self._db.executescript(self._SCHEMA)
             self._migrate()
@@ -3578,6 +7380,69 @@ class LocalStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def contacts_with_caps(self, bits: int) -> list:
+        """Every contact, listed or met in a group, that has shown all of
+        `bits`."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM contacts WHERE caps & ? = ?",
+                (int(bits), int(bits))).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---- pictures (v9.1.2) ------------------------------------------------------
+    def picture(self, peer: str) -> Optional[dict]:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM pictures WHERE peer = ?", (peer,)).fetchone()
+        return dict(row) if row else None
+
+    def picture_version(self, peer: str) -> int:
+        row = self.picture(peer)
+        return int(row["version"]) if row else 0
+
+    def picture_paths(self) -> dict:
+        """{peer: file} for every picture held, this identity's own
+        included (under its address)."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT peer, path FROM pictures WHERE path IS NOT NULL"
+            ).fetchall()
+        return {r["peer"]: r["path"] for r in rows}
+
+    def set_picture(self, peer: str, version: int,
+                    path: Optional[str]) -> bool:
+        """Record version `version` of `peer`'s picture (`path` None: there
+        is none now). Only ever moves forward: returns False, writing
+        nothing, unless `version` is newer than the one held."""
+        with self._lock:
+            cur = self._db.execute(
+                "INSERT INTO pictures (peer, version, path, updated_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(peer) DO UPDATE SET "
+                "version = excluded.version, path = excluded.path, "
+                "updated_at = excluded.updated_at "
+                "WHERE excluded.version > pictures.version",
+                (peer, int(version), path, now_iso()))
+            self._db.commit()
+            return cur.rowcount > 0
+
+    def picture_sent(self, key: str) -> int:
+        """Which version of a picture `key` was last sent: a contact's
+        address for our own picture, gid + '/' + address for a group's."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT version FROM pictures_sent WHERE peer = ?",
+                (key,)).fetchone()
+        return int(row["version"]) if row else 0
+
+    def set_picture_sent(self, key: str, version: int) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO pictures_sent (peer, version) VALUES (?, ?) "
+                "ON CONFLICT(peer) DO UPDATE SET version = "
+                "MAX(pictures_sent.version, excluded.version)",
+                (key, int(version)))
+            self._db.commit()
+
     # ---- messages ------------------------------------------------------------
     def _claim_server_id(self, server_id: int, keep_local_id: int = -1) -> bool:
         """Make `server_id` available to one row, freeing any stale claim.
@@ -3619,23 +7484,27 @@ class LocalStore:
     def add_out(self, peer: str, body: str, created_at: str,
                 client_msg_id: str, kind: str = "text",
                 ext: Optional[dict] = None, media_path: Optional[str] = None,
-                media_state: str = "", recipients: Optional[list] = None
-                ) -> int:
+                media_state: str = "", recipients: Optional[list] = None,
+                ttl: int = 0) -> int:
         """Insert an outgoing message at 0/3 (grey tick). Returns local id.
 
         `body` is always the human-readable rendering ("Photo", the caption,
         "Voice message (0:07)"…); `kind`/`ext` carry what a v9 screen needs
         to draw it richly. See the compatibility policy on _MIGRATIONS.
+        `ttl` (v11): seconds it lasts, counted from now.
         """
+        ttl = max(0, int(ttl or 0))
         with self._lock:
             cur = self._db.execute(
                 """INSERT INTO messages (client_msg_id, peer, direction, body,
                                          status, read, created_at, kind, ext,
-                                         media_path, media_state)
-                   VALUES (?, ?, 'out', ?, 0, 1, ?, ?, ?, ?, ?)""",
+                                         media_path, media_state, ttl,
+                                         expires_at)
+                   VALUES (?, ?, 'out', ?, 0, 1, ?, ?, ?, ?, ?, ?, ?)""",
                 (client_msg_id, peer, body, created_at, kind,
                  json.dumps(ext, separators=(",", ":")) if ext else None,
-                 media_path, media_state))
+                 media_path, media_state, ttl,
+                 time.time() + ttl if ttl else 0))
             if recipients:
                 # A group message: one delivery row per recipient, all at 0.
                 self._db.executemany(
@@ -3754,8 +7623,9 @@ class LocalStore:
                server_id: Optional[int], client_msg_id: Optional[str],
                unread: bool = True, kind: str = "text",
                ext: Optional[dict] = None, media_state: str = "",
-               author: Optional[str] = None) -> str:
-        """Insert an incoming message (unread).
+               author: Optional[str] = None, ttl: int = 0) -> str:
+        """Insert an incoming message (unread). With a `ttl` (v11) it
+        disappears that long after it is read.
 
         Returns STORED, DUPLICATE or FAILED. The old boolean collapsed
         DUPLICATE and FAILED into one value, and the sync worker acked on
@@ -3793,17 +7663,21 @@ class LocalStore:
                     return self.DUPLICATE
                 if server_id:
                     self._claim_server_id(server_id)
+                ttl = max(0, int(ttl or 0))
                 self._db.execute(
                     """INSERT INTO messages (server_id, client_msg_id, peer,
                                              direction, body, status, read,
                                              created_at, receipt_sent, kind,
-                                             ext, media_state, author)
-                       VALUES (?, ?, ?, 'in', ?, 0, ?, ?, ?, ?, ?, ?, ?)""",
+                                             ext, media_state, author, ttl,
+                                             expires_at)
+                       VALUES (?, ?, ?, 'in', ?, 0, ?, ?, ?, ?, ?, ?, ?, ?,
+                               ?)""",
                     (server_id, client_msg_id, peer, body,
                      0 if unread else 1, created_at, 0 if unread else 1,
                      kind,
                      json.dumps(ext, separators=(",", ":")) if ext else None,
-                     media_state, author))
+                     media_state, author, ttl,
+                     time.time() + ttl if ttl and not unread else 0))
                 self._db.commit()
                 return self.STORED
         except sqlite3.Error:
@@ -3820,13 +7694,27 @@ class LocalStore:
                    ORDER BY id ASC""", (peer,)).fetchall()
         return [(r["id"], r["server_id"]) for r in rows]
 
+    def unread_messages(self, peer: str, limit: int = 7) -> list:
+        """The newest `limit` unread messages of a chat, oldest first (for
+        its notification); events never count."""
+        with self._lock:
+            rows = self._db.execute(
+                """SELECT id, body, kind, ext, author, created_at
+                   FROM messages WHERE peer = ? AND direction = 'in'
+                   AND read = 0 AND kind != 'event'
+                   ORDER BY id DESC LIMIT ?""", (peer, int(limit))).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
     def mark_read_local(self, local_ids: list) -> None:
+        """Read now: and a disappearing message's time starts running."""
         if not local_ids:
             return
+        now = time.time()
         with self._lock:
             self._db.executemany(
-                "UPDATE messages SET read = 1 WHERE id = ?",
-                [(i,) for i in local_ids])
+                "UPDATE messages SET read = 1, expires_at = CASE WHEN ttl > 0 "
+                "AND expires_at = 0 THEN ? + ttl ELSE expires_at END "
+                "WHERE id = ?", [(now, i) for i in local_ids])
             self._db.commit()
 
     def pending_read_receipts(self, limit: int = 200) -> list:
@@ -3876,7 +7764,8 @@ class LocalStore:
 
     def messages_for(self, peer: str, limit: Optional[int] = None,
                      before_id: Optional[int] = None,
-                     from_id: Optional[int] = None) -> list:
+                     from_id: Optional[int] = None,
+                     to_id: Optional[int] = None) -> list:
         """Messages oldest-first.
 
         Three modes, all used by the chat screen:
@@ -3890,6 +7779,12 @@ class LocalStore:
           * before_id + limit -> the page immediately older ("load earlier")
         """
         with self._lock:
+            if from_id is not None and to_id is not None:    # a window back
+                rows = self._db.execute(
+                    """SELECT * FROM messages WHERE peer = ? AND id >= ?
+                       AND id <= ? ORDER BY id ASC""",
+                    (peer, from_id, to_id)).fetchall()
+                return [dict(r) for r in rows]
             if from_id is not None:
                 rows = self._db.execute(
                     """SELECT * FROM messages WHERE peer = ? AND id >= ?
@@ -3918,6 +7813,336 @@ class LocalStore:
                 (peer, message_id)).fetchone()
         return row is not None
 
+    def messages_after(self, peer: str, message_id: int, limit: int) -> list:
+        """The page immediately newer than `message_id`, oldest first."""
+        with self._lock:
+            rows = self._db.execute(
+                """SELECT * FROM messages WHERE peer = ? AND id > ?
+                   ORDER BY id ASC LIMIT ?""",
+                (peer, message_id, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_after(self, peer: str, message_id: int) -> int:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT COUNT(*) AS n FROM messages WHERE peer = ? AND id > ?",
+                (peer, message_id)).fetchone()
+        return int(row["n"] if row else 0)
+
+    def id_around(self, peer: str, message_id: int, before: int,
+                  after: int) -> tuple:
+        """(oldest, newest-or-None) ids of a window holding up to `before`
+        messages older than `message_id` and `after` newer; newest is None
+        when the window reaches the end of the conversation."""
+        with self._lock:
+            lo = self._db.execute(
+                """SELECT id FROM messages WHERE peer = ? AND id < ?
+                   ORDER BY id DESC LIMIT 1 OFFSET ?""",
+                (peer, message_id, max(0, before - 1))).fetchone()
+            first = self._db.execute(
+                "SELECT MIN(id) AS m FROM messages WHERE peer = ?",
+                (peer,)).fetchone()
+            hi = self._db.execute(
+                """SELECT id FROM messages WHERE peer = ? AND id > ?
+                   ORDER BY id ASC LIMIT 1 OFFSET ?""",
+                (peer, message_id, after)).fetchone()
+        oldest = lo["id"] if lo else (first["m"] if first and first["m"]
+                                      is not None else message_id)
+        newest = None
+        if hi is not None:          # more beyond the window: stop short
+            with self._lock:
+                edge = self._db.execute(
+                    """SELECT id FROM messages WHERE peer = ? AND id > ?
+                       ORDER BY id ASC LIMIT 1 OFFSET ?""",
+                    (peer, message_id, max(0, after - 1))).fetchone()
+            newest = edge["id"] if edge else None
+        return min(oldest, message_id), newest
+
+    # ---- v9.1.2: how chats sit in the list -------------------------------------
+    _FLAGS = ("archived", "marked_unread", "blocked", "hidden")
+
+    def chat_flags(self) -> dict:
+        """{peer: {pinned, archived, marked_unread, blocked, hidden}}."""
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM chat_flags").fetchall()
+        return {r["peer"]: dict(r) for r in rows}
+
+    def set_chat_flag(self, peers, field: str, value) -> None:
+        assert field in self._FLAGS or field == "pinned"   # whitelisted
+        with self._lock:
+            for peer in peers:
+                self._db.execute(
+                    f"""INSERT INTO chat_flags (peer, {field}) VALUES (?, ?)
+                        ON CONFLICT(peer) DO UPDATE SET {field} =
+                        excluded.{field}""", (peer, value))
+            self._db.commit()
+
+    def is_blocked(self, peer: str) -> bool:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT blocked FROM chat_flags WHERE peer = ?",
+                (peer,)).fetchone()
+        return bool(row and row["blocked"])
+
+    # ---- v11: held frames from blocked contacts --------------------------------
+    #: The most frames kept for one blocked sender; past it, more are let go.
+    HELD_MAX_PER_SENDER = 2000
+
+    def hold_frame(self, sender: str, frame: dict) -> bool:
+        """Keep what a blocked contact sent, still sealed, until they are
+        unblocked. True if it is held (a re-push of one already held counts
+        as held); False if this sender's allowance is used up."""
+        sid = frame.get("id") if isinstance(frame.get("id"), int) else None
+        cid = frame.get("client_msg_id") or None
+        with self._lock:
+            if cid:
+                dup = self._db.execute(
+                    "SELECT 1 FROM held WHERE sender = ? AND cid = ?",
+                    (sender, str(cid))).fetchone()
+            elif sid is not None:
+                dup = self._db.execute(
+                    "SELECT 1 FROM held WHERE sender = ? AND sid = ?",
+                    (sender, sid)).fetchone()
+            else:
+                dup = None
+            if dup is not None:
+                return True
+            count = self._db.execute(
+                "SELECT COUNT(*) FROM held WHERE sender = ?",
+                (sender,)).fetchone()[0]
+            if count >= self.HELD_MAX_PER_SENDER:
+                return False
+            self._db.execute(
+                "INSERT INTO held (sender, sid, cid, frame, held_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (sender, sid, str(cid) if cid else None,
+                 json.dumps(frame, separators=(",", ":")), now_iso()))
+            self._db.commit()
+        return True
+
+    def held_count(self, sender: str) -> int:
+        with self._lock:
+            return int(self._db.execute(
+                "SELECT COUNT(*) FROM held WHERE sender = ?",
+                (sender,)).fetchone()[0])
+
+    def held_frames(self, sender: str, limit: int = 100) -> list:
+        """[(row id, frame), …] oldest first."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT id, frame FROM held WHERE sender = ? ORDER BY id "
+                "LIMIT ?", (sender, int(limit))).fetchall()
+        out = []
+        for row in rows:
+            try:
+                out.append((row["id"], json.loads(row["frame"])))
+            except ValueError:
+                out.append((row["id"], None))
+        return out
+
+    def drop_held(self, row_ids: list) -> None:
+        if not row_ids:
+            return
+        with self._lock:
+            self._db.executemany("DELETE FROM held WHERE id = ?",
+                                 [(int(i),) for i in row_ids])
+            self._db.commit()
+
+    def held_senders(self) -> list:
+        with self._lock:
+            return [r["sender"] for r in self._db.execute(
+                "SELECT DISTINCT sender FROM held").fetchall()]
+
+    # ---- v11: mute, with an end --------------------------------------------------
+    #: mute_until for a mute that lasts until it is turned off.
+    MUTE_FOREVER = 0.0
+
+    @staticmethod
+    def muted_now(notify, mute_until, now: Optional[float] = None) -> bool:
+        """notify = 0 is muted; with an end in the past, no longer."""
+        if notify is None or int(notify):
+            return False
+        until = float(mute_until or 0)
+        return until <= 0 or until > (time.time() if now is None else now)
+
+    def set_mute(self, peer: str, until: Optional[float]) -> None:
+        """Mute a chat until `until` (epoch seconds), until it is turned off
+        (MUTE_FOREVER), or — None — unmute it. A muted chat still receives
+        and shows everything; it only stops notifying."""
+        notify = 1 if until is None else 0
+        value = 0.0 if until is None else max(0.0, float(until))
+        gid = gid_of(peer)
+        with self._lock:
+            if gid:
+                self._db.execute(
+                    "UPDATE groups SET notify = ?, mute_until = ? "
+                    "WHERE gid = ?", (notify, value, gid))
+            else:
+                self._db.execute(
+                    "UPDATE contacts SET notify = ?, mute_until = ? "
+                    "WHERE address = ?", (notify, value, peer))
+            self._db.commit()
+
+    def mute_state(self, peer: str) -> tuple:
+        """(muted, until): until is 0 for a mute without an end. A mute
+        whose end has passed reads as off, and is cleared."""
+        gid = gid_of(peer)
+        with self._lock:
+            if gid:
+                row = self._db.execute(
+                    "SELECT notify, mute_until FROM groups WHERE gid = ?",
+                    (gid,)).fetchone()
+            else:
+                row = self._db.execute(
+                    "SELECT notify, mute_until FROM contacts "
+                    "WHERE address = ?", (peer,)).fetchone()
+        if row is None:
+            return False, 0.0
+        if self.muted_now(row["notify"], row["mute_until"]):
+            return True, float(row["mute_until"] or 0)
+        if not int(row["notify"]):
+            self.set_mute(peer, None)
+        return False, 0.0
+
+    def end_finished_mutes(self, now: Optional[float] = None) -> int:
+        """Turn notifications back on for every mute whose end has passed."""
+        now = time.time() if now is None else now
+        changed = 0
+        with self._lock:
+            for table in ("contacts", "groups"):
+                changed += self._db.execute(
+                    f"UPDATE {table} SET notify = 1, mute_until = 0 "
+                    f"WHERE notify = 0 AND mute_until > 0 AND "
+                    f"mute_until <= ?", (now,)).rowcount
+            self._db.commit()
+        return changed
+
+    # ---- v11: drafts ---------------------------------------------------------------
+    def draft(self, peer: str) -> str:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT draft FROM chat_flags WHERE peer = ?",
+                (peer,)).fetchone()
+        return (row["draft"] or "") if row else ""
+
+    def set_draft(self, peer: str, text: str) -> None:
+        """Keep unsent text for a chat ('' or blank clears it)."""
+        text = (text or "")[:MAX_MESSAGE_CHARS]
+        with self._lock:
+            if text.strip():
+                self._db.execute(
+                    "INSERT INTO chat_flags (peer, draft) VALUES (?, ?) "
+                    "ON CONFLICT(peer) DO UPDATE SET draft = excluded.draft",
+                    (peer, text))
+            else:
+                self._db.execute(
+                    "UPDATE chat_flags SET draft = NULL WHERE peer = ?",
+                    (peer,))
+            self._db.commit()
+
+    # ---- v11: disappearing messages ---------------------------------------------
+    def chat_timer(self, peer: str) -> tuple:
+        """(seconds, set at): a chat's timer for new messages; 0 is off."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT timer, timer_at FROM chat_flags WHERE peer = ?",
+                (peer,)).fetchone()
+        if row is None:
+            return 0, 0.0
+        return int(row["timer"] or 0), float(row["timer_at"] or 0)
+
+    def set_chat_timer(self, peer: str, seconds: int, at: float) -> bool:
+        """Set a chat's timer as of `at`, unless a later setting is held:
+        both sides may change it, and the latest change wins. True if this
+        one took."""
+        with self._lock:
+            cur = self._db.execute(
+                """INSERT INTO chat_flags (peer, timer, timer_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(peer) DO UPDATE SET timer = excluded.timer,
+                       timer_at = excluded.timer_at
+                   WHERE excluded.timer_at > chat_flags.timer_at""",
+                (peer, max(0, int(seconds)), float(at)))
+            self._db.commit()
+            return cur.rowcount > 0
+
+    def expire_due(self, now: Optional[float] = None) -> list:
+        """Delete every message whose time is up, with its reactions and
+        delivery rows; tombstoned like any deletion, so a re-push cannot
+        bring one back. Returns the removed rows (for their media files)."""
+        now = time.time() if now is None else now
+        with self._lock:
+            rows = [dict(r) for r in self._db.execute(
+                "SELECT * FROM messages WHERE expires_at > 0 AND "
+                "expires_at <= ?", (now,)).fetchall()]
+            if not rows:
+                return []
+            for row in rows:
+                self._tombstone(row["peer"], [row["client_msg_id"]])
+                if row["client_msg_id"]:
+                    self._db.execute(
+                        "DELETE FROM reactions WHERE peer = ? AND cid = ?",
+                        (row["peer"], row["client_msg_id"]))
+            self._db.executemany("DELETE FROM messages WHERE id = ?",
+                                 [(r["id"],) for r in rows])
+            self._db.executemany("DELETE FROM group_sends WHERE local_id = ?",
+                                 [(r["id"],) for r in rows])
+            self._db.commit()
+        return rows
+
+    def next_expiry(self) -> Optional[float]:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT MIN(expires_at) AS t FROM messages "
+                "WHERE expires_at > 0").fetchone()
+        return float(row["t"]) if row and row["t"] else None
+
+    # ---- v11: verified contacts ----------------------------------------------------
+    def set_verified(self, address: str, verified: bool) -> None:
+        with self._lock:
+            self._db.execute(
+                "UPDATE contacts SET verified = ? WHERE address = ?",
+                (1 if verified else 0, address))
+            self._db.commit()
+
+    def clear_conversation(self, peer: str) -> int:
+        """Delete a chat's messages, their reactions and per-member sends
+        from this device. Returns how many messages went."""
+        with self._lock:
+            ids = [r["id"] for r in self._db.execute(
+                "SELECT id FROM messages WHERE peer = ?", (peer,)).fetchall()]
+            if ids:
+                marks = ",".join("?" * len(ids))
+                self._db.execute(
+                    f"DELETE FROM group_sends WHERE local_id IN ({marks})", ids)
+            self._db.execute("DELETE FROM messages WHERE peer = ?", (peer,))
+            self._db.execute("DELETE FROM reactions WHERE peer = ?", (peer,))
+            self._db.commit()
+        return len(ids)
+
+    def search_messages(self, query: str, limit: int = 80,
+                        peer: Optional[str] = None) -> list:
+        """Messages whose text holds `query` (any case, any script), the
+        newest first — in every chat, or in `peer`'s only (v11). Events and
+        empty bodies never match."""
+        needle = (query or "").strip().casefold()
+        if not needle:
+            return []
+        pattern = "%" + needle.replace("\\", "\\\\").replace(
+            "%", "\\%").replace("_", "\\_") + "%"
+        where, args = "", [pattern]
+        if peer is not None:
+            where, args = " AND peer = ?", [pattern, peer]
+        with self._lock:
+            rows = self._db.execute(
+                f"""SELECT id, peer, body, created_at, direction, kind, author,
+                           client_msg_id
+                    FROM messages
+                    WHERE kind != 'event' AND fx_fold(body) LIKE ? ESCAPE '\\'
+                    {where}
+                    ORDER BY id DESC LIMIT ?""", args + [limit]).fetchall()
+        return [dict(r) for r in rows]
+
     def message_count(self, peer: str) -> int:
         with self._lock:
             row = self._db.execute(
@@ -3936,7 +8161,9 @@ class LocalStore:
         with self._lock:
             rows = self._db.execute(
                 """SELECT m.peer, c.username, c.ticks_enabled, c.notify,
+                          c.mute_until, c.verified,
                           g.name AS group_name, g.notify AS group_notify,
+                          g.mute_until AS group_mute_until,
                           g.state AS group_state,
                           l.body AS preview, l.created_at AS last_at,
                           l.direction AS last_direction, l.kind AS last_kind,
@@ -3952,6 +8179,7 @@ class LocalStore:
                    GROUP BY m.peer ORDER BY last_id DESC""").fetchall()
             contact_only = self._db.execute(
                 """SELECT address AS peer, username, ticks_enabled, notify,
+                          mute_until, verified,
                           NULL AS preview, added_at AS last_at,
                           0 AS unread, 0 AS last_id
                    FROM contacts
@@ -3960,23 +8188,38 @@ class LocalStore:
                    ORDER BY added_at DESC""").fetchall()
             group_only = self._db.execute(
                 """SELECT 'g:' || gid AS peer, name AS group_name,
-                          notify AS group_notify, state AS group_state,
+                          notify AS group_notify,
+                          mute_until AS group_mute_until,
+                          state AS group_state,
                           NULL AS preview, updated_at AS last_at,
                           0 AS unread, 0 AS last_id
                    FROM groups WHERE 'g:' || gid NOT IN
                        (SELECT DISTINCT peer FROM messages)
                    ORDER BY updated_at DESC""").fetchall()
+        flags = self.chat_flags()
+        now = time.time()
         out = []
         for row in [dict(r) for r in rows] + [dict(r) for r in group_only] \
                 + [dict(r) for r in contact_only]:
             peer = row["peer"]
+            f = flags.get(peer) or {}
+            row["pinned"] = f.get("pinned")
+            for name in self._FLAGS:
+                row[name] = int(f.get(name) or 0)
+            if row["hidden"] and not row.get("last_id"):
+                continue          # deleted, and nothing has arrived since
             if peer.startswith(GROUP_PREFIX):
                 row["kind"] = "group"
                 row["notify"] = row.get("group_notify", 1)
+                row["mute_until"] = row.get("group_mute_until", 0)
             elif me is not None and peer == me:
                 row["kind"] = "self"
             else:
                 row["kind"] = "dm"
+            row["muted"] = self.muted_now(row.get("notify"),
+                                          row.get("mute_until"), now)
+            row["draft"] = f.get("draft") or ""
+            row["timer"] = int(f.get("timer") or 0)
             out.append(row)
         return out
 
@@ -4501,6 +8744,12 @@ class SyncWorker(threading.Thread):
         # write_heartbeat. None disables beating (tests).
         self.beat_owner: Optional[str] = "app"
         self._last_beat = 0.0
+        # v11: chores done between frames — notification actions, timers
+        # that ran out, mutes that ended — and frames held from people who
+        # have since been unblocked.
+        self._last_chores = 0.0
+        self._last_sweep = 0.0
+        self._release_lock = threading.Lock()
 
     def _beat(self) -> None:
         if self.beat_owner and time.monotonic() - self._last_beat \
@@ -4511,6 +8760,79 @@ class SyncWorker(threading.Thread):
     def nudge(self) -> None:
         """Cut any pending backoff short and re-dial immediately."""
         self.wake_event.set()
+
+    # ---- v11: chores between frames ----------------------------------------------
+    def _chores(self, force: bool = False) -> None:
+        """Every couple of seconds while connected or polling: the actions
+        taken on notifications (Android), and every ten seconds, messages
+        whose time is up and mutes that have ended."""
+        now = time.monotonic()
+        if not force and now - self._last_chores < 2.0:
+            return
+        self._last_chores = now
+        app = self.app
+        try:
+            app.run_commands(self)
+        except Exception:
+            log.exception("could not act on a notification")
+        if force or now - self._last_sweep >= 10.0:
+            self._last_sweep = now
+            try:
+                self.sweep_expired()
+                app.store.end_finished_mutes()
+            except Exception:
+                log.exception("could not sweep expired messages")
+
+    def sweep_expired(self) -> list:
+        """Delete disappearing messages whose time is up, here and in the
+        notification shade. Returns the chats that changed."""
+        removed = self.app.store.expire_due()
+        peers = sorted({row["peer"] for row in removed})
+        for row in removed:
+            discard_media_file(row.get("media_path"))
+        for peer in peers:
+            self.app.ui_queue.put(("message_stored", peer))
+            self.app.ui_queue.put(("expired", peer))
+        if peers:
+            flow_log.info("⌛   %d message(s) disappeared from %d chat(s)",
+                          len(removed), len(peers))
+        return peers
+
+    def release_held(self, sender: Optional[str] = None) -> int:
+        """Receive again, in order, what was held while `sender` (or anyone
+        since unblocked) was blocked. Frames go through the same door as a
+        live one, quietly; each leaves the hold once it is through. Returns
+        how many were received."""
+        store = self.app.store
+        senders = [sender] if sender else store.held_senders()
+        done = 0
+        with self._release_lock:
+            for who in senders:
+                if store.is_blocked(who):
+                    continue
+                while not self.stop_event.is_set():
+                    batch = store.held_frames(who, limit=50)
+                    if not batch:
+                        break
+                    finished = []
+                    for row_id, frame in batch:
+                        if frame is None or not isinstance(frame, dict):
+                            finished.append(row_id)
+                            continue
+                        try:
+                            if self._ingest_message(frame, quiet=True) \
+                                    is not None:
+                                finished.append(row_id)
+                                done += 1
+                        except Exception:
+                            log.exception("could not receive a held frame")
+                            finished.append(row_id)
+                    store.drop_held(finished)
+                    if len(finished) < len(batch):
+                        break          # a database problem: try again later
+        if done:
+            self.app.ui_queue.put(("held_released", sender, done))
+        return done
 
     def _sleep(self, seconds: float) -> None:
         """Interruptible wait: returns early on stop OR on a manual retry."""
@@ -4591,8 +8913,11 @@ class SyncWorker(threading.Thread):
     #: momentarily stale — fixes itself on the next directory refresh.
     MAX_DECRYPT_ATTEMPTS = 3
 
-    def _ingest_message(self, msg: dict) -> Optional[int]:
-        """Decrypt + verify + store one envelope.
+    def _ingest_message(self, msg: dict, quiet: bool = False
+                        ) -> Optional[int]:
+        """Decrypt + verify + store one envelope. `quiet`: raise no
+        notification (frames held while their sender was blocked, received
+        again on unblocking).
 
         Returns the relay id to ACKNOWLEDGE, or None to leave the message on
         the relay for another attempt.
@@ -4626,6 +8951,29 @@ class SyncWorker(threading.Thread):
         group_traffic = isinstance(x, dict) and (
             isinstance(x.get("grp"), dict) or (isinstance(ctl, dict) and (
                 ctl.get("grp") or ctl.get("op") in ("group", "leave"))))
+        if self.app.store.is_blocked(sender):
+            op = ctl.get("op") if isinstance(ctl, dict) else None
+            if op in ("call", "ringing", "answer", "cands", "end"):
+                # A call cannot wait for an unblock.
+                MessageFlowLog.let_go(server_id, who,
+                                      "refused: a call from a blocked contact")
+                return server_id
+            if op not in ("group", "leave"):
+                # v11: held, still sealed, exactly as the relay sent it —
+                # shown nowhere and announced to nobody — and received
+                # again, in order, when they are unblocked. Acknowledged:
+                # this device now has it, and the relay can forget it.
+                # (A group's membership and name are not messages: those
+                # apply now, so the group stays whole for everyone else.)
+                if self.app.store.hold_frame(sender, msg):
+                    MessageFlowLog.let_go(server_id, who,
+                                          "held sealed: from a blocked "
+                                          "contact, until unblocked")
+                else:
+                    MessageFlowLog.let_go(server_id, who,
+                                          "let go: from a blocked contact, "
+                                          "more than can be held")
+                return server_id
         # Verified sender keys come from INSIDE the authenticated ciphertext
         # — trust them over anything the directory says. Someone met only
         # in a group is remembered but not added to the chat list.
@@ -4645,12 +8993,15 @@ class SyncWorker(threading.Thread):
             # screen can offer what only v9 peers understand.
             cid = cid or x.get("cid")
             try:
-                self.app.store.add_caps(sender, LocalStore.CAP_V9)
+                self.app.store.add_caps(sender, self.caps_of(x))
             except sqlite3.Error:
                 log.exception("could not record capabilities of %s", sender)
             if x.get("k") == "ctl":
-                return self._handle_control(server_id, sender, cid, ctl, who,
-                                            inner)
+                acked = self._handle_control(server_id, sender, cid, ctl, who,
+                                             inner)
+                # After the control: a picture it carried is held by now.
+                self._picture_hints(sender, x)
+                return acked
             if isinstance(x.get("grp"), dict):
                 gid = self._group_route(sanitize_gid(x["grp"].get("id")),
                                         sender, inner)
@@ -4662,18 +9013,21 @@ class SyncWorker(threading.Thread):
                                            "group message from a non-member")
                     return server_id
                 conversation, author = group_peer(gid), sender
-            ext = sanitize_ext(x) or None
+            ext = sanitize_ext_with_body(
+                x, sanitize_text(str(payload.get("body", "")))) or None
             media = (ext or {}).get("media")
             if x.get("k") == "media" and media is not None:
                 kind, media_state = media["kind"], "pending"
 
         body = sanitize_text(str(payload.get("body", "")))
+        # v11: a disappearing message says how long it lasts once read.
+        ttl = sanitize_timer(x.get("ttl")) if x is not None else 0
         outcome = self.app.store.add_in(
             peer=conversation, body=body,
             created_at=payload.get("sent_at",
                                    msg.get("created_at", now_iso())),
             server_id=server_id, client_msg_id=cid, kind=kind, ext=ext,
-            media_state=media_state, author=author)
+            media_state=media_state, author=author, ttl=ttl or 0)
 
         if outcome == LocalStore.FAILED:
             # Not ours yet. Withhold the ack; the relay keeps its copy and
@@ -4690,16 +9044,22 @@ class SyncWorker(threading.Thread):
             return server_id
 
         self._decrypt_failures.pop(server_id, None)
+        if x is not None:
+            self._picture_hints(sender, x)
         MessageFlowLog.tick(2, server_id,
                             MessageFlowLog.who(sender, inner.get("username")),
                             MessageFlowLog.who(self.app.keys.address,
                                                self.app.keys.username),
                             f"{fragment}  [stored locally — acking]")
         self.app.ui_queue.put(("message_stored", conversation))
-        # Separate from message_stored, which also fires for receipts and
-        # deletions: THIS one means a new message someone may want to hear
-        # about, and is what notifications are raised from.
-        self.app.ui_queue.put(("incoming", conversation, body, kind, sender))
+        # Raised from this thread, not the screen's queue: a paused app's
+        # screen does nothing until it is back, and the notification is for
+        # exactly that time (v11).
+        if not quiet:
+            try:
+                self.app.notify_incoming(conversation, body, kind, sender)
+            except Exception:
+                log.exception("could not raise a notification")
         if media_state == "pending":
             self.app.ui_queue.put(("media_pending", conversation, cid))
         return server_id
@@ -4845,6 +9205,13 @@ class SyncWorker(threading.Thread):
         if op == "leave":
             self._apply_leave(sender, sanitize_gid(ctl.get("grp")))
             return server_id
+        if op in ("call", "ringing", "answer", "cands", "end"):
+            # Calls are between two people: never in a group's name.
+            signal = sanitize_call_signal(op, ctl) \
+                if ctl.get("grp") is None else None
+            if signal is not None:
+                self.app.call_signal_arrived(sender, signal)
+            return server_id
         conversation = sender
         if ctl.get("grp") is not None:
             gid = sanitize_gid(ctl.get("grp"))
@@ -4855,6 +9222,37 @@ class SyncWorker(threading.Thread):
                          sender)
                 return server_id
             conversation = group_peer(gid)
+        if op in ("pic", "gpic"):
+            # A contact's own picture comes from them; a group's, from its
+            # admin and nobody else.
+            gid = gid_of(conversation)
+            if op == "pic" and gid is None:
+                self._take_picture(sender, ctl)
+            elif op == "gpic" and gid is not None and \
+                    (store.group(gid) or {}).get("admin") == sender:
+                self._take_picture(conversation, ctl)
+            return server_id
+        if op == "picreq":
+            self.app.ui_queue.put(("picture_request", sender,
+                                   gid_of(conversation)))
+            return server_id
+        if op == "timer":
+            # v11: disappearing messages, set by either side of a chat (in a
+            # group, by its admin); the latest setting wins on both.
+            seconds = sanitize_timer(ctl.get("s"))
+            at = ctl.get("at")
+            gid = gid_of(conversation)
+            if seconds is None or not isinstance(at, (int, float)) or \
+                    isinstance(at, bool) or not 0 < at < 4e9 or (
+                    gid and (store.group(gid) or {}).get("admin") != sender):
+                return server_id
+            if store.set_chat_timer(conversation, seconds, float(at)):
+                name = (inner or {}).get("username") or \
+                    (store.get_contact(sender) or {}).get("username") or \
+                    short_addr(sender, 10)
+                store.add_event(conversation, timer_event(name, seconds))
+                self.app.ui_queue.put(("message_stored", conversation))
+            return server_id
         if op == "react":
             target = _str(ctl.get("cid"), 64)
             emoji = sanitize_emoji(ctl.get("e"))
@@ -4893,6 +9291,76 @@ class SyncWorker(threading.Thread):
         else:
             log.info("ignoring unknown control op %r from %s", op, sender)
         return server_id
+
+    # ---- v9.1.2: features and pictures --------------------------------------------
+    @staticmethod
+    def caps_of(x: dict) -> int:
+        """contacts.caps bits a verified extension block proves: v9 itself,
+        and the features its x.ft names."""
+        bits = LocalStore.CAP_V9
+        ft = _int(x.get("ft"), 0, 2 ** 31 - 1) or 0
+        if ft & FEATURE_PICTURES:
+            bits |= LocalStore.CAP_PIC
+        if ft & FEATURE_CALLS:
+            bits |= LocalStore.CAP_CALL
+        if ft & FEATURE_TIMER:
+            bits |= LocalStore.CAP_TIMER
+        return bits
+
+    def _picture_hints(self, sender: str, x: dict) -> None:
+        """A message names the version of its author's picture (and, from a
+        group's admin, of the group's). Holding an older one — or none —
+        means one went missing: ask for it."""
+        store = self.app.store
+        try:
+            pv = _int(x.get("pv"), 1, 2 ** 40)
+            if pv and pv > store.picture_version(sender):
+                self.app.ui_queue.put(("picture_wanted", sender, None, pv))
+            grp = x.get("grp")
+            if isinstance(grp, dict):
+                gid = sanitize_gid(grp.get("id"))
+                gpv = _int(grp.get("pv"), 1, 2 ** 40)
+                group = store.group(gid) if gid and gpv else None
+                if group is not None and group["admin"] == sender and \
+                        group["state"] == "active" and \
+                        gpv > store.picture_version(group_peer(gid)):
+                    self.app.ui_queue.put(("picture_wanted", sender, gid,
+                                           gpv))
+        except sqlite3.Error:
+            log.exception("could not check pictures from %s", sender)
+
+    def _take_picture(self, peer: str, ctl: dict) -> None:
+        """Keep version `v` of `peer`'s picture (`d`: a JPEG in base64, or
+        "" for none), if it is newer than the one held. A picture this
+        device will not keep still counts as that version — the old one is
+        gone either way, and it is not asked for again."""
+        store = self.app.store
+        version = _int(ctl.get("v"), 1, 2 ** 40)
+        data = ctl.get("d")
+        if not version or not isinstance(data, str) or \
+                version <= store.picture_version(peer):
+            return
+        path = None
+        if data:
+            clean = None
+            if len(data) <= PICTURE_ACCEPT_BYTES * 4 // 3 + 4:
+                try:
+                    clean = clean_picture(b64d(data))
+                except ValueError:
+                    clean = None
+            target = peer_picture_path(self.app.keys.address, peer)
+            if clean is None:
+                log.info("refused a picture for %s", peer[:14])
+            elif write_picture(target, clean):
+                path = str(target)
+            else:
+                return
+        old = store.picture(peer)
+        if not store.set_picture(peer, version, path):
+            return
+        if path is None and old and old.get("path"):
+            discard_picture_file(old["path"])
+        self.app.ui_queue.put(("picture", peer, path))
 
     def _handle_undecryptable(self, server_id, sender: str, who: str,
                               fragment: str, exc: Exception) -> Optional[int]:
@@ -4936,6 +9404,12 @@ class SyncWorker(threading.Thread):
     def _handle_frame(self, frame: dict) -> Optional[dict]:
         """Process one pushed frame; returns an ack frame to send, if any."""
         kind = frame.get("type")
+        if kind == "cmedia":
+            # A call's sound, forwarded by the relay when UDP cannot pass.
+            on_packet = getattr(self.app, "call_ws_packet", None)
+            if on_packet is not None:
+                on_packet(frame.get("tag"), frame.get("d"))
+            return None
         if kind == "message":
             server_id = self._ingest_message(frame)
             if server_id:
@@ -5027,6 +9501,7 @@ class SyncWorker(threading.Thread):
             last_outbound = time.monotonic()
             while not self.stop_event.is_set():
                 self._beat()
+                self._chores()
                 if time.monotonic() - last_outbound >= WS_IDLE_TIMEOUT:
                     if not self.send_ws({"type": "ping"}):
                         break
@@ -5100,10 +9575,29 @@ class SyncWorker(threading.Thread):
              * no socket, HTTP reachable  -> steady POLL_INTERVAL cadence
              * fully offline              -> exponential backoff (capped)
         """
+        try:
+            self._run()
+        finally:
+            if IS_ANDROID:
+                # Notifications are posted from this thread (v11); a thread
+                # that used the JVM must leave it before it ends.
+                try:
+                    from jnius import detach
+                    detach()
+                except Exception:
+                    pass
+
+    def _run(self) -> None:
         online: Optional[bool] = None
         backoff = WS_RECONNECT_MIN
+        # Unblocked while this worker was not running: their frames now.
+        try:
+            self.release_held()
+        except Exception:
+            log.exception("could not receive held frames")
         while not self.stop_event.is_set():
             self._beat()
+            self._chores()
             had_ws = self._ws_session()
             if self.stop_event.is_set():
                 break
@@ -5850,6 +10344,140 @@ def icon_geometry(name: str, cx: float, cy: float, size: float, rgba,
         wire += turn(-5.6, 0.0, 3.6, 270, 90)
         wire += list(uv(3.6, 3.6))
         Line(points=G(*wire), **line)
+    elif name == "menu":                       # three bars
+        for y in (6.6, 12.0, 17.4):
+            Line(points=G(4.2, y, 19.8, y), **line)
+    elif name == "search":                     # a lens and its handle
+        Line(circle=(*G(10.4, 10.4), 6.4 * s), width=w)
+        Line(points=G(15.1, 15.1, 20.0, 20.0), **line)
+    elif name in ("archive", "unarchive"):     # a box, an arrow in or out
+        def R(x0, y0, x1, y1, r):
+            return (cx + (x0 - 12) * s, cy + (12 - y1) * s,
+                    (x1 - x0) * s, (y1 - y0) * s, r * s)
+        Line(rounded_rectangle=R(3.2, 3.8, 20.8, 8.4, 1.2), width=w)
+        Line(points=G(4.8, 8.4, 4.8, 18.6) + arc(6.8, 18.6, 2.0, 180, 90) +
+             G(17.2, 20.6) + arc(17.2, 18.6, 2.0, 90, 0) +
+             G(19.2, 8.4), **line)
+        if name == "archive":
+            Line(points=G(12, 11.2, 12, 17.4), **line)
+            Line(points=G(9.4, 14.9, 12, 17.5, 14.6, 14.9), **line)
+        else:
+            Line(points=G(12, 17.6, 12, 11.4), **line)
+            Line(points=G(9.4, 13.9, 12, 11.3, 14.6, 13.9), **line)
+    elif name in ("pin", "unpin"):             # an upright drawing pin
+        Line(points=G(8.0, 3.6, 16.0, 3.6), **line)
+        Line(points=G(9.6, 3.8, 9.6, 9.4, 6.4, 13.4, 17.6, 13.4, 14.4, 9.4,
+                      14.4, 3.8), **line)
+        Line(points=G(12, 13.6, 12, 20.6), **line)
+        if name == "unpin":
+            Line(points=G(3.6, 3.4, 20.4, 20.4), **line)
+    elif name == "block":                      # a circle, struck through
+        Line(circle=(*G(12, 12), 8.6 * s), width=w)
+        Line(points=G(6.0, 6.0, 18.0, 18.0), **line)
+    elif name in ("unread", "read"):           # a speech bubble...
+        pts = G(3.6, 6.4) + arc(5.6, 6.4, 2.0, 180, 270) + \
+            G(15.4, 4.4) + arc(15.4, 6.4, 2.0, 270, 360) + \
+            G(17.4, 13.6) + arc(15.4, 13.6, 2.0, 0, 90) + \
+            G(9.8, 15.6, 5.4, 19.4, 6.4, 15.6) + arc(5.6, 13.6, 2.0, 90, 180)
+        Line(points=pts, close=True, **line)
+        if name == "unread":                   # ...with a dot: not read yet
+            dot(19.0, 4.8, 2.8)
+        else:                                  # ...with a tick: read
+            Line(points=G(7.2, 10.2, 9.6, 12.4, 13.8, 7.6), **line)
+    elif name == "lock":                       # a padlock
+        Line(points=G(7.8, 11.2, 7.8, 8.4) + arc(12, 8.4, 4.2, 180, 360) +
+             G(16.2, 11.2), **line)
+        def R(x0, y0, x1, y1, r):
+            return (cx + (x0 - 12) * s, cy + (12 - y1) * s,
+                    (x1 - x0) * s, (y1 - y0) * s, r * s)
+        Line(rounded_rectangle=R(5.2, 11.2, 18.8, 20.6, 1.8), width=w)
+        dot(12, 15.6, 1.5)
+    elif name in ("chevron_up", "chevron_down"):
+        d = -1 if name == "chevron_up" else 1
+        Line(points=G(6.6, 12 - 2.8 * d, 12, 12 + 2.8 * d,
+                      17.4, 12 - 2.8 * d), **line)
+    elif name in ("phone", "phone_end"):
+        # A handset's outline; hung up, it lies on its side.
+        pts = _handset_outline()
+        if name == "phone_end":
+            ca, sa = math.cos(math.radians(135)), math.sin(math.radians(135))
+            turned = []
+            for i in range(0, len(pts), 2):
+                x, y = pts[i] - 12, pts[i + 1] - 12.6
+                turned += [12 + (x * ca - y * sa) * .94,
+                           12.8 + (x * sa + y * ca) * .94]
+            pts = turned
+        Line(points=G(*pts), close=True, width=w, joint="round")
+    elif name in ("mic_off",):
+        icon_geometry("mic", cx, cy, size, rgba, w, u)
+        Line(points=G(4.2, 3.6, 19.8, 20.4), **line)
+    elif name == "speaker":
+        Line(points=G(3.4, 9.4, 7.4, 9.4, 12, 4.8, 12, 19.2, 7.4, 14.6,
+                      3.4, 14.6), close=True, width=w, joint="round")
+        Line(points=arc(12, 12, 3.9, -48, 48), **line)
+        Line(points=arc(12, 12, 7.6, -52, 52), **line)
+    elif name == "clock":
+        Line(circle=(cx, cy, size * 8.6 / 24.0), width=w)
+        Line(points=G(12, 7.4, 12, 12, 15.4, 14), **line)
+    elif name == "bluetooth":
+        # The rune: a stem, and the two wedges that cross it.
+        Line(points=G(7, 7.5, 17, 16.5, 12, 21, 12, 3, 17, 7.5, 7, 16.5),
+             **line)
+    elif name == "link":
+        # Two links of a chain, crossing on the diagonal.
+        for x1, y1, x2, y2 in ((5.4, 18.6, 11.2, 12.8),
+                               (12.8, 11.2, 18.6, 5.4)):
+            a = math.degrees(math.atan2(y2 - y1, x2 - x1))
+            Line(points=arc(x2, y2, 3.3, a - 90, a + 90) +
+                 arc(x1, y1, 3.3, a + 90, a + 270), close=True, width=w,
+                 joint="round")
+    elif name == "external":
+        # A page, and an arrow leaving it by its corner.
+        Line(points=G(18, 13.5, 18, 19, 16, 21, 5, 21, 3, 19, 3, 8, 5, 6,
+                      10.5, 6), **line)
+        Line(points=G(14.5, 3, 21, 3, 21, 9.5), **line)
+        Line(points=G(10, 14, 21, 3), **line)
+
+
+_HANDSET: list = []
+
+
+def _handset_outline() -> list:
+    """Grid points around a telephone handset (y down), sampled once from
+    its curves."""
+    if _HANDSET:
+        return _HANDSET
+    segments = (
+        ("C", (20.01, 15.38), (18.78, 15.38), (17.59, 15.18), (16.48, 14.82)),
+        ("C", (16.48, 14.82), (16.13, 14.70), (15.74, 14.79), (15.47, 15.06)),
+        ("L", (15.47, 15.06), (13.90, 17.03)),
+        ("C", (13.90, 17.03), (11.07, 15.68), (8.42, 13.13), (7.01, 10.20)),
+        ("L", (7.01, 10.20), (8.96, 8.54)),
+        ("C", (8.96, 8.54), (9.23, 8.26), (9.31, 7.87), (9.20, 7.52)),
+        ("C", (9.20, 7.52), (8.83, 6.41), (8.64, 5.22), (8.64, 3.99)),
+        ("C", (8.64, 3.99), (8.64, 3.45), (8.19, 3.00), (7.65, 3.00)),
+        ("L", (7.65, 3.00), (4.19, 3.00)),
+        ("C", (4.19, 3.00), (3.65, 3.00), (3.00, 3.24), (3.00, 3.99)),
+        ("C", (3.00, 3.99), (3.00, 13.28), (10.73, 21.0), (20.01, 21.0)),
+        ("C", (20.01, 21.0), (20.72, 21.0), (21.0, 20.37), (21.0, 19.82)),
+        ("L", (21.0, 19.82), (21.0, 16.37)),
+        ("C", (21.0, 16.37), (21.0, 15.83), (20.55, 15.38), (20.01, 15.38)),
+    )
+    for seg in segments:
+        if seg[0] == "L":
+            _HANDSET.extend(seg[1])
+            continue
+        (x0, y0), (x1, y1), (x2, y2), (x3, y3) = seg[1:]
+        steps = 10 if abs(x3 - x0) + abs(y3 - y0) > 4 else 4
+        for i in range(steps):
+            t = i / steps
+            m = 1 - t
+            _HANDSET.extend((
+                m * m * m * x0 + 3 * m * m * t * x1 + 3 * m * t * t * x2
+                + t * t * t * x3,
+                m * m * m * y0 + 3 * m * m * t * y1 + 3 * m * t * t * y2
+                + t * t * t * y3))
+    return _HANDSET
 
 
 
@@ -6001,32 +10629,62 @@ class TickMarks(Widget):
 
 
 class Avatar(Widget):
-    """A coloured disc with an initial.
+    """Someone's picture in a disc, or, until they have one, a coloured disc
+    with an initial.
 
     A group's disc carries an inner ring; notes to self are a gold disc with
-    a bookmark.
+    a bookmark. Every disc on screen follows its picture: Avatar.refresh
+    repaints those of one seed when its picture changes.
     """
+
+    _live: "weakref.WeakSet" = weakref.WeakSet()
 
     def __init__(self, seed: str, name: str, diameter=dp(48),
                  kind: str = "dm", **kw):
         kw.setdefault("size_hint", (None, None))
         kw.setdefault("size", (diameter, diameter))
         super().__init__(**kw)
-        self.kind, self._d = kind, diameter
+        self.seed, self.kind, self._d = seed, kind, diameter
         self._fill = T.accent if kind == "self" else avatar_color(seed)
         self._initial = None
+        self._picture = None
         if kind != "self":
             self._initial = Label(text=initial_of(name), bold=False,
                                   font_size=diameter * 0.48,
                                   color=C("#FFFFF8"), size_hint=(None, None))
             self.add_widget(self._initial)
+            self._picture = picture_texture(PICTURES.path(seed), diameter)
+            Avatar._live.add(self)
         self.bind(pos=self._redraw, size=self._redraw)
         self._redraw()
+
+    @property
+    def has_picture(self) -> bool:
+        return self._picture is not None
+
+    @classmethod
+    def refresh(cls, seed: Optional[str] = None) -> None:
+        """Repaint every disc for `seed` (all of them when None) with the
+        picture it has now."""
+        for avatar in list(cls._live):
+            if seed is None or avatar.seed == seed:
+                avatar._picture = picture_texture(PICTURES.path(avatar.seed),
+                                                  avatar._d)
+                avatar._redraw()
 
     def _redraw(self, *_a):
         self.canvas.before.clear()
         d = min(self.width, self.height, self._d)
         x, y = (self.x + self.width / 2) - d / 2, (self.y + self.height / 2) - d / 2
+        if self._picture is not None:
+            with self.canvas.before:
+                Color(1, 1, 1, 1)
+                Rectangle(texture=self._picture, pos=(x, y), size=(d, d))
+            if self._initial is not None:
+                self._initial.opacity = 0
+            return
+        if self._initial is not None:
+            self._initial.opacity = 1
         with self.canvas.before:
             Color(*C(self._fill))
             SmoothEllipse(pos=(x, y), size=(d, d))
@@ -6329,10 +10987,12 @@ class TappableBox(ButtonBehavior, BoxLayout):
 
 
 class UnreadBadge(Label):
-    """The unread count, in red. Muted chats show it in grey."""
+    """The unread count, in red. Muted chats show it in grey. A `dot` is
+    the badge of a chat marked unread by hand: no number."""
 
-    def __init__(self, count: int, muted: bool = False, **kw):
-        text = str(count) if count < 1000 else "999+"
+    def __init__(self, count: int, muted: bool = False, dot: bool = False,
+                 **kw):
+        text = "" if dot else (str(count) if count < 1000 else "999+")
         super().__init__(text=text, font_size=fs(13), bold=True,
                          color=C(T.bg if muted else T.on_alert),
                          size_hint=(None, None),
@@ -6420,9 +11080,11 @@ class Sheet(ModalView):
         if title:
             self.title_label = InfoLabel(title, font_size=fs(22))
             self.card.add_widget(self.title_label)
+        self.subtitle_label = None
         if subtitle:
-            self.card.add_widget(InfoLabel(subtitle, color=T.text_3,
-                                           italic=True, font_size=fs(15)))
+            self.subtitle_label = InfoLabel(subtitle, color=T.text_3,
+                                            italic=True, font_size=fs(15))
+            self.card.add_widget(self.subtitle_label)
         self.body = BoxLayout(orientation="vertical", size_hint_y=None,
                               spacing=dp(12))
         self.body.bind(minimum_height=self.body.setter("height"))
@@ -6463,11 +11125,34 @@ class Sheet(ModalView):
         self._align_center()
 
     def open(self, *a, **kw):
+        self._leaving = False
         self.rise = 0.0 if motion(1) else 1.0
+        self._anim_duration = LAYER_FADE              # the scrim's fade
         super().open(*a, **kw)
         self._align_center()
         if motion(1):
-            Animation(rise=1.0, d=0.22, t="out_cubic").start(self)
+            self.card.opacity = 0
+            Animation(rise=1.0, d=SHEET_RISE, t="out_cubic").start(self)
+            Animation(opacity=1, d=SHEET_FADE).start(self.card)
+
+    def dismiss(self, *a, **kw):
+        """Sink and fade with the scrim, then go: the opening reversed.
+        Kivy's own checks come first, so a sheet that must be answered
+        (on_dismiss returning True) stays exactly as it was."""
+        if not self._is_open or getattr(self, "_leaving", False):
+            return
+        if not motion(1) or kw.get("animation", True) is False:
+            return super().dismiss(*a, **kw)
+        self.dispatch("on_pre_dismiss")
+        if self.dispatch("on_dismiss") is True and kw.get("force") is not True:
+            return
+        self._leaving = True
+        Animation.cancel_all(self, "rise")
+        Animation.cancel_all(self.card, "opacity")
+        Animation(rise=0.6, d=LAYER_OUT, t="in_quad").start(self)
+        Animation(opacity=0, d=LAYER_OUT).start(self.card)
+        # ModalView removes itself when its scrim reaches 0.
+        Animation(_anim_alpha=0.0, d=LAYER_OUT).start(self)
 
     def add(self, widget):
         self.body.add_widget(widget)
@@ -6488,6 +11173,26 @@ class Sheet(ModalView):
 CozyModal = Sheet                       # pre-9.1 name
 
 
+def mute_label(until: float, short: bool = False) -> str:
+    """'Muted until Tue 09:15', 'Muted until you unmute' (and short forms)."""
+    if not until:
+        return "Muted" if short else "Muted until you turn it back on"
+    when = datetime.fromtimestamp(until)
+    now = datetime.now()
+    if when.date() == now.date():
+        text = when.strftime("%H:%M")
+    elif when.date() == (now + timedelta(days=1)).date():
+        text = "tomorrow " + when.strftime("%H:%M")
+    else:
+        text = when.strftime("%a %d %b %H:%M")
+    return f"Muted until {text}"
+
+
+#: How long the mute choices last (seconds); None: until turned back on.
+MUTE_CHOICES = (("For 12 hours", 12 * 3600), ("For 3 days", 3 * 86400),
+                ("Until I turn it back on", None))
+
+
 class MenuSheet(Sheet):
     """A short list of actions, one per full-width row (the ⋮ menu)."""
 
@@ -6496,6 +11201,8 @@ class MenuSheet(Sheet):
         self.card.padding = [0, dp(8), 0, dp(14)]
         if title:
             self.title_label.padding = [dp(22), 0]
+        if self.subtitle_label is not None:
+            self.subtitle_label.padding = [dp(22), 0]
         rows = []
         for item in items:
             icon, text, action = item[:3]
@@ -6507,6 +11214,409 @@ class MenuSheet(Sheet):
     def _run(self, action: Callable) -> None:
         self.dismiss()
         Clock.schedule_once(lambda _dt: action(), 0.05)
+
+
+class TimerSheet(MenuSheet):
+    """Disappearing messages for a chat (v11): off, or how long after
+    being read each new message goes — your copy that long after you send
+    it. Either of you can change it (in a group, its admin)."""
+
+    def __init__(self, app: "FextApp", peer: str, **kw):
+        current = app.store.chat_timer(peer)[0]
+        items = [("check" if seconds == current else "clock", label,
+                  lambda s=seconds: app.set_chat_timer(peer, s))
+                 for seconds, label in TIMER_CHOICES]
+        behind = app.timer_laggards(peer)
+        note = ("New messages go that long after they are read. Exporting "
+                "the chat still works.")
+        if behind:
+            note += (" " + behind + "'s app does not delete them yet (an "
+                     "older Ferritext): their copies stay.")
+        super().__init__(items, title="Disappearing messages",
+                         subtitle=note, **kw)
+
+
+class VerifySheet(Sheet):
+    """Make sure a contact is who the relay says: compare the code (it is
+    the same on both phones only if each has the other's real key), in
+    person or on a call — or scan the QR code on their phone (v11)."""
+
+    def __init__(self, app: "FextApp", peer: str) -> None:
+        contact = app.store.get_contact(peer) or {}
+        name = contact.get("username") or short_addr(peer, 12)
+        super().__init__(f"Verify {name}",
+                         subtitle="On both phones this code is the same — "
+                                  "only if each of you has the other's "
+                                  "real key.")
+        self.app, self.peer = app, peer
+        code = safety_code(app.keys.public_key_hex, contact["public_key"])
+        groups = code.split()
+        grid = GridLayout(cols=3, size_hint_y=None, spacing=dp(6),
+                          padding=[dp(8), dp(6)])
+        grid.bind(minimum_height=grid.setter("height"))
+        for group in groups:
+            grid.add_widget(Label(text=group, font_size=fs(24),
+                                  color=C(T.text), size_hint_y=None,
+                                  height=line_height(24) + dp(4)))
+        self.add(grid)
+        self.add(hint("Read the groups to each other, in person or on a "
+                      "call. Or scan the code on their phone, and let them "
+                      "scan yours:"))
+        side = dp(168)
+        holder = AnchorLayout(size_hint_y=None, height=side + dp(20))
+        plate = AnchorLayout(size_hint=(None, None),
+                             size=(side + dp(16), side + dp(16)))
+        paint_round(plate, T.plate, radius=dp(6))
+        image = KivyImage(size_hint=(None, None), size=(side, side),
+                          allow_stretch=True)
+        image.texture = qr_texture(json.dumps(app.keys.public_bundle(),
+                                              separators=(",", ":")))
+        plate.add_widget(image)
+        holder.add_widget(plate)
+        self.add(holder)
+        self.status = self.status_label()
+        rows = []
+        if can_read_qr():
+            rows.append(ListRow("camera", "Scan their code",
+                                "With the camera, from their phone's screen",
+                                chevron=True, on_tap=self._scan))
+            if not IS_ANDROID:
+                rows.append(ListRow("image", "Read it from a picture",
+                                    "A screenshot of their code",
+                                    chevron=True, on_tap=self._pick))
+        verified = bool(contact.get("verified"))
+        rows.append(ListRow(
+            "check", "The codes match — mark as verified" if not verified
+            else "Verified · tap to clear", on_tap=self._toggle))
+        self.add(rows_card(rows))
+        if verified:
+            self.set_status(self.status, f"{name} is verified.", COL_OK)
+
+    def _toggle(self) -> None:
+        verified = bool((self.app.store.get_contact(self.peer) or {}).get(
+            "verified"))
+        self.app.set_verified(self.peer, not verified)
+        self.dismiss()
+
+    def _scan(self) -> None:
+        if IS_ANDROID:
+            try:
+                android_take_photo(self._read)
+            except Exception:
+                log.exception("camera failed")
+                self.set_status(self.status, "Couldn't open the camera",
+                                COL_DANGER)
+        else:
+            open_desktop_camera(self._read, on_choose=self._pick)
+
+    def _pick(self) -> None:
+        ImageChooserModal(self._read, title="Their code").open()
+
+    def _read(self, path: str) -> None:
+        text = read_qr_image(path)
+        if text is None:
+            self.set_status(self.status, "No code found in that picture — "
+                            "try again, closer and steadier", COL_DANGER)
+            return
+        found = address_in_qr(text)
+        if found == self.peer:
+            self.app.set_verified(self.peer, True)
+            self.set_status(self.status, "It matches: verified.", COL_OK)
+            Clock.schedule_once(lambda _dt: self.dismiss(), 1.2)
+        elif found is None:
+            self.set_status(self.status, "That is not a Ferritext code",
+                            COL_DANGER)
+        else:
+            self.set_status(self.status, "That code is someone else's — not "
+                            "the one this chat is with. Do not mark them "
+                            "verified.", COL_DANGER)
+
+
+class LinkSheet(Sheet):
+    """Where a link leads, before going there (v11): the site as it really
+    is, then the whole link, anything to know about it, and Open or Copy.
+    Nothing is opened by a tap on a message alone."""
+
+    def __init__(self, app: "FextApp", url: str) -> None:
+        super().__init__(escape_markup(link_host(url)),
+                         subtitle="Opens in your browser, outside Ferritext.")
+        self.app, self.url = app, url
+        self.add(InfoLabel(escape_markup(url), color=T.text_2,
+                           font_size=fs(14.5)))
+        warning = link_warning(url)
+        if warning:
+            self.add(InfoLabel(escape_markup(warning), color=T.alert,
+                               italic=True, font_size=fs(14.5)))
+        self.add(rows_card([
+            ListRow("external", "Open the link", on_tap=self._open),
+            ListRow("copy", "Copy the link", on_tap=self._copy)]))
+
+    def _open(self) -> None:
+        self.dismiss()
+        try:
+            open_url(self.url)
+        except Exception:
+            log.exception("could not open a link")
+            self.app._set_status("No app here opens links", COL_DANGER)
+
+    def _copy(self) -> None:
+        self.dismiss()
+        self.app.copy_text(self.url)
+
+
+class BackupSheet(Sheet):
+    """Back up what this device keeps for Ferritext to one file, sealed
+    with a passphrase (v11): every identity's key, its chats, contacts and
+    groups, the pictures and, if wanted, the photos and voice notes."""
+
+    def __init__(self, app: "FextApp") -> None:
+        super().__init__("Back up to a file",
+                         subtitle="Every identity here, with its chats, "
+                                  "contacts and groups, sealed with a "
+                                  "passphrase. Without it nobody can open "
+                                  "the backup — not even you.")
+        self.app = app
+        self._media = True
+        self.pass1 = self.add(Field(hint=f"at least {BACKUP_MIN_PASSPHRASE} "
+                                         f"characters; a few words is best",
+                                    label="Passphrase", password=True))
+        self.pass2 = self.add(Field(hint="the same again",
+                                    label="The passphrase again",
+                                    password=True, on_enter=self._start))
+        count, size = backup_media_size(app.keys)
+        self.add(rows_card([ListRow(
+            "image", "Photos and voice notes",
+            f"{count} · {size_text(size)}" if count else "None here yet",
+            control=ToggleSwitch(True, lambda on: setattr(self, "_media",
+                                                          on)))], inset=0))
+        self.path_field = None
+        if not IS_ANDROID:
+            self.path_field = self.add(Field(label="Save it as"))
+            self.path_field.text = str(default_backup_dir() /
+                                       default_backup_name())
+        self.add(hint("It holds your private keys: keep it somewhere safe, "
+                      "away from this device. Ferritext never sends it "
+                      "anywhere."))
+        self.status = self.status_label()
+        self.button = self.add(Btn("Make the backup",
+                                   on_release=lambda _w: self._start()))
+
+    def _start(self) -> None:
+        one, two = self.pass1.text, self.pass2.text
+        if len(one) < BACKUP_MIN_PASSPHRASE:
+            self.set_status(self.status, f"Use at least "
+                            f"{BACKUP_MIN_PASSPHRASE} characters.", T.alert)
+            return
+        if one != two:
+            self.set_status(self.status, "The two passphrases differ.",
+                            T.alert)
+            return
+        if IS_ANDROID:
+            folder = DATA_DIR / "cache"
+            folder.mkdir(parents=True, exist_ok=True)
+            target = folder / default_backup_name()
+        else:
+            target = Path(os.path.expanduser(self.path_field.text.strip()))
+            if not target.name.endswith(BACKUP_SUFFIX):
+                target = target.with_name(target.name + BACKUP_SUFFIX)
+            if not target.parent.is_dir():
+                self.set_status(self.status, f"There is no folder "
+                                f"{target.parent}.", T.alert)
+                return
+        self.button.disabled = True
+        self.set_status(self.status, "Sealing…")
+        threading.Thread(target=self._work, args=(one, target, self._media),
+                         daemon=True).start()
+
+    def _work(self, passphrase: str, target: Path, media: bool) -> None:
+        def progress(done: float) -> None:
+            run_on_ui(self.set_status, self.status,
+                      f"Sealing… {int(done * 100)}%")
+        try:
+            result = make_backup(self.app.keys, passphrase, target, media,
+                                 progress)
+        except BackupError as exc:
+            run_on_ui(self._failed, str(exc))
+            return
+        except Exception as exc:
+            log.exception("backup failed")
+            run_on_ui(self._failed, f"The backup failed: {exc}")
+            return
+        run_on_ui(self._made, result)
+
+    def _failed(self, why: str) -> None:
+        self.button.disabled = False
+        self.set_status(self.status, why, T.alert)
+
+    def _made(self, result: dict) -> None:
+        idents = len(result["identities"])
+        what = (f"{idents} identit{'y' if idents == 1 else 'ies'}, "
+                f"{size_text(result['size'])}")
+        if not IS_ANDROID:
+            self.button.disabled = False
+            opened = open_folder_in_explorer(Path(result["path"]).parent)
+            self.set_status(self.status, f"Saved: {what}, to "
+                            f"{result['path']}" +
+                            (" (the folder is open)" if opened else ""),
+                            COL_OK)
+            return
+        self.set_status(self.status, f"Sealed ({what}). Now choose where "
+                        f"to keep it…")
+        path = result["path"]
+
+        def saved(ok: bool) -> None:
+            discard_cache_file(path)
+            self.button.disabled = False
+            self.set_status(self.status, f"Saved: {what}." if ok else
+                            "Not saved: no place was chosen.",
+                            COL_OK if ok else T.alert)
+        try:
+            android_save_document(path, Path(path).name, saved)
+        except Exception:
+            log.exception("could not ask where to save")
+            saved(False)
+
+
+class RestoreSheet(Sheet):
+    """Restore a backup onto this device (v11). Its identities that are
+    not here yet arrive with their chats; one that is here keeps its own
+    chats, unless it has none yet."""
+
+    def __init__(self, app: "FextApp",
+                 on_done: Optional[Callable[[dict], None]] = None) -> None:
+        super().__init__("Restore from a backup",
+                         subtitle="Adds the identities in a backup to this "
+                                  "device, with their chats.")
+        self.app, self.on_done = app, on_done
+        self.path: Optional[str] = None
+        self.chooser = None
+        if IS_ANDROID:
+            self.add(rows_card([ListRow(
+                "download", "Choose the backup file",
+                "From this phone, a memory card or a cloud drive",
+                chevron=True, on_tap=self._choose)], inset=0))
+        else:
+            self.chooser = self.add(_file_chooser(
+                str(default_backup_dir()), [f"*{BACKUP_SUFFIX}"],
+                min(dp(300), Window.height * .4)))
+            self.chooser.bind(selection=lambda _w, sel: self._picked(
+                sel[0]) if sel else None)
+        self.made = self.add(InfoLabel("", color=T.text_3, italic=True,
+                                       font_size=fs(14.5)))
+        self.passphrase = self.add(Field(label="The backup's passphrase",
+                                         password=True,
+                                         on_enter=self._start))
+        self.add(hint("Use each identity on one device at a time: while one "
+                      "is in use on two, messages go to whichever is "
+                      "connected, and neither has them all."))
+        self.status = self.status_label()
+        self.button = self.add(Btn("Restore",
+                                   on_release=lambda _w: self._start()))
+
+    def _choose(self) -> None:
+        try:
+            android_open_document(self._picked)
+        except Exception:
+            log.exception("could not open the file picker")
+            self.set_status(self.status, "Couldn't open the file picker",
+                            T.alert)
+
+    def _picked(self, path: str) -> None:
+        self.path = path
+        try:
+            header = read_backup_header(path)
+        except (BackupError, OSError) as exc:
+            self.made.text = ""
+            self.set_status(self.status, str(exc) if isinstance(
+                exc, BackupError) else "That file cannot be read.", T.alert)
+            return
+        when = str(header.get("made") or "")[:10]
+        self.made.text = escape_markup(
+            f"Made {when} by {header.get('by') or 'Ferritext'}.")
+        self.set_status(self.status, "")
+
+    def _start(self) -> None:
+        if not self.path:
+            self.set_status(self.status, "Choose the backup file first.",
+                            T.alert)
+            return
+        if not self.passphrase.text:
+            self.set_status(self.status, "Enter the backup's passphrase.",
+                            T.alert)
+            return
+        if self.app.call is not None and not self.app.call.ended:
+            self.set_status(self.status, "Not during a call.", T.alert)
+            return
+        self.button.disabled = True
+        self.set_status(self.status, "Opening…")
+        previous = self.app.pause_identity()
+        threading.Thread(target=self._work, args=(
+            self.path, self.passphrase.text, previous), daemon=True).start()
+
+    def _work(self, path: str, passphrase: str,
+              previous: Optional[str]) -> None:
+        def progress(done: float) -> None:
+            run_on_ui(self.set_status, self.status,
+                      f"Opening… {int(done * 100)}%")
+        try:
+            summary = restore_backup(self.app.keys, path, passphrase,
+                                     progress)
+        except BackupError as exc:
+            run_on_ui(self._failed, str(exc), previous)
+            return
+        except Exception as exc:
+            log.exception("restore failed")
+            run_on_ui(self._failed, f"The restore failed: {exc}", previous)
+            return
+        run_on_ui(self._restored, summary, previous)
+
+    def _failed(self, why: str, previous: Optional[str]) -> None:
+        self.button.disabled = False
+        self.set_status(self.status, why, T.alert)
+        self.app.resume_identity(previous)
+
+    def _restored(self, summary: dict, previous: Optional[str]) -> None:
+        if self.path and IS_ANDROID:
+            discard_cache_file(self.path)          # our private copy of it
+        self.app.resume_identity(previous)
+        done = summary["added"] + summary["replaced"]
+        bits = []
+        if done:
+            bits.append(f"Restored {', '.join(done)}, with "
+                        f"{summary['messages']:,} messages.")
+        if summary["kept"]:
+            bits.append(f"Already here, kept as they are: "
+                        f"{', '.join(summary['kept'])}.")
+        if not bits:
+            bits.append("There was nothing in it to restore.")
+        self.set_status(self.status, escape_markup(" ".join(bits)),
+                        COL_OK if done else None)
+        self.button.disabled = False
+        if self.on_done is not None and done:
+            self.on_done(summary)
+
+
+class MuteSheet(MenuSheet):
+    """How long to mute a chat, or several: 12 hours, 3 days, or until
+    turned back on — and Unmute for those already muted. A muted chat
+    still receives and shows everything; it only stops notifying."""
+
+    def __init__(self, app: "FextApp", peers: list, **kw):
+        self.app, self.peers = app, list(peers)
+        items = [("bell_off", label,
+                  lambda s=seconds: app.set_mute(
+                      self.peers, LocalStore.MUTE_FOREVER if s is None
+                      else time.time() + s))
+                 for label, seconds in MUTE_CHOICES]
+        if any(app.store.mute_state(p)[0] for p in self.peers):
+            items.append(("bell", "Unmute" + (" all" if len(self.peers) > 1
+                                              else ""),
+                          lambda: app.set_mute(self.peers, None)))
+        many = len(self.peers) > 1
+        super().__init__(items, title=f"Mute {len(self.peers)} chats"
+                         if many else "Mute notifications",
+                         subtitle="Messages still arrive and show here; "
+                                  "only the notifications stop.", **kw)
 
 
 # =============================================================================
@@ -6634,7 +11744,7 @@ class AddContactModal(Sheet):
                           "Fec… address.")
                 return
             if user["address"] == self.app.keys.address:
-                run_on_ui(self._fail, "That's you — your notes to self are "
+                run_on_ui(self._fail, "That's you — your saved messages are "
                           "at the top of the list.")
                 return
             self.app.store.upsert_contact(user["address"], user["username"],
@@ -6688,11 +11798,18 @@ class NewIdentityModal(Sheet):
             "Import key", kind="quiet",
             on_release=lambda _w: self._import_key()))
         self.status = self.status_label()
+        self.add(Btn("Restore from a backup", kind="text",
+                     on_release=lambda _w: RestoreSheet(
+                         app, on_done=self._restored).open()))
         if not first_run:
             self.add(Btn("Cancel", kind="text",
                          on_release=lambda _w: self._close()))
         self.bind(on_dismiss=lambda *_a: setattr(self, "_cancel_mining",
                                                  True))
+
+    def _restored(self, _summary: dict) -> None:
+        self._cancel_mining = True
+        self.dismiss()
 
     def _start_mining(self) -> None:
         if self._mining:
@@ -6762,8 +11879,23 @@ class NewIdentityModal(Sheet):
 
 
 def _file_chooser(path: str, filters: list, height: float):
+    """A computer's file list, in the page's own ink: Kivy's draws white
+    names, which vanish on the light theme."""
     chooser = FileChooserListView(path=path, filters=filters,
                                   size_hint_y=None, height=height)
+    ink, quiet = C(T.text), C(T.text_3)
+
+    def tint(widget) -> None:
+        for part in widget.walk(restrict=True):
+            if isinstance(part, Label):
+                part.color = quiet if part.bold or part.halign == "right" \
+                    else ink
+            if isinstance(part, TreeViewNode):
+                part.color_selected = C(T.accent)[:3] + [0.28]
+                part.odd_color = [0, 0, 0, 0]
+                part.even_color = C(T.text)[:3] + [0.04]
+    tint(chooser.layout)
+    chooser.layout.bind(on_entry_added=lambda _l, entry, *_a: tint(entry))
     return chooser
 
 
@@ -6856,7 +11988,7 @@ def conversation_title(app, peer: str) -> tuple:
     notes to self."""
     kind = app.conversation_kind(peer)
     if kind == "self":
-        return "Notes to self", kind
+        return "Saved messages", kind
     if kind == "group":
         group = app.store.group(gid_of(peer)) if app.store else None
         return (group or {}).get("name") or "Group", kind
@@ -6963,6 +12095,40 @@ class DeleteModal(Sheet):
         self.app.delete_messages(self.msg_ids, for_everyone)
 
 
+class DeleteChatsSheet(Sheet):
+    """Delete chats from the list: what goes (this device's copy), what
+    stays (everyone else's), and that a group is left on the way out."""
+
+    def __init__(self, app: "FextApp", convs: list,
+                 on_done: Optional[Callable] = None) -> None:
+        n = len(convs)
+        super().__init__("Delete this chat?" if n == 1 else
+                         f"Delete {n} chats?")
+        self.app, self.convs, self.on_done = app, convs, on_done
+        groups = [c for c in convs if c.get("kind") == "group" and
+                  (c.get("group_state") or "active") == "active"]
+        text = ("Its messages are removed from this device; the people you "
+                "wrote to keep their copies." if n == 1 else
+                "Their messages are removed from this device; the people "
+                "you wrote to keep their copies.")
+        if groups:
+            text += (" You also leave the group, and its members are told."
+                     if len(groups) == 1 else
+                     f" You also leave {len(groups)} groups, and their "
+                     "members are told.")
+        self.add(InfoLabel(text, color=T.text_2, font_size=fs(16)))
+        self.add(button_row(
+            Btn("Cancel", kind="quiet", on_release=lambda _w: self.dismiss()),
+            Btn("Delete", kind="solid_danger",
+                on_release=lambda _w: self._go())))
+
+    def _go(self) -> None:
+        self.dismiss()
+        if self.on_done is not None:
+            self.on_done()
+        self.app.delete_chats([c["peer"] for c in self.convs])
+
+
 class StarredModal(Sheet):
     """Starred messages of one chat — private bookmarks, never sent."""
 
@@ -7001,23 +12167,26 @@ class StarredModal(Sheet):
 
 
 class ImageViewer(ModalView):
-    """A photo, full screen on black. Tap anywhere to close."""
+    """A photo, full screen on black. Tap anywhere to close. `nocache` for
+    a file that is rewritten in place (a picture), which Kivy's image cache
+    would otherwise show as it was."""
 
-    def __init__(self, path: str, **kw):
+    def __init__(self, path: str, nocache: bool = False, **kw):
         super().__init__(background_color=(0, 0, 0, 0),
                          overlay_color=(0, 0, 0, 0.94), auto_dismiss=True,
                          size_hint=(1, 1), **kw)
         box = TappableBox(on_tap=self.dismiss)
         box.add_widget(KivyImage(source=path, allow_stretch=True,
-                                 keep_ratio=True))
+                                 keep_ratio=True, nocache=nocache))
         self.add_widget(box)
 
 
 class ImageChooserModal(Sheet):
     """Desktop photo picker."""
 
-    def __init__(self, on_pick: Callable[[str], None]) -> None:
-        super().__init__("Send a photo")
+    def __init__(self, on_pick: Callable[[str], None],
+                 title: str = "Send a photo") -> None:
+        super().__init__(title)
         self._on_pick = on_pick
         self.chooser = self.add(_file_chooser(
             str(Path.home()), ["*.jpg", "*.jpeg", "*.png", "*.webp", "*.JPG",
@@ -7063,6 +12232,146 @@ class AttachPreviewModal(Sheet):
         self.dismiss()
         self.app.send_image(self.path, sanitize_text(self.caption.text),
                             temporary=self.temporary)
+
+
+class _CropFrame(StencilView):
+    """The round window a picture is framed in. Only touches that start
+    inside it are its own: the photo behind reaches far past its edges.
+    A mouse wheel calls `on_zoom(factor, point)`."""
+
+    def __init__(self, on_zoom: Callable, **kw):
+        super().__init__(**kw)
+        self._on_zoom = on_zoom
+
+    def on_touch_down(self, touch):
+        if not self.collide_point(*touch.pos):
+            return False
+        if touch.is_mouse_scrolling:
+            if touch.button in ("scrolldown", "scrollup"):
+                self._on_zoom(1.12 if touch.button == "scrolldown"
+                              else 1 / 1.12, touch.pos)
+            return True
+        return super().on_touch_down(touch)
+
+
+_CROP_SHADE: dict = {}
+
+
+def crop_shade_texture():
+    """Dark outside a circle, clear inside, with a smooth edge: laid over
+    the photo being framed, it shows what the round picture will hold."""
+    if "tex" not in _CROP_SHADE:
+        from PIL import Image, ImageDraw
+        side = 512
+        big = Image.new("L", (side * 4, side * 4), 150)
+        ImageDraw.Draw(big).ellipse((0, 0, side * 4 - 1, side * 4 - 1),
+                                    fill=0)
+        shade = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+        shade.putalpha(big.resize((side, side), Image.LANCZOS))
+        _CROP_SHADE["tex"] = texture_from_pil(shade)
+    return _CROP_SHADE["tex"]
+
+
+class PictureCropSheet(Sheet):
+    """Frame a picture: the photo behind a round window — drag it into
+    place, pinch (or scroll) to size it. What the circle holds becomes the
+    picture; `on_done(jpeg_bytes)` gets it. A `temporary` photo (a copy this
+    app made) is deleted when the sheet closes."""
+
+    ZOOM = 4.0                       # at most this far past "just covers"
+
+    def __init__(self, path: str, on_done: Callable[[bytes], None],
+                 title: str = "Profile photo",
+                 temporary: bool = False) -> None:
+        super().__init__(title)
+        self.on_done, self.path, self.temporary = on_done, path, temporary
+        self.image = open_picture_source(path)          # raises if unusable
+        if temporary:
+            self.bind(on_dismiss=lambda *_a: discard_media_file(self.path))
+        side = int(min(dp(300), Window.width - dp(44), Window.height * 0.46))
+        self.side = side
+        holder = AnchorLayout(size_hint_y=None, height=side)
+        self.view = RelativeLayout(size_hint=(None, None), size=(side, side))
+        frame = _CropFrame(self.zoom, size_hint=(None, None),
+                           size=(side, side))
+        width, height = self.image.size
+        self._cover = side / float(min(width, height))
+        self.scatter = Scatter(do_rotation=False, auto_bring_to_front=False,
+                               size_hint=(None, None), size=(width, height),
+                               scale_min=self._cover,
+                               scale_max=self._cover * self.ZOOM)
+        self.scatter.add_widget(KivyImage(
+            texture=texture_from_pil(self.image), size=(width, height),
+            size_hint=(None, None), pos=(0, 0), allow_stretch=True,
+            keep_ratio=False))
+        frame.add_widget(self.scatter)
+        self.view.add_widget(frame)
+        shade = Widget(size_hint=(None, None), size=(side, side))
+        with shade.canvas:
+            Color(1, 1, 1, 1)
+            Rectangle(texture=crop_shade_texture(), pos=(0, 0),
+                      size=(side, side))
+            Color(1, 1, 1, .85)
+            SmoothLine(circle=(side / 2, side / 2, side / 2 - .5),
+                       width=max(1.0, dp(.8)))
+        self.view.add_widget(shade)
+        holder.add_widget(self.view)
+        # Outside the sheet's scrolling body, which would take every drag.
+        self.card.add_widget(holder, index=1)
+        self.scatter.scale = self._cover
+        self.scatter.center = (side / 2, side / 2)
+        self.scatter.bind(on_transform_with_touch=lambda *_a: self._clamp())
+        self.add(hint("Drag the photo to place it; " +
+                      ("pinch" if IS_MOBILE else "scroll") +
+                      " to make it larger or smaller."))
+        self.add(button_row(Btn("Cancel", kind="quiet",
+                                on_release=lambda _w: self.dismiss()),
+                            Btn("Use photo",
+                                on_release=lambda _w: self._use())))
+        self._fit()
+
+    def zoom(self, factor: float, anchor) -> None:
+        scatter = self.scatter
+        target = min(max(scatter.scale * factor, scatter.scale_min),
+                     scatter.scale_max)
+        if target != scatter.scale:
+            from kivy.graphics.transformation import Matrix
+            step = target / scatter.scale
+            scatter.apply_transform(Matrix().scale(step, step, step),
+                                    anchor=anchor)
+        self._clamp()
+
+    def _clamp(self) -> None:
+        """Keep the photo covering the whole window: never smaller than
+        it, never pulled far enough to show what lies past its edge."""
+        scatter, side = self.scatter, self.side
+        if scatter.scale < self._cover:
+            scatter.scale = self._cover
+        (x, y), (w, h) = scatter.bbox
+        dx = -x if x > 0 else (side - (x + w) if x + w < side else 0)
+        dy = -y if y > 0 else (side - (y + h) if y + h < side else 0)
+        if dx or dy:
+            from kivy.graphics.transformation import Matrix
+            scatter.apply_transform(Matrix().translate(dx, dy, 0))
+
+    def crop_box(self) -> tuple:
+        """The window, in the photo's pixels (left, top, right, bottom)."""
+        width, height = self.image.size
+        x0, y0 = self.scatter.to_local(0, 0)
+        x1, y1 = self.scatter.to_local(self.side, self.side)
+        left, right = max(0.0, min(x0, x1)), min(float(width), max(x0, x1))
+        bottom, top = max(0.0, min(y0, y1)), min(float(height), max(y0, y1))
+        edge = min(right - left, top - bottom)        # square, inside it
+        return (left, height - bottom - edge, left + edge, height - bottom)
+
+    def _use(self) -> None:
+        try:
+            data = picture_jpeg(self.image, self.crop_box())
+        except Exception:
+            log.exception("could not make the picture")
+            return
+        self.dismiss()
+        self.on_done(data)
 
 
 class CameraSheet(Sheet):
@@ -7461,10 +12770,863 @@ ProfileMenuModal = IdentitySheet            # pre-9.1 name
 
 
 # =============================================================================
+#  The menu — a drawer from the left over the page, blurred (v9.1.2)
+# =============================================================================
+_BLUR_FS = """
+$HEADER$
+uniform vec2 step_dir;
+void main(void) {
+    /* a 9-tap Gaussian folded into five bilinear fetches */
+    vec4 c = texture2D(texture0, tex_coord0) * 0.2270270270;
+    c += texture2D(texture0, tex_coord0 + step_dir * 1.3846153846) * 0.3162162162;
+    c += texture2D(texture0, tex_coord0 - step_dir * 1.3846153846) * 0.3162162162;
+    c += texture2D(texture0, tex_coord0 + step_dir * 3.2307692308) * 0.0702702703;
+    c += texture2D(texture0, tex_coord0 - step_dir * 3.2307692308) * 0.0702702703;
+    gl_FragColor = c;
+}
+"""
+
+
+def blurred_snapshot(widget, scale: float = 0.2, passes: int = 3):
+    """The widget as drawn now, shrunk and blurred, for the menu's backdrop:
+    (texture, the framebuffers that own it) — or None where the GPU cannot
+    do it (the caller then dims the page plainly). Drawn once, when the
+    menu opens, at a fifth of the size: the blur costs next to nothing."""
+    w, h = max(8, int(widget.width * scale)), max(8, int(widget.height * scale))
+    parent = widget.parent
+    index = parent.canvas.indexof(widget.canvas) if parent is not None else -1
+    keep = []
+    try:
+        # A canvas has one parent: lend it to the framebuffer and put it
+        # back exactly where it was (what Widget.export_as_image does).
+        if index > -1:
+            parent.canvas.remove(widget.canvas)
+        try:
+            shot = Fbo(size=(w, h), with_stencilbuffer=True, noadd=True)
+            with shot:
+                ClearColor(*C(T.bg))
+                ClearBuffers()
+                Scale(scale, scale, 1)
+                Translate(-widget.x, -widget.y, 0)
+            shot.add(widget.canvas)
+            shot.draw()
+            shot.remove(widget.canvas)
+        finally:
+            if index > -1:
+                parent.canvas.insert(index, widget.canvas)
+        keep.append(shot)
+        tex = shot.texture
+        for _ in range(passes):
+            for direction in ((1.6 / w, 0.0), (0.0, 1.6 / h)):
+                f = Fbo(size=(w, h), fs=_BLUR_FS, noadd=True)
+                if not f.shader.success:
+                    raise RuntimeError("the blur shader did not compile")
+                f["step_dir"] = direction
+                with f:
+                    ClearColor(0, 0, 0, 0)
+                    ClearBuffers()
+                    Color(1, 1, 1, 1)
+                    Rectangle(texture=tex, size=(w, h))
+                f.draw()
+                keep.append(f)
+                tex = f.texture
+        return tex, keep
+    except Exception as exc:
+        log.info("blurred backdrop unavailable (%s); dimming instead", exc)
+        return None
+
+
+class DrawerRow(ButtonBehavior, BoxLayout):
+    """One line of the menu: a glyph and a word or two."""
+
+    def __init__(self, icon: str, title: str, on_tap: Callable, **kw):
+        kw.setdefault("size_hint_y", None)
+        kw.setdefault("height", max(dp(52), line_height(17) + dp(20)))
+        kw.setdefault("padding", [dp(22), 0, dp(16), 0])
+        kw.setdefault("spacing", dp(22))
+        super().__init__(**kw)
+        glyph = Widget(size_hint_x=None, width=dp(24))
+        glyph.bind(pos=lambda w, *_a: ListRow._glyph(w, icon, T.text_2),
+                   size=lambda w, *_a: ListRow._glyph(w, icon, T.text_2))
+        self.add_widget(glyph)
+        self.title = single_line(title, fs(17), T.text)
+        self.add_widget(self.title)
+        with self.canvas.before:
+            self._bg = Color(0, 0, 0, 0)
+            self._rect = Rectangle()
+        self.bind(pos=self._sync, size=self._sync,
+                  state=lambda _w, st: setattr(
+                      self._bg, "rgba", C(T.press) if st == "down"
+                      else (0, 0, 0, 0)))
+        self.bind(on_release=lambda _w: on_tap())
+
+    def _sync(self, *_a):
+        self._rect.pos, self._rect.size = self.pos, self.size
+
+
+class NavDrawer(FloatLayout):
+    """The menu. It comes in from the left over 80% of the screen, and the
+    page behind it fades back, blurred: a tinted copy of what was
+    showing. Your identity heads it, with the others to switch
+    to and a new one; then your profile, a new group and saved messages;
+    then settings and about. Tap outside it, or press back, to close it."""
+
+    progress = NumericProperty(0.0)
+    WIDTH_SHARE, MAX_WIDTH = 0.8, dp(400)
+
+    def __init__(self, app: "FextApp", **kw):
+        kw.setdefault("size_hint", (1, 1))
+        super().__init__(**kw)
+        self.app = app
+        self.is_open = False
+        self._frost = None
+        self._show_identities = True
+        with self.canvas.before:
+            self._glass_col = Color(1, 1, 1, 0)
+            self._glass = Rectangle()
+            self._tint_col = Color(0, 0, 0, 0)
+            self._tint = Rectangle()
+        self.theme = T.name
+        self.panel = BoxLayout(orientation="vertical", size_hint=(None, None))
+        paint_round(self.panel, T.surface if T.dark else T.bg, radius=0)
+        with self.panel.canvas.after:
+            self._edge_col = Color(*C(T.rule))
+            self._edge = Rectangle()
+        self.scroll = ScrollView(bar_width=dp(2), do_scroll_x=False)
+        self.column = BoxLayout(orientation="vertical", size_hint_y=None,
+                                padding=[0, 0, 0, dp(24)])
+        self.column.bind(minimum_height=self.column.setter("height"))
+        self.scroll.add_widget(self.column)
+        self.panel.add_widget(self.scroll)
+        self.add_widget(self.panel)
+        self.bind(pos=self._layout, size=self._layout,
+                  progress=self._layout)
+
+    # ---- geometry ------------------------------------------------------------
+    def panel_width(self) -> float:
+        return min(self.width * self.WIDTH_SHARE, self.MAX_WIDTH)
+
+    def _layout(self, *_a):
+        pw, p = self.panel_width(), self.progress
+        self.panel.size = (pw, self.height)
+        self.panel.pos = (self.x - pw * (1 - p), self.y)
+        self._edge.pos = (self.panel.right - 1, self.panel.y)
+        self._edge.size = (1, self.panel.height)
+        self._glass.pos, self._glass.size = self.pos, self.size
+        self._tint.pos, self._tint.size = self.pos, self.size
+        self._glass_col.a = p if self._frost is not None else 0
+        # the page fades back: blurred where the GPU allows, dimmed always
+        self._tint_col.rgba = list(T.scrim[:3]) + [
+            p * (0.42 if self._frost is not None else 0.6)]
+
+    # ---- opening and closing -------------------------------------------------
+    def open(self, drag: bool = False) -> None:
+        """Slide in; `drag`: stay shut, for a finger to bring in (v11)."""
+        if self.is_open:
+            return
+        self.is_open = True
+        self.app.conversation_screen.cancel_backfill()
+        frost = blurred_snapshot(self.app.manager)
+        self._frost = frost
+        self._glass.texture = frost[0] if frost else None
+        self.rebuild()
+        self.scroll.scroll_y = 1
+        if self.parent is None:
+            self.app.layers.add_widget(self)
+        Animation.cancel_all(self, "progress")
+        if drag:
+            self.progress = 0.0
+        elif motion(1):
+            Animation(progress=1.0, d=LAYER_IN + 0.04,
+                      t="out_cubic").start(self)
+        else:
+            self.progress = 1.0
+
+    def settle_open(self) -> None:
+        """Let go past half way: the rest of the way in."""
+        Animation.cancel_all(self, "progress")
+        if motion(1):
+            Animation(progress=1.0, d=0.12, t="out_cubic").start(self)
+        else:
+            self.progress = 1.0
+
+    def close(self, then: Optional[Callable] = None) -> None:
+        """Slide away; `then` runs at once, so the next page is already
+        moving in underneath as the menu goes."""
+        if not self.is_open:
+            if then is not None:
+                then()
+            return
+        self.is_open = False
+        Animation.cancel_all(self, "progress")
+
+        def gone(*_a):
+            if self.parent is not None:
+                self.parent.remove_widget(self)
+            self._glass.texture = None
+            self._frost = None
+        if motion(1):
+            anim = Animation(progress=0.0, d=LAYER_OUT, t="in_quad")
+            anim.bind(on_complete=gone)
+            anim.start(self)
+        else:
+            self.progress = 0.0
+            gone()
+        if then is not None:
+            then()
+
+    def on_touch_down(self, touch):
+        if not self.is_open:
+            return False
+        if self.panel.collide_point(*touch.pos):
+            super().on_touch_down(touch)
+            return True
+        self.close()                     # a tap on the page behind
+        return True
+
+    def on_touch_move(self, touch):
+        if self.is_open:
+            super().on_touch_move(touch)
+        return self.is_open
+
+    def on_touch_up(self, touch):
+        if self.is_open:
+            super().on_touch_up(touch)
+        return self.is_open
+
+    # ---- contents ------------------------------------------------------------
+    def rebuild(self) -> None:
+        col, app = self.column, self.app
+        col.clear_widgets()
+        keys = app.keys
+        col.add_widget(self._header())
+        if keys.has_identity and self._show_identities:
+            for ident in sorted(keys.identities,
+                                key=lambda i: i["address"] != keys.address):
+                col.add_widget(self._identity_row(ident))
+        col.add_widget(DrawerRow("person_add", "New identity",
+                                 lambda: self.close(lambda: NewIdentityModal(
+                                     app).open())))
+        col.add_widget(Rule())
+        if keys.has_identity:
+            col.add_widget(DrawerRow("person", "My profile",
+                                     lambda: self.close(app.open_profile)))
+            col.add_widget(DrawerRow("group", "New group",
+                                     lambda: self.close(app.open_new_group)))
+            col.add_widget(DrawerRow(
+                "bookmark", "Saved messages",
+                lambda: self.close(lambda: app.open_conversation(
+                    keys.address))))
+            col.add_widget(Rule())
+        col.add_widget(DrawerRow("sliders", "Settings",
+                                 lambda: self.close(app.open_settings)))
+        col.add_widget(DrawerRow("info", "About",
+                                 lambda: self.close(lambda: AboutSheet(
+                                     app).open())))
+
+    def _header(self) -> Widget:
+        keys, app = self.app.keys, self.app
+        head = BoxLayout(orientation="vertical", size_hint_y=None,
+                         padding=[dp(20), dp(26), dp(8), dp(14)],
+                         spacing=dp(10))
+        head.bind(minimum_height=head.setter("height"))
+        if not keys.has_identity:
+            head.add_widget(single_line(APP_NAME, fs(24), T.text,
+                                        size_hint_y=None,
+                                        height=line_height(24)))
+            return head
+        name = keys.label or keys.username or "?"
+        top = BoxLayout(size_hint_y=None, height=dp(72))
+        disc = AvatarButton(keys.address, keys.username or keys.label,
+                            diameter=dp(64), size=(dp(72), dp(72)))
+        disc.bind(on_release=lambda _w: self.close(app.open_profile))
+        top.add_widget(disc)
+        top.add_widget(Widget())
+        head.add_widget(top)
+        line = BoxLayout(size_hint_y=None, height=max(TOUCH, line_height(19)
+                                                      + line_height(14)))
+        texts = TappableBox(orientation="vertical",
+                            on_tap=lambda: self.close(app.open_profile))
+        texts.add_widget(single_line(name, fs(19), T.text, bold=True))
+        texts.add_widget(single_line(
+            f"@{keys.username or 'unregistered'}  ·  "
+            f"{short_addr(keys.address, 10)}", fs(14), T.text_3,
+            italic=True))
+        line.add_widget(texts)
+        line.add_widget(IconButton(
+            "chevron_up" if self._show_identities else "chevron_down",
+            label="Hide identities" if self._show_identities
+            else "Show identities", pos_hint={"center_y": .5},
+            on_release=lambda _w: self._toggle_identities()))
+        head.add_widget(line)
+        return head
+
+    def _toggle_identities(self) -> None:
+        self._show_identities = not self._show_identities
+        self.rebuild()
+
+    def _identity_row(self, ident: dict) -> Widget:
+        keys = self.app.keys
+        address = ident["address"]
+        active = address == keys.address
+        row = TappableBox(orientation="horizontal", size_hint_y=None,
+                          height=max(dp(56), line_height(16) + dp(22)),
+                          padding=[dp(18), 0, dp(18), 0], spacing=dp(16),
+                          on_tap=lambda: self._switch(address))
+        row.add_widget(Avatar(address, ident.get("username") or
+                              ident.get("label") or "?", diameter=dp(32),
+                              pos_hint={"center_y": .5}))
+        texts = BoxLayout(orientation="vertical", padding=[0, dp(9)])
+        texts.add_widget(single_line(ident.get("label") or "?", fs(16),
+                                     T.text, bold=active))
+        texts.add_widget(single_line(
+            f"@{ident.get('username') or 'unregistered'}", fs(13.5),
+            T.text_3))
+        row.add_widget(texts)
+        if active:
+            tick = Widget(size_hint_x=None, width=dp(24))
+            tick.bind(pos=lambda w, *_a: ListRow._glyph(w, "check", T.accent),
+                      size=lambda w, *_a: ListRow._glyph(w, "check",
+                                                         T.accent))
+            row.add_widget(tick)
+        return row
+
+    def _switch(self, address: str) -> None:
+        if address == self.app.keys.address:
+            self.close()
+            return
+        self.close(lambda: self.app._activate_identity(address))
+
+
+SOURCE_URL = "https://github.com/ferritecoin/fapp"
+
+#: What Ferritext is made with: (group, [(name, what it does here, licence)]).
+#: CREDITS.md says the same, for those reading the source.
+OPEN_SOURCE = (
+    ("In the app", (
+        ("Python", "the language it is written in", "PSF License 2.0"),
+        ("Kivy", "its windows, touch and drawing", "MIT"),
+        ("cryptography", "the sealing: AES-GCM, HKDF, scrypt",
+         "Apache 2.0 or BSD"),
+        ("Pillow", "photos and pictures, made small", "HPND"),
+        ("requests, urllib3, idna, charset-normalizer",
+         "talking to the relay", "Apache 2.0, MIT, BSD, MIT"),
+        ("certifi", "the certificates HTTPS trusts", "MPL 2.0"),
+        ("websocket-client", "the relay's live connection", "Apache 2.0"),
+        ("qrcode", "drawing QR codes", "BSD"),
+        ("SQLite", "the database every chat is kept in", "public domain"),
+    )),
+    ("On Android", (
+        ("python-for-android", "the Android build", "MIT"),
+        ("pyjnius", "Python speaking to Android", "MIT"),
+        ("SDL 2, SDL_image, SDL_mixer, SDL_ttf",
+         "the screen, touch, sound and type", "zlib"),
+        ("FreeType", "drawing the type", "FreeType License"),
+        ("libpng, libjpeg-turbo", "PNG and JPEG pictures",
+         "libpng, IJG and BSD"),
+        ("OpenSSL", "the cryptography beneath", "OpenSSL and SSLeay"),
+        ("libffi, cffi, pycparser", "Python calling native code",
+         "MIT, MIT, BSD"),
+        ("Opus", "calls, clear on weak networks", "BSD"),
+        ("ZXing", "reading QR codes from photos", "Apache 2.0"),
+        ("AndroidX Core", "photos from the camera app", "Apache 2.0"),
+    )),
+    ("On computers, when installed", (
+        ("Opus", "calls, clear on weak networks", "BSD"),
+        ("sounddevice, PortAudio", "choosing the microphone and speaker",
+         "MIT"),
+        ("NumPy", "voice notes at 1.5× and 2×", "BSD"),
+        ("PyAV, FFmpeg", "playing voice notes recorded on a phone",
+         "BSD, LGPL 2.1+"),
+        ("OpenCV, pyzbar, ZBar", "reading QR codes from a picture",
+         "Apache 2.0, MIT, LGPL 2.1"),
+    )),
+    ("Type", (
+        ("EB Garamond", "the text: The EB Garamond Project Authors",
+         "SIL Open Font License 1.1"),
+        ("Noto Emoji", "the emoji: Google", "SIL Open Font License 1.1"),
+        ("Titillium Web", "the capitals: Accademia di Belle Arti di Urbino",
+         "SIL Open Font License 1.1"),
+    )),
+)
+
+
+class CreditsSheet(Sheet):
+    """The open-source work Ferritext is made with, and its licences."""
+
+    def __init__(self) -> None:
+        super().__init__("Open source",
+                         subtitle="Ferritext is made with the work of many "
+                                  "people, freely shared. Thank you.")
+        for group, items in OPEN_SOURCE:
+            self.add(CapsLabel(group, size=10.5, color=T.accent))
+            for name, what, licence in items:
+                self.add(InfoLabel(
+                    f"{escape_markup(name)}[color={T.text_3.lstrip('#')}] — "
+                    f"{escape_markup(what)} · [i]{escape_markup(licence)}"
+                    f"[/i][/color]", font_size=fs(15)))
+        self.add(hint("Each project's full licence comes with it; the "
+                      "fonts' licences come with the app."))
+
+
+class AboutSheet(Sheet):
+    """What this is, which version, where its source is, and the open
+    source it is made with."""
+
+    def __init__(self, app: "FextApp") -> None:
+        super().__init__(APP_NAME, subtitle="Ferrite Text Messenger")
+        self.app = app
+        self.add(InfoLabel(
+            "Messages, photos and voice notes, sealed on this device and "
+            "opened only on the devices they are for. The relay passes on "
+            "what it cannot read.", font_size=fs(16)))
+        transport = ("TLS" if ENDPOINT.secure else "cleartext") \
+            if ENDPOINT.resolved else "not connected yet"
+        self.add(rows_card([
+            ListRow("info", f"Version {APP_VERSION}", f"Relay {SERVER_HOST} · "
+                    f"{transport}"),
+            ListRow("link", "Source code", "github.com/ferritecoin/fapp",
+                    chevron=True,
+                    on_tap=lambda: self._go(lambda: app.open_link(
+                        SOURCE_URL))),
+            ListRow("group", "Open source", "The work Ferritext is made "
+                    "with, and its licences", chevron=True,
+                    on_tap=lambda: self._go(lambda: CreditsSheet().open())),
+        ]))
+        self.add(InfoLabel("by koh-gt", color=T.text_3, italic=True,
+                           font_size=fs(15), halign="center"))
+
+    def _go(self, then: Callable) -> None:
+        self.dismiss()
+        Clock.schedule_once(lambda _dt: then(), 0.05)
+
+
+# =============================================================================
+#  Swipes (v11, touch screens)
+# =============================================================================
+SWIPE_START = dp(16)    # this far sideways, and plainly more than up or down
+SWIPE_REPLY = dp(64)    # a message slid this far to the left is replied to
+SWIPE_MOUSE = False     # a computer's mouse drag selects text instead (tests)
+SWIPE_KINDS = ("back", "menu", "reply")
+
+
+def window_pos(widget, x: float, y: float) -> tuple:
+    """Where a point a touch handler of `widget` was given lies on the
+    window. A handler sees the touch in its parent's coordinates (a
+    MotionEvent itself knows nothing of windows)."""
+    parent = widget.parent
+    return parent.to_window(x, y) if parent is not None else (x, y)
+
+
+def hits(widget, wx: float, wy: float) -> bool:
+    """Is window point (wx, wy) on `widget`? (collide_point wants the
+    parent's coordinates — a scroll view's own are its contents'.)"""
+    parent = widget.parent
+    if parent is None:
+        return False
+    return widget.collide_point(*parent.to_widget(wx, wy))
+
+
+def swiped(touch) -> bool:
+    """Has a page taken this touch for a swipe (so it is no tap or hold)?"""
+    return touch.ud.get("fext_swipe") in SWIPE_KINDS
+
+
+def _take_touch(touch, owner) -> None:
+    """A page takes a touch for a swipe: whatever else holds it lets go —
+    a scroll view without passing it on as a tap, a button without
+    firing."""
+    for ref in list(touch.grab_list):
+        widget = ref()
+        if widget is None or widget is owner:
+            continue
+        touch.ungrab(widget)
+        if isinstance(widget, ScrollView):
+            touch.ud[widget._get_uid("svavoid")] = True
+            if getattr(widget, "_touch", None) is touch:
+                widget._touch = None
+            Clock.unschedule(widget._change_touch_mode)
+        elif isinstance(widget, ButtonBehavior):
+            widget.state = "normal"
+
+
+class SwipeGestures:
+    """Sideways swipes on a page (v11). To the right: back to the page
+    beneath, which shows as the page follows the finger — or, on the chat
+    list, the menu comes in with it. To the left on a message: reply to it.
+    A swipe is decided early, once plainly sideways, and taken from what
+    lies below so it never also counts as a tap; where it may start is the
+    page's to say (never in the composer or on a voice note's waveform).
+    On a computer a mouse drag selects text instead."""
+
+    def swipe_kind(self, touch, dx: float) -> Optional[str]:
+        """'back', 'menu' or 'reply' for a swipe starting here, or None."""
+        return None
+
+    # ---- deciding --------------------------------------------------------------
+    def on_touch_move(self, touch):
+        page = touch.ud.get("fext_swipe_page")
+        if page is self:
+            if touch.grab_current is self:
+                self._swipe_follow(touch)
+            return True
+        if page is None and touch.grab_current is None and \
+                touch.ud.get("fext_swipe") is None and \
+                (SWIPE_MOUSE or getattr(touch, "device", "") != "mouse"):
+            dx, dy = touch.x - touch.ox, touch.y - touch.oy
+            if abs(dy) > SWIPE_START and abs(dy) >= abs(dx):
+                touch.ud["fext_swipe"] = "none"          # a scroll
+            elif abs(dx) > SWIPE_START and abs(dx) > 1.8 * abs(dy):
+                kind = self.swipe_kind(touch, dx)
+                if kind and self._swipe_start(touch, kind):
+                    touch.ud["fext_swipe"] = kind
+                    _take_touch(touch, self)
+                    touch.grab(self)
+                    touch.ud["fext_swipe_page"] = self
+                    touch.ud["fext_swipe_v"] = (touch.x, time.monotonic(), 0.0)
+                    return True
+                touch.ud["fext_swipe"] = "none"
+        return super().on_touch_move(touch)
+
+    def on_touch_up(self, touch):
+        if touch.ud.get("fext_swipe_page") is self:
+            if touch.grab_current is self:
+                touch.ungrab(self)
+                self._swipe_finish(touch)
+            return True
+        return super().on_touch_up(touch)
+
+    # ---- following -----------------------------------------------------------------
+    def _swipe_start(self, touch, kind: str) -> bool:
+        if kind == "back":
+            return self._back_begin()
+        if kind == "menu":
+            return self.app.drawer_drag_begin()
+        if kind == "reply":
+            return self.reply_swipe_begin(touch)
+        return False
+
+    def _swipe_follow(self, touch) -> None:
+        x, t, _v = touch.ud["fext_swipe_v"]
+        now = time.monotonic()
+        if now > t:
+            touch.ud["fext_swipe_v"] = (touch.x, now, (touch.x - x) / (now - t))
+        dx = touch.x - touch.ox
+        kind = touch.ud.get("fext_swipe")
+        if kind == "back":
+            self._back_follow(dx)
+        elif kind == "menu":
+            self.app.drawer_drag(dx)
+        elif kind == "reply":
+            self.reply_swipe_follow(dx)
+
+    def _swipe_finish(self, touch) -> None:
+        dx = touch.x - touch.ox
+        speed = touch.ud.get("fext_swipe_v", (0, 0, 0.0))[2]
+        kind = touch.ud.get("fext_swipe")
+        if kind == "back":
+            self._back_end(dx > self.width * 0.33 or
+                           (speed > dp(800) and dx > dp(40)))
+        elif kind == "menu":
+            self.app.drawer_drag_end(dx, speed)
+        elif kind == "reply":
+            self.reply_swipe_end(dx)
+
+    # ---- back: the page follows the finger, the one beneath shows -----------------
+    def _back_begin(self) -> bool:
+        app = self.app
+        target = app.back_target()
+        if target is None or app.manager.current != self.name:
+            return False
+        name, action = target
+        sm = app.manager
+        under = sm.get_screen(name)
+        if name == "chats":
+            app.repaint_list_if_stale()
+        if under.parent is None:
+            # Beneath this page, as LayerTransition lays it going back.
+            super(ScreenManager, sm).add_widget(under, len(sm.children))
+        under.x, under.opacity = sm.x, 1
+        self._swipe_under, self._swipe_back = under, action
+        return True
+
+    def _back_follow(self, dx: float) -> None:
+        sm = self.app.manager
+        self.x = sm.x + max(0.0, dx)
+        self.opacity = 1 - 0.3 * min(1.0, max(0.0, dx) / max(1, self.width))
+
+    def _back_end(self, go: bool) -> None:
+        sm, under = self.app.manager, self._swipe_under
+        action = self._swipe_back
+
+        def settle(*_a):
+            if under.parent is not None and under is not sm.current_screen:
+                sm.real_remove_widget(under)
+            if go:
+                self.app.navigate_instantly(action)
+            self.x, self.opacity = sm.x, 1
+        if motion(1):
+            anim = Animation(x=sm.x + (self.width if go else 0),
+                             opacity=0.6 if go else 1, d=0.13, t="out_quad")
+            anim.bind(on_complete=settle)
+            anim.start(self)
+        else:
+            settle()
+
+    # ---- reply (ConversationScreen) ----------------------------------------------------
+    def reply_swipe_begin(self, touch) -> bool:
+        return False
+
+    def reply_swipe_follow(self, dx: float) -> None:
+        pass
+
+    def reply_swipe_end(self, dx: float) -> None:
+        pass
+
+
+# =============================================================================
 #  The chat list — the "home" screen
 # =============================================================================
 BULLET = "•"
 FLEURON = "❦"                 # ❦ — the empty page's ornament
+
+
+class CallButton(ButtonBehavior, BoxLayout):
+    """A round call control with its name beneath. `kind` 'end' is red,
+    'accept' green; a plain one fills in while it is on (mute, speaker)."""
+
+    def __init__(self, icon: str, caption: str, on_tap: Callable,
+                 kind: str = "plain", **kw):
+        kw.setdefault("size_hint", (None, None))
+        kw.setdefault("size", (dp(88), dp(64) + dp(8) + line_height(13.5)))
+        super().__init__(orientation="vertical", spacing=dp(8), **kw)
+        self.icon, self.kind, self.on = icon, kind, False
+        self.disc = Widget(size_hint=(None, None), size=(dp(64), dp(64)),
+                           pos_hint={"center_x": .5})
+        self.add_widget(self.disc)
+        self.caption = Label(text=caption, font_size=fs(13.5),
+                             color=C(T.text_2), size_hint_y=None,
+                             height=line_height(13.5), halign="center")
+        self.caption.bind(size=lambda w, v: setattr(w, "text_size", v))
+        self.add_widget(self.caption)
+        self.disc.bind(pos=self._draw, size=self._draw)
+        self.bind(state=self._draw)
+        self.bind(on_release=lambda _w: on_tap())
+        self._draw()
+
+    def set_on(self, on: bool, icon: Optional[str] = None,
+               caption: Optional[str] = None) -> None:
+        self.on = on
+        if icon:
+            self.icon = icon
+        if caption:
+            self.caption.text = caption
+        self._draw()
+
+    def _draw(self, *_a) -> None:
+        d = self.disc
+        d.canvas.clear()
+        if self.kind == "end":
+            fill, ink = T.alert, T.on_alert
+        elif self.kind == "accept":
+            fill, ink = T.ok, T.on_alert
+        elif self.on:
+            fill, ink = T.text, T.bg
+        else:
+            fill, ink = T.surface_hi, T.text
+        with d.canvas:
+            Color(*C(fill))
+            SmoothEllipse(pos=d.pos, size=d.size)
+            if self.state == "down":
+                Color(0, 0, 0, .18)
+                SmoothEllipse(pos=d.pos, size=d.size)
+            draw_icon(self.icon, d.center_x, d.center_y, dp(28), C(ink))
+
+
+class CallOverlay(ModalView):
+    """The call, full screen: who, how far along (or how long), which way
+    the sound goes, and the controls — answer or decline while it rings;
+    mute, loudspeaker (on a phone) and hang up once it is on."""
+
+    def __init__(self, app: "FextApp", call: "Call") -> None:
+        super().__init__(size_hint=(1, 1), auto_dismiss=False,
+                         background_color=(0, 0, 0, 0),
+                         overlay_color=(0, 0, 0, 0))
+        self.app, self.call = app, call
+        self._layout = None
+        contact = app.store.get_contact(call.peer) if app.store else None
+        name = (contact or {}).get("username") or short_addr(call.peer, 14)
+        root = BoxLayout(orientation="vertical",
+                         padding=[dp(24), dp(34), dp(24), dp(40)],
+                         spacing=dp(6))
+        paint_round(root, T.bg, radius=0)
+        root.add_widget(CapsLabel("Voice call · sealed end to end",
+                                  size=10.5, color=T.text_3,
+                                  halign="center"))
+        root.add_widget(Widget(size_hint_y=.22))
+        disc = AnchorLayout(size_hint_y=None, height=dp(136))
+        disc.add_widget(Avatar(call.peer, name, diameter=dp(128)))
+        root.add_widget(disc)
+        root.add_widget(Widget(size_hint_y=None, height=dp(14)))
+        self.name_label = InfoLabel(name, font_size=fs(28), halign="center")
+        root.add_widget(self.name_label)
+        self.status = single_line("", fs(17), T.text_2, italic=True,
+                                  halign="center", size_hint_y=None,
+                                  height=line_height(17) + dp(4))
+        root.add_widget(self.status)
+        self.detail = single_line("", fs(13.5), T.text_3, halign="center",
+                                  size_hint_y=None,
+                                  height=line_height(13.5) + dp(2))
+        root.add_widget(self.detail)
+        root.add_widget(Widget())
+        self.controls = BoxLayout(size_hint_y=None, height=dp(110),
+                                  spacing=dp(10))
+        root.add_widget(self.controls)
+        self.add_widget(root)
+        self.mute = CallButton("mic", "Mute", lambda: app.toggle_call_mute())
+        self.speaker = CallButton("speaker", "Speaker",
+                                  lambda: app.choose_call_route())
+        self.end = CallButton("phone_end", "End", lambda: app.end_call(),
+                              kind="end")
+        self.decline = CallButton("phone_end", "Decline",
+                                  lambda: app.decline_call(), kind="end")
+        self.accept = CallButton("phone", "Accept",
+                                 lambda: app.answer_call(), kind="accept")
+        self.refresh()
+
+    def _arrange(self, layout: str) -> None:
+        if layout == self._layout:
+            return
+        self._layout = layout
+        self.controls.clear_widgets()
+        if layout == "ringing":
+            parts = [Widget(), self.decline, Widget(), self.accept, Widget()]
+        elif layout == "ended":
+            parts = []
+        else:
+            parts = [Widget(), self.mute]
+            if self.app.call_audio_has_speaker():
+                parts += [Widget(), self.speaker]
+            parts += [Widget(), self.end, Widget()]
+        for part in parts:
+            self.controls.add_widget(part)
+
+    def refresh(self) -> None:
+        call = self.call
+        if call.ended:
+            self.status.text = call.summary or "Call ended"
+            self.detail.text = ""
+            self._arrange("ended")
+            return
+        self._arrange("ringing" if call.state == "incoming" else "call")
+        self.mute.set_on(call.muted, "mic_off" if call.muted else "mic",
+                         "Unmute" if call.muted else "Mute")
+        route = getattr(call, "route", "") or (
+            "speaker" if call.speaker else "earpiece")
+        if route == "bluetooth":
+            self.speaker.set_on(True, "bluetooth", "Bluetooth")
+        elif route == "wired":
+            self.speaker.set_on(False, "speaker", "Headset")
+        else:
+            self.speaker.set_on(call.speaker, "speaker", "Speaker")
+        if call.state == "active":
+            self.status.text = "Reconnecting…" if call.quiet else \
+                call_clock(call.duration())
+        else:
+            self.status.text = {
+                "calling": "Calling…", "ringing": "Ringing…",
+                "incoming": "Incoming voice call",
+                "connecting": "Connecting…"}.get(call.state, "")
+        engine = call.engine
+        self.detail.text = call_path_label(
+            call.path, engine.rtt_ms if engine else None) \
+            if call.state in ("active", "connecting") else ""
+
+
+class CallPill(ButtonBehavior, Widget):
+    """While the call screen is set aside: a slim bar just under the app
+    bar (which stays usable), the time running, tap to return."""
+
+    def __init__(self, app: "FextApp", **kw):
+        super().__init__(size_hint=(None, None), **kw)
+        self.app = app
+        self.label = Label(font_size=fs(14.5), color=C(T.on_accent),
+                           halign="center", valign="middle")
+        self.add_widget(self.label)
+        self.bind(pos=self._draw, size=self._draw, state=self._draw)
+        self.bind(on_release=lambda _w: app.show_call())
+        Window.bind(size=self._place)
+        self._place()
+
+    PILL = dp(38)                  # drawn this tall, inside a 48dp target
+
+    def _place(self, *_a) -> None:
+        bar = max(dp(62), line_height(19) + line_height(14) + dp(14))
+        self.size = (min(Window.width - dp(32), dp(320)), TOUCH)
+        self.pos = ((Window.width - self.width) / 2,
+                    Window.height - bar - self.height - dp(3))
+
+    def _draw(self, *_a) -> None:
+        self.canvas.before.clear()
+        y = self.y + (self.height - self.PILL) / 2
+        with self.canvas.before:
+            Color(*C(T.accent_press if self.state == "down" else T.accent))
+            SmoothRoundedRectangle(pos=(self.x, y),
+                                   size=(self.width, self.PILL),
+                                   radius=[self.PILL / 2])
+        self.label.pos, self.label.size = self.pos, self.size
+        self.label.text_size = self.size
+
+    def set_text(self, text: str) -> None:
+        self.label.text = text
+
+    def remove(self) -> None:
+        Window.unbind(size=self._place)
+        if self.parent is not None:
+            self.parent.remove_widget(self)
+
+
+class LayerTransition(TransitionBase):
+    """Screens as layers. Forward, the new layer fades in over the page it
+    covers while settling from a short slide; back, the top layer fades
+    and slides away, uncovering the page beneath, which stays still. With
+    reduced motion, a plain quick fade."""
+
+    def __init__(self, forward: bool = True, **kw):
+        kw.setdefault("duration", (LAYER_IN if forward else LAYER_OUT)
+                      if motion(1) else LAYER_FADE)
+        super().__init__(**kw)
+        self.forward = forward
+        self.shift = dp(28) if motion(1) else 0
+
+    def add_screen(self, screen):
+        if self.forward:
+            self.manager.real_add_widget(screen)
+            return
+        # Back: the page being uncovered goes BENEATH the leaving one.
+        # ScreenManager.real_add_widget drops an index, so add it through
+        # the layout itself.
+        if screen.parent is not None:
+            screen.parent.real_remove_widget(screen)
+        super(ScreenManager, self.manager).add_widget(
+            screen, len(self.manager.children))
+
+    def on_progress(self, progress):
+        a = 1 - (1 - progress) ** 3                       # out cubic
+        x = self.manager.x
+        if self.forward:
+            self.screen_out.x, self.screen_out.opacity = x, 1
+            self.screen_in.x = x + self.shift * (1 - a)
+            self.screen_in.opacity = a
+        else:
+            self.screen_in.x, self.screen_in.opacity = x, 1
+            self.screen_out.x = x + self.shift * a
+            self.screen_out.opacity = 1 - a
+
+    def on_complete(self):
+        for screen in (self.screen_in, self.screen_out):
+            screen.x, screen.opacity = self.manager.x, 1
+        super().on_complete()
 
 
 class AppBar(BoxLayout):
@@ -7540,8 +13702,10 @@ class ConversationRow(ButtonBehavior, BoxLayout):
     text does. Groups show who spoke last; your own last message shows its
     ticks."""
 
+    LONG_PRESS = 0.42                     # seconds, as BubbleRow
+
     def __init__(self, conv: dict, on_open: Callable[[str], None],
-                 author_name: Optional[Callable] = None, **kw):
+                 author_name: Optional[Callable] = None, screen=None, **kw):
         kw.setdefault("size_hint_y", None)
         kw.setdefault("height", max(dp(76), line_height(18) +
                                     line_height(15.5) + dp(26)))
@@ -7549,17 +13713,20 @@ class ConversationRow(ButtonBehavior, BoxLayout):
         kw.setdefault("spacing", dp(14))
         super().__init__(**kw)
         peer, kind = conv["peer"], conv.get("kind", "dm")
-        self.peer = peer
+        self.peer, self.kind, self.conv = peer, kind, conv
+        self._screen, self._press, self._held = screen, None, False
         if kind == "self":
-            name = "Notes to self"
+            name = "Saved messages"
         elif kind == "group":
             name = conv.get("group_name") or "Group"
         else:
             name = conv.get("username") or short_addr(peer, 14)
         unread = int(conv.get("unread") or 0)
-        notify = conv.get("notify")
-        muted = kind != "self" and notify is not None and not notify
+        muted = kind != "self" and bool(conv.get("muted"))
         with self.canvas.before:
+            self._wash_col = Color(*T.select)
+            self._wash_col.a = 0
+            self._wash = Rectangle()
             self._bg = Color(0, 0, 0, 0)
             self._rect = Rectangle()
         hairline(self, "bottom", inset=dp(18) + dp(52) + dp(14))
@@ -7567,18 +13734,21 @@ class ConversationRow(ButtonBehavior, BoxLayout):
                   state=lambda _w, st: setattr(
                       self._bg, "rgba", C(T.press) if st == "down"
                       else (0, 0, 0, 0)))
-        self.bind(on_release=lambda _w: on_open(peer))
+        self.bind(on_release=lambda _w: self._released(on_open))
 
-        self.add_widget(Avatar(peer, name, diameter=dp(52), kind=kind,
-                               pos_hint={"center_y": .5}))
+        self.avatar = Avatar(peer, name, diameter=dp(52), kind=kind,
+                             pos_hint={"center_y": .5})
+        self.add_widget(self.avatar)
         middle = BoxLayout(orientation="vertical", padding=[0, dp(2)])
         top = BoxLayout(spacing=dp(6))
         top.add_widget(single_line(name, fs(18), T.text, bold=True))
-        if muted:
-            bell = Widget(size_hint_x=None, width=dp(18))
-            bell.bind(pos=lambda w, *_a: self._bell(w),
-                      size=lambda w, *_a: self._bell(w))
-            top.add_widget(bell)
+        for flag, glyph in ((conv.get("blocked"), "block"), (muted, "bell_off"),
+                            (conv.get("pinned"), "pin")):
+            if flag:
+                mark = Widget(size_hint_x=None, width=dp(18))
+                mark.bind(pos=lambda w, *_a, g=glyph: self._mark(w, g),
+                          size=lambda w, *_a, g=glyph: self._mark(w, g))
+                top.add_widget(mark)
         when = Label(text=pretty_day(conv.get("last_at") or "")
                      if conv.get("preview") is not None else "",
                      font_size=fs(13.5),
@@ -7592,7 +13762,15 @@ class ConversationRow(ButtonBehavior, BoxLayout):
 
         bottom = BoxLayout(spacing=dp(6))
         preview, italic = self._preview(conv, kind, author_name)
-        if conv.get("last_direction") == "out" and \
+        draft = " ".join(str(conv.get("draft") or "").split())
+        if draft:
+            mark = Label(text="Draft:", font_size=fs(15.5), color=C(T.alert),
+                         size_hint_x=None, halign="left", valign="middle")
+            mark.texture_update()
+            mark.width = mark.texture_size[0] + dp(2)
+            bottom.add_widget(mark)
+            preview, italic = draft, False
+        elif conv.get("last_direction") == "out" and \
                 conv.get("last_kind") != "event" and kind != "self":
             status = int(conv.get("last_status") or 0)
             if not conv.get("ticks_enabled", 1) and kind == "dm":
@@ -7608,6 +13786,11 @@ class ConversationRow(ButtonBehavior, BoxLayout):
             holder = AnchorLayout(size_hint_x=None, width=dp(44),
                                   anchor_x="right")
             holder.add_widget(UnreadBadge(min(unread, 9999), muted=muted))
+            bottom.add_widget(holder)
+        elif conv.get("marked_unread"):           # marked unread by hand
+            holder = AnchorLayout(size_hint_x=None, width=dp(44),
+                                  anchor_x="right")
+            holder.add_widget(UnreadBadge(0, muted=muted, dot=True))
             bottom.add_widget(holder)
         middle.add_widget(bottom)
         self.add_widget(middle)
@@ -7634,13 +13817,108 @@ class ConversationRow(ButtonBehavior, BoxLayout):
 
     def _sync(self, *_a):
         self._rect.pos, self._rect.size = self.pos, self.size
+        self._wash.pos, self._wash.size = self.pos, self.size
+
+    def set_selected(self, selected: bool) -> None:
+        self._wash_col.a = T.select[3] if selected else 0
 
     @staticmethod
-    def _bell(widget):
+    def _mark(widget, glyph: str):
         widget.canvas.clear()
         with widget.canvas:
-            draw_icon("bell_off", (widget.x + widget.width / 2), (widget.y + widget.height / 2), dp(14),
-                      C(T.text_3))
+            draw_icon(glyph, (widget.x + widget.width / 2),
+                      (widget.y + widget.height / 2), dp(14), C(T.text_3))
+
+    # ---- touches: tap opens, hold selects (then taps add and remove) --------
+    def on_touch_down(self, touch):
+        if not self.collide_point(*touch.pos) or touch.is_mouse_scrolling:
+            return super().on_touch_down(touch)
+        self._held = False
+        screen = self._screen
+        if screen is not None and self.kind != "self":
+            if screen.selecting:
+                screen.toggle_selection(self.peer)
+                return True
+            if getattr(touch, "button", "left") == "right":
+                screen.start_selection(self.peer)
+                return True
+            self._press = (touch.uid, touch.pos, Clock.schedule_once(
+                lambda _dt: self._long_press(touch), self.LONG_PRESS))
+        return super().on_touch_down(touch)
+
+    def _long_press(self, touch):
+        if self._press and self._press[0] == touch.uid and not swiped(touch):
+            self._press = None
+            self._held = True
+            self.state = "normal"
+            self._screen.start_selection(self.peer)
+
+    def on_touch_move(self, touch):
+        if self._press and self._press[0] == touch.uid:
+            ox, oy = self._press[1]
+            if abs(touch.x - ox) > dp(10) or abs(touch.y - oy) > dp(10):
+                self._press[2].cancel()
+                self._press = None
+        return super().on_touch_move(touch)
+
+    def on_touch_up(self, touch):
+        if self._press and self._press[0] == touch.uid:
+            self._press[2].cancel()
+            self._press = None
+        return super().on_touch_up(touch)
+
+    def _released(self, on_open) -> None:
+        if self._held:              # the hold selected it; do not open it
+            self._held = False
+            return
+        on_open(self.peer)
+
+
+class ArchiveRow(ButtonBehavior, BoxLayout):
+    """The way into archived chats, at the top of the list: how many, and
+    how many of their messages are unread."""
+
+    def __init__(self, count: int, unread: int, on_open: Callable, **kw):
+        kw.setdefault("size_hint_y", None)
+        kw.setdefault("height", max(dp(60), line_height(17) + dp(26)))
+        kw.setdefault("padding", [dp(18), dp(6), dp(18), dp(6)])
+        kw.setdefault("spacing", dp(14))
+        super().__init__(**kw)
+        disc = Widget(size_hint_x=None, width=dp(52))
+
+        def paint(w, *_a):
+            w.canvas.clear()
+            with w.canvas:
+                Color(*C(T.surface_hi))
+                d = dp(44)
+                SmoothEllipse(pos=(w.x + (w.width - d) / 2,
+                                   w.y + (w.height - d) / 2), size=(d, d))
+                draw_icon("archive", w.x + w.width / 2, w.y + w.height / 2,
+                          dp(22), C(T.text_2))
+        disc.bind(pos=paint, size=paint)
+        self.add_widget(disc)
+        self.add_widget(single_line("Archived chats", fs(17), T.text_2))
+        tail = BoxLayout(size_hint_x=None, width=dp(64), spacing=dp(6))
+        tail.add_widget(single_line(str(count), fs(14), T.text_3,
+                                    halign="right"))
+        if unread:
+            holder = AnchorLayout(size_hint_x=None, width=dp(36),
+                                  anchor_x="right")
+            holder.add_widget(UnreadBadge(min(unread, 9999), muted=True))
+            tail.add_widget(holder)
+        self.add_widget(tail)
+        hairline(self, "bottom", inset=dp(18) + dp(52) + dp(14))
+        with self.canvas.before:
+            self._bg = Color(0, 0, 0, 0)
+            self._rect = Rectangle()
+        self.bind(pos=lambda *_a: self._sync(), size=lambda *_a: self._sync(),
+                  state=lambda _w, st: setattr(
+                      self._bg, "rgba", C(T.press) if st == "down"
+                      else (0, 0, 0, 0)))
+        self.bind(on_release=lambda _w: on_open())
+
+    def _sync(self):
+        self._rect.pos, self._rect.size = self.pos, self.size
 
 
 class FabButton(IconButton):
@@ -7661,7 +13939,7 @@ class FabButton(IconButton):
                       C(T.on_accent), width=dp(1.0))
 
 
-class ChatsScreen(Screen):
+class ChatsScreen(SwipeGestures, Screen):
     """Home: the wordmark, who you are, your conversations, and the button
     that starts a new one."""
 
@@ -7675,25 +13953,87 @@ class ChatsScreen(Screen):
                            pos_hint={"x": 0, "y": 0})
         root.add_widget(column)
 
-        # ---- the head: wordmark, identity, settings --------------------------
-        head = BoxLayout(size_hint_y=None, height=max(dp(84), line_height(30)
-                                                      + dp(30)),
-                         padding=[dp(20), dp(6), dp(6), dp(4)], spacing=dp(2))
-        titles = BoxLayout(orientation="vertical", padding=[0, dp(8)])
-        self.brand = single_line(APP_NAME, fs(30), T.text)
-        titles.add_widget(self.brand)
-        # Not in capitals: an address is case-sensitive Base58.
-        self.me_label = single_line("", fs(14), T.text_3, italic=True)
-        titles.add_widget(self.me_label)
-        head.add_widget(titles)
-        self.avatar_holder = AnchorLayout(size_hint_x=None, width=TOUCH)
-        head.add_widget(self.avatar_holder)
-        head.add_widget(IconButton("sliders", label="Settings",
+        # ---- the head: the menu, the wordmark (who you are beneath), search --
+        head = BoxLayout(size_hint_y=None, height=max(dp(72), line_height(26)
+                                                      + line_height(13.5)
+                                                      + dp(22)),
+                         padding=[dp(4), dp(4), dp(6), dp(4)], spacing=dp(2))
+        head.add_widget(IconButton("menu", label="Menu",
                                    pos_hint={"center_y": .5},
                                    on_release=lambda _w:
-                                   self.app.open_settings()))
+                                   self.app.open_drawer()))
+        titles = BoxLayout(orientation="vertical",
+                           padding=[dp(6), dp(10), 0, dp(8)])
+        self.brand = single_line(APP_NAME, fs(26), T.text)
+        titles.add_widget(self.brand)
+        # Not in capitals: an address is case-sensitive Base58.
+        self.me_label = single_line("", fs(13.5), T.text_3, italic=True)
+        titles.add_widget(self.me_label)
+        head.add_widget(titles)
+        head.add_widget(IconButton("search", label="Search",
+                                   pos_hint={"center_y": .5},
+                                   on_release=lambda _w:
+                                   self.app.open_search()))
         hairline(head, "bottom", inset=dp(20), inset_right=dp(20))
-        column.add_widget(head)
+        self.head = head
+        self.head_box = BoxLayout(size_hint_y=None, height=head.height)
+        self.head_box.add_widget(head)
+        column.add_widget(self.head_box)
+        # ---- search: the head becomes a field, the list becomes results ------
+        self.searching = False
+        self._search_ev = None
+        self.search_head = BoxLayout(size_hint_y=None, height=head.height,
+                                     padding=[dp(4), dp(4), dp(6), dp(4)],
+                                     spacing=dp(2))
+        self.search_head.add_widget(IconButton(
+            "back", label="Close search", pos_hint={"center_y": .5},
+            on_release=lambda _w: self.exit_search()))
+        self.search_field = Field("Search names and messages",
+                                  pos_hint={"center_y": .5})
+        self.search_field.input.font_size = fs(18)
+        self.search_field.input.bind(text=lambda _w, v: self._search_soon())
+        self.search_head.add_widget(self.search_field)
+        self.search_clear = IconButton(
+            "close", label="Clear search", pos_hint={"center_y": .5},
+            on_release=lambda _w: setattr(self.search_field, "text", ""))
+        self.search_head.add_widget(self.search_clear)
+        # ---- hold a chat: the head becomes what can be done with it --------
+        self.selected: list = []          # peers, in the order picked
+        self.showing_archive = False
+        self._rows: dict = {}             # peer -> (signature, row)
+        self.select_head = BoxLayout(size_hint_y=None, height=head.height,
+                                     padding=[dp(4), dp(4), dp(4), dp(4)],
+                                     spacing=dp(2))
+        self.select_head.add_widget(IconButton(
+            "close", label="Cancel selection", pos_hint={"center_y": .5},
+            on_release=lambda _w: self.clear_selection()))
+        self.select_count = single_line("1", fs(21), T.text,
+                                        padding=[dp(6), 0])
+        self.select_head.add_widget(self.select_count)
+        self.act_mute = IconButton("bell_off", label="Mute",
+                                   pos_hint={"center_y": .5},
+                                   on_release=lambda _w: self._act_mute())
+        self.act_archive = IconButton("archive", label="Archive",
+                                      pos_hint={"center_y": .5},
+                                      on_release=lambda _w:
+                                      self._act_archive())
+        self.act_delete = IconButton("delete", label="Delete",
+                                     pos_hint={"center_y": .5},
+                                     on_release=lambda _w: self._act_delete())
+        self.act_more = IconButton("more", label="More",
+                                   pos_hint={"center_y": .5},
+                                   on_release=lambda _w: self._act_more())
+        for button in (self.act_mute, self.act_archive, self.act_delete,
+                       self.act_more):
+            self.select_head.add_widget(button)
+        self.archive_head = BoxLayout(size_hint_y=None, height=head.height,
+                                      padding=[dp(4), dp(4), dp(6), dp(4)],
+                                      spacing=dp(2))
+        self.archive_head.add_widget(IconButton(
+            "back", label="Back to chats", pos_hint={"center_y": .5},
+            on_release=lambda _w: self.show_archive(False)))
+        self.archive_head.add_widget(single_line("Archived chats", fs(22),
+                                                 T.text, padding=[dp(6), 0]))
 
         # ---- the status line: tap it to reconnect at once --------------------
         ribbon = TappableBox(on_tap=lambda: self.app.retry_now(),
@@ -7730,17 +14070,109 @@ class ChatsScreen(Screen):
                               size_hint=(1, 1), pos_hint={"x": 0, "y": 0})
         holder.add_widget(self.fab)
         root.add_widget(holder)
+        self.fab_holder, self._root = holder, root
+
+    # ---- v11: a swipe to the right brings the menu in ------------------------------
+    def swipe_kind(self, touch, dx: float) -> Optional[str]:
+        if dx <= 0 or self.searching or self.selecting:
+            return None
+        wx, wy = window_pos(self, *touch.opos)
+        return "menu" if hits(self.scroll, wx, wy) else None
+
+    # ---- search ----------------------------------------------------------------
+    def enter_search(self) -> None:
+        if self.searching or not self.app.keys.has_identity:
+            return
+        self.clear_selection()
+        self.searching = True
+        self._set_head()
+        self.search_field.text = ""
+        self._show_results("")
+        Clock.schedule_once(lambda _dt: setattr(self.search_field.input,
+                                                "focus", True), 0.05)
+
+    def exit_search(self) -> None:
+        if not self.searching:
+            return
+        self.searching = False
+        if self._search_ev is not None:
+            self._search_ev.cancel()
+            self._search_ev = None
+        self.search_field.input.focus = False
+        self._set_head()
+        self.app.refresh_sidebar()
+
+    def _search_soon(self) -> None:
+        """Search as you type, once the typing pauses for a moment."""
+        if not self.searching:
+            return
+        if self._search_ev is not None:
+            self._search_ev.cancel()
+        self._search_ev = Clock.schedule_once(
+            lambda _dt: self._show_results(self.search_field.text), 0.18)
+
+    def _show_results(self, query: str) -> None:
+        self._search_ev = None
+        self.list.clear_widgets()
+        self.scroll.scroll_y = 1
+        app = self.app
+        q = (query or "").strip()
+        if not q:
+            self.list.add_widget(InfoLabel(
+                "Names, usernames, addresses and the words of your "
+                "messages, on this device only.", color=T.text_3,
+                italic=True, font_size=fs(15.5), halign="center",
+                padding=[dp(32), dp(28)]))
+            return
+        fold = q.casefold()
+        chats = []
+        for conv in app.store.conversations(me=app.keys.address):
+            name, kind = conversation_title(app, conv["peer"])
+            hay = " ".join(filter(None, (name, conv.get("username"),
+                                         conv["peer"]))).casefold()
+            if fold in hay:
+                chats.append((conv["peer"], name, kind))
+        hits = app.store.search_messages(q, limit=80)
+        if chats:
+            self.list.add_widget(SectionHead("Chats"))
+            for peer, name, kind in chats[:12]:
+                self.list.add_widget(PersonRow(
+                    peer, name, short_addr(peer, 14) if kind == "dm" else
+                    ("Group" if kind == "group" else "Saved messages"),
+                    kind=kind, on_tap=lambda p=peer: self._open(p)))
+        if hits:
+            self.list.add_widget(SectionHead(
+                f"Messages · {len(hits)}{'+' if len(hits) >= 80 else ''}"))
+            author = app.conversation_screen.author_name
+            for hit in hits:
+                title, kind = conversation_title(app, hit["peer"])
+                body = hit["body"] or ""
+                if kind == "group" and hit.get("author"):
+                    body = f"{author(hit['author'])}: {body}"
+                elif hit["direction"] == "out" and kind != "self":
+                    body = f"You: {body}"
+                self.list.add_widget(SearchHit(
+                    title, hit["peer"], kind, pretty_time(hit["created_at"]),
+                    search_snippet(body, q), on_tap=lambda h=hit:
+                    self._open(h["peer"], h["id"])))
+        if not chats and not hits:
+            self.list.add_widget(InfoLabel(
+                f"Nothing here matches “{q}”.", color=T.text_3,
+                italic=True, font_size=fs(15.5), halign="center",
+                padding=[dp(32), dp(28)]))
+
+    def _open(self, peer: str, message_id: Optional[int] = None) -> None:
+        self.search_field.input.focus = False
+        if message_id is None:
+            self.app.open_conversation(peer)
+        else:
+            self.app.open_conversation_at(peer, message_id)
 
     def refresh_header(self) -> None:
         keys = self.app.keys
-        self.avatar_holder.clear_widgets()
         if not keys.has_identity:
             self.me_label.text = "end-to-end encrypted correspondence"
             return
-        avatar = AvatarButton(keys.address, keys.username or keys.label,
-                              diameter=dp(38))
-        avatar.bind(on_release=lambda _w: IdentitySheet(self.app).open())
-        self.avatar_holder.add_widget(avatar)
         self.me_label.text = (f"@{keys.username}" if keys.username
                               else "unregistered") + \
             f"  ·  {short_addr(keys.address, 10)}"
@@ -7754,6 +14186,13 @@ class ChatsScreen(Screen):
         self.retry_hint.opacity = 0 if calm or "retry" in text.lower() else 1
 
     def refresh_list(self, conversations: list) -> None:
+        """Saved messages first, then pinned chats (the latest pin first),
+        then the rest by recent activity — or, in the archive, only the
+        archived ones. Rows whose chat has not changed are kept, not
+        rebuilt, which is what makes coming back to the list cheap."""
+        if self.searching:              # results stay until search closes
+            return
+        self._convs = {c["peer"]: c for c in conversations}
         self.list.clear_widgets()
         keys = self.app.keys
         if not keys.has_identity:
@@ -7763,14 +14202,174 @@ class ChatsScreen(Screen):
                      None) or {"peer": keys.address, "kind": "self",
                                "preview": None, "unread": 0}
         rest = [c for c in conversations if c.get("kind") != "self"]
+        archived = [c for c in rest if c.get("archived")]
+        live = [c for c in rest if not c.get("archived")]
+        if self.showing_archive:
+            shown = sorted(archived, key=lambda c: -(c.get("pinned") or 0)) \
+                if archived else []
+            if not archived:
+                self.show_archive(False)
+                return
+        else:
+            pinned = sorted((c for c in live if c.get("pinned")),
+                            key=lambda c: -c["pinned"])
+            shown = [notes] + pinned + [c for c in live if not c.get("pinned")]
+            if archived:
+                self.list.add_widget(ArchiveRow(
+                    len(archived), sum(int(c.get("unread") or 0)
+                                       for c in archived),
+                    lambda: self.show_archive(True)))
         author = self.app.conversation_screen.author_name
-        self.list.add_widget(ConversationRow(notes, self.app.open_conversation,
-                                             author))
-        for conv in rest:
-            self.list.add_widget(ConversationRow(
-                conv, self.app.open_conversation, author))
-        if not rest:
+        rows = {}
+        for conv in shown:
+            sig = tuple(sorted((k, str(v)) for k, v in conv.items()))
+            old = self._rows.get(conv["peer"])
+            if old is not None and old[0] == sig:
+                row = old[1]
+            else:
+                row = ConversationRow(conv, self.app.open_conversation,
+                                      author, screen=self)
+            rows[conv["peer"]] = (sig, row)
+            row.set_selected(conv["peer"] in self.selected)
+            self.list.add_widget(row)
+        self._rows = rows
+        self.selected = [p for p in self.selected if p in self._convs]
+        self._sync_select_head()
+        if not self.showing_archive and not live:
             self.list.add_widget(self._empty_state())
+
+    # ---- the archive ------------------------------------------------------------
+    def show_archive(self, on: bool) -> None:
+        if on == self.showing_archive:
+            return
+        self.clear_selection()
+        self.showing_archive = on
+        self._set_head()
+        self.scroll.scroll_y = 1
+        self.app.refresh_sidebar()
+
+    def _set_head(self) -> None:
+        head = (self.select_head if self.selected else
+                self.search_head if self.searching else
+                self.archive_head if self.showing_archive else self.head)
+        if head.parent is not self.head_box:
+            self.head_box.clear_widgets()
+            self.head_box.add_widget(head)
+        # The compose button belongs to the plain list only. Out of the
+        # layout, not just hidden: a hidden widget still takes taps.
+        want = head is self.head
+        if want and self.fab_holder.parent is None:
+            self._root.add_widget(self.fab_holder)
+        elif not want and self.fab_holder.parent is not None:
+            self._root.remove_widget(self.fab_holder)
+
+    # ---- selection: hold a chat, then tap more -----------------------------------
+    @property
+    def selecting(self) -> bool:
+        return bool(self.selected)
+
+    def start_selection(self, peer: str) -> None:
+        if self.searching or peer not in self._convs or \
+                self._convs[peer].get("kind") == "self":
+            return
+        if peer not in self.selected:
+            self.selected.append(peer)
+        self._paint_selection()
+
+    def toggle_selection(self, peer: str) -> None:
+        if peer in self.selected:
+            self.selected.remove(peer)
+        elif peer in self._convs and self._convs[peer].get("kind") != "self":
+            self.selected.append(peer)
+        self._paint_selection()
+
+    def clear_selection(self) -> None:
+        if self.selected:
+            self.selected = []
+            self._paint_selection()
+
+    def _paint_selection(self) -> None:
+        for peer, (_sig, row) in self._rows.items():
+            row.set_selected(peer in self.selected)
+        self._sync_select_head()
+
+    def _sync_select_head(self) -> None:
+        self._set_head()
+        if not self.selected:
+            return
+        convs = [self._convs[p] for p in self.selected if p in self._convs]
+        self.select_count.text = str(len(convs))
+        mute = self.mute_choice(convs)
+        self.act_mute.set_icon("bell_off" if mute else "bell")
+        self.act_mute.label = ("Mute" if mute else "Unmute") + \
+            (" all" if len(convs) > 1 else "")
+        self.act_archive.set_icon("unarchive" if self.showing_archive
+                                  else "archive")
+        self.act_archive.label = "Unarchive" if self.showing_archive \
+            else "Archive"
+
+    @staticmethod
+    def is_muted(conv: dict) -> bool:
+        return bool(conv.get("muted"))
+
+    @classmethod
+    def mute_choice(cls, convs: list) -> bool:
+        """True to offer Mute, False for Unmute: one chat, its opposite;
+        several, whichever most of them need (a tie mutes)."""
+        muted = sum(1 for c in convs if cls.is_muted(c))
+        return muted * 2 <= len(convs) if len(convs) > 1 else not muted
+
+    def _picked(self) -> list:
+        return [self._convs[p] for p in self.selected if p in self._convs]
+
+    def _act_mute(self) -> None:
+        convs = self._picked()
+        mute = self.mute_choice(convs)
+        self.clear_selection()
+        self.app.set_chats_muted([c["peer"] for c in convs], mute)
+
+    def _act_archive(self) -> None:
+        peers = [c["peer"] for c in self._picked()]
+        archive = not self.showing_archive
+        self.clear_selection()
+        self.app.set_chats_archived(peers, archive)
+
+    def _act_delete(self) -> None:
+        convs = self._picked()
+        if convs:
+            DeleteChatsSheet(self.app, convs,
+                             on_done=self.clear_selection).open()
+
+    def _act_more(self) -> None:
+        convs = self._picked()
+        if not convs:
+            return
+        peers = [c["peer"] for c in convs]
+        app = self.app
+        pin = not all(c.get("pinned") for c in convs)
+        unread = any(int(c.get("unread") or 0) or c.get("marked_unread")
+                     for c in convs)
+        items = [("unpin" if not pin else "pin",
+                  ("Pin" if pin else "Unpin") +
+                  (" all" if len(convs) > 1 else ""),
+                  lambda: app.set_chats_pinned(peers, pin)),
+                 ("read" if unread else "unread",
+                  "Mark as read" if unread else "Mark as unread",
+                  lambda: (app.mark_chats_read if unread
+                           else app.mark_chats_unread)(peers))]
+        direct = [c for c in convs if c.get("kind") == "dm"]
+        if len(direct) == len(convs):
+            block = not all(c.get("blocked") for c in convs)
+            items.append(("block", ("Block" if block else "Unblock") +
+                          (f" {len(convs)} contacts" if len(convs) > 1
+                           else ""),
+                          lambda: app.set_blocked(peers, block)))
+
+        def run(action):
+            self.clear_selection()
+            action()
+        MenuSheet([(icon, label, lambda a=action: run(a))
+                   for icon, label, action in items]).open()
 
     def _empty_state(self) -> BoxLayout:
         box = BoxLayout(orientation="vertical", size_hint_y=None,
@@ -7794,6 +14393,66 @@ class ChatsScreen(Screen):
         return box
 
 
+def search_snippet(body: str, query: str, width: int = 70) -> str:
+    """Kivy markup: the words around the first match, the match in gold
+    and bold, everything escaped."""
+    text = " ".join((body or "").split())
+    at = text.casefold().find(query.casefold()) if query else -1
+    if at < 0:
+        return escape_markup(text[:width])
+    start = max(0, at - width // 3)
+    end = min(len(text), at + len(query) + width)
+    lead = ("…" if start else "") + text[start:at]
+    match = text[at:at + len(query)]
+    tail = text[at + len(query):end] + ("…" if end < len(text) else "")
+    return (escape_markup(lead) + f"[b][color={T.accent}]"
+            + escape_markup(match) + "[/color][/b]" + escape_markup(tail))
+
+
+class SearchHit(ButtonBehavior, BoxLayout):
+    """A message found by search: its chat, when, and the words around
+    the match. Tap it to open the chat at that message."""
+
+    def __init__(self, title: str, seed: str, kind: str, when: str,
+                 snippet_markup: str, on_tap: Callable, **kw):
+        kw.setdefault("size_hint_y", None)
+        kw.setdefault("height", max(dp(72), line_height(16.5)
+                                    + line_height(15) + dp(24)))
+        kw.setdefault("padding", [dp(16), dp(8), dp(16), dp(8)])
+        kw.setdefault("spacing", dp(14))
+        super().__init__(**kw)
+        self.add_widget(Avatar(seed, title, diameter=dp(44), kind=kind,
+                               pos_hint={"center_y": .5}))
+        texts = BoxLayout(orientation="vertical", spacing=dp(2))
+        top = BoxLayout(size_hint_y=None, height=line_height(16.5))
+        top.add_widget(single_line(title, fs(16.5), T.text, bold=True))
+        stamp = single_line(when, fs(13), T.text_3, size_hint_x=None,
+                            halign="right")
+        stamp.texture_update()
+        stamp.width = stamp.texture_size[0] + dp(4)
+        top.add_widget(stamp)
+        texts.add_widget(top)
+        snippet = Label(text=snippet_markup, markup=True, font_size=fs(15),
+                        color=C(T.text_2), halign="left", valign="top",
+                        shorten=True, shorten_from="right", max_lines=1,
+                        size_hint_y=None, height=line_height(15))
+        snippet.bind(size=lambda w, v: setattr(w, "text_size", v))
+        texts.add_widget(snippet)
+        self.add_widget(texts)
+        hairline(self, "bottom", inset=dp(74))
+        with self.canvas.before:
+            self._bg = Color(0, 0, 0, 0)
+            self._rect = Rectangle()
+        self.bind(pos=self._sync, size=self._sync,
+                  state=lambda _w, st: setattr(
+                      self._bg, "rgba", C(T.press) if st == "down"
+                      else (0, 0, 0, 0)))
+        self.bind(on_release=lambda _w: on_tap())
+
+    def _sync(self, *_a):
+        self._rect.pos, self._rect.size = self.pos, self.size
+
+
 class ComposeSheet(Sheet):
     """The compose button's sheet: a new contact, a new group, notes to self,
     or one of the people you already know."""
@@ -7810,7 +14469,7 @@ class ComposeSheet(Sheet):
             ListRow("group", "New group",
                     f"You and up to {MAX_GROUP_MEMBERS - 1} others",
                     on_tap=lambda: self._then(app.open_new_group)),
-            ListRow("bookmark", "Notes to self", "Kept on this device only",
+            ListRow("bookmark", "Saved messages", "Kept on this device only",
                     on_tap=lambda: self._then(
                         lambda: app.open_conversation(app.keys.address))),
         ]))
@@ -7837,7 +14496,7 @@ _METRIC_LABEL = None
 
 
 def measure_text(text: str, font_size: float, wrap_width: float,
-                 italic: bool = False) -> tuple:
+                 italic: bool = False, markup: bool = False) -> tuple:
     """Pixel (width, height) of `text` wrapped at `wrap_width`.
 
     One shared, never-displayed Label measures every bubble: the widget
@@ -7853,6 +14512,7 @@ def measure_text(text: str, font_size: float, wrap_width: float,
     metric = _METRIC_LABEL
     metric.font_size = font_size
     metric.italic = italic
+    metric.markup = markup
     metric.text = text
     if len(text) * font_size * 0.42 < wrap_width * 3:
         metric.text_size = (None, None)
@@ -7863,6 +14523,29 @@ def measure_text(text: str, font_size: float, wrap_width: float,
     metric.text_size = (wrap_width, None)
     metric.texture_update()
     return metric.texture_size
+
+
+_METRIC_INPUTS: dict = {}
+
+
+def measure_selectable(text: str, font_size: float,
+                       wrap_width: float) -> tuple:
+    """measure_text for the desktop's selectable text, by its own wrapping:
+    a TextInput breaks a word too long for a line (a link, mostly) where
+    it runs out of room, where a label first moves it to a line of its
+    own — so a label's measure left a blank line under such a message."""
+    metric = _METRIC_INPUTS.get(font_size)
+    if metric is None:
+        metric = _METRIC_INPUTS[font_size] = SelectableText(
+            font_size=font_size)
+    metric.width = wrap_width + metric.padding[0] + metric.padding[2]
+    lines, _flags = metric._split_smart(text)
+    lines = lines or [""]
+    width = max(metric._text_width(line) for line in lines)
+    one = metric._label_cached.get_extents("_")[1]
+    height = len(lines) * (one + metric.line_spacing) + metric.padding[1] + \
+        metric.padding[3]
+    return min(width, wrap_width), height
 
 
 class SelectableText(TextInput):
@@ -7889,6 +14572,9 @@ class SelectableText(TextInput):
         kw.setdefault("size_hint", (None, None))
         super().__init__(**kw)
         self._on_tap = on_tap
+        self._links: list = []                    # v11: (start, end) spans
+        self._link_lines = InstructionGroup()
+        self.canvas.after.add(self._link_lines)
         # A TextInput scrolls to keep its cursor in view. Given the width
         # it starts with (100px) every message wraps tall, and with the
         # cursor at the end it scrolled to the LAST line — which then stayed
@@ -7899,6 +14585,63 @@ class SelectableText(TextInput):
 
     def _unscroll(self, *_a):
         self.scroll_x = self.scroll_y = 0
+
+    # ---- v11: links, underlined; which character a click is on ---------------
+    def set_links(self, spans: list) -> None:
+        self._links = [(start, end) for start, end, _url in spans]
+        self._trigger_update_graphics()
+
+    def _update_graphics(self, *largs):
+        super()._update_graphics(*largs)
+        self._draw_links()
+
+    def _draw_links(self) -> None:
+        """A gold rule under each link (a TextInput draws its text in one
+        colour), line by line where a link wraps."""
+        group = self._link_lines
+        group.clear()
+        lines = self._lines
+        if not self._links or not lines:
+            return
+        dy = self.line_height + self.line_spacing
+        left = self.x + self.padding[0] - self.scroll_x
+        top = self.top - self.padding[1] + self.scroll_y
+        group.add(Color(*(C(T.accent)[:3] + [0.9])))
+        for start, end in self._links:
+            c0, r0 = self.get_cursor_from_index(start)
+            c1, r1 = self.get_cursor_from_index(end)
+            for row in range(r0, min(r1, len(lines) - 1) + 1):
+                line = lines[row]
+                a = c0 if row == r0 else 0
+                b = c1 if row == r1 else len(line.rstrip())
+                if b <= a:
+                    continue
+                x0 = left + self._text_width(line[:a])
+                x1 = left + self._text_width(line[:b])
+                y = top - row * dy - self.line_height * 0.84
+                group.add(Rectangle(pos=(x0, y),
+                                    size=(x1 - x0, max(1.0, dp(1)))))
+
+    def _text_width(self, text: str) -> float:
+        return self._get_text_width(text, self.tab_width,
+                                    self._label_cached) if text else 0.0
+
+    def index_at(self, x: float, y: float) -> int:
+        """The index in the text of the character at (x, y) — in the
+        coordinates of this widget's position — or -1."""
+        lines = self._lines
+        if not lines:
+            return -1
+        col, row = self.get_cursor_from_xy(x, y)
+        if row >= len(lines):
+            return -1
+        line = lines[row]
+        left = self.x + self.padding[0] - self.scroll_x
+        if x < left + self._text_width(line[:col]):
+            col -= 1                     # the nearest gap is after it
+        if col < 0 or col >= len(line):
+            return -1
+        return self.cursor_index((col, row))
 
     # Tapping a message marks it read; the TextInput swallows the touch, so
     # re-dispatch it — only when the press AND release were on this text.
@@ -7926,13 +14669,30 @@ def message_ext(msg: dict) -> dict:
         return {}
 
 
+_INLINE_TEXTURES: dict = {}
+
+
 def texture_from_b64(data: str):
-    """Kivy texture for a small inline JPEG (the photo thumbnail)."""
+    """Kivy texture for a small inline JPEG (the photo thumbnail).
+
+    Decoded once per picture and kept: a bubble repaints often (ticks,
+    reactions) and must not decode it again each time. The pixels are kept
+    too, because a texture made from memory has no file to reload from when
+    Android recreates the GL context on resume: the reload observer puts
+    them back, where it would otherwise come back blank."""
+    if data in _INLINE_TEXTURES:
+        return _INLINE_TEXTURES[data]
     import io as _io
     try:
-        return CoreImage(_io.BytesIO(b64d(data)), ext="jpg").texture
+        from PIL import Image as _PIL
+        with _PIL.open(_io.BytesIO(b64d(data))) as im:
+            tex = texture_from_pil(im)
     except Exception:
         return None
+    if len(_INLINE_TEXTURES) > 400:          # a long scroll back: drop the oldest
+        _INLINE_TEXTURES.pop(next(iter(_INLINE_TEXTURES)))
+    _INLINE_TEXTURES[data] = tex
+    return tex
 
 
 class QuoteBlock(ButtonBehavior, BoxLayout):
@@ -7968,6 +14728,110 @@ class QuoteBlock(ButtonBehavior, BoxLayout):
         return max(self.author.natural_width,
                    measure_text(self.snippet.text, fs(15), dp(600),
                                 italic=True)[0]) + dp(22)
+
+
+def clamp_lines(text: str, font_size: float, width: float, lines: int,
+                italic: bool = False) -> str:
+    """`text`, cut at a word and ended with an ellipsis if it would take
+    more than `lines` lines at `width`."""
+    one = measure_text("Ag", font_size, width, italic=italic)[1]
+    room = one * lines + 0.5
+    if measure_text(text, font_size, width, italic=italic)[1] <= room:
+        return text
+    words = text.split(" ")
+    lo, hi = 0, len(words)
+    while lo < hi:                       # the most words that still fit
+        mid = (lo + hi + 1) // 2
+        if measure_text(" ".join(words[:mid]) + "…", font_size, width,
+                        italic=italic)[1] <= room:
+            lo = mid
+        else:
+            hi = mid - 1
+    if lo:
+        return " ".join(words[:lo]).rstrip(",;:—-") + "…"
+    cut = len(text)                      # one long word: cut it by letters
+    while cut > 1 and measure_text(text[:cut] + "…", font_size, width,
+                                   italic=italic)[1] > room:
+        cut = cut * 3 // 4
+    return text[:cut] + "…"
+
+
+class LinkCard(ButtonBehavior, BoxLayout):
+    """A link's preview in the message (v11): its site in capitals, its
+    title, a line or two about it, and its picture — as the sender's phone
+    found them; nothing is fetched to show it. Tap it to see where the
+    link leads before going there."""
+
+    THUMB = dp(56)
+
+    def __init__(self, preview: dict, outgoing: bool, on_tap: Callable,
+                 **kw):
+        kw.setdefault("size_hint", (None, None))
+        kw.setdefault("padding", [dp(12), dp(6), dp(8), dp(8)])
+        kw.setdefault("spacing", dp(10))
+        super().__init__(**kw)
+        self.preview = preview
+        with self.canvas.before:
+            Color(*C(T.quote_own if outgoing else T.quote_peer))
+            self._bg = SmoothRoundedRectangle(radius=[dp(4)])
+            Color(*C(T.accent))
+            self._bar = Rectangle()
+        self.bind(pos=self._sync, size=self._sync)
+        self.texts = BoxLayout(orientation="vertical", size_hint=(None, None),
+                               spacing=dp(2), pos_hint={"top": 1})
+        self.site = CapsLabel(preview.get("s") or link_host(preview["u"]),
+                              size=10.5, color=T.accent)
+        self.title = Label(text="", font_size=fs(15.5), color=C(T.text),
+                           halign="left", valign="top",
+                           size_hint=(None, None))
+        self.desc = Label(text="", font_size=fs(14), italic=True,
+                          color=C(T.text_2), halign="left", valign="top",
+                          size_hint=(None, None))
+        for part in (self.site, self.title, self.desc):
+            self.texts.add_widget(part)
+        self.add_widget(self.texts)
+        self.thumb = None
+        texture = texture_from_b64(preview["i"]) if preview.get("i") else None
+        if texture is not None:
+            self.thumb = KivyImage(texture=texture, size_hint=(None, None),
+                                   size=(self.THUMB, self.THUMB),
+                                   allow_stretch=True, keep_ratio=True,
+                                   pos_hint={"top": 1})
+            self.add_widget(self.thumb)
+        self._laid_at = None
+        self.bind(on_release=lambda _w: on_tap())
+
+    def _sync(self, *_a):
+        self._bg.pos, self._bg.size = self.pos, self.size
+        self._bar.pos, self._bar.size = self.pos, (dp(2), self.height)
+
+    def natural_width(self, max_w: float) -> float:
+        return min(max_w, dp(300))
+
+    def layout_for(self, width: float) -> float:
+        """Lay the card out `width` wide; returns its height. The title
+        keeps to two lines and the description to three."""
+        if self._laid_at != width:
+            self._laid_at = width
+            pad_l, pad_t, pad_r, pad_b = self.padding
+            text_w = max(dp(80), width - pad_l - pad_r - (
+                self.THUMB + self.spacing if self.thumb else 0))
+            self.site.size = (text_w, self.site.height)
+            for label, key, size, lines, italic in (
+                    (self.title, "t", 15.5, 2, False),
+                    (self.desc, "d", 14, 3, True)):
+                text = self.preview.get(key) or ""
+                label.text = clamp_lines(text, fs(size), text_w, lines,
+                                         italic=italic) if text else ""
+                label.text_size = (text_w, None)
+                label.texture_update()
+                label.size = (text_w, label.texture_size[1] if text else 0)
+            self.texts.width = text_w
+            self.texts.height = (self.site.height + self.title.height +
+                                 self.desc.height + self.texts.spacing * 2)
+            inner = max(self.texts.height, self.THUMB if self.thumb else 0)
+            self.size = (width, inner + pad_t + pad_b)
+        return self.height
 
 
 class MediaStatus(Label):
@@ -8019,15 +14883,25 @@ class ImageContent(ButtonBehavior, FloatLayout):
         return width, height
 
     def refresh(self, msg: dict) -> None:
+        """Called on every repaint of the bubble (ticks, reactions, stars):
+        it only touches the picture when what it should show has changed.
+        Setting the same `source` again is not a change to Kivy, so clearing
+        the texture first, as 9.1.1 did, left a white rectangle behind on
+        the first repaint after a photo arrived."""
         self.msg = msg
         state = msg.get("media_state") or ""
         path = msg.get("media_path")
         if path and Path(path).is_file() and state in ("ready", ""):
-            self.picture.texture = None
-            self.picture.source = path
+            if self.picture.source != path:
+                self.picture.source = path
+            elif self.picture.texture is None:      # it failed, or was dropped
+                self.picture.reload()
         elif self.media.get("thumb"):
-            self.picture.source = ""
-            self.picture.texture = texture_from_b64(self.media["thumb"])
+            thumb = texture_from_b64(self.media["thumb"])
+            if self.picture.source:
+                self.picture.source = ""
+            if self.picture.texture is not thumb:
+                self.picture.texture = thumb
         outgoing = msg["direction"] == "out"
         self.chip.text = {
             "uploading": "Sending…",
@@ -8041,16 +14915,44 @@ class ImageContent(ButtonBehavior, FloatLayout):
 
 
 class Waveform(Widget):
-    """Voice-note level bars; the played part is drawn in gold."""
+    """Voice-note level bars; the played part is drawn in gold. With
+    `on_seek`, a tap or a drag along it moves through the note (v11)."""
 
-    def __init__(self, wave: str = "", **kw):
+    def __init__(self, wave: str = "", on_seek: Optional[Callable] = None,
+                 **kw):
         super().__init__(**kw)
         try:
             self._levels = list(b64d(wave)) if wave else []
         except (TypeError, ValueError):
             self._levels = []
         self.progress = 0.0
+        self.on_seek = on_seek
         self.bind(pos=self._redraw, size=self._redraw)
+
+    def _fraction(self, touch) -> float:
+        return max(0.0, min(1.0, (touch.x - self.x) / max(1.0, self.width)))
+
+    def on_touch_down(self, touch):
+        if self.on_seek is None or not self.collide_point(*touch.pos) or \
+                touch.is_mouse_scrolling:
+            return super().on_touch_down(touch)
+        touch.grab(self)
+        touch.ud["fext_scrub"] = True
+        self.set_progress(self._fraction(touch))
+        return True
+
+    def on_touch_move(self, touch):
+        if touch.grab_current is self:
+            self.set_progress(self._fraction(touch))
+            return True
+        return super().on_touch_move(touch)
+
+    def on_touch_up(self, touch):
+        if touch.grab_current is self:
+            touch.ungrab(self)
+            self.on_seek(self._fraction(touch))
+            return True
+        return super().on_touch_up(touch)
 
     def set_progress(self, fraction: float) -> None:
         self.progress = max(0.0, min(1.0, fraction))
@@ -8087,14 +14989,34 @@ class VoiceContent(BoxLayout):
                                  screen.on_media_tap(self.msg))
         self.add_widget(self.button)
         self.wave = Waveform(media.get("wave", ""), size_hint_y=None,
-                             height=dp(26), pos_hint={"center_y": .5})
+                             height=dp(26), pos_hint={"center_y": .5},
+                             on_seek=self._seek)
         self.add_widget(self.wave)
         dur = int(media.get("dur") or 0) // 1000
         self.length = Label(text=f"{dur // 60}:{dur % 60:02d}",
                             font_size=fs(13.5), color=C(T.text_3),
                             size_hint=(None, 1), width=dp(38))
         self.add_widget(self.length)
+        # v11: while it plays, the length gives way to its speed, tapped to
+        # go 1× → 1.5× → 2×.
+        self.speed = SpeedChip(on_tap=self._next_speed, size_hint=(None, 1),
+                               width=dp(38))
         self.refresh(msg)
+
+    def _seek(self, fraction: float) -> None:
+        path = self.msg.get("media_path")
+        if not path or not Path(path).is_file():
+            self.wave.set_progress(0)
+            self.screen.on_media_tap(self.msg)        # fetch it first
+            return
+        self.screen.seek_voice(self.msg, fraction)
+
+    def _next_speed(self) -> None:
+        voice = self.screen.app.voice
+        at = VOICE_SPEEDS.index(voice.speed) if voice.speed in VOICE_SPEEDS \
+            else 0
+        voice.set_speed(VOICE_SPEEDS[(at + 1) % len(VOICE_SPEEDS)])
+        self.screen.refresh_voice_buttons()
 
     def natural_size(self, max_w: float) -> tuple:
         return min(max_w, dp(240)), TOUCH
@@ -8107,18 +15029,53 @@ class VoiceContent(BoxLayout):
         elif state in ("pending", "downloading", "uploading", "requested"):
             self.button.set_icon("download")
         else:
-            playing = self.screen.app.voice.path == msg.get("media_path") \
-                and self.screen.app.voice.playing
+            voice = self.screen.app.voice
+            playing = voice.path == msg.get("media_path") and voice.playing
             self.button.set_icon("pause" if playing else "play")
+            shown = self.speed if playing else self.length
+            hidden = self.length if playing else self.speed
+            if hidden.parent is self:
+                self.remove_widget(hidden)
+            if shown.parent is None:
+                self.add_widget(shown)
+            self.speed.text = speed_label(voice.speed)
 
 
-def make_body(text: str, font_size) -> Widget:
+class SpeedChip(ButtonBehavior, Label):
+    """A voice note's speed, outlined, tapped to change (v11)."""
+
+    def __init__(self, on_tap: Callable, **kw):
+        kw.setdefault("font_size", fs(13))
+        kw.setdefault("bold", True)
+        super().__init__(color=C(T.accent), halign="center", valign="middle",
+                         **kw)
+        self.on_tap = on_tap
+        with self.canvas.before:
+            self._edge_col = Color(*C(T.accent))
+            self._edge = SmoothLine(width=1.1)
+        self.bind(pos=self._sync, size=self._sync)
+        self.bind(on_release=lambda _w: self.on_tap())
+
+    def _sync(self, *_a):
+        w, h = min(self.width, dp(36)), dp(20)
+        x, y = self.center_x - w / 2, self.center_y - h / 2
+        self._edge.rounded_rectangle = (x, y, w, h, dp(10))
+        self.text_size = self.size
+
+
+def make_body(text: str, font_size, links: list = ()) -> Widget:
     """The message text: selectable on a desktop; on a phone a plain label
-    (a long press there selects the whole message instead)."""
+    (a long press there selects the whole message instead). Links in it
+    are underlined, and a tap on one says where it leads (v11)."""
     if IS_MOBILE:
-        return Label(text=text, color=C(T.text), font_size=font_size,
-                     halign="left", valign="top", size_hint=(None, None))
-    return SelectableText(text=text, font_size=font_size)
+        return Label(text=link_markup(text, links, T.accent.lstrip("#"))
+                     if links else text, markup=bool(links), color=C(T.text),
+                     font_size=font_size, halign="left", valign="top",
+                     size_hint=(None, None))
+    body = SelectableText(text=text, font_size=font_size)
+    if links:
+        body.set_links(links)
+    return body
 
 
 class ReactionChip(ButtonBehavior, Widget):
@@ -8299,11 +15256,24 @@ class MessageBubble(BoxLayout):
             self.add_widget(self.media)
 
         text = self._display_text(msg, media)
-        self.body = make_body(text, fs(17)) if text else None
+        self.links = link_spans(text) if text else []
+        self.body = make_body(text, fs(17), self.links) if text else None
         if self.body is not None:
             if isinstance(self.body, SelectableText):
                 self.body.bind(minimum_height=self._body_min_height)
             self.add_widget(self.body)
+
+        # v11: a link's preview, as its sender's phone found it. Shown when
+        # previews are on here — and on your own messages, since it is what
+        # they were sent.
+        self.card = None
+        preview = ext.get("lp")
+        if isinstance(preview, dict) and preview.get("u") and \
+                preview.get("t") and (outgoing or link_previews_enabled()):
+            self.card = LinkCard(preview, outgoing,
+                                 on_tap=lambda u=preview["u"]:
+                                 screen.on_link_tap(u))
+            self.add_widget(self.card)
 
         self.reactions = ReactionBar()
         self._react_row = AnchorLayout(anchor_x="left", anchor_y="top",
@@ -8451,8 +15421,13 @@ class MessageBubble(BoxLayout):
         if self.body is not None:
             wrap = self.media.width if isinstance(self.media,
                                                   ImageContent) else max_w
-            text_w, text_h = measure_text(self.body.text, self.body.font_size,
-                                          wrap)
+            if isinstance(self.body, SelectableText):
+                text_w, text_h = measure_selectable(self.body.text,
+                                                    self.body.font_size, wrap)
+            else:
+                text_w, text_h = measure_text(self.body.text,
+                                              self.body.font_size, wrap,
+                                              markup=self.body.markup)
             self._text_w, self._text_h = text_w, text_h
             if isinstance(self.body, SelectableText):
                 self.body.width = text_w + dp(2)
@@ -8466,6 +15441,8 @@ class MessageBubble(BoxLayout):
             parts.append(self.body.height)
         if self.quote is not None:
             widest = max(widest, min(max_w, self.quote.natural_width()))
+        if self.card is not None:
+            widest = max(widest, self.card.natural_width(max_w))
         if self.fwd is not None:
             widest = max(widest, measure_text("Forwarded", fs(14), dp(300),
                                               italic=True)[0])
@@ -8484,6 +15461,8 @@ class MessageBubble(BoxLayout):
         if self.fwd is not None:
             self.fwd.width = widest
             parts.append(self.fwd.height)
+        if self.card is not None:
+            parts.append(self.card.layout_for(widest))
         if self._react_row.parent is not None:
             parts.append(rh)
         parts.append(line_height(12.5))             # the meta row
@@ -8491,6 +15470,30 @@ class MessageBubble(BoxLayout):
         self.width = widest + pad_l + pad_r
         self.height = (sum(parts) + self.spacing * (len(self.children) - 1)
                        + pad_t + pad_b)
+
+    def link_at(self, wx: float, wy: float) -> Optional[str]:
+        """The link in the text under window point (wx, wy), if any."""
+        body = self.body
+        if body is None or not self.links or not hits(body, wx, wy):
+            return None
+        x, y = body.parent.to_widget(wx, wy)
+        if isinstance(body, SelectableText):
+            index = body.index_at(x, y)
+            for start, end, url in self.links:
+                if start <= index < end:
+                    return url
+            return None
+        # A label's refs are boxes on its texture, top down.
+        tw, th = body.texture_size
+        tx = x - (body.center_x - tw / 2.0)
+        ty = th - (y - (body.center_y - th / 2.0))
+        slack = dp(4)                    # a fingertip is wider than a letter
+        for ref, zones in body.refs.items():
+            for x0, y0, x1, y1 in zones:
+                if x0 - slack <= tx <= x1 + slack and \
+                        y0 - slack <= ty <= y1 + slack:
+                    return self.links[int(ref)][2]
+        return None
 
 
 class BubbleRow(AnchorLayout):
@@ -8502,6 +15505,7 @@ class BubbleRow(AnchorLayout):
     """
 
     LONG_PRESS = 0.42                     # seconds
+    shift = NumericProperty(0.0)          # v11: slid left, to reply
 
     def __init__(self, bubble: MessageBubble, outgoing: bool, screen, **kw):
         kw.setdefault("size_hint_y", None)
@@ -8515,7 +15519,10 @@ class BubbleRow(AnchorLayout):
             self._tint = Color(*T.select)
             self._wash = Rectangle()
         self._tint.a = 0
-        self.bind(pos=self._sync, size=self._sync)
+        self._cue = Canvas()
+        self.canvas.after.add(self._cue)
+        self.bind(pos=self._sync, size=self._sync,
+                  shift=lambda *_a: self._trigger_layout())
         self.add_widget(bubble)
         bubble.bind(height=lambda _w, v: setattr(self, "height", v + dp(6)))
         self.bind(width=lambda _w, v: bubble.layout_for(v))
@@ -8524,11 +15531,40 @@ class BubbleRow(AnchorLayout):
     def _sync(self, *_a):
         self._wash.pos, self._wash.size = self.pos, self.size
 
+    def do_layout(self, *args):
+        super().do_layout(*args)
+        if self.shift:
+            self.bubble.x += self.shift
+        self._draw_cue()
+
+    def _draw_cue(self) -> None:
+        """The reply mark that comes in at the right as the message slides
+        left: faint, then whole once letting go would reply."""
+        self._cue.clear()
+        if self.shift >= 0:
+            return
+        reach = min(1.0, -self.shift / SWIPE_REPLY)
+        cx, cy = self.right - dp(30), self.center_y
+        r = dp(15) * (0.6 + 0.4 * reach)
+        with self._cue:
+            Color(*(C(T.accent)[:3] + [0.12 + 0.3 * reach]))
+            Ellipse(pos=(cx - r, cy - r), size=(2 * r, 2 * r))
+            draw_icon("reply", cx, cy, dp(16), C(T.accent)[:3] + [reach])
+
+    def settle_shift(self) -> None:
+        if not self.shift:
+            return
+        if motion(1):
+            Animation(shift=0.0, d=0.16, t="out_back").start(self)
+        else:
+            self.shift = 0.0
+
     def set_selected(self, selected: bool) -> None:
         self._tint.a = T.select[3] if selected else 0
 
     def on_touch_down(self, touch):
-        if not self.collide_point(*touch.pos) or touch.is_mouse_scrolling:
+        if not self.collide_point(*touch.pos) or touch.is_mouse_scrolling \
+                or swiped(touch):
             return super().on_touch_down(touch)
         if self.screen.selecting:
             self.screen.toggle_selection(self.msg_id)
@@ -8537,13 +15573,14 @@ class BubbleRow(AnchorLayout):
             self.screen.start_selection(self.msg_id)
             return True
         touch.grab(self)
+        touch.ud["fext_row"] = True
         self._press = (touch.uid, touch.pos, Clock.schedule_once(
             lambda _dt: self._long_press(touch), self.LONG_PRESS))
         super().on_touch_down(touch)       # children: quote, play, chips
         return True
 
     def _long_press(self, touch):
-        if self._press and self._press[0] == touch.uid:
+        if self._press and self._press[0] == touch.uid and not swiped(touch):
             self._press = None
             touch.ud["fext_long_press"] = True
             self.screen.start_selection(self.msg_id)
@@ -8562,8 +15599,8 @@ class BubbleRow(AnchorLayout):
             pending, self._press = self._press, None
             if pending:
                 pending[2].cancel()
-                if not touch.ud.get("fext_long_press"):
-                    self.screen.on_bubble_tap(self.msg_id)
+                if not touch.ud.get("fext_long_press") and not swiped(touch):
+                    self.screen.on_bubble_tap(self.msg_id, touch)
             return True
         return super().on_touch_up(touch)
 
@@ -8941,6 +15978,101 @@ class ComposerInput(BoxLayout):
         self.input.cursor = self.input.get_cursor_from_index(len(value))
 
 
+class SendMicButton(IconButton):
+    """The composer's send button — a microphone while nothing is written.
+    Hold it to record: let go to send, slide left to delete, slide up to
+    lock it hands-free. A tap records hands-free straight away."""
+
+    def __init__(self, screen, *a, **kw):
+        super().__init__(*a, **kw)
+        self.screen = screen
+        self._holding = False
+
+    def set_holding(self, holding: bool) -> None:
+        """While held, the microphone turns red and grows under the finger."""
+        if holding == self._holding:
+            return
+        self._holding = holding
+        self._bg_hex = T.alert if holding else T.accent
+        Animation.cancel_all(self, "icon_scale")
+        self.icon_scale = 1.0
+        self._redraw()
+
+    def on_touch_down(self, touch):
+        if self.collide_point(*touch.pos) and not touch.is_mouse_scrolling \
+                and not self.disabled and self.screen.mic_mode() and \
+                getattr(touch, "button", "left") == "left":
+            touch.grab(self)
+            self.screen.hold_begin(touch)
+            return True
+        return super().on_touch_down(touch)
+
+    def on_touch_move(self, touch):
+        if touch.grab_current is self:
+            self.screen.hold_move(touch)
+            return True
+        return super().on_touch_move(touch)
+
+    def on_touch_up(self, touch):
+        if touch.grab_current is self:
+            touch.ungrab(self)
+            self.screen.hold_end(touch)
+            return True
+        return super().on_touch_up(touch)
+
+
+class LockPill(Widget):
+    """Over the held microphone: a padlock and an arrow up, rising with
+    the finger — slide up to it to record hands-free."""
+
+    def __init__(self, **kw):
+        kw.setdefault("size_hint", (None, None))
+        kw.setdefault("size", (dp(40), dp(76)))
+        super().__init__(**kw)
+        self._rise = 0.0
+        self._host = None
+        self._anchor = None
+        self.bind(pos=self._paint, size=self._paint)
+
+    def show(self, host, anchor) -> None:
+        self._host, self._anchor = host, anchor
+        if self.parent is None:
+            host.add_widget(self)
+        self.set_rise(0.0)
+        if motion(1):
+            self.opacity = 0
+            Animation(opacity=1, d=SHEET_FADE).start(self)
+
+    def hide(self) -> None:
+        Animation.cancel_all(self, "opacity")
+        if self.parent is not None:
+            self.parent.remove_widget(self)
+
+    def set_rise(self, rise: float) -> None:
+        self._rise = max(0.0, min(1.0, rise))
+        host, anchor = self._host, self._anchor
+        if host is None or anchor is None:
+            return
+        ax, ay = anchor.to_window(anchor.center_x, anchor.top)
+        x, y = host.to_widget(ax, ay)
+        self.pos = (host.x + x - self.width / 2,
+                    host.y + y + dp(10) + self._rise * dp(24))
+        self._paint()
+
+    def _paint(self, *_a) -> None:
+        self.canvas.clear()
+        x, y, w, h = self.x, self.y, self.width, self.height
+        with self.canvas:
+            Color(*C(T.surface_hi))
+            SmoothRoundedRectangle(pos=(x, y), size=(w, h), radius=[w / 2])
+            Color(*C(T.rule_strong))
+            SmoothLine(rounded_rectangle=(x, y, w, h, w / 2), width=1.0)
+            tint = C(T.accent if self._rise > .6 else T.text_2)
+            draw_icon("lock", x + w / 2, y + h - dp(22), dp(18), tint)
+            draw_icon("chevron_up", x + w / 2, y + dp(20) + self._rise * dp(4),
+                      dp(16), C(T.text_3))
+
+
 class LiveLevels(Widget):
     """The microphone's level while recording: the latest readings as bars
     running in from the right."""
@@ -8970,7 +16102,7 @@ class LiveLevels(Widget):
                 x += step
 
 
-class ConversationScreen(Screen):
+class ConversationScreen(SwipeGestures, Screen):
     """A conversation: its head (or, while messages are held, their
     actions), the messages bottom-anchored over the page, the reaction strip
     over a held message, and the composer — with the emoji panel beneath
@@ -8986,6 +16118,15 @@ class ConversationScreen(Screen):
         self._rendered_peer: Optional[str] = None
         self._rendered_ticks: Optional[bool] = None
         self._last_day: Optional[str] = None
+        # The topmost day heading and its day: what a page of older
+        # messages joins onto (see prepend_messages).
+        self._first_divider = None
+        self._first_day: Optional[str] = None
+        self._render_gen = 0              # bumped by every full render
+        self._newer = 0                   # beyond a window opened further back
+        self._strip_for: Optional[int] = None   # reactions raised by a tap
+        self._backfill_ev = None
+        self._user_scrolling = False
         self._unseen = 0
         self._scroll_trigger = None
         self._stick_to_bottom = True
@@ -9006,7 +16147,13 @@ class ConversationScreen(Screen):
         self.group: Optional[dict] = None
         self.peer_name_text = ""
         self._emoji_target: Optional[int] = None   # react via the panel
-        self._drafts: dict = {}                    # peer -> unsent text
+        self._draft_save = None                    # a pending draft write
+        # v11: the preview of a link being written (when previews are on).
+        self.link_preview: Optional[dict] = None
+        self._preview_url: Optional[str] = None     # fetched, or being
+        self._preview_dismissed: Optional[str] = None
+        self._preview_ev = None
+        self._previews_on = False
         root = BoxLayout(orientation="vertical")
         paint_round(root, T.bg, radius=0)
         self.add_widget(root)
@@ -9034,6 +16181,10 @@ class ConversationScreen(Screen):
         titles.add_widget(self.peer_name)
         titles.add_widget(self.peer_sub)
         self.normal_bar.add_widget(titles)
+        self.call_button = IconButton(
+            "phone", label="Voice call", pos_hint={"center_y": .5},
+            on_release=lambda _w: self.app.start_call())
+        self.normal_bar.add_widget(self.call_button)
         self.more_button = IconButton(
             "more", label="More", pos_hint={"center_y": .5},
             on_release=lambda w: self.open_menu(w))
@@ -9065,6 +16216,40 @@ class ConversationScreen(Screen):
                                 on_release=lambda _w, h=handler: h())
             self.actions[name] = button
             self.select_bar.add_widget(button)
+        # v11: search in this chat — the head becomes a field, with the
+        # matches counted and stepped through, newest first.
+        self.searching = False
+        self._search_hits: list = []          # message ids, newest first
+        self._search_at = -1
+        self._search_ev = None
+        self.search_bar = BoxLayout(padding=[dp(2), 0, dp(2), 0],
+                                    spacing=dp(2), size_hint=(1, 1),
+                                    pos_hint={"x": 0, "y": 0})
+        self.search_bar.add_widget(IconButton(
+            "back", label="Close search", pos_hint={"center_y": .5},
+            on_release=lambda _w: self.close_search()))
+        self.search_field = Field("Search this chat",
+                                  pos_hint={"center_y": .5},
+                                  on_enter=lambda: self.search_step(1))
+        self.search_field.input.font_size = fs(18)
+        self.search_field.input.bind(text=lambda _w, _v: self._search_soon())
+        self.search_bar.add_widget(self.search_field)
+        self.search_count = Label(text="", font_size=fs(14),
+                                  color=C(T.text_3), size_hint_x=None,
+                                  width=dp(62), halign="right",
+                                  valign="middle")
+        self.search_count.bind(size=lambda w, v: setattr(w, "text_size", v))
+        self.search_bar.add_widget(self.search_count)
+        self.search_up = IconButton(
+            "chevron_up", label="Earlier match", size=(dp(40), TOUCH),
+            pos_hint={"center_y": .5},
+            on_release=lambda _w: self.search_step(1))
+        self.search_down = IconButton(
+            "chevron_down", label="Later match", size=(dp(40), TOUCH),
+            pos_hint={"center_y": .5},
+            on_release=lambda _w: self.search_step(-1))
+        self.search_bar.add_widget(self.search_up)
+        self.search_bar.add_widget(self.search_down)
         self.bar.add_widget(self.normal_bar)
 
         # ---- messages --------------------------------------------------------
@@ -9094,7 +16279,44 @@ class ConversationScreen(Screen):
         self.scroll.bind(scroll_y=lambda *_a: self._on_scrolled())
         self.scroll.bind(scroll_y=lambda *_a: self._place_strip(),
                          size=lambda *_a: self._place_strip())
+        self.scroll.bind(
+            on_scroll_start=lambda *_a: setattr(self, "_user_scrolling", True),
+            on_scroll_stop=lambda *_a: setattr(self, "_user_scrolling", False))
         root.add_widget(self.stack)
+
+        # ---- v11: a link's preview, to go with the message -------------------
+        self.preview_bar = ConcealableBox(size_hint_y=None, height=0,
+                                          opacity=0,
+                                          padding=[dp(16), dp(6), dp(4),
+                                                   dp(6)],
+                                          spacing=dp(12))
+        self.preview_bar.conceal(True)
+        hairline(self.preview_bar, "top")
+        link_icon = Widget(size_hint_x=None, width=dp(22))
+        link_icon.bind(pos=lambda w, *_a: self._paint_bar_icon(
+            w, self.preview_bar, "link"), size=lambda w, *_a:
+            self._paint_bar_icon(w, self.preview_bar, "link"))
+        self.preview_bar.add_widget(link_icon)
+        ptexts = BoxLayout(orientation="vertical", padding=[dp(10), dp(2)])
+        with ptexts.canvas.before:
+            Color(*C(T.accent))
+            ptexts._rule = Rectangle()
+        ptexts.bind(pos=self._sync_bar_rule, size=self._sync_bar_rule)
+        self.preview_site = CapsLabel("", size=10.5, color=T.accent)
+        self.preview_title = single_line("", fs(15), T.text_2, italic=True)
+        ptexts.add_widget(self.preview_site)
+        ptexts.add_widget(self.preview_title)
+        self.preview_bar.add_widget(ptexts)
+        self.preview_thumb = KivyImage(size_hint=(None, None),
+                                       size=(0, dp(40)), allow_stretch=True,
+                                       keep_ratio=True, opacity=0,
+                                       pos_hint={"center_y": .5})
+        self.preview_bar.add_widget(self.preview_thumb)
+        self.preview_bar.add_widget(IconButton(
+            "close", label="Send without a preview",
+            pos_hint={"center_y": .5},
+            on_release=lambda _w: self.dismiss_preview()))
+        root.add_widget(self.preview_bar)
 
         # ---- reply preview (while composing a reply) -------------------------
         self.reply_bar = ConcealableBox(size_hint_y=None, height=0,
@@ -9128,9 +16350,8 @@ class ConversationScreen(Screen):
         # Writing:              ( ☺  the text…      📎 ) [send]
         # The avatar and the camera fold away, and the microphone turns
         # into the send button.
-        self.composer = BoxLayout(size_hint_y=None,
-                                  height=max(dp(64), line_height(17) +
-                                             dp(30)),
+        self._composer_h = max(dp(64), line_height(17) + dp(30))
+        self.composer = BoxLayout(size_hint_y=None, height=self._composer_h,
                                   padding=[dp(4), dp(8), dp(4), dp(8)])
         hairline(self.composer, "top")
         self.me_holder = AnchorLayout(size_hint_x=None, width=TOUCH)
@@ -9142,11 +16363,11 @@ class ConversationScreen(Screen):
         self.attach_button = self.entry.attach_button
         self.camera_button = self.entry.camera_button
         self.action_holder = AnchorLayout(size_hint_x=None, width=dp(56))
-        self.action_button = IconButton(
-            "send", bg=T.accent, tint=T.on_accent, label="Send",
+        self.action_button = SendMicButton(
+            self, "send", bg=T.accent, tint=T.on_accent, label="Send",
             icon_size=dp(23), on_release=lambda _w: self._on_action_button())
         self.action_holder.add_widget(self.action_button)
-        self.entry.input.bind(text=lambda *_a: self._sync_composer(),
+        self.entry.input.bind(text=lambda *_a: self._on_text_changed(),
                               focus=self._on_entry_focus)
         self.composer_parts = (self.me_holder, self.entry, self.action_holder)
         for part in self.composer_parts:
@@ -9155,6 +16376,21 @@ class ConversationScreen(Screen):
         self.closed_note = InfoLabel("", color=T.text_3, italic=True,
                                      font_size=fs(15), halign="center",
                                      pos_hint={"center_y": .5})
+        self.blocked_note = BoxLayout(padding=[dp(18), dp(4), dp(10), dp(4)],
+                                      spacing=dp(10))
+        self.blocked_text = InfoLabel("", color=T.text_3, italic=True,
+                                      font_size=fs(15),
+                                      pos_hint={"center_y": .5})
+        self.blocked_note.add_widget(self.blocked_text)
+        # A note longer than the composer is tall makes room for itself.
+        for label in (self.closed_note, self.blocked_text):
+            label.bind(height=lambda *_a: self._fit_note())
+        unblock = Btn("Unblock", kind="text", size_hint_x=None,
+                      pos_hint={"center_y": .5},
+                      on_release=lambda _w: self.app.set_blocked(
+                          [self.peer], False))
+        unblock.width = unblock.natural_width() + dp(8)
+        self.blocked_note.add_widget(unblock)
         # What the composer becomes while recording: discard, the time and
         # the microphone's level, send.
         self.rec_cancel = IconButton(
@@ -9172,6 +16408,18 @@ class ConversationScreen(Screen):
             "send", bg=T.accent, tint=T.on_accent, label="Send recording",
             icon_size=dp(23), pos_hint={"center_y": .5},
             on_release=lambda _w: self.finish_recording())
+        # Holding: what sliding does, and (over the microphone) the lock.
+        self.rec_hint = Label(text="‹  Slide to cancel", font_size=fs(15),
+                              italic=True, color=C(T.text_3),
+                              halign="center", valign="middle")
+        self.rec_hint.bind(size=lambda w, v: setattr(w, "text_size", v))
+        self.rec_pause = IconButton("pause", label="Pause recording",
+                                    pos_hint={"center_y": .5},
+                                    on_release=lambda _w:
+                                    self.toggle_pause())
+        self.lock_pill = LockPill()
+        self._hold: Optional[dict] = None
+        self._rec_locked = False
         root.add_widget(self.composer)
         self.emoji_panel = EmojiPanel(self._emoji_picked)
         root.add_widget(self.emoji_panel)
@@ -9180,28 +16428,44 @@ class ConversationScreen(Screen):
     # ---- header --------------------------------------------------------------
     def set_peer(self, peer: str, contact: dict, unread_count: int,
                  kind: str = "dm", group: Optional[dict] = None) -> None:
+        self._previews_on = link_previews_enabled()
         if peer != self.peer:
+            self.close_search()
             self.clear_selection()
             self.cancel_reply()
+            self.cancel_preview()
             self.cancel_recording()
             self.close_emoji()
-            if self.peer is not None:
-                self._drafts[self.peer] = self.entry.text
-            self.entry.text = self._drafts.pop(peer, "")
+            self.keep_draft()
+            # v11: drafts live in the identity's database, so unsent text
+            # survives the app being closed or the phone restarting.
+            store = self.app.store
+            self.peer = peer          # before the text, so it is its draft
+            self.entry.text = store.draft(peer) if store is not None else ""
             self._sync_composer(animate=False)
         self._refresh_me()
         self.peer, self.kind, self.group = peer, kind, group
         if kind == "self":
-            name = "Notes to self"
+            name = "Saved messages"
         elif kind == "group":
             name = (group or {}).get("name") or "Group"
         else:
             name = contact.get("username") or short_addr(peer, 14)
         self.peer_name_text = name
         self.peer_avatar_holder.clear_widgets()
-        self.peer_avatar_holder.add_widget(Avatar(
-            peer, name, diameter=dp(38), kind=kind,
-            pos_hint={"center_y": .5}))
+        disc = AvatarButton(peer, name, diameter=dp(38), kind=kind,
+                            size=(dp(42), TOUCH), pos_hint={"center_y": .5})
+        disc.bind(on_release=lambda _w: self.app.open_chat_info())
+        self.peer_avatar_holder.add_widget(disc)
+        # Calls are between two people: the button is there for a direct
+        # chat only (a hidden one would still take touches).
+        has_call = self.call_button.parent is not None
+        if kind == "dm" and not has_call:
+            self.normal_bar.add_widget(self.call_button,
+                                       index=self.normal_bar.children.index(
+                                           self.more_button) + 1)
+        elif kind != "dm" and has_call:
+            self.normal_bar.remove_widget(self.call_button)
         self.peer_name.text = name
         bits = []
         if kind == "self":
@@ -9213,22 +16477,31 @@ class ConversationScreen(Screen):
                                if m["a"] != me]
             bits.append(", ".join(names) if len(names) <= 4
                         else f"{len(members)} members")
-            muted = not (group or {}).get("notify", 1)
-            if muted:
+            if self.app.store is not None and \
+                    self.app.store.mute_state(peer)[0]:
                 bits.append("muted")
         else:
             bits.append(short_addr(peer, 12))
-            if not contact.get("notify", 1):
+            if self.app.store is not None and \
+                    self.app.store.mute_state(peer)[0]:
                 bits.append("muted")
         if unread_count and kind != "group" and not contact.get("auto_read",
                                                                 1):
             bits.append(f"{unread_count} unread")
+        if kind == "dm" and contact.get("verified"):
+            bits.insert(0, "verified")
+        timer = self.app.store.chat_timer(peer)[0] \
+            if self.app.store is not None and kind != "self" else 0
+        if timer:               # first: it is cut short before the address
+            bits.insert(1 if bits and bits[0] == "verified" else 0,
+                        f"disappearing: {timer_label(timer).lower()}")
         self.peer_sub.text = " · ".join(bits)
         self._sync_closed()
 
     def _sync_closed(self) -> None:
         """A group you left (or were removed from, or not yet joined) is
-        read-only: the composer gives way to a note saying why."""
+        read-only: the composer gives way to a note saying why. So is a
+        contact you blocked, with the way to unblock them."""
         note = ""
         if self.kind == "group":
             state = (self.group or {}).get("state")
@@ -9236,21 +16509,45 @@ class ConversationScreen(Screen):
                     "removed": "You are no longer a member of this group.",
                     "pending": "This group's invitation has not arrived "
                                "yet."}.get(state, "")
-        closed = bool(note)
-        showing = self.closed_note.parent is not None
+        blocked = self.kind == "dm" and self.peer is not None and \
+            self.app.store is not None and self.app.store.is_blocked(self.peer)
+        part = self.blocked_note if blocked else self.closed_note
+        other = self.closed_note if blocked else self.blocked_note
+        closed = bool(note) or blocked
+        if other.parent is not None:
+            self.composer.remove_widget(other)
+        showing = part.parent is not None
+        if blocked:
+            held = self.app.store.held_count(self.peer)
+            self.blocked_text.text = (
+                f"Blocked. {held} message{'s' if held != 1 else ''} held, "
+                f"unopened, until you unblock them." if held else
+                "Blocked. What they send is held, unopened, until you "
+                "unblock them.")
         if closed and not showing:
             self.close_emoji()
+            self.cancel_recording()
             self.composer.clear_widgets()
+            if not blocked:
+                self.closed_note.text = note
+            self.composer.add_widget(part)
+        elif closed and not blocked:
             self.closed_note.text = note
-            self.composer.add_widget(self.closed_note)
-        elif closed:
-            self.closed_note.text = note
-        elif showing:
+        elif not closed and (showing or not self.composer.children):
             self.composer.clear_widgets()
             for part in self.composer_parts:
                 self.composer.add_widget(part)
             self._sync_composer(animate=False)
+        self._fit_note()
         self.more_button.disabled = False
+
+    def _fit_note(self) -> None:
+        label = self.blocked_text if self.blocked_note.parent is not None \
+            else self.closed_note if self.closed_note.parent is not None \
+            else None
+        pad = self.composer.padding[1] + self.composer.padding[3] + dp(8)
+        self.composer.height = max(self._composer_h, label.height + pad) \
+            if label is not None else self._composer_h
 
     # ---- bubbles -------------------------------------------------------------
     def render(self, messages: list, ticks_enabled: bool,
@@ -9298,11 +16595,15 @@ class ConversationScreen(Screen):
 
     def _full_render(self, messages: list, ticks_enabled: bool,
                      on_tap_unread: Callable, peer: Optional[str]) -> None:
+        self.cancel_backfill()
+        self.close_strip()
+        self._render_gen += 1
         self.messages.clear_widgets()
         self.messages.add_widget(self._filler)
         self._bubbles.clear()
         self._rows.clear()
         self._last_day = None
+        self._first_divider, self._first_day = None, None
         if not messages:
             self.messages.add_widget(self._empty_state())
         if self._more_button.parent is not None:
@@ -9326,27 +16627,132 @@ class ConversationScreen(Screen):
                 msg.get("media_state"), msg.get("media_path"), msg.get("ext"),
                 tuple(msg.get("reactions") or ()))
 
-    def _append_bubble(self, msg: dict, ticks_enabled: bool,
-                       on_tap_unread: Callable) -> None:
+    def _widgets_for(self, msg: dict, ticks_enabled: bool,
+                     prev_day: Optional[str]) -> tuple:
+        """The widgets one message adds, top to bottom (a day heading when
+        its day differs from `prev_day`), and its day."""
+        out = []
         day = str(msg.get("created_at", ""))[:10]
-        if day and day != self._last_day:
-            self._last_day = day
-            self.messages.add_widget(DayDivider(self._day_text(day)))
+        if day and day != prev_day:
+            out.append(DayDivider(self._day_text(day)))
         if msg.get("kind") == "event":
-            self.messages.add_widget(EventRow(msg))
-            return
+            out.append(EventRow(msg))
+            return out, day or prev_day
         outgoing = msg["direction"] == "out"
         bubble = MessageBubble(msg, ticks_enabled, self)
         self._bubbles[msg["id"]] = bubble
         row = BubbleRow(bubble, outgoing, self)
         row.set_selected(msg["id"] in self.selected)
         self._rows[msg["id"]] = row
-        self.messages.add_widget(row)
+        out.append(row)
         pending = self.take_pending_pop(msg.get("client_msg_id"))
         if pending:
             chip = bubble.reactions.chip_for(pending)
             if chip is not None:
                 chip.animate_in()
+        return out, day or prev_day
+
+    def _append_bubble(self, msg: dict, ticks_enabled: bool,
+                       on_tap_unread: Callable) -> None:
+        widgets, self._last_day = self._widgets_for(msg, ticks_enabled,
+                                                    self._last_day)
+        for widget in widgets:
+            if self._first_divider is None and isinstance(widget, DayDivider):
+                self._first_divider = widget
+                self._first_day = self._last_day
+            self.messages.add_widget(widget)
+
+    def prepend_messages(self, older: list, ticks_enabled: bool) -> None:
+        """Older messages above those shown (oldest first in `older`),
+        without moving the view: a page of history joins on at the top,
+        dropping the heading of a day that it continues."""
+        if not older:
+            return
+        built, day = [], None
+        for msg in older:
+            widgets, day = self._widgets_for(msg, ticks_enabled, day)
+            built.extend(widgets)
+        if self._first_divider is not None and day == self._first_day and \
+                self._first_divider.parent is self.messages:
+            self.messages.remove_widget(self._first_divider)
+        self._first_divider = built[0] if isinstance(built[0], DayDivider) \
+            else self._first_divider
+        self._first_day = str(older[0].get("created_at", ""))[:10] or \
+            self._first_day
+        # children run newest-first; the filler (and the button for earlier
+        # messages) sit at the end, above everything.
+        top = len(self.messages.children) - 1
+        if self._more_button.parent is self.messages:
+            top -= 1
+        for widget in built:
+            self.messages.add_widget(widget, index=top)
+        self._rendered_ids = [m["id"] for m in older] + self._rendered_ids
+        self._rendered_sigs.update({m["id"]: self._signature(m) for m in older})
+        if self.content_height() <= self.scroll.height:
+            self._stick_to_bottom = True
+
+    def set_newer(self, count: int) -> None:
+        """Messages newer than the window shown (0 when it is live): the
+        jump button carries them, and leads back to the end."""
+        self._newer = count
+        if count:
+            self._unseen = count
+        self._sync_jump_button()
+
+    def focus_message(self, message_id: int) -> bool:
+        """Scroll to a message on screen and flash it; False if it is not
+        in the window drawn."""
+        row = self._rows.get(message_id)
+        if row is None:
+            return False
+        self.cancel_pending_scroll()
+        self.scroll.scroll_to(row, padding=dp(80), animate=bool(motion(1)))
+        row.set_selected(True)
+        Clock.schedule_once(
+            lambda _dt: row.set_selected(message_id in self.selected), 1.1)
+        return True
+
+    def set_has_older(self, has_older: bool) -> None:
+        """Show or drop the 'Earlier messages' button at the top."""
+        self.has_older = has_older
+        showing = self._more_button.parent is self.messages
+        if has_older and not showing:
+            self.messages.add_widget(self._more_button,
+                                     index=len(self.messages.children) - 1)
+        elif not has_older and showing:
+            self.messages.remove_widget(self._more_button)
+
+    def run_backfill(self, pages: list, ticks_enabled: bool,
+                     on_page: Optional[Callable] = None,
+                     on_done: Optional[Callable] = None) -> None:
+        """Prepend `pages` (each a chronological list, newest page first)
+        one per frame, pausing while a finger is scrolling. Abandoned if the
+        chat is re-rendered meanwhile. `on_page(page)` follows each one."""
+        self.cancel_backfill()
+        gen = self._render_gen
+
+        def step(_dt):
+            self._backfill_ev = None
+            if gen != self._render_gen:
+                return
+            if self._user_scrolling:
+                self._backfill_ev = Clock.schedule_once(step, 0.08)
+                return
+            if pages:
+                page = pages.pop(0)
+                self.prepend_messages(page, ticks_enabled)
+                if on_page is not None:
+                    on_page(page)
+            if pages:
+                self._backfill_ev = Clock.schedule_once(step, 0)
+            elif on_done is not None:
+                on_done()
+        self._backfill_ev = Clock.schedule_once(step, 0)
+
+    def cancel_backfill(self) -> None:
+        if self._backfill_ev is not None:
+            self._backfill_ev.cancel()
+            self._backfill_ev = None
 
     # =========================================================================
     #  Reactions
@@ -9376,25 +16782,37 @@ class ConversationScreen(Screen):
         return bool(msg.get("client_msg_id")) and msg.get("kind") != "event" \
             and self.closed_note.parent is None
 
+    def _strip_target(self) -> Optional[int]:
+        """The message the strip is over: one held, or one tapped."""
+        if len(self.selected) == 1:
+            return next(iter(self.selected))
+        if not self.selected and self._strip_for in self._bubbles:
+            return self._strip_for
+        return None
+
     def _strip_pick(self, emoji: str) -> None:
-        msgs = list(self.selected.values())
+        target = self._strip_target()
         self.clear_selection()
-        if len(msgs) == 1:
-            self.app.react(msgs[0]["id"], emoji)
+        self.close_strip()
+        if target is not None:
+            self.app.react(target, emoji)
 
     def _strip_more(self) -> None:
-        msgs = list(self.selected.values())
-        if len(msgs) != 1:
+        target = self._strip_target()
+        if target is None:
             return
-        self._emoji_target = msgs[0]["id"]
+        self._emoji_target = target
         self.clear_selection()
+        self.close_strip()
         self.open_emoji()
 
     def _place_strip(self, *_a) -> None:
-        """Float the strip just above the held message, inside the view."""
-        if self.strip.concealed or len(self.selected) != 1:
+        """Float the strip just above the held (or tapped) message, inside
+        the view."""
+        target = self._strip_target()
+        if self.strip.concealed or target is None:
             return
-        row = self._rows.get(next(iter(self.selected)))
+        row = self._rows.get(target)
         if row is None:
             return
         bubble = row.bubble
@@ -9451,12 +16869,10 @@ class ConversationScreen(Screen):
         """Swap the app bar, enable only the actions that apply, and raise
         the reaction strip over a single held message."""
         on = bool(self.selected)
-        if on and self.select_bar.parent is None:
-            self.bar.remove_widget(self.normal_bar)
-            self.bar.add_widget(self.select_bar)
-        elif not on and self.normal_bar.parent is None:
-            self.bar.remove_widget(self.select_bar)
-            self.bar.add_widget(self.normal_bar)
+        if on:
+            self._strip_for = None
+        self._show_head(self.select_bar if on else self.search_bar
+                        if self.searching else self.normal_bar)
         msgs = list(self.selected.values())
         if len(msgs) == 1 and self._reactable(msgs[0]):
             self.strip.show(self.app.store.reaction_of(
@@ -9465,6 +16881,7 @@ class ConversationScreen(Screen):
             self._place_strip()
         else:
             self.strip.hide()
+            self._strip_for = None
         if not on:
             return
         self.select_count.text = str(len(msgs))
@@ -9480,6 +16897,141 @@ class ConversationScreen(Screen):
             m.get("kind") in ("image", "voice") and not
             ((message_ext(m).get("media") or {}).get("blob") or
              m.get("media_path")) for m in msgs)
+
+    def _show_head(self, bar) -> None:
+        """Exactly one of the head's three bars: normal, held messages'
+        actions, or search."""
+        if bar.parent is self.bar:
+            return
+        for other in (self.normal_bar, self.select_bar, self.search_bar):
+            if other.parent is self.bar:
+                self.bar.remove_widget(other)
+        self.bar.add_widget(bar)
+
+    # ---- v11: swipes ------------------------------------------------------------------
+    def swipe_kind(self, touch, dx: float) -> Optional[str]:
+        """In the messages: to the right goes back to the chats; to the
+        left on a message replies to it (never from its waveform)."""
+        if self.selecting or self.recorder is not None:
+            return None
+        wx, wy = window_pos(self, *touch.opos)
+        if not hits(self.stack, wx, wy):
+            return None
+        if dx > 0:
+            return "back"
+        row = self._row_at(wx, wy)
+        if row is None or self.composer_closed():
+            return None
+        media = row.bubble.media
+        if isinstance(media, VoiceContent) and hits(media.wave, wx, wy):
+            return None
+        self._swipe_row = row
+        return "reply"
+
+    def _row_at(self, wx: float, wy: float) -> Optional["BubbleRow"]:
+        for row in self._rows.values():
+            if hits(row, wx, wy):
+                return row
+        return None
+
+    def composer_closed(self) -> bool:
+        """You cannot write here: a group you are not in, a blocked
+        contact."""
+        return self.closed_note.parent is not None or \
+            self.blocked_note.parent is not None
+
+    def reply_swipe_begin(self, touch) -> bool:
+        self.close_strip()
+        return getattr(self, "_swipe_row", None) is not None
+
+    def reply_swipe_follow(self, dx: float) -> None:
+        row = self._swipe_row
+        if row is None:
+            return
+        pull = min(0.0, dx)
+        # Freely to the reply mark, then stiffly beyond it.
+        if pull < -SWIPE_REPLY:
+            pull = -SWIPE_REPLY + (pull + SWIPE_REPLY) * 0.25
+        row.shift = max(pull, -SWIPE_REPLY * 1.6)
+
+    def reply_swipe_end(self, dx: float) -> None:
+        row, self._swipe_row = self._swipe_row, None
+        if row is None:
+            return
+        row.settle_shift()
+        if dx <= -SWIPE_REPLY:
+            bubble = self._bubbles.get(row.msg_id)
+            if bubble is not None:
+                self.set_reply(bubble.msg)
+
+    # ---- v11: search in this chat ----------------------------------------------------
+    def open_search(self) -> None:
+        if self.peer is None or self.app.store is None:
+            return
+        self.clear_selection()
+        self.close_strip()
+        self.searching = True
+        self._show_head(self.search_bar)
+        self.search_field.text = ""
+        self._search_hits, self._search_at = [], -1
+        self._sync_search_count()
+        Clock.schedule_once(lambda _dt: setattr(self.search_field.input,
+                                                "focus", True), 0.05)
+
+    def close_search(self) -> None:
+        if not self.searching:
+            return
+        self.searching = False
+        if self._search_ev is not None:
+            self._search_ev.cancel()
+            self._search_ev = None
+        self.search_field.input.focus = False
+        self._search_hits, self._search_at = [], -1
+        self._show_head(self.select_bar if self.selected
+                        else self.normal_bar)
+
+    def _search_soon(self) -> None:
+        if not self.searching:
+            return
+        if self._search_ev is not None:
+            self._search_ev.cancel()
+        self._search_ev = Clock.schedule_once(lambda _dt: self._run_search(),
+                                              0.25)
+
+    def _run_search(self) -> None:
+        self._search_ev = None
+        store, peer = self.app.store, self.peer
+        query = self.search_field.text.strip()
+        if store is None or peer is None or not query:
+            self._search_hits, self._search_at = [], -1
+            self._sync_search_count()
+            return
+        hits = store.search_messages(query, limit=999, peer=peer)
+        self._search_hits = [h["id"] for h in hits]
+        self._search_at = -1
+        self.search_step(1)
+
+    def search_step(self, step: int) -> None:
+        """To the next match: `step` 1 goes back in time, -1 forward."""
+        if not self._search_hits:
+            self._sync_search_count()
+            return
+        at = max(0, min(len(self._search_hits) - 1, self._search_at + step))
+        self._search_at = at
+        self._sync_search_count()
+        self.app.open_conversation_at(self.peer, self._search_hits[at])
+
+    def _sync_search_count(self) -> None:
+        hits, at = self._search_hits, self._search_at
+        query = self.search_field.text.strip()
+        if not query:
+            self.search_count.text = ""
+        elif not hits:
+            self.search_count.text = "none"
+        else:
+            self.search_count.text = f"{at + 1} of {len(hits)}"
+        self.search_up.disabled = not hits or at >= len(hits) - 1
+        self.search_down.disabled = not hits or at <= 0
 
     @staticmethod
     def _text_of(msg: dict) -> str:
@@ -9507,6 +17059,18 @@ class ConversationScreen(Screen):
             part = (bubble.body.selection_text if bubble is not None and
                     isinstance(bubble.body, SelectableText) else "")
             text = part or self._text_of(msgs[0])
+            links = links_in(text) if not part else []
+            if links:
+                # v11: the text, or one of its links (to see where it leads,
+                # open it, or copy it alone).
+                self.clear_selection()
+                items = [("copy", "Copy the text",
+                          lambda: self.app.copy_text(text))]
+                items += [("link", escape_markup(link_host(url)),
+                           lambda u=url: self.app.open_link(u))
+                          for url in links[:4]]
+                MenuSheet(items, title="Copy").open()
+                return
         else:
             text = "\n".join(
                 f"[{pretty_time(m['created_at'])}] "
@@ -9605,17 +17169,69 @@ class ConversationScreen(Screen):
                 Clock.schedule_once(
                     lambda _dt: row.set_selected(mid in self.selected), 0.9)
                 return
-        self.app._set_status("That message is further back — open "
-                             "‘Earlier messages’ to find it", T.text_3)
+        row = self.app.store.message_by_cid(self.peer, cid) \
+            if self.peer else None
+        if row is not None:
+            self.app.open_conversation_at(self.peer, row["id"])
+        else:
+            self.app._set_status("That message is no longer on this device",
+                                 T.text_3)
 
     # ---- taps ------------------------------------------------------------------
-    def on_bubble_tap(self, msg_id: int) -> None:
+    def on_bubble_tap(self, msg_id: int, touch=None) -> None:
+        """A tap on a message marks it read, and raises the reactions over
+        it (v9.1.2) — unless it landed on something with a tap of its own:
+        a photo, a voice note, a quote, a link or its preview, a reaction.
+        Tap it again, or anywhere else, to put them away."""
         bubble = self._bubbles.get(msg_id)
         if bubble is None:
             return
         msg = bubble.msg
         if msg["direction"] == "in" and not msg["read"]:
             self.app._mark_single_read(msg["id"], msg.get("server_id"))
+        row = self._rows.get(msg_id)
+        if touch is not None and row is not None:
+            # The row's handler passed its own view of the touch on.
+            wx, wy = window_pos(row, *touch.pos)
+            for part in (bubble.media, bubble.quote, bubble.card,
+                         bubble.reactions):
+                if part is not None and part.width > 0 and part.height > 0 \
+                        and part.collide_point(*part.to_widget(wx, wy)):
+                    return
+            url = bubble.link_at(wx, wy)
+            if url:
+                self.close_strip()
+                self.app.open_link(url)
+                return
+        if self._strip_for == msg_id:
+            self.close_strip()
+        elif self._reactable(msg):
+            self._strip_for = msg_id
+            self.strip.show(self.app.store.reaction_of(
+                msg["peer"], msg["client_msg_id"], self.app.keys.address)
+                if self.app.store else "")
+            self._place_strip()
+
+    def on_link_tap(self, url: str) -> None:
+        if not self.selecting:
+            self.close_strip()
+            self.app.open_link(url)
+
+    def close_strip(self) -> None:
+        """Put away reactions raised by a tap (not those of a held one)."""
+        if self._strip_for is not None:
+            self._strip_for = None
+            if not self.selected:
+                self.strip.hide()
+
+    def on_touch_up(self, touch):
+        handled = super().on_touch_up(touch)
+        # A tap off the messages (or a scroll) puts tap-raised reactions away.
+        if self._strip_for is not None and not touch.ud.get("fext_row") and \
+                not self.strip.collide_point(*self.strip.to_widget(
+                    *window_pos(self, *touch.pos))):
+            self.close_strip()
+        return handled
 
     def on_media_tap(self, msg: dict) -> None:
         if self.selecting:
@@ -9643,6 +17259,18 @@ class ConversationScreen(Screen):
                                          T.alert)
                 self.refresh_voice_buttons()
 
+    def seek_voice(self, msg: dict, fraction: float) -> None:
+        """A drag or tap on a voice note's waveform: play it from there."""
+        if self.selecting:
+            return
+        path = msg.get("media_path")
+        try:
+            self.app.voice.seek(path, fraction)
+        except Exception:
+            log.exception("could not play voice note")
+            self.app._set_status("Couldn't play that voice message", T.alert)
+        self.refresh_voice_buttons()
+
     def refresh_voice_buttons(self) -> None:
         for bubble in self._bubbles.values():
             if isinstance(bubble.media, VoiceContent):
@@ -9663,7 +17291,7 @@ class ConversationScreen(Screen):
         if self.peer is None or self.app.store is None:
             return
         peer, app = self.peer, self.app
-        items = []
+        items = [("search", "Search in this chat", self.open_search)]
         if self.app.store.unread_for(peer):
             items.append(("check", "Mark all as read",
                           lambda: app.mark_peer_read(peer)))
@@ -9672,11 +17300,13 @@ class ConversationScreen(Screen):
             items.append(("group", "Group info", app.open_chat_info))
             items.append(("star", "Starred messages",
                           lambda: StarredModal(app, peer).open()))
-            on = (self.group or {}).get("notify", 1)
-            items.append(("bell_off" if on else "bell",
-                          "Mute notifications" if on else
-                          "Unmute notifications",
-                          lambda: app.set_group_notify(gid, not on)))
+            muted = app.store.mute_state(peer)[0]
+            items.append(("bell" if muted else "bell_off",
+                          "Unmute notifications" if muted else
+                          "Mute notifications…",
+                          lambda: app.toggle_notify(peer)))
+            items.append(("clock", "Disappearing messages…",
+                          lambda: app.choose_timer(peer)))
             items.append(("share", "Export or import",
                           lambda: ChatHistorySheet(app, peer).open()))
             if (self.group or {}).get("state") == "active":
@@ -9688,15 +17318,17 @@ class ConversationScreen(Screen):
             items.append(("share", "Export or import",
                           lambda: ChatHistorySheet(app, peer).open()))
         else:
-            contact = self.app.store.get_contact(peer) or {}
             items.append(("info", "Chat info", app.open_chat_info))
             items.append(("star", "Starred messages",
                           lambda: StarredModal(app, peer).open()))
-            on = contact.get("notify", 1)
-            items.append(("bell_off" if on else "bell",
-                          "Mute notifications" if on else
-                          "Unmute notifications",
+            muted = app.store.mute_state(peer)[0]
+            items.append(("bell" if muted else "bell_off",
+                          "Unmute notifications" if muted else
+                          "Mute notifications…",
                           lambda: app.toggle_notify(peer)))
+            items.append(("clock", "Disappearing messages…",
+                          lambda: app.choose_timer(peer)))
+            items.append(("lock", "Verify…", lambda: app.open_verify(peer)))
             items.append(("share", "Export or import",
                           lambda: ChatHistorySheet(app, peer).open()))
         MenuSheet(items).open()
@@ -9731,9 +17363,126 @@ class ConversationScreen(Screen):
             return
         self.entry.input.insert_text(emoji)
 
+    def _on_text_changed(self) -> None:
+        self._sync_composer()
+        self._preview_soon()
+        if self._draft_save is not None:
+            self._draft_save.cancel()
+        self._draft_save = Clock.schedule_once(lambda _dt: self.keep_draft(),
+                                               1.2)
+
+    def keep_draft(self) -> None:
+        """Write what is in the composer as this chat's draft (or clear it)."""
+        if self._draft_save is not None:
+            self._draft_save.cancel()
+            self._draft_save = None
+        store = self.app.store
+        if self.peer is None or store is None:
+            return
+        text = self.entry.text
+        if text.strip() != store.draft(self.peer).strip() or \
+                (not text.strip() and store.draft(self.peer)):
+            store.set_draft(self.peer, text)
+            self.app.refresh_sidebar()
+
     def _on_entry_focus(self, _w, focused: bool) -> None:
         if focused and self.emoji_panel.is_open and IS_MOBILE:
             self.close_emoji()
+
+    # ---- v11: a link's preview, while writing -------------------------------
+    # Only with previews turned on in Settings: a moment after a link is
+    # written this device fetches its preview, shown over the composer to
+    # send with the message, or to be put away (✕) and not sent.
+    def _preview_soon(self) -> None:
+        if not self._previews_on:
+            return
+        if self._preview_ev is not None:
+            self._preview_ev.cancel()
+        self._preview_ev = Clock.schedule_once(
+            lambda _dt: self._preview_check(), 0.8)
+
+    def _preview_check(self) -> None:
+        self._preview_ev = None
+        links = links_in(self.entry.text)
+        if not links:
+            self.cancel_preview()
+            return
+        url = links[0]
+        if url in (self._preview_url, self._preview_dismissed):
+            return
+        self._preview_url, self.link_preview = url, None
+        self._show_preview_bar(link_host(url), "Fetching a preview…", None)
+        threading.Thread(target=self._fetch_preview, args=(url, self.peer),
+                         daemon=True).start()
+
+    def _fetch_preview(self, url: str, peer: Optional[str]) -> None:
+        try:
+            preview = fetch_link_preview(url)
+        except Exception:
+            log.exception("could not fetch a link preview")
+            preview = None
+        Clock.schedule_once(
+            lambda _dt: self._preview_arrived(url, peer, preview))
+
+    def _preview_arrived(self, url: str, peer: Optional[str],
+                         preview: Optional[dict]) -> None:
+        if url != self._preview_url or peer != self.peer:
+            return                                  # the text moved on
+        if preview is None:
+            self._hide_preview_bar()        # none to be had: sent without
+            return
+        self.link_preview = preview
+        self._show_preview_bar(preview.get("s") or link_host(url),
+                               preview["t"], preview.get("i"))
+
+    def dismiss_preview(self) -> None:
+        self._preview_dismissed = self._preview_url
+        self.link_preview = None
+        self._hide_preview_bar()
+
+    def cancel_preview(self) -> None:
+        if self._preview_ev is not None:
+            self._preview_ev.cancel()
+            self._preview_ev = None
+        self._preview_url = self._preview_dismissed = None
+        self.link_preview = None
+        self._hide_preview_bar()
+
+    def take_preview(self, body: str) -> Optional[dict]:
+        """The preview to send with `body` (it must be of a link in it)."""
+        preview = self.link_preview
+        self.cancel_preview()
+        if preview and preview.get("u") in links_in(body):
+            return preview
+        return None
+
+    def _show_preview_bar(self, site: str, title: str,
+                          thumb: Optional[str]) -> None:
+        self.preview_site.text = site
+        self.preview_title.text = title
+        texture = texture_from_b64(thumb) if thumb else None
+        self.preview_thumb.texture = texture
+        self.preview_thumb.opacity = 1 if texture is not None else 0
+        self.preview_thumb.width = dp(40) if texture is not None else 0
+        self.preview_bar.height = max(dp(56), self.preview_site.height +
+                                      line_height(15) + dp(14))
+        self.preview_bar.opacity = 1
+        self.preview_bar.conceal(False)
+
+    def _hide_preview_bar(self) -> None:
+        self.preview_bar.height, self.preview_bar.opacity = 0, 0
+        self.preview_bar.conceal(True)
+
+    def _paint_bar_icon(self, widget, bar, name: str) -> None:
+        widget.canvas.clear()
+        with widget.canvas:
+            draw_icon(name, widget.x + widget.width / 2,
+                      bar.y + bar.height / 2, dp(20), C(T.accent))
+
+    @staticmethod
+    def _sync_bar_rule(widget, *_a) -> None:
+        widget._rule.pos = (widget.x, widget.y + dp(3))
+        widget._rule.size = (dp(2), max(0, widget.height - dp(6)))
 
     # ---- composer: photo, voice, send ------------------------------------------
     def _paint_reply_icon(self, widget) -> None:
@@ -9788,6 +17537,8 @@ class ConversationScreen(Screen):
             else "Send"
 
     def _on_action_button(self) -> None:
+        if self.recorder is not None:          # already recording
+            return
         if self.entry.input.text.strip() or not self._voice_possible():
             self.app.send_current()
         else:
@@ -9831,7 +17582,106 @@ class ConversationScreen(Screen):
         camera photo), deleted once it is sent or set aside."""
         AttachPreviewModal(self.app, path, temporary=temporary).open()
 
-    def start_recording(self) -> None:
+    # ---- recording: hold, slide, lock ----------------------------------------
+    HOLD_TAP = 0.35        # a press shorter than this is a tap: hands-free
+    CANCEL_SLIDE = dp(110)  # this far left, and the recording is deleted
+    LOCK_SLIDE = dp(80)    # this far up, and it carries on hands-free
+
+    def mic_mode(self) -> bool:
+        """Is the action button the microphone (nothing written)?"""
+        return not self.entry.input.text.strip() and self._voice_possible() \
+            and self.recorder is None
+
+    def hold_begin(self, touch) -> None:
+        self._hold = {"t0": time.monotonic(), "x0": touch.x, "y0": touch.y}
+        self.start_recording(held=True)
+        if self.recorder is None:          # refused, or asking permission
+            self._hold = None
+
+    def hold_move(self, touch) -> None:
+        hold = self._hold
+        if hold is None or self.recorder is None or self._rec_locked:
+            return
+        dx, dy = touch.x - hold["x0"], touch.y - hold["y0"]
+        if -dx >= self.CANCEL_SLIDE:
+            self._hold = None
+            self.cancel_recording()
+            self.app._set_status("Recording deleted", T.text_3)
+            return
+        if dy >= self.LOCK_SLIDE:
+            self._hold = None
+            self.lock_recording()
+            return
+        # follow the finger: the hint slides away left, the lock rises
+        left = max(0.0, -dx) / self.CANCEL_SLIDE
+        self.rec_hint.opacity = 1 - 0.7 * left
+        self.rec_hint.padding = [0, 0, min(dp(60), max(0.0, -dx) * 0.6), 0]
+        self.lock_pill.set_rise(max(0.0, dy) / self.LOCK_SLIDE)
+
+    def hold_end(self, touch) -> None:
+        hold, self._hold = self._hold, None
+        if hold is None or self.recorder is None or self._rec_locked:
+            return
+        if time.monotonic() - hold["t0"] < self.HOLD_TAP:
+            self.lock_recording()          # a tap: record hands-free
+        else:
+            self.finish_recording()        # let go: send it
+
+    def lock_recording(self) -> None:
+        """Hands-free: delete · the time and level · pause · send."""
+        if self.recorder is None:
+            return
+        self._rec_locked = True
+        self._show_rec_ui()
+
+    def toggle_pause(self) -> None:
+        recorder = self.recorder
+        if recorder is None or not getattr(recorder, "can_pause", False):
+            return
+        if getattr(recorder, "paused", False):
+            recorder.resume()
+        else:
+            recorder.pause()
+        self._sync_pause()
+
+    def _sync_pause(self) -> None:
+        paused = bool(getattr(self.recorder, "paused", False))
+        self.rec_pause.set_icon("mic" if paused else "pause")
+        self.rec_pause.label = "Carry on recording" if paused \
+            else "Pause recording"
+        Animation.cancel_all(self.rec_dot, "opacity")
+        self.rec_dot.opacity = .35 if paused else 1
+        if motion(1) and not paused:
+            pulse = Animation(opacity=.25, d=.6, t="in_out_sine") + \
+                Animation(opacity=1, d=.6, t="in_out_sine")
+            pulse.repeat = True
+            pulse.start(self.rec_dot)
+
+    def _show_rec_ui(self) -> None:
+        """The composer while recording: held (the time and level, the hint,
+        the microphone under the finger, the lock over it) or hands-free."""
+        self.close_emoji()
+        self.composer.clear_widgets()
+        if self._rec_locked:
+            parts = [self.rec_cancel, self.rec_dot, self.rec_label,
+                     self.rec_levels]
+            if getattr(self.recorder, "can_pause", False):
+                parts.append(self.rec_pause)
+            parts.append(self.rec_send)
+            self.lock_pill.hide()
+        else:
+            self.rec_hint.opacity, self.rec_hint.padding = 1, [0, 0, 0, 0]
+            parts = [Widget(size_hint_x=None, width=dp(12)), self.rec_dot,
+                     self.rec_label, self.rec_hint, self.action_holder]
+            self.lock_pill.show(self.stack, self.action_holder)
+        for part in parts:
+            self.composer.add_widget(part)
+        if not self._rec_locked:
+            self.action_button.show_icon("mic")
+        self.action_button.set_holding(not self._rec_locked)
+        self._sync_pause()
+
+    def start_recording(self, held: bool = False) -> None:
         if self._media_refused("Voice messages"):
             return
         if IS_ANDROID and not android_has_permission(
@@ -9849,18 +17699,8 @@ class ConversationScreen(Screen):
             self.app._set_status("Couldn't start recording — is a "
                                  "microphone connected?", T.alert)
             return
-        self.close_emoji()
-        self.composer.clear_widgets()
-        for part in (self.rec_cancel, self.rec_dot, self.rec_label,
-                     self.rec_levels, self.rec_send):
-            self.composer.add_widget(part)
-        Animation.cancel_all(self.rec_dot, "opacity")
-        self.rec_dot.opacity = 1
-        if motion(1):
-            pulse = Animation(opacity=.25, d=.6, t="in_out_sine") + \
-                Animation(opacity=1, d=.6, t="in_out_sine")
-            pulse.repeat = True
-            pulse.start(self.rec_dot)
+        self._rec_locked = not held
+        self._show_rec_ui()
         self._rec_tick = Clock.schedule_interval(self._update_rec_label, 0.1)
         self._update_rec_label(0)
 
@@ -9900,6 +17740,9 @@ class ConversationScreen(Screen):
             self._rec_tick.cancel()
             self._rec_tick = None
         Animation.cancel_all(self.rec_dot, "opacity")
+        self._hold, self._rec_locked = None, False
+        self.lock_pill.hide()
+        self.action_button.set_holding(False)
         self.composer.clear_widgets()
         for part in self.composer_parts:
             self.composer.add_widget(part)
@@ -9986,6 +17829,9 @@ class ConversationScreen(Screen):
 
     def jump_to_latest(self) -> None:
         self._unseen = 0
+        if self.reading_back():
+            self.app.reopen_live()
+            return
         self.scroll_to_bottom(animate=True)
 
     def _on_content_height(self) -> None:
@@ -10003,13 +17849,28 @@ class ConversationScreen(Screen):
             offset_px = self.scroll.scroll_y * old_span
             self.scroll.scroll_y = max(0.0, min(1.0, offset_px / new_span))
 
+    def reading_back(self) -> bool:
+        """Is a window short of the conversation's end showing?"""
+        return getattr(self.app, "_chat_ceiling", None) is not None
+
     def _on_scrolled(self) -> None:
+        if self.reading_back():                     # a window further back
+            self._stick_to_bottom = False
+            self._sync_jump_button()
+            if self.scroll.scroll_y <= self.BOTTOM_EPSILON and \
+                    self.content_height() > self.scroll.height:
+                self.app.load_newer_messages()
+            return
         if self.at_bottom():
             self._unseen = 0
             self._stick_to_bottom = True
         else:
             self._stick_to_bottom = False
         self._sync_jump_button()
+        if self.has_older and self._backfill_ev is None and \
+                self.scroll.scroll_y >= 0.98 and \
+                self.content_height() > self.scroll.height:
+            self.app.load_older_messages()
 
     def cancel_pending_scroll(self) -> None:
         """Hand scroll control back to the user: the queued settle, any
@@ -10030,7 +17891,7 @@ class ConversationScreen(Screen):
     def _sync_jump_button(self) -> None:
         self.jump_button.set_count(self._unseen)
         self.jump_button.set_visible(not self.at_bottom() or
-                                     self._unseen > 0)
+                                     self._unseen > 0 or self._newer > 0)
 
     def note_new_messages(self, count: int) -> None:
         """Announce arrivals while reading history — without moving."""
@@ -10058,8 +17919,8 @@ class ConversationScreen(Screen):
 
     def _empty_state(self) -> BoxLayout:
         if self.kind == "self":
-            text = ("Notes to self. Whatever you write, forward or photograph "
-                    "here stays on this device and goes nowhere.")
+            text = ("Saved messages. Whatever you write, forward or "
+                    "photograph here stays on this device and goes nowhere.")
         elif self.kind == "group":
             text = ("The beginning of the group. Each message is sealed "
                     "separately for every member before it leaves.")
@@ -10080,7 +17941,7 @@ class ConversationScreen(Screen):
 # =============================================================================
 #  Info, groups, settings
 # =============================================================================
-class PageScreen(Screen):
+class PageScreen(SwipeGestures, Screen):
     """A titled page: app bar with back, and a scrolling column."""
 
     def __init__(self, app: "FextApp", name: str, title: str,
@@ -10106,15 +17967,53 @@ class PageScreen(Screen):
         self.body.add_widget(label)
         return label
 
+    def swipe_kind(self, touch, dx: float) -> Optional[str]:
+        """Anywhere on a page, a swipe to the right goes back."""
+        return "back" if dx > 0 else None
+
+    def _timer_row(self, peer: str, can_set: bool = True) -> "ListRow":
+        """Disappearing messages: off, or how long — tap to change."""
+        seconds = self.app.store.chat_timer(peer)[0]
+        value = (timer_label(seconds) + " after reading") if seconds \
+            else "Off"
+        if not can_set:
+            value += " · set by the group's admin"
+        return ListRow("clock", "Disappearing messages", value,
+                       chevron=can_set,
+                       on_tap=(lambda: self.app.choose_timer(peer))
+                       if can_set else None)
+
+    def _mute_row(self, peer: str) -> "ListRow":
+        """Notifications: on, or muted until when — tap to change."""
+        muted, until = self.app.store.mute_state(peer)
+        return ListRow("bell_off" if muted else "bell", "Notifications",
+                       mute_label(until) if muted else
+                       "On · muting keeps messages coming, quietly",
+                       chevron=True,
+                       on_tap=lambda: self.app.choose_mute([peer]))
+
     def hero(self, seed: str, name: str, kind: str, sub: str = "",
-             on_sub: Optional[Callable] = None, on_name=None) -> None:
-        """The big disc, the name, and a line beneath (tap to copy)."""
+             on_sub: Optional[Callable] = None, on_name=None,
+             on_avatar: Optional[Callable] = None,
+             editable: bool = False) -> None:
+        """The big disc, the name, and a line beneath (tap to copy). With
+        `on_avatar` the disc is a button; `editable` marks it with a camera,
+        for a picture that can be changed."""
         head = BoxLayout(orientation="vertical", size_hint_y=None,
                          padding=[dp(20), dp(26), dp(20), dp(16)],
                          spacing=dp(8))
         head.bind(minimum_height=head.setter("height"))
         holder = AnchorLayout(size_hint_y=None, height=dp(96))
-        holder.add_widget(Avatar(seed, name, diameter=dp(92), kind=kind))
+        if on_avatar is not None:
+            self.hero_disc = AvatarButton(seed, name, diameter=dp(92),
+                                          kind=kind, size=(dp(96), dp(96)))
+            self.hero_disc.bind(on_release=lambda _w: on_avatar())
+            if editable:
+                self.hero_disc.bind(pos=self._badge, size=self._badge)
+                self._badge(self.hero_disc)
+        else:
+            self.hero_disc = Avatar(seed, name, diameter=dp(92), kind=kind)
+        holder.add_widget(self.hero_disc)
         head.add_widget(holder)
         title = InfoLabel(name, font_size=fs(25), halign="center")
         if on_name is not None:
@@ -10138,6 +18037,22 @@ class PageScreen(Screen):
         self.body.add_widget(head)
         self.body.add_widget(Rule())
 
+    @staticmethod
+    def _badge(disc, *_a) -> None:
+        """A small gold disc with a camera, on the picture's lower right."""
+        disc.canvas.after.clear()
+        radius, gap = dp(15), dp(2.5)
+        cx = disc.center_x + dp(46) * .7
+        cy = disc.center_y - dp(46) * .7
+        with disc.canvas.after:
+            Color(*C(T.bg))
+            SmoothEllipse(pos=(cx - radius - gap, cy - radius - gap),
+                          size=(2 * (radius + gap), 2 * (radius + gap)))
+            Color(*C(T.accent))
+            SmoothEllipse(pos=(cx - radius, cy - radius),
+                          size=(2 * radius, 2 * radius))
+            draw_icon("camera", cx, cy, radius * 1.15, C(T.on_accent))
+
 
 class ChatInfoScreen(PageScreen):
     """A direct chat's (or notes to self's) page: who this is, and the
@@ -10155,8 +18070,8 @@ class ChatInfoScreen(PageScreen):
         self.body.clear_widgets()
         kind = self.app.conversation_kind(peer)
         if kind == "self":
-            self.appbar.title.text = "Notes to self"
-            self.hero(peer, "Notes to self", "self",
+            self.appbar.title.text = "Saved messages"
+            self.hero(peer, "Saved messages", "self",
                       "Kept on this device only")
             starred = len(store.starred(peer))
             self.body.add_widget(rows_card([
@@ -10178,14 +18093,19 @@ class ChatInfoScreen(PageScreen):
         contact = store.get_contact(peer) or {}
         name = contact.get("username") or short_addr(peer, 14)
         self.hero(peer, name, "dm", short_addr(peer, 22),
-                  on_sub=lambda: self.app.copy_text(peer))
+                  on_sub=lambda: self.app.copy_text(peer),
+                  on_avatar=lambda: self.app.view_picture(peer))
         self.body.add_widget(SectionHead("This chat"))
         self.body.add_widget(rows_card([
-            ListRow("bell", "Notifications",
-                    "Alerts for new messages in this chat",
-                    control=ToggleSwitch(contact.get("notify", 1),
-                                         lambda on: self.app.set_notify(peer,
-                                                                        on))),
+            ListRow("phone", "Voice call", "Sealed end to end, like the "
+                    "messages", on_tap=lambda: self.app.start_call(peer)),
+            self._mute_row(peer),
+            self._timer_row(peer),
+            ListRow("lock", "Verify " + name,
+                    ("Verified — you compared codes" if contact.get(
+                        "verified") else
+                     "Not verified · compare a code in person, or on a call"),
+                    chevron=True, on_tap=lambda: self.app.open_verify(peer)),
             ListRow("check", "Delivery and read ticks",
                     "Off on either side caps both at one tick",
                     control=ToggleSwitch(contact.get("ticks_enabled", 1),
@@ -10208,6 +18128,11 @@ class ChatInfoScreen(PageScreen):
                     "Plaintext copies, kept on this device", chevron=True,
                     on_tap=lambda: ChatHistorySheet(self.app, peer).open()),
         ]))
+        held = store.held_count(peer) if store.is_blocked(peer) else 0
+        if held:
+            self.paragraph(f"Blocked. {held} message{'s are' if held != 1 else ' is'} "
+                           f"kept here unopened, to arrive if you unblock "
+                           f"them.", italic=True)
         caps = contact.get("caps", 0) & LocalStore.CAP_V9
         self.paragraph(
             "Sealed end to end. " +
@@ -10293,7 +18218,9 @@ class GroupInfoScreen(PageScreen):
         members = group.get("members") or []
         self.hero(peer, group.get("name") or "Group", "group",
                   f"{len(members)} member{'s' if len(members) != 1 else ''}",
-                  on_name=(lambda: self._rename(group)) if admin else None)
+                  on_name=(lambda: self._rename(group)) if admin else None,
+                  on_avatar=(lambda: app.picture_menu(gid)) if admin else
+                  (lambda: app.view_picture(peer)), editable=admin)
         state = group.get("state")
         if state != "active":
             self.paragraph({"left": "You left this group. Its history stays "
@@ -10305,15 +18232,15 @@ class GroupInfoScreen(PageScreen):
                                        "join it when that arrives."
                             }.get(state, ""), italic=True)
         self.body.add_widget(SectionHead("This group"))
-        rows = [ListRow("bell", "Notifications",
-                        "Alerts for new messages here",
-                        control=ToggleSwitch(group.get("notify", 1),
-                                             lambda on: app.set_group_notify(
-                                                 gid, on)))]
+        rows = [self._mute_row(peer), self._timer_row(
+            peer, can_set=group.get("admin") == me)]
         if admin:
             rows.append(ListRow("edit", "Rename the group",
                                 group.get("name") or "", chevron=True,
                                 on_tap=lambda: self._rename(group)))
+            rows.append(ListRow("camera", "Group photo",
+                                "Every member sees it", chevron=True,
+                                on_tap=lambda: app.picture_menu(gid)))
         starred = len(store.starred(peer))
         rows.append(ListRow("star", "Starred messages",
                             f"{starred} message{'s' if starred != 1 else ''}",
@@ -10437,13 +18364,12 @@ class AddMembersSheet(Sheet):
 
 
 class SettingsScreen(PageScreen):
-    """Settings: how the app looks and reads, notifications, and this
-    identity's keys."""
+    """Settings: how the app looks and moves, notifications, and the way to
+    this identity's profile and keys."""
 
     def __init__(self, app: "FextApp", **kw):
         super().__init__(app, "settings", "Settings",
                          lambda: app.close_settings(), **kw)
-        self._revealed = False
 
     def show(self) -> None:
         self.body.clear_widgets()
@@ -10475,29 +18401,156 @@ class SettingsScreen(PageScreen):
         self.body.add_widget(pad)
         self.body.add_widget(rows_card([ListRow(
             None, "Reduce motion",
-            "Sheets, reactions and scrolling move without animation",
+            "Pages cross-fade instead of sliding; sheets, reactions and "
+            "scrolling move without animation",
             control=ToggleSwitch(APPEARANCE.reduce_motion,
                                  lambda on: app.set_appearance(
                                      reduce_motion=on)))]))
+        self.body.add_widget(SectionHead("Notifications"))
         if IS_ANDROID or os.environ.get("FEXT_SHOW_ANDROID_SETTINGS"):
-            self.body.add_widget(SectionHead("Notifications"))
-            self.body.add_widget(rows_card([ListRow(
+            rows = [ListRow(
                 "bell", "Receive messages while closed",
                 "A small service keeps listening after Android closes the "
                 "app; Android shows it as running. Off saves battery — you "
                 "are then only notified while Ferritext is open.",
                 control=ToggleSwitch(background_delivery_enabled(),
-                                     self._on_delivery))]))
-        self._identity()
+                                     self._on_delivery))]
+            if not android_full_screen_allowed():
+                rows.append(ListRow(
+                    "phone", "Let calls ring over the lock screen",
+                    "Android asks you to allow it: until then a call rings "
+                    "as a notification only", chevron=True,
+                    on_tap=android_open_full_screen_settings))
+            self.body.add_widget(rows_card(rows))
+        else:
+            self.body.add_widget(rows_card([ListRow(
+                "bell", "Notifications on this computer",
+                "The system's own, while Ferritext's window is not in "
+                "front; muted chats stay quiet",
+                control=ToggleSwitch(desktop_notifications_enabled(),
+                                     lambda on: save_pref(
+                                         "desktop_notifications", bool(on))))]))
+        self.body.add_widget(InfoLabel(
+            "A muted chat still receives everything and shows it here; only "
+            "its notifications stop. Mute one for 12 hours, 3 days, or until "
+            "you turn it back on, from its page or by holding it in the list.",
+            color=T.text_3, italic=True, font_size=fs(14.5),
+            padding=[dp(20), dp(4)]))
+        if not IS_MOBILE:
+            self.body.add_widget(SectionHead("Calls and voice notes"))
+            rows = []
+            for kind, title in (("input", "Microphone"), ("output",
+                                                          "Speaker")):
+                rows.append(ListRow(
+                    "mic" if kind == "input" else "speaker", title,
+                    chosen_device(kind) or "The system's own", chevron=True,
+                    on_tap=lambda k=kind: self._choose_device(k)))
+            self.body.add_widget(rows_card(rows))
+            echo = use_system_echo_cancel()
+            self.body.add_widget(InfoLabel(
+                ("Echo is cancelled by your system (" + echo + ")."
+                 if echo else
+                 "Echo cancelling comes from your computer or headset: with "
+                 "headphones, a headset, or a speakerphone that cancels echo "
+                 "itself, the other side never hears themselves. On Linux, "
+                 "PulseAudio's or PipeWire's echo-cancel module is used "
+                 "whenever it is on.") +
+                ("" if _has_sounddevice() else
+                 " Install sounddevice to choose the devices here."),
+                color=T.text_3, italic=True, font_size=fs(14.5),
+                padding=[dp(20), dp(4)]))
+        self.body.add_widget(SectionHead("Privacy"))
+        self.body.add_widget(rows_card([ListRow(
+            "link", "Link previews",
+            "When you write a link, this device fetches its title and "
+            "picture from the site (which sees the request) and sends them "
+            "with the message. Off: nothing is fetched, and previews others "
+            "send are not shown.",
+            control=ToggleSwitch(link_previews_enabled(),
+                                 self._on_previews))]))
+        self.body.add_widget(SectionHead("Backup"))
+        self.body.add_widget(rows_card([
+            ListRow("archive", "Back up to a file",
+                    "Your identities and chats, sealed with a passphrase",
+                    chevron=True, on_tap=lambda: BackupSheet(app).open()),
+            ListRow("unarchive", "Restore from a backup",
+                    "Adds the identities in a backup to this device",
+                    chevron=True, on_tap=lambda: RestoreSheet(app).open())]))
+        if app.keys.has_identity:
+            self.body.add_widget(SectionHead("Identity"))
+            self.body.add_widget(rows_card([ListRow(
+                "key", "Profile and keys",
+                "Your name, address, QR codes and private key",
+                chevron=True, on_tap=app.open_profile)]))
         self.body.add_widget(SectionHead("About"))
-        self.paragraph(
-            f"{APP_NAME} {APP_VERSION}. Set in EB Garamond, with Noto Emoji "
-            "and Titillium Web, under the SIL Open Font License.",
-            italic=True)
+        self.body.add_widget(rows_card([ListRow(
+            "info", f"{APP_NAME} {APP_VERSION}", "Version, relay and type",
+            chevron=True, on_tap=lambda: AboutSheet(app).open())]))
 
     def _on_delivery(self, on: bool) -> None:
         save_pref("background_delivery", bool(on))
         self.app._sync_background_service()
+
+    def _on_previews(self, on: bool) -> None:
+        save_pref("link_previews", bool(on))
+        screen = self.app.conversation_screen
+        screen._previews_on = bool(on)
+        screen._rendered_peer = None    # its bubbles show or hide them anew
+        if not on:
+            screen.cancel_preview()
+
+    def _choose_device(self, kind: str) -> None:
+        names = sound_devices(kind)
+        if not names:
+            self.app._set_status("Choosing devices needs the sounddevice "
+                                 "package", T.accent)
+            return
+        now = chosen_device(kind)
+
+        def pick(name):
+            save_pref(f"sound_{kind}", name or "")
+            self.show()
+        items = [("check" if now is None else "speaker", "The system's own",
+                  lambda: pick(None))]
+        items += [("check" if name == now else
+                   ("mic" if kind == "input" else "speaker"), name,
+                   lambda n=name: pick(n)) for name in names[:20]]
+        MenuSheet(items, title="Microphone" if kind == "input"
+                  else "Speaker").open()
+
+class ProfileScreen(PageScreen):
+    """Your profile: the identity you are writing as — its disc, name and
+    username — and its keys: the address and public bundle (to share, as
+    text or QR), the private key (never to share), and removing it."""
+
+    def __init__(self, app: "FextApp", **kw):
+        super().__init__(app, "profile", "My profile",
+                         lambda: app.close_profile(), **kw)
+        self._revealed = False
+
+    def show(self) -> None:
+        self.body.clear_widgets()
+        self._revealed = False
+        keys, app = self.app.keys, self.app
+        if not keys.has_identity:
+            return
+        self.hero(keys.address, keys.label or keys.username or "?", "dm",
+                  sub=f"@{keys.username or 'not registered'}",
+                  on_name=lambda: RenameIdentityModal(app,
+                                                      keys.address).open(),
+                  on_avatar=lambda: app.picture_menu(), editable=True)
+        self.body.add_widget(SectionHead("Photo"))
+        self.body.add_widget(rows_card([ListRow(
+            "camera", "Change the profile photo" if
+            PICTURES.path(keys.address) else "Set a profile photo",
+            "The people you write to see it", chevron=True,
+            on_tap=lambda: app.picture_menu())]))
+        self._identity()
+        self.body.add_widget(SectionHead("This device"))
+        self.body.add_widget(rows_card([ListRow(
+            "delete", "Remove this identity",
+            "Its key, chats and settings leave this device", danger=True,
+            on_tap=lambda: RemoveIdentityModal(app, keys.address).open())]))
 
     def _qr(self, data: str, side=dp(184)) -> AnchorLayout:
         holder = AnchorLayout(size_hint_y=None, height=side + dp(20))
@@ -10515,12 +18568,8 @@ class SettingsScreen(PageScreen):
         keys, app = self.app.keys, self.app
         if not keys.has_identity:
             return
-        self.body.add_widget(SectionHead("This identity"))
+        self.body.add_widget(SectionHead("Address"))
         self.body.add_widget(rows_card([
-            ListRow("person", keys.label,
-                    f"@{keys.username or 'not registered'}", chevron=True,
-                    on_tap=lambda: RenameIdentityModal(app,
-                                                       keys.address).open()),
             ListRow("copy", "Copy address", keys.address,
                     on_tap=lambda: app.copy_text(keys.address)),
         ] + ([ListRow("share", "Open the key folder", str(DATA_DIR),
@@ -10568,6 +18617,7 @@ class SettingsScreen(PageScreen):
         data = json.loads(self.app.keys.private_export())
         Clipboard.copy(data["private_key_wif"])
         self.app._set_status("Private key copied — keep it safe", T.accent)
+
 
 
 class SettingsModal:
@@ -10663,6 +18713,13 @@ class MessagingMixin:
         me = MessageFlowLog.who(self.keys.address, self.keys.username)
         contact = self.store.get_contact(peer) or {}
         them = MessageFlowLog.who(peer, contact.get("username"))
+        if x is not None:
+            # v9.1.2: what this app can do, and which version of our picture
+            # is current — older releases verify these and ignore them.
+            x = dict(x, ft=FEATURES)
+            pv = self.store.picture_version(self.keys.address)
+            if pv:
+                x["pv"] = pv
         try:
             envelope, _sent_at = self.crypto.build_envelope(
                 body, peer_pub, x=x, recipient=peer, cid=client_msg_id)
@@ -10718,21 +18775,243 @@ class MessagingMixin:
             contact = self.store.get_contact(peer)
             if contact is None:
                 return False
+            if local_id is not None:
+                self._send_picture_if_due(contact)
             return self._send_worker(local_id, peer, contact["public_key"],
                                      body, cid, x)
         gid = gid_of(peer)
         group = self.store.group(gid) if gid else None
         if group is None:
             return False
+        admin = group["admin"] == self.keys.address
         if x.get("k") == "ctl":
             x = dict(x, ctl=dict(x["ctl"], grp=gid))
         else:
             x = dict(x, grp={"id": gid, "v": group["version"]})
+            gpv = self.store.picture_version(peer) if admin else 0
+            if gpv:
+                x["grp"]["pv"] = gpv      # the group picture, from its admin
         ok = True
         for address, pub in self.group_recipients(gid):
+            if local_id is not None:
+                contact = self.store.get_contact(address)
+                if contact is not None:
+                    self._send_picture_if_due(contact)
+                    if admin:
+                        self._send_group_picture_if_due(gid, contact)
             ok = self._send_worker(local_id, address, pub, body, cid, x,
                                    group=gid if local_id else None) and ok
         return ok
+
+    def send_text(self, peer: str, body: str, reply: Optional[dict] = None,
+                  forwarded: bool = False, preview: Optional[dict] = None
+                  ) -> Optional[int]:
+        """Queue a text message. Returns its local id (None if impossible).
+
+        Every v9 message carries a signed extension block, even a plain one:
+        it is what binds the message to its recipient (see build_envelope)
+        and how the other side learns this device understands replies,
+        media and delete-for-both.
+        """
+        ext = {}
+        if reply:
+            ext["reply"] = reply
+        if forwarded:
+            ext["fwd"] = 1
+        if preview and preview.get("u") in links_in(body):
+            preview = dict(preview)
+            if len(body.encode("utf-8")) > 12000:
+                preview.pop("i", None)     # a long text leaves it no room
+            ext["lp"] = preview
+        return self._queue_message(peer, body, dict(ext, k="text"), "text",
+                                   ext)
+
+    def _queue_message(self, peer: str, body: str, x: dict, kind: str,
+                       ext: Optional[dict], media_path: Optional[str] = None,
+                       media_state: str = "",
+                       on_local_row: Optional[Callable] = None
+                       ) -> Optional[int]:
+        """Record an outgoing message at 0/3 and send it in the background.
+
+        Notes to self are recorded and go nowhere. A group message records
+        one delivery row per member, then goes out to each of them.
+        """
+        if self.store is None:
+            return None
+        conv = self.conversation_kind(peer)
+        recipients = None
+        if conv == "dm":
+            contact = self.store.get_contact(peer)
+            if contact is None:
+                self._set_status("Unknown contact", COL_DANGER)
+                return None
+            label = contact.get("username")
+        elif conv == "group":
+            recipients = [a for a, _k in self.group_recipients(gid_of(peer))]
+            if not recipients:
+                self._set_status("You are no longer a member of this group",
+                                 COL_TICK_GOLD)
+                return None
+            label = (self.store.group(gid_of(peer)) or {}).get("name")
+        else:
+            label = "saved messages"
+        client_msg_id = uuid.uuid4().hex
+        # v11: in a chat with disappearing messages, each one says how long
+        # it lasts, and this copy goes that long after sending.
+        ttl = self.store.chat_timer(peer)[0] if conv != "self" else 0
+        if ttl:
+            x = dict(x, ttl=ttl)
+        # 0/3 immediately: the grey tick means "not yet on the server".
+        local_id = self.store.add_out(peer, body, now_iso(), client_msg_id,
+                                      kind=kind, ext=ext or None,
+                                      media_path=media_path,
+                                      media_state=media_state,
+                                      recipients=recipients, ttl=ttl)
+        MessageFlowLog.tick(
+            0, None, MessageFlowLog.who(self.keys.address, self.keys.username),
+            label or MessageFlowLog.who(peer),
+            f"[local id {local_id}, client_msg_id {client_msg_id[:8]}…]")
+        if on_local_row is not None:
+            on_local_row(local_id, client_msg_id)
+        self._after_local_row(peer)
+        if media_state != "uploading" and conv != "self":
+            threading.Thread(
+                target=self._send_copies,
+                args=(local_id, peer, body, client_msg_id, x),
+                daemon=True).start()
+        return local_id
+
+    def _after_local_row(self, peer: str) -> None:
+        """A message was just recorded here; the app repaints (FextApp)."""
+        self.ui_queue.put(("message_stored", peer))
+
+    # ---- v11: telling the user, from the sync thread ---------------------------
+    def notify_incoming(self, peer: str, body: str, kind: str,
+                        author: Optional[str] = None) -> None:
+        """A new message (sync thread). A muted chat stays quiet — it still
+        shows everything when it is opened. FextApp also stays quiet about
+        the chat on screen, and notifies a computer its own way."""
+        if self.store is None:
+            return
+        name, preview, muted = notification_text(self.store, peer, body,
+                                                 kind, author)
+        if muted:
+            return
+        if IS_ANDROID:
+            android_message_notification(self, peer, name, preview[:160])
+
+    def call_signal_arrived(self, sender: str, sig: dict) -> None:
+        """A call's message (sync thread). Nothing is on screen here: keep
+        an offer for the app, ring through a notification, and log a call
+        that was given up on as missed. FextApp sends signals to its call
+        screen instead when it is showing, or a call is on."""
+        _service_call_signal(self, sender, sig)
+
+    def run_commands(self, worker=None) -> int:
+        """Act on what was done to a notification (Android): NotifyReceiver
+        writes one small file per action — a reply, mark as read, decline —
+        and whichever worker runs takes it by renaming it. Another
+        identity's waits for that identity, a day at most."""
+        try:
+            names = sorted(p.name for p in COMMANDS_DIR.iterdir()
+                           if p.suffix == ".json")
+        except OSError:
+            return 0
+        done = 0
+        for name in names:
+            path = COMMANDS_DIR / name
+            try:
+                cmd = json.loads(path.read_text("utf-8"))
+            except (OSError, ValueError):
+                cmd = None
+            if not isinstance(cmd, dict):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                continue
+            owner = cmd.get("me")
+            if owner and owner != self.keys.address:
+                at = float(cmd.get("at") or 0) / 1000.0
+                if time.time() - at > 86400:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+                continue
+            claim = COMMANDS_DIR / f"{name}.{os.getpid()}.run"
+            try:
+                path.rename(claim)
+            except OSError:
+                continue                    # another worker took it
+            try:
+                self._run_command(cmd, worker)
+                done += 1
+            except Exception:
+                log.exception("a notification action failed: %r",
+                              cmd.get("op"))
+            finally:
+                try:
+                    claim.unlink()
+                except OSError:
+                    pass
+        return done
+
+    def _run_command(self, cmd: dict, worker=None) -> None:
+        op, peer = cmd.get("op"), cmd.get("peer")
+        if not isinstance(peer, str) or not peer or self.store is None:
+            return
+        known = (self.store.group(gid_of(peer)) is not None
+                 if peer.startswith(GROUP_PREFIX)
+                 else self.store.get_contact(peer) is not None)
+        if not known:
+            return
+        if op == "reply":
+            text = sanitize_text(str(cmd.get("text") or ""))
+            if text and not self.store.is_blocked(peer):
+                self.send_text(peer, text)
+                flow_log.info("↩   reply from a notification to %s",
+                              MessageFlowLog.who(peer))
+            self._read_quietly(peer, worker)
+        elif op == "read":
+            self._read_quietly(peer, worker)
+        elif op == "decline":
+            self._decline_quietly(peer, str(cmd.get("call") or ""))
+
+    def _read_quietly(self, peer: str, worker=None) -> None:
+        """Mark a chat read without its screen: the receipts go, and its
+        disappearing messages start their time."""
+        unread = self.store.unread_for(peer)
+        if unread:
+            self.store.mark_read_local([local_id for local_id, _ in unread])
+            server_ids = [sid for _, sid in unread if sid]
+            if server_ids and worker is not None:
+                threading.Thread(target=worker.send_read_receipts,
+                                 args=(server_ids,), daemon=True).start()
+            self.ui_queue.put(("message_stored", peer))
+        if IS_ANDROID:
+            android_clear_notification(peer)
+
+    def _decline_quietly(self, peer: str, call_id: str) -> None:
+        """Decline a call from its notification: tell the caller, forget
+        the offer kept for the app, and say so in the chat."""
+        if not _CALL_ID_RE.match(call_id):
+            return
+        self._declined_calls.add(call_id)
+        path = DATA_DIR / f"call_offer_{self.keys.address}.json"
+        try:
+            pending = json.loads(path.read_text("utf-8"))
+            if (pending.get("sig") or {}).get("id") == call_id:
+                path.unlink()
+        except (OSError, ValueError):
+            pass
+        if IS_ANDROID:
+            android_cancel_call_notification()
+        threading.Thread(target=self._send_control_to, args=(
+            peer, {"op": "end", "id": call_id, "why": "declined"},
+            "Voice call"), daemon=True).start()
+        self.store.add_event(peer, "Declined call")
+        self.ui_queue.put(("message_stored", peer))
 
     def _send_control(self, peer: str, op: dict, fallback: str) -> bool:
         """Send a control to a whole conversation, synchronously (call from
@@ -10752,6 +19031,145 @@ class MessagingMixin:
             pub = contact["public_key"]
         return self._send_worker(None, address, pub, fallback,
                                  uuid.uuid4().hex, {"k": "ctl", "ctl": op})
+
+    # ---- v9.1.2: pictures ------------------------------------------------------
+    # Sent only to apps that have said they keep pictures (x.ft), so nobody
+    # is sent forty kilobytes to throw away; and only to people we write to:
+    # a picture goes out with the first message after it changes, or when it
+    # is changed, or when someone's app finds its copy is out of date.
+    def _picture_payload(self, peer: str) -> Optional[dict]:
+        """{"v", "d"} for the picture held under `peer` (ours: our address;
+        a group's: its conversation key), or None if there never was one."""
+        row = self.store.picture(peer)
+        if row is None:
+            return None
+        data = ""
+        if row.get("path"):
+            try:
+                data = b64e(Path(row["path"]).read_bytes())
+            except OSError:
+                log.warning("picture file for %s is missing", peer[:12])
+                return None
+        return {"v": int(row["version"]), "d": data}
+
+    def _send_own_picture(self, contact: dict) -> bool:
+        payload = self._picture_payload(self.keys.address)
+        if payload is None:
+            return False
+        ok = self._send_control_to(contact["address"], dict(payload, op="pic"),
+                                   "Updated their profile photo",
+                                   pub=contact["public_key"])
+        if ok:
+            self.store.set_picture_sent(contact["address"], payload["v"])
+        return ok
+
+    def _send_group_picture(self, gid: str, contact: dict) -> bool:
+        payload = self._picture_payload(group_peer(gid))
+        if payload is None:
+            return False
+        ok = self._send_control_to(contact["address"],
+                                   dict(payload, op="gpic", grp=gid),
+                                   "Updated the group photo",
+                                   pub=contact["public_key"])
+        if ok:
+            self.store.set_picture_sent(f"{gid}/{contact['address']}",
+                                        payload["v"])
+        return ok
+
+    def _picture_wanted_by(self, contact: Optional[dict]) -> bool:
+        return bool(contact) and \
+            bool(contact.get("caps", 0) & LocalStore.CAP_PIC) and \
+            contact["address"] != self.keys.address and \
+            not self.store.is_blocked(contact["address"])
+
+    def _send_picture_if_due(self, contact: dict) -> bool:
+        """Before a message: our picture, if their app keeps pictures and
+        has not been sent the current version. True if it was sent."""
+        if not self._picture_wanted_by(contact):
+            return False
+        version = self.store.picture_version(self.keys.address)
+        if version and self.store.picture_sent(contact["address"]) < version:
+            return self._send_own_picture(contact)
+        return False
+
+    def _send_group_picture_if_due(self, gid: str, contact: dict) -> bool:
+        if not self._picture_wanted_by(contact):
+            return False
+        version = self.store.picture_version(group_peer(gid))
+        if version and self.store.picture_sent(
+                f"{gid}/{contact['address']}") < version:
+            return self._send_group_picture(gid, contact)
+        return False
+
+    def broadcast_picture(self, gid: Optional[str] = None) -> int:
+        """A picture changed — ours, or (as its admin) a group's: send it to
+        everyone concerned whose app keeps pictures. Blocking; run it on a
+        worker thread. Paced, to stay inside the relay's rate limit.
+        Returns how many were sent."""
+        sent = 0
+        if gid is None:
+            people = self.store.contacts_with_caps(LocalStore.CAP_PIC)
+        else:
+            group = self.store.group(gid)
+            if group is None or group["admin"] != self.keys.address or \
+                    group["state"] != "active":
+                return 0
+            people = [c for c in (self.store.get_contact(m["a"])
+                                  for m in group["members"]) if c]
+        for contact in people:
+            if (self._send_picture_if_due(contact) if gid is None else
+                    self._send_group_picture_if_due(gid, contact)):
+                sent += 1
+                time.sleep(0.3)
+        return sent
+
+    def _picture_memo(self, name: str) -> dict:
+        memo = getattr(self, name, None)
+        if memo is None:
+            memo = {}
+            setattr(self, name, memo)
+        return memo
+
+    def ask_for_picture(self, address: str, gid: Optional[str],
+                        version: int) -> bool:
+        """Their message says a newer picture exists than the one this
+        device holds (ours was lost, or theirs never arrived): ask for it.
+        At most once in half an hour for the same version. Blocking."""
+        asked = self._picture_memo("_pictures_asked")
+        key = (address, gid)
+        before = asked.get(key)
+        if before and before[0] >= version and \
+                time.monotonic() - before[1] < 1800:
+            return False
+        if self.store.is_blocked(address) and gid is None:
+            return False
+        asked[key] = (version, time.monotonic())
+        op = {"op": "picreq"}
+        if gid:
+            op["grp"] = gid
+        return self._send_control_to(address, op, "Asked for a profile photo")
+
+    def answer_picture_request(self, requester: str,
+                               gid: Optional[str]) -> bool:
+        """They asked for our picture (or, as its admin, the group's):
+        send the current one, whatever they were sent before. At most once
+        in ten minutes each. Blocking."""
+        answered = self._picture_memo("_pictures_answered")
+        key = (requester, gid)
+        if time.monotonic() - answered.get(key, -1e9) < 600:
+            return False
+        contact = self.store.get_contact(requester)
+        if contact is None or (gid is None and
+                               self.store.is_blocked(requester)):
+            return False
+        answered[key] = time.monotonic()
+        if gid is None:
+            return self._send_own_picture(contact)
+        group = self.store.group(gid)
+        if group is None or group["admin"] != self.keys.address or \
+                requester not in {m["a"] for m in group["members"]}:
+            return False
+        return self._send_group_picture(gid, contact)
 
     def _group_state(self, gid: str) -> Optional[dict]:
         group = self.store.group(gid)
@@ -10778,6 +19196,12 @@ class MessagingMixin:
         for address, pub in targets:
             ok = self._send_control_to(address, {"op": "group", "g": state},
                                        body, pub=pub) and ok
+        # Someone just added has not seen the group's picture yet.
+        if self.store.picture_version(group_peer(gid)):
+            for member in state["members"]:
+                contact = self.store.get_contact(member["a"])
+                if contact is not None:
+                    self._send_group_picture_if_due(gid, contact)
         return ok
 
     def _on_resend_request(self, peer: str, cid: str,
@@ -10837,11 +19261,20 @@ class FextApp(MessagingMixin, App):
         self.current_peer: Optional[str] = None
         self._pending_status = ("Starting…", T.text_3)
         self._chat_anchor: Optional[int] = None  # oldest id shown in the chat
+        # Newest id shown, when the window stops short of the end (opened
+        # at a found or quoted message); None while it follows the chat.
+        self._chat_ceiling: Optional[int] = None
         self._dirty_chat = False               # coalesced refresh flags
         self._dirty_list = False
         self.foreground = True                 # drives reconnect aggressiveness
         self._register_modal: Optional[RegisterModal] = None
         self.splash: Optional["SplashOverlay"] = None
+        # v11: calls declined from their notification, so an offer still
+        # queued for the screen does not ring again; and a call to answer
+        # the moment it rings here (Answer pressed on its notification).
+        self._declined_calls: set = set()
+        self._answer_on_ring: Optional[str] = None
+        self._watchdog: Optional[threading.Thread] = None
 
     # ---- lifecycle -----------------------------------------------------------
     def build(self):
@@ -10863,6 +19296,11 @@ class FextApp(MessagingMixin, App):
         self.voice = VoicePlayer()
         self._build_screens()
         Window.bind(on_keyboard=self._on_keyboard)     # Android back button
+        if not IS_MOBILE:
+            # Bound after the text fields' own keyboard, so heard first:
+            # shortcuts, and an image pasted into a chat (v11).
+            Window.bind(on_key_down=self._on_key_down)
+            Window.bind(on_drop_file=self._on_drop_file)
         Clock.schedule_interval(self._drain_ui_queue, 0.15)
         Clock.schedule_interval(self._watch_system_theme, 4.0)
         self._bind_notification_taps()
@@ -10872,6 +19310,9 @@ class FextApp(MessagingMixin, App):
         # talks to self.manager.
         root = FloatLayout()
         root.add_widget(self.manager)
+        # Layers above the screens (the menu, a call) go into `layers`.
+        self.layers = root
+        self.drawer: Optional[NavDrawer] = None
         self.splash = SplashOverlay()
         root.add_widget(self.splash)
         Clock.schedule_once(lambda _dt: self._probe_transport(), 0.05)
@@ -10886,21 +19327,92 @@ class FextApp(MessagingMixin, App):
         self.group_info_screen = GroupInfoScreen(self)
         self.new_group_screen = NewGroupScreen(self)
         self.settings_screen = SettingsScreen(self)
+        self.profile_screen = ProfileScreen(self)
         for screen in (self.chats_screen, self.conversation_screen,
                        self.chat_info_screen, self.group_info_screen,
-                       self.new_group_screen, self.settings_screen):
+                       self.new_group_screen, self.settings_screen,
+                       self.profile_screen):
             self.manager.add_widget(screen)
         self.voice.on_progress = self.conversation_screen.on_voice_progress
         self.voice.on_stop = self.conversation_screen.on_voice_stop
 
+    def back_target(self) -> Optional[tuple]:
+        """(the page beneath, what going back does) for the page showing —
+        what a swipe back reveals and then does (v11). None: the chats."""
+        current = self.manager.current
+        if current == "conversation":
+            return "chats", self.go_back_to_chats
+        if current in ("info", "group_info"):
+            return "conversation", self.close_chat_info
+        if current == "settings":
+            back = getattr(self, "_settings_from", "chats")
+            if back not in self.manager.screen_names or back == "settings":
+                back = "chats"
+            return back, self.close_settings
+        if current == "profile":
+            back = getattr(self, "_profile_from", "chats")
+            if back not in self.manager.screen_names or back == "profile":
+                back = "chats"
+            return back, self.close_profile
+        if current == "new_group":
+            return "chats", self.go_back_to_chats
+        return None
+
+    def navigate_instantly(self, action: Callable) -> None:
+        """Run a back action without its transition: a swipe has already
+        moved the page."""
+        self._instant_nav = True
+        try:
+            action()
+        finally:
+            self._instant_nav = False
+
+    def repaint_list_if_stale(self) -> None:
+        if getattr(self, "_list_stale", False) and self.store is not None:
+            self._list_stale = False
+            self.chats_screen.refresh_list(
+                self.store.conversations(me=self.keys.address))
+
+    def drawer_drag_begin(self) -> bool:
+        if not self.keys.has_identity:
+            return False
+        if self.drawer is None or self.drawer.theme != T.name:
+            self.drawer = NavDrawer(self)
+        if self.drawer.is_open:
+            return False
+        self.drawer.open(drag=True)
+        return True
+
+    def drawer_drag(self, dx: float) -> None:
+        if self.drawer is not None and self.drawer.is_open:
+            self.drawer.progress = max(0.0, min(
+                1.0, dx / max(1.0, self.drawer.panel_width())))
+
+    def drawer_drag_end(self, dx: float, speed: float) -> None:
+        drawer = self.drawer
+        if drawer is None or not drawer.is_open:
+            return
+        if drawer.progress > 0.4 or (speed > dp(800) and dx > dp(40)):
+            drawer.settle_open()
+        else:
+            drawer.close()
+
     def _navigate(self, name: str, direction: Optional[str] = "left") -> None:
-        """Show screen `name`, sliding (unless motion is reduced)."""
-        if direction is None or not motion(1) or \
-                self.manager.current == name:
+        """Show screen `name`: "left" lays it over the current page, "right"
+        lifts the current page off it (see LayerTransition)."""
+        if name == "chats" and getattr(self, "_list_stale", False) and \
+                self.store is not None:
+            self._list_stale = False      # repainted before it is uncovered
+            self.chats_screen.refresh_list(
+                self.store.conversations(me=self.keys.address))
+        if name != "conversation":
+            self.conversation_screen.cancel_backfill()
+        if direction is None or self.manager.current == name or \
+                getattr(self, "_instant_nav", False):
             self.manager.transition = NoTransition()
         else:
-            self.manager.transition = SlideTransition(duration=0.18,
-                                                      direction=direction)
+            self.manager.transition = LayerTransition(
+                forward=direction != "right")
         self.manager.current = name
 
     # =========================================================================
@@ -10987,6 +19499,8 @@ class FextApp(MessagingMixin, App):
             self.new_group_screen.show()
         elif current == "settings":
             self.settings_screen.show()
+        elif current == "profile":
+            self.profile_screen.show()
         if current in self.manager.screen_names:
             self._navigate(current, None)
 
@@ -11022,10 +19536,23 @@ class FextApp(MessagingMixin, App):
         self.splash = None
         self._post_build(0)
 
+    def _warm_caches(self, _dt=None) -> None:
+        """Draw, once and while nothing else happens, what the settings page
+        would otherwise draw the first time it opens: its two QR codes."""
+        keys = self.keys
+        if keys is None or not keys.has_identity:
+            return
+        try:
+            qr_texture(keys.address)
+            qr_texture(json.dumps(keys.public_bundle(), separators=(",", ":")))
+        except Exception as exc:
+            log.debug("QR warm-up skipped: %s", exc)
+
     def _post_build(self, _dt) -> None:
         """Deferred until the loading screen has gone — see SplashOverlay."""
         if self.keys.has_identity:
             self._activate_identity(self.keys.active["address"])
+            Clock.schedule_once(self._warm_caches, 2.5)
         else:
             NewIdentityModal(self, first_run=True).open()
 
@@ -11034,6 +19561,53 @@ class FextApp(MessagingMixin, App):
             self.worker.stop_event.set()
         if self.store is not None:
             self.store.close()
+
+    # ---- v11: keyboard shortcuts, pasting and dropping (computers) ---------------
+    def _on_key_down(self, _window, key, _scancode=None, _codepoint=None,
+                     modifiers=None) -> bool:
+        """Ctrl+F search (in the chat open, else everywhere), Ctrl+N new
+        chat, Ctrl+Shift+M mute in a call, Ctrl+V of an image into a chat;
+        Esc is back (_on_keyboard). Cmd for Ctrl on a Mac."""
+        mods = set(modifiers or ())
+        if not mods & {"ctrl", "meta"} or self.store is None:
+            return False
+        current = self.manager.current
+        if key == ord("f") and not mods & {"shift", "alt"}:
+            if current == "conversation":
+                self.conversation_screen.open_search()
+            else:
+                self.open_search()
+            return True
+        if key == ord("n") and not mods & {"shift", "alt"}:
+            self.open_compose()
+            return True
+        if key == ord("m") and "shift" in mods:
+            if self.call is not None and not self.call.ended:
+                self.toggle_call_mute()
+                return True
+            return False
+        if key == ord("v") and not mods & {"shift", "alt"} and \
+                current == "conversation" and \
+                self.conversation_screen.peer is not None:
+            found = clipboard_image()
+            if found:
+                self.conversation_screen._picked(*found)
+                return True
+        return False
+
+    def _on_drop_file(self, _window, filename, *_args) -> None:
+        """A file dropped onto the window: an image goes to the open chat,
+        to look at before it is sent."""
+        path = filename.decode("utf-8", "replace") \
+            if isinstance(filename, bytes) else str(filename)
+        screen = self.conversation_screen
+        if self.manager.current != "conversation" or screen.peer is None:
+            self._set_status("Open a chat, then drop the photo on it", T.accent)
+            return
+        if not is_image_file(path):
+            self._set_status("Only photos can be dropped here", T.accent)
+            return
+        screen._picked(path, False)
 
     def _on_keyboard(self, _window, key, *_args) -> bool:
         """Android/Esc back, innermost first: an open sheet, highlight mode,
@@ -11044,12 +19618,20 @@ class FextApp(MessagingMixin, App):
         sheets = [v for v in Window.children if isinstance(v, ModalView)]
         if sheets:
             top = sheets[0]
+            if isinstance(top, CallOverlay):
+                self.hide_call()
+                return True
             if getattr(top, "dismissable", True) and top.auto_dismiss:
                 top.dismiss()
+            return True
+        if self.close_drawer():
             return True
         current = self.manager.current
         if current in ("info", "group_info"):
             self.close_chat_info()
+            return True
+        if current == "profile":
+            self.close_profile()
             return True
         if current == "settings":
             self.close_settings()
@@ -11061,6 +19643,10 @@ class FextApp(MessagingMixin, App):
             screen = self.conversation_screen
             if screen.selecting:
                 screen.clear_selection()
+            elif screen.searching:
+                screen.close_search()
+            elif screen._strip_for is not None:
+                screen.close_strip()
             elif screen.emoji_panel.is_open:
                 screen.close_emoji()
             elif screen.recorder is not None:
@@ -11070,7 +19656,22 @@ class FextApp(MessagingMixin, App):
             else:
                 self.go_back_to_chats()
             return True
-        return False
+        if current == "chats":
+            chats = self.chats_screen
+            if chats.searching:
+                chats.exit_search()
+                return True
+            if getattr(chats, "selecting", False):
+                chats.clear_selection()
+                return True
+            if getattr(chats, "showing_archive", False):
+                chats.show_archive(False)
+                return True
+        # The outermost page: Android goes to the home screen with the app
+        # kept as it is; a computer's Esc does nothing (it used to close
+        # the window).
+        android_move_to_back()
+        return True
 
     # =========================================================================
     #  Identity lifecycle
@@ -11088,6 +19689,7 @@ class FextApp(MessagingMixin, App):
         self.crypto = CryptoEngine(self.keys)
         self.api = ApiClient(self.keys)
         self.store = LocalStore(self.keys.store_path())
+        self._load_pictures()
         self.current_peer = None
         self._navigate("chats", None)
         self.chats_screen.refresh_header()
@@ -11096,6 +19698,10 @@ class FextApp(MessagingMixin, App):
             self._start_worker()
             self._ask_notification_permission()
             self._sync_background_service()
+            action, call_id = self._launch_call_action()
+            if action == "answer" and call_id:
+                self._answer_on_ring = str(call_id)
+            self._check_pending_offer()
             peer = self._launch_peer()
             if peer and self._known_conversation(peer):
                 self.open_conversation(peer)
@@ -11103,6 +19709,17 @@ class FextApp(MessagingMixin, App):
             self._set_status("Pick a username to start chatting",
                              COL_TICK_GOLD)
             RegisterModal(self).open()
+
+    def _load_pictures(self) -> None:
+        """Which disc shows which picture, for the identity now in use."""
+        PICTURES.load(self.store, [i["address"] for i in
+                                   self.keys.identities])
+        Avatar.refresh()
+
+    def _on_picture(self, peer: str, path: Optional[str]) -> None:
+        """A picture arrived (or went): every disc showing it follows."""
+        PICTURES.set(peer, path)
+        Avatar.refresh(peer)
 
     def _start_worker(self) -> None:
         self.worker = SyncWorker(self)
@@ -11131,6 +19748,26 @@ class FextApp(MessagingMixin, App):
     def on_identity_created(self, address: str) -> None:
         self._activate_identity(address)
 
+    def pause_identity(self) -> Optional[str]:
+        """Stop syncing and close the database, for a restore that is about
+        to change the files. Returns the identity that was in use."""
+        if self.worker is not None:
+            self.worker.stop_event.set()
+            self.worker = None
+        if self.store is not None:
+            self.store.close()
+            self.store = None
+        active = self.keys.active
+        return active["address"] if active else None
+
+    def resume_identity(self, previous: Optional[str]) -> None:
+        """After a restore: back to the identity that was in use, or, on a
+        new device, to the first one restored."""
+        if previous is None and self.keys.has_identity:
+            previous = self.keys.identities[0]["address"]
+        if previous is not None:
+            self._activate_identity(previous)
+
     def on_identity_removed(self, address: str, note: str = "") -> None:
         """Finish removing an identity and land somewhere sensible.
 
@@ -11153,6 +19790,7 @@ class FextApp(MessagingMixin, App):
             # Nothing left: return to the first-run experience rather than
             # leaving a half-live UI pointing at an identity that is gone.
             self.current_peer = None
+            PICTURES.load(None)
             self.chats_screen.refresh_header()
             self.chats_screen.refresh_list([])
             self._navigate("chats", None)
@@ -11192,14 +19830,61 @@ class FextApp(MessagingMixin, App):
             android_clear_notification(peer)
         self.current_peer = peer
         self._chat_anchor = None                # fresh window per chat
+        self._chat_ceiling = None
+        if (self.store.chat_flags().get(peer) or {}).get("marked_unread"):
+            self.store.set_chat_flag([peer], "marked_unread", 0)
         if self._auto_read(peer):
             self.mark_peer_read(peer, refresh=False)
         self._navigate("conversation", "left")
         self.refresh_chat(peer)
         self.refresh_sidebar()
 
+    def open_conversation_at(self, peer: str, message_id: int) -> None:
+        """Open a chat at one message, however far back: a window around
+        it (CHAT_PAGE_SIZE / 3 older, as many newer), scrolled to it, the
+        message flashing. Newer messages follow as you scroll down; the
+        jump button returns to the end."""
+        if self.store is None:
+            return
+        if peer == self.current_peer and \
+                self.conversation_screen.focus_message(message_id):
+            self._navigate("conversation", "left")
+            return
+        self.open_conversation(peer)
+        lo, hi = self.store.id_around(peer, message_id, CHAT_PAGE_SIZE // 3,
+                                      CHAT_PAGE_SIZE // 3)
+        self._chat_anchor, self._chat_ceiling = lo, hi
+        self.conversation_screen._rendered_peer = None     # a new window
+        self.refresh_chat(peer)
+        Clock.schedule_once(lambda _dt: self.conversation_screen.focus_message(
+            message_id), 0.05)
+
+    def load_newer_messages(self) -> None:
+        """Reading back in a window: the next page of newer messages joins
+        on below; reaching the end, the chat follows new arrivals again."""
+        peer = self.current_peer
+        if peer is None or self._chat_ceiling is None:
+            return
+        newer = self.store.messages_after(peer, self._chat_ceiling,
+                                          CHAT_PAGE_SIZE // 2)
+        caught_up = not newer or self.store.count_after(
+            peer, newer[-1]["id"]) == 0
+        self._chat_ceiling = None if caught_up else newer[-1]["id"]
+        self.refresh_chat(peer)
+
+    def reopen_live(self) -> None:
+        """Back to the end of the conversation from a window further back."""
+        peer = self.current_peer
+        if peer is None:
+            return
+        self._chat_anchor, self._chat_ceiling = None, None
+        self.conversation_screen._rendered_peer = None
+        self.refresh_chat(peer)
+        self.conversation_screen.scroll_to_bottom(animate=False)
+
     def go_back_to_chats(self) -> None:
         screen = self.conversation_screen
+        screen.keep_draft()
         screen.clear_selection()
         screen.cancel_recording()
         screen.close_emoji()
@@ -11212,11 +19897,34 @@ class FextApp(MessagingMixin, App):
     #  Rendering
     # =========================================================================
     def refresh_sidebar(self) -> None:
-        """Repaint the conversation list (name kept from v2 for continuity)."""
+        """Repaint the conversation list (name kept from v2 for continuity).
+        Hidden behind another screen, it is only marked stale and repainted
+        when it shows again: opening a chat no longer pays for it."""
         if self.store is None:
             return
-        self.chats_screen.refresh_list(
-            self.store.conversations(me=self.keys.address))
+        if self.manager.current != "chats":
+            self._list_stale = True
+            return
+        self._list_stale = False
+        conversations = self.store.conversations(me=self.keys.address)
+        self.chats_screen.refresh_list(conversations)
+        self._title_unread(conversations)
+
+    def _title_unread(self, conversations: list) -> None:
+        """A computer's window says how many unread messages wait in chats
+        that are not muted: "(3) Ferritext" in its title and taskbar."""
+        if IS_MOBILE:
+            return
+        unread = sum(int(c.get("unread") or 0) for c in conversations
+                     if not c.get("muted") and not c.get("blocked"))
+        base = f"{APP_NAME} {APP_VERSION} — end-to-end encrypted messenger"
+        title = f"({unread}) {base}" if unread else base
+        if title != getattr(self, "_title_now", None):
+            self._title_now = title
+            try:
+                Window.set_title(title)
+            except Exception:
+                pass
 
     def refresh_chat(self, peer: Optional[str]) -> None:
         """Repaint the open conversation from the local store.
@@ -11233,12 +19941,14 @@ class FextApp(MessagingMixin, App):
         unread = self.store.unread_for(peer)
         self.conversation_screen.set_peer(peer, contact, len(unread), kind,
                                           group)
-        if self._chat_anchor is None:            # cold open: newest page
-            messages = self.store.messages_for(peer, limit=CHAT_PAGE_SIZE)
+        cold = self._chat_anchor is None
+        if cold:              # cold open: what fills the screen, at once
+            messages = self.store.messages_for(peer, limit=FIRST_PAINT)
             self._chat_anchor = messages[0]["id"] if messages else None
         else:                                    # anchored: list only grows
             messages = self.store.messages_for(peer,
-                                               from_id=self._chat_anchor)
+                                               from_id=self._chat_anchor,
+                                               to_id=self._chat_ceiling)
         reactions = self.store.reactions_for(
             peer, [m.get("client_msg_id") for m in messages])
         for msg in messages:
@@ -11250,6 +19960,13 @@ class FextApp(MessagingMixin, App):
             else True
         self.conversation_screen.render(messages, ticks,
                                         self._mark_single_read, peer=peer)
+        self.conversation_screen.set_newer(
+            0 if self._chat_ceiling is None else
+            self.store.count_after(peer, self._chat_ceiling))
+        if cold and self.conversation_screen.has_older:
+            # The rest of the first page, built once the chat is showing.
+            Clock.schedule_once(lambda _dt: self._extend_history(
+                peer, CHAT_PAGE_SIZE - len(messages)), LAYER_IN + 0.04)
         # Photos/voice notes that arrived while the background service was
         # syncing were never downloaded; fetch them now someone is looking.
         for msg in messages:
@@ -11258,17 +19975,39 @@ class FextApp(MessagingMixin, App):
 
     def load_older_messages(self) -> None:
         """Page one more CHAT_PAGE_SIZE of history in above the anchor."""
-        if self.current_peer is None or self._chat_anchor is None:
+        if self.current_peer is not None:
+            self._extend_history(self.current_peer, CHAT_PAGE_SIZE)
+
+    def _extend_history(self, peer: str, count: int) -> None:
+        """Up to `count` messages older than those shown, prepended a few a
+        frame (ConversationScreen.run_backfill) — never a full rebuild."""
+        screen = self.conversation_screen
+        if peer != self.current_peer or self._chat_anchor is None or \
+                screen._rendered_peer != peer or screen._backfill_ev or \
+                count <= 0:
             return
-        older = self.store.messages_for(self.current_peer,
-                                        limit=CHAT_PAGE_SIZE,
+        older = self.store.messages_for(peer, limit=count,
                                         before_id=self._chat_anchor)
         if not older:
-            self.conversation_screen.has_older = False
+            screen.set_has_older(False)
             return
-        self._chat_anchor = older[0]["id"]
-        self.conversation_screen._rendered_peer = None    # force a full pass
-        self.refresh_chat(self.current_peer)
+        reactions = self.store.reactions_for(
+            peer, [m.get("client_msg_id") for m in older])
+        for msg in older:
+            msg["reactions"] = reactions.get(msg.get("client_msg_id"), [])
+        pages = [older[max(0, end - BACKFILL_CHUNK):end]
+                 for end in range(len(older), 0, -BACKFILL_CHUNK)]
+
+        def page_done(page):
+            # The window now starts at this page: what refresh_chat lists
+            # stays exactly what is drawn, so arrivals still append.
+            self._chat_anchor = page[0]["id"]
+
+        def done():
+            screen.set_has_older(self.store.has_messages_before(
+                peer, self._chat_anchor))
+        screen.run_backfill(pages, screen._rendered_ticks, on_page=page_done,
+                            on_done=done)
 
     # =========================================================================
     #  Read marking (the 3/3 tick, from the recipient's side)
@@ -11301,6 +20040,11 @@ class FextApp(MessagingMixin, App):
     #  Sending
     # =========================================================================
     def send_current(self) -> None:
+        if self._chat_ceiling is not None:      # what you send is at the end
+            self.reopen_live()
+        self._send_current()
+
+    def _send_current(self) -> None:
         """Send what is in the composer — as a reply, if one is pending."""
         if self.store is None or self.current_peer is None:
             return
@@ -11310,81 +20054,18 @@ class FextApp(MessagingMixin, App):
         body = sanitize_text(screen.entry.text)
         if not body:
             return
+        preview = screen.take_preview(body)
         screen.entry.text = ""
         reply = screen.take_reply()
-        self.send_text(self.current_peer, body, reply=reply)
+        self.send_text(self.current_peer, body, reply=reply, preview=preview)
 
-    def send_text(self, peer: str, body: str, reply: Optional[dict] = None,
-                  forwarded: bool = False) -> Optional[int]:
-        """Queue a text message. Returns its local id (None if impossible).
-
-        Every v9 message carries a signed extension block, even a plain one:
-        it is what binds the message to its recipient (see build_envelope)
-        and how the other side learns this device understands replies,
-        media and delete-for-both.
-        """
-        ext = {}
-        if reply:
-            ext["reply"] = reply
-        if forwarded:
-            ext["fwd"] = 1
-        return self._queue_message(peer, body, dict(ext, k="text"), "text",
-                                   ext)
-
-    def _queue_message(self, peer: str, body: str, x: dict, kind: str,
-                       ext: Optional[dict], media_path: Optional[str] = None,
-                       media_state: str = "",
-                       on_local_row: Optional[Callable] = None
-                       ) -> Optional[int]:
-        """Record an outgoing message at 0/3 and send it in the background.
-
-        Notes to self are recorded and go nowhere. A group message records
-        one delivery row per member, then goes out to each of them.
-        """
-        if self.store is None:
-            return None
-        conv = self.conversation_kind(peer)
-        recipients = None
-        if conv == "dm":
-            contact = self.store.get_contact(peer)
-            if contact is None:
-                self._set_status("Unknown contact", COL_DANGER)
-                return None
-            label = contact.get("username")
-        elif conv == "group":
-            recipients = [a for a, _k in self.group_recipients(gid_of(peer))]
-            if not recipients:
-                self._set_status("You are no longer a member of this group",
-                                 COL_TICK_GOLD)
-                return None
-            label = (self.store.group(gid_of(peer)) or {}).get("name")
-        else:
-            label = "notes to self"
-        client_msg_id = uuid.uuid4().hex
-        # 0/3 immediately: the grey tick means "not yet on the server".
-        local_id = self.store.add_out(peer, body, now_iso(), client_msg_id,
-                                      kind=kind, ext=ext or None,
-                                      media_path=media_path,
-                                      media_state=media_state,
-                                      recipients=recipients)
-        MessageFlowLog.tick(
-            0, None, MessageFlowLog.who(self.keys.address, self.keys.username),
-            label or MessageFlowLog.who(peer),
-            f"[local id {local_id}, client_msg_id {client_msg_id[:8]}…]")
-        if on_local_row is not None:
-            on_local_row(local_id, client_msg_id)
+    def _after_local_row(self, peer: str) -> None:
         if threading.current_thread() is threading.main_thread():
             if peer == self.current_peer:
                 self.refresh_chat(peer)
             self._dirty_list = True
         else:                         # media pipeline: repaint via the queue
             self.ui_queue.put(("message_stored", peer))
-        if media_state != "uploading" and conv != "self":
-            threading.Thread(
-                target=self._send_copies,
-                args=(local_id, peer, body, client_msg_id, x),
-                daemon=True).start()
-        return local_id
 
     # =========================================================================
     #  Message actions (v9): star, delete, forward, share, copy
@@ -11638,14 +20319,19 @@ class FextApp(MessagingMixin, App):
         self.refresh_sidebar()
 
     def set_group_notify(self, gid: str, on: bool) -> None:
-        self.store.set_group_notify(gid, on)
-        if not on and IS_ANDROID:
-            android_clear_notification(group_peer(gid))
-        self.refresh_chat(self.current_peer)
+        """On: unmute the group. Off: offer how long to mute it."""
+        if on:
+            self.set_mute([group_peer(gid)], None)
+        else:
+            self.choose_mute([group_peer(gid)])
 
     def copy_text(self, text: str) -> None:
         Clipboard.copy(text)
         self._set_status("Copied", COL_OK)
+
+    def open_link(self, url: str) -> None:
+        """A link tapped in a message: first, where it leads (v11)."""
+        LinkSheet(self, url).open()
 
     def share_messages(self, local_ids: list) -> None:
         """Hand messages to another app: Android's share sheet, or — on a
@@ -11872,6 +20558,589 @@ class FextApp(MessagingMixin, App):
         threading.Thread(target=work, daemon=True).start()
 
     # =========================================================================
+    #  Voice calls
+    # =========================================================================
+    call: Optional["Call"] = None
+    _call_overlay = None
+    _call_pill = None
+    _ringer = None
+    _call_clock = None
+    _call_service_on = False
+
+    def call_blocker(self, peer: Optional[str]) -> Optional[str]:
+        """Why `peer` cannot be called from here, now — or None."""
+        if not peer or self.store is None:
+            return "Open a chat to call"
+        if self.conversation_kind(peer) != "dm":
+            return "Calls are between two people"
+        if self.call is not None and not self.call.ended:
+            return "You are already in a call"
+        if self.store.is_blocked(peer):
+            return "Unblock them to call"
+        features = self.api.features() if self.api is not None else {}
+        if not features.get("calls"):
+            return "Calls need the relay to be updated first"
+        contact = self.store.get_contact(peer) or {}
+        if not contact.get("caps", 0) & LocalStore.CAP_CALL:
+            return ("They can take calls once they run Ferritext 9.1.2 or "
+                    "later — and have written to you since")
+        if not calls_possible_here():
+            return "This computer has no microphone or speaker to call with"
+        return None
+
+    def start_call(self, peer: Optional[str] = None) -> None:
+        peer = peer or self.current_peer
+        why = self.call_blocker(peer)
+        if why:
+            self._set_status(why, T.accent)
+            return
+
+        def go():
+            if self.call is not None and not self.call.ended:
+                return
+            call = Call(peer, outgoing=True)
+            self.call = call
+            self.show_call()
+            self._start_call_clock()
+            # v11: the call service from the moment of dialling. Android
+            # starts a microphone service only for an app on screen, and a
+            # caller who leaves while it rings would otherwise be answered
+            # with their microphone silent.
+            if IS_ANDROID and not self._call_service_on:
+                try:
+                    android_call_service(True)
+                    self._call_service_on = True
+                except Exception:
+                    log.exception("could not start the call service")
+            threading.Thread(target=self._place_call, args=(call,),
+                             daemon=True).start()
+        self._with_microphone(go)
+
+    def _with_microphone(self, then: Callable[[], None]) -> None:
+        if IS_ANDROID and not android_has_permission(
+                "android.permission.RECORD_AUDIO"):
+            def answered(_p, grants):
+                if grants and all(grants):
+                    run_on_ui(then)
+                else:
+                    run_on_ui(self._set_status, "Calls need the microphone "
+                              "permission", T.accent)
+            android_request_permissions(["android.permission.RECORD_AUDIO"],
+                                        answered)
+            return
+        then()
+
+    def _call_relay(self) -> tuple:
+        """(the relay's call address, a ticket for it) — or (None, '') when
+        the relay offers none, and only a direct way can work."""
+        features = self.api.features() if self.api is not None else {}
+        if not features.get("calls"):
+            return None, ""
+        try:
+            from urllib.parse import urlsplit
+            data = self.api.call_ticket()
+            port = int(data.get("udp") or features.get("call_udp") or 0)
+            host = urlsplit(ENDPOINT.base or "").hostname or ""
+            found = socket.getaddrinfo(host, port, socket.AF_INET,
+                                       socket.SOCK_DGRAM)
+            return (found[0][4][0], port), str(data.get("ticket") or "")
+        except Exception as exc:
+            log.warning("no way through the relay for a call: %s", exc)
+            return None, ""
+
+    def _new_engine(self, call: "Call", role: int, relay, ticket: str,
+                    ) -> "CallEngine":
+        engine = CallEngine(
+            call.id, call.tag_bytes, role, relay, ticket,
+            on_event=lambda kind, value, cid=call.id: self.ui_queue.put(
+                ("call_engine", cid, kind, value)),
+            send_ws=self._call_ws_send)
+        call.engine = engine
+        engine.start()
+        if call.ended:
+            engine.stop()
+        return engine
+
+    @staticmethod
+    def _await_relay(call: "Call", engine: "CallEngine", relay) -> None:
+        """Give the relay a moment to say where we are, so the first
+        message can carry our public address."""
+        until = time.monotonic() + 1.0
+        while relay and not engine.relay_ok and not call.ended and \
+                time.monotonic() < until:
+            time.sleep(0.02)
+
+    def _place_call(self, call: "Call") -> None:
+        """Worker thread: the caller's side of setting up."""
+        relay, ticket = self._call_relay()
+        if call.ended:
+            return
+        engine = self._new_engine(call, 0, relay, ticket)
+        self._await_relay(call, engine, relay)
+        if call.ended:
+            return
+        op = {"op": "call", "id": call.id, "tag": call.tag, "k": call.pub,
+              "codecs": call_codecs(), "c": engine.candidates(),
+              "t": int(time.time())}
+        call.signalled = True
+        if not self._send_control_to(call.peer, op, "Voice call"):
+            self.ui_queue.put(("call_engine", call.id, "failed",
+                               "The call could not be placed"))
+
+    def _prepare_incoming(self, call: "Call") -> None:
+        """Worker thread: the callee's side, while it rings — find the way
+        to the caller now, so speech flows the moment it is answered."""
+        relay, ticket = self._call_relay()
+        if call.ended:
+            return
+        engine = self._new_engine(call, 1, relay, ticket)
+        engine.set_keys(call.keys())
+        engine.add_candidates(call.remote_cands)
+        engine.set_send_codecs(call.their_codecs)
+        if call.state == "connecting":                # answered already
+            engine.start_audio()
+        self._await_relay(call, engine, relay)
+        if call.ended:
+            return
+        call.signalled = True
+        self._send_control_to(call.peer, {"op": "ringing", "id": call.id,
+                                          "k": call.pub,
+                                          "c": engine.candidates(),
+                                          "codecs": call_codecs()},
+                              "Voice call")
+
+    def _incoming_call(self, sender: str, sig: dict) -> None:
+        contact = self.store.get_contact(sender) if self.store else None
+        if contact is None:
+            return
+        age = time.time() - sig["t"] if sig.get("t") else 0
+        if age > CALL_OFFER_MAX_AGE:
+            self._log_call(sender, "Missed call", missed=True)
+            return
+        current = self.call
+        if current is not None and not current.ended:
+            if current.id != sig["id"]:
+                self._send_call_end(sender, sig["id"], "busy")
+                self._log_call(sender, "Missed call", missed=True)
+            return
+        if not calls_possible_here():
+            self._send_call_end(sender, sig["id"], "unavailable")
+            self._log_call(sender, "Missed call", missed=True)
+            return
+        if sig["id"] in self._declined_calls:
+            return                     # declined from its notification
+        call = Call(sender, outgoing=False, call_id=sig["id"],
+                    tag=sig["tag"])
+        call.their_key, call.remote_cands = sig["k"], sig["c"]
+        call.their_codecs = sig.get("codecs") or ["ima16"]
+        self.call = call
+        self.show_call()
+        self._start_call_clock()
+        if IS_ANDROID:
+            android_cancel_call_notification()     # the screen rings now
+        threading.Thread(target=self._prepare_incoming, args=(call,),
+                         daemon=True).start()
+        if self._answer_on_ring == call.id:
+            self._answer_on_ring = None
+            self.answer_call()
+        else:
+            self._ring(True)
+
+    def _on_call_signal(self, sender: str, sig: dict) -> None:
+        if self.store is None:
+            return
+        op, call = sig["op"], self.call
+        if op == "call":
+            self._incoming_call(sender, sig)
+            return
+        if call is None or call.ended or call.id != sig["id"] or \
+                call.peer != sender:
+            return
+        engine = call.engine
+        if op in ("ringing", "answer") and call.outgoing and \
+                call.their_key is None:
+            call.their_key = sig["k"]
+            if engine is not None:
+                engine.set_keys(call.keys())
+        if op in ("ringing", "answer") and call.outgoing and \
+                engine is not None:
+            call.their_codecs = sig.get("codecs") or ["ima16"]
+            engine.set_send_codecs(call.their_codecs)
+        if op in ("ringing", "answer", "cands") and engine is not None:
+            engine.add_candidates(sig.get("c") or [])
+        if op == "ringing" and call.outgoing and call.state == "calling":
+            call.state = "ringing"
+            self._ringback(True)
+        elif op == "answer" and call.outgoing and \
+                call.state in ("calling", "ringing"):
+            self._ringback(False)
+            call.answered_at = time.monotonic()
+            # Their voice can come quicker than the message saying they
+            # answered: then the call is on already.
+            if engine is not None and engine.last_heard is not None:
+                call.state, call.connected_at = "active", time.monotonic()
+            else:
+                call.state = "connecting"
+            if engine is not None:
+                engine.start_audio()
+            self._call_audio_started()
+        elif op == "end":
+            self._finish_call(sig["why"], local=False)
+        self._refresh_call()
+
+    def _on_call_engine(self, call_id: str, kind: str, value) -> None:
+        call = self.call
+        if call is None or call.id != call_id or call.ended:
+            return
+        if kind == "path":
+            call.path = value
+        elif kind == "reflexive":
+            # Our public address arrived after the first message went: send
+            # it on, so the direct way can be found.
+            if getattr(call, "signalled", False) and call.engine:
+                op = {"op": "cands", "id": call.id,
+                      "c": call.engine.candidates()}
+                threading.Thread(target=self._send_control_to,
+                                 args=(call.peer, op, "Voice call"),
+                                 daemon=True).start()
+        elif kind == "audio" and call.state == "connecting":
+            call.state = "active"
+            call.connected_at = time.monotonic()
+        elif kind == "quiet":
+            call.quiet = True
+        elif kind == "heard":
+            call.quiet = False
+        elif kind == "bye":
+            self._finish_call("hangup", local=False)
+        elif kind == "lost":
+            self._set_status("The call dropped", T.alert)
+            self._finish_call("failed", local=True)
+        elif kind in ("audio_failed", "failed"):
+            self._set_status(str(value) if kind == "failed" else
+                             f"The call's sound would not start ({value})",
+                             T.alert)
+            self._finish_call("failed", local=True)
+        self._refresh_call()
+
+    def answer_call(self) -> None:
+        call = self.call
+        if call is None or call.ended or call.outgoing or \
+                call.state != "incoming":
+            return
+
+        def go():
+            if call.ended or call.state != "incoming":
+                return
+            call.state = "connecting"
+            call.answered_at = time.monotonic()
+            self._ring(False)
+            engine = call.engine
+            op = {"op": "answer", "id": call.id, "k": call.pub,
+                  "c": engine.candidates() if engine else [],
+                  "codec": pick_send_codec(call.their_codecs),
+                  "codecs": call_codecs()}
+            threading.Thread(target=self._send_control_to,
+                             args=(call.peer, op, "Voice call"),
+                             daemon=True).start()
+            if engine is not None:
+                engine.start_audio()
+            self._call_audio_started()
+            self._refresh_call()
+        self._with_microphone(go)
+
+    def decline_call(self) -> None:
+        self._finish_call("declined", local=True)
+
+    def end_call(self) -> None:
+        call = self.call
+        if call is None:
+            return
+        if call.connected_at is not None or call.state == "connecting":
+            why = "hangup"
+        else:
+            why = "cancelled" if call.outgoing else "declined"
+        self._finish_call(why, local=True)
+
+    def _finish_call(self, why: str, local: bool) -> None:
+        call = self.call
+        if call is None or call.ended:
+            return
+        call.ended = True
+        call.summary = call_summary(call, why, local)
+        self._ring(False)
+        self._ringback(False)
+        self._call_audio_stopped()
+        self._stop_call_clock()
+        engine = call.engine
+        if local:
+            if engine is not None:
+                engine.hangup()
+            self._send_call_end(call.peer, call.id, why)
+        elif engine is not None:
+            engine.stop()
+        self._log_call(call.peer, call.summary,
+                       missed=not call.outgoing and not local and
+                       call.connected_at is None)
+        self._refresh_call()
+        Clock.schedule_once(lambda _dt: self._close_call_screen(call), 1.4)
+
+    def _send_call_end(self, peer: str, call_id: str, why: str) -> None:
+        call = self.call
+        if call is not None and call.id == call_id:
+            if getattr(call, "end_sent", False):
+                return                 # said already, while off screen
+            call.end_sent = True
+        threading.Thread(target=self._send_control_to, args=(
+            peer, {"op": "end", "id": call_id, "why": why}, "Voice call"),
+            daemon=True).start()
+
+    def _log_call(self, peer: str, text: str, missed: bool = False) -> None:
+        """What became of a call, as a line in the chat."""
+        if self.store is None:
+            return
+        self.store.add_event(peer, text)
+        if peer == self.current_peer:
+            self.refresh_chat(peer)
+        self._dirty_list = True
+        if missed:
+            name = (self.store.get_contact(peer) or {}).get("username") or \
+                short_addr(peer, 12)
+            if IS_ANDROID:
+                try:
+                    android_notify(peer, name, "Missed call")
+                except Exception:
+                    log.exception("could not post a missed call")
+            else:
+                self._set_status(f"Missed call from {name}", COL_ACCENT)
+
+    def toggle_call_mute(self) -> None:
+        call = self.call
+        if call is None or call.ended:
+            return
+        call.muted = not call.muted
+        if call.engine is not None:
+            call.engine.muted = call.muted
+        self._refresh_call()
+
+    def toggle_call_speaker(self) -> None:
+        call = self.call
+        if call is None or call.ended:
+            return
+        call.speaker = not call.speaker
+        call.route = "speaker" if call.speaker else "earpiece"
+        if call.engine is not None:
+            call.engine.set_speaker(call.speaker)
+        if IS_ANDROID:
+            android_proximity(not call.speaker)
+        self._refresh_call()
+
+    @staticmethod
+    def call_audio_has_speaker() -> bool:
+        return IS_ANDROID
+
+    def call_routes(self) -> list:
+        call = self.call
+        engine = call.engine if call is not None else None
+        return engine.routes() if engine is not None else []
+
+    def choose_call_route(self) -> None:
+        """The call screen's sound button (v11): with only the phone and
+        its speaker, it switches between them; with a headset connected
+        too, it offers them all."""
+        call = self.call
+        if call is None or call.ended:
+            return
+        routes = self.call_routes()
+        if len(routes) <= 2:
+            self.toggle_call_speaker()
+            return
+        now = call.engine.route() if call.engine else ""
+        icons = {"earpiece": "phone", "wired": "phone", "speaker": "speaker",
+                 "bluetooth": "bluetooth"}
+        MenuSheet([(icons.get(key, "speaker"),
+                    label + ("  ✓" if key == now else ""),
+                    lambda k=key: self.set_call_route(k))
+                   for key, label in routes], title="Sound").open()
+
+    def set_call_route(self, key: str) -> None:
+        call = self.call
+        if call is None or call.ended or call.engine is None:
+            return
+        call.speaker = key == "speaker"
+        call.route = key
+        call.engine.set_route(key)
+        if IS_ANDROID:
+            android_proximity(key == "earpiece")
+        self._refresh_call()
+
+    def _call_audio_started(self) -> None:
+        if IS_ANDROID:
+            call = self.call
+            android_proximity(not (call and call.speaker))
+            try:
+                android_call_service(True)
+                self._call_service_on = True
+            except Exception:
+                log.exception("could not start the call service")
+
+    def _call_audio_stopped(self) -> None:
+        if IS_ANDROID:
+            android_proximity(False)
+            if self._call_service_on:
+                self._call_service_on = False
+                try:
+                    android_call_service(False)
+                except Exception:
+                    log.exception("could not stop the call service")
+
+    # ---- the call's screen ---------------------------------------------------------
+    def show_call(self) -> None:
+        call = self.call
+        if call is None:
+            return
+        android_show_over_lock(True)
+        if self._call_pill is not None:
+            self._call_pill.remove()
+            self._call_pill = None
+        if self._call_overlay is None or self._call_overlay.call is not call:
+            self._call_overlay = CallOverlay(self, call)
+        if self._call_overlay.parent is None:
+            self._call_overlay.open()
+        self._call_overlay.refresh()
+
+    def hide_call(self) -> None:
+        """Set the call screen aside (back): the call goes on, a bar at
+        the top leads back to it."""
+        call = self.call
+        if call is None or call.ended or self._call_overlay is None:
+            return
+        self._call_overlay.dismiss()
+        if self._call_pill is None:
+            self._call_pill = CallPill(self)
+            Window.add_widget(self._call_pill)
+        self._refresh_call()
+
+    def _close_call_screen(self, call: "Call") -> None:
+        if self.call is call:
+            self.call = None
+            android_show_over_lock(False)
+        if self._call_overlay is not None and self._call_overlay.call is call:
+            self._call_overlay.dismiss()
+            self._call_overlay = None
+        if self._call_pill is not None and self.call is None:
+            self._call_pill.remove()
+            self._call_pill = None
+
+    def _refresh_call(self) -> None:
+        call = self.call
+        if self._call_overlay is not None and \
+                self._call_overlay.parent is not None:
+            self._call_overlay.refresh()
+        if self._call_pill is not None and call is not None:
+            what = call_clock(call.duration()) if call.state == "active" \
+                else {"incoming": "Incoming call", "ringing": "Ringing…",
+                      "calling": "Calling…",
+                      "connecting": "Connecting…"}.get(call.state, "Call")
+            self._call_pill.set_text(f"{what}  ·  tap to return")
+
+    def _start_call_clock(self) -> None:
+        if self._call_clock is None:
+            self._call_clock = Clock.schedule_interval(self._call_tick, 0.5)
+
+    def _stop_call_clock(self) -> None:
+        if self._call_clock is not None:
+            self._call_clock.cancel()
+            self._call_clock = None
+
+    def _call_tick(self, _dt) -> None:
+        call = self.call
+        if call is None or call.ended:
+            return
+        now = time.monotonic()
+        if call.state in ("calling", "ringing") and \
+                now - call.created > CALL_RING_SECONDS:
+            self._finish_call("timeout", local=True)
+        elif call.state == "incoming" and \
+                now - call.created > CALL_RING_SECONDS + 10:
+            self._finish_call("timeout", local=True)
+        elif call.state == "connecting" and \
+                now - (call.answered_at or now) > CALL_CONNECT_SECONDS:
+            self._set_status("No way through to them was found", T.alert)
+            self._finish_call("failed", local=True)
+        self._refresh_call()
+
+    def _ringback(self, on: bool) -> None:
+        """The caller's tone while it rings at the other end (v11)."""
+        tone = getattr(self, "_ringback_tone", None)
+        if not on:
+            if tone is not None:
+                self._ringback_tone = None
+                try:
+                    tone.stop()
+                except Exception:
+                    log.exception("the ringback would not stop")
+            return
+        if tone is None:
+            tone = AndroidRingback() if IS_ANDROID else DesktopRingback()
+            try:
+                tone.start()
+                self._ringback_tone = tone
+            except Exception:
+                log.exception("no ringback tone")
+
+    def _ring(self, on: bool) -> None:
+        if not on:
+            if self._ringer is not None:
+                ringer, self._ringer = self._ringer, None
+                try:
+                    ringer.stop()
+                except Exception:
+                    log.exception("the ringer would not stop")
+            return
+        if self._ringer is None:
+            self._ringer = AndroidRinger() if IS_ANDROID else DesktopRinger()
+            try:
+                self._ringer.start()
+            except Exception:
+                log.exception("the ringer would not start")
+
+    # ---- a call's sound over the WebSocket -----------------------------------------
+    def _call_ws_send(self, tag: bytes, role: int, packet: bytes) -> bool:
+        """Engine thread: one packet, through the relay's WebSocket."""
+        worker = self.worker
+        if worker is None or not hasattr(worker, "send_ws"):
+            return False
+        return bool(worker.send_ws({"type": "cmedia", "tag": tag.hex(),
+                                    "role": role, "d": b64e(packet)}))
+
+    def call_ws_packet(self, tag, data) -> None:
+        """Sync thread: a packet the relay forwarded over the WebSocket."""
+        call = self.call
+        if call is None or call.engine is None or tag != call.tag or \
+                not isinstance(data, str) or len(data) > 2 * CALL_MAX_PACKET:
+            return
+        try:
+            call.engine.ws_packet(b64d(data))
+        except ValueError:
+            pass
+
+    def _check_pending_offer(self) -> None:
+        """A call that rang while the app was closed: the background
+        service kept its offer. Still fresh, it rings here now."""
+        if self.store is None or not self.keys.has_identity:
+            return
+        path = DATA_DIR / f"call_offer_{self.keys.address}.json"
+        try:
+            pending = json.loads(path.read_text("utf-8"))
+            path.unlink()
+        except (OSError, ValueError):
+            return
+        sig = sanitize_call_signal("call", (pending or {}).get("sig") or {})
+        sender = (pending or {}).get("from")
+        if sig is not None and isinstance(sender, str):
+            self._on_call_signal(sender, sig)
+
+    # =========================================================================
     #  UI-queue pump (the only place workers reach the UI)
     # =========================================================================
     def _drain_ui_queue(self, _dt) -> None:
@@ -11897,8 +21166,20 @@ class FextApp(MessagingMixin, App):
                             self.mark_peer_read(peer, refresh=False)
                         self._dirty_chat = True
                     self._dirty_list = True
-                elif kind == "incoming":
-                    self._notify_incoming(*event[1:5])
+                elif kind == "expired":
+                    # Disappearing messages went: so does what the shade
+                    # still said of them.
+                    if IS_ANDROID:
+                        android_clear_notification(event[1])
+                elif kind == "held_released" and self.store is not None:
+                    peer, count = event[1], event[2]
+                    if peer:
+                        name = (self.store.get_contact(peer) or {}).get(
+                            "username") or short_addr(peer, 10)
+                        self._set_status(
+                            f"{count} message{'s' if count != 1 else ''} "
+                            f"from {name} arrived", COL_OK)
+                    self._dirty_list = True
                 elif kind == "media_pending" and self.store is not None:
                     row = self.store.message_by_cid(event[1], event[2], "in")
                     if row is not None:
@@ -11911,6 +21192,18 @@ class FextApp(MessagingMixin, App):
                 elif kind == "group_publish" and self.store is not None:
                     threading.Thread(target=self._announce_group,
                                      args=(event[1],), daemon=True).start()
+                elif kind == "picture":
+                    self._on_picture(event[1], event[2])
+                elif kind == "picture_wanted" and self.store is not None:
+                    threading.Thread(target=self.ask_for_picture,
+                                     args=event[1:4], daemon=True).start()
+                elif kind == "picture_request" and self.store is not None:
+                    threading.Thread(target=self.answer_picture_request,
+                                     args=event[1:3], daemon=True).start()
+                elif kind == "call_signal":
+                    self._on_call_signal(event[1], event[2])
+                elif kind == "call_engine":
+                    self._on_call_engine(*event[1:4])
         except queue.Empty:
             pass
         if self._dirty_chat:
@@ -11923,26 +21216,138 @@ class FextApp(MessagingMixin, App):
     # =========================================================================
     #  Notifications
     # =========================================================================
-    def _notify_incoming(self, peer: str, body: str, kind: str,
-                         author: Optional[str] = None) -> None:
-        """Raise a notification for a new message — unless the user is
-        looking at that very chat, or has muted it."""
+    @staticmethod
+    def _window_focused() -> bool:
+        return bool(getattr(Window, "focus", True))
+
+    def notify_incoming(self, peer: str, body: str, kind: str,
+                        author: Optional[str] = None) -> None:
+        """A new message (sync thread, v11): notify — unless that very chat
+        is in front of the user, or muted. Run from here rather than the
+        screen's queue, a paused app notifies too: Android stops a paused
+        app's screen, not its sync thread. On a computer, the system's own
+        notification while the window is elsewhere; a line in the app
+        while it is in front."""
         if self.store is None:
             return
-        if (self.foreground and peer == self.current_peer
-                and self.manager.current == "conversation"):
+        looking = self.foreground and peer == self.current_peer and \
+            self.manager.current == "conversation"
+        if looking and (IS_MOBILE or self._window_focused()):
             return
         name, preview, muted = notification_text(self.store, peer, body,
                                                  kind, author)
         if muted:
             return
         if IS_ANDROID:
+            android_message_notification(self, peer, name, preview[:160])
+        elif not self._window_focused():
+            if desktop_notifications_enabled():
+                desktop_notify(name, preview)
+            desktop_flash_window()
+        else:
+            self.ui_queue.put(("status", f"New message from {name}",
+                               COL_ACCENT))
+
+    def call_signal_arrived(self, sender: str, sig: dict) -> None:
+        """A call's message (sync thread, v11). On screen, or with a call
+        on, it goes to the call screen. Away from the screen with no call,
+        it is handled as the background service would — the offer kept and
+        rung through a notification — because a paused app's screen would
+        not see it until someone came back to it."""
+        call = self.call
+        in_call = call is not None and not call.ended
+        if self.foreground or in_call:
+            if in_call and not self.foreground and sig["op"] == "end" and \
+                    call.id == sig["id"] and call.peer == sender:
+                self._halt_call_quietly(call)
+            self.ui_queue.put(("call_signal", sender, sig))
+            return
+        _service_call_signal(self, sender, sig)
+
+    # ---- v11: a call while the app is off screen -------------------------------
+    @staticmethod
+    def _call_overdue(call: "Call") -> Optional[str]:
+        """Why a call should end now ('timeout', 'failed'), or None — the
+        same limits _call_tick applies on screen."""
+        now = time.monotonic()
+        if call.state in ("calling", "ringing") and \
+                now - call.created > CALL_RING_SECONDS:
+            return "timeout"
+        if call.state == "incoming" and \
+                now - call.created > CALL_RING_SECONDS + 10:
+            return "timeout"
+        if call.state == "connecting" and \
+                now - (call.answered_at or now) > CALL_CONNECT_SECONDS:
+            return "failed"
+        return None
+
+    def _halt_call_quietly(self, call: "Call",
+                           why: Optional[str] = None) -> None:
+        """Off screen, a call that has ended (or, `why`, run out of time)
+        stops its sound, its ringing and its 'Call in progress' service at
+        once; its screen and its line in the chat follow when the app is
+        back. Safe from any thread: no widget is touched."""
+        engine = call.engine
+        if engine is not None:
             try:
-                android_notify(peer, name, preview[:160])
+                engine.hangup() if why else engine.stop()
             except Exception:
-                log.exception("could not post a notification")
-        elif not self.foreground or peer != self.current_peer:
-            self._set_status(f"New message from {name}", COL_ACCENT)
+                log.exception("could not stop a call's sound")
+        if why and not getattr(call, "end_sent", False):
+            call.end_sent = True
+            threading.Thread(target=self._send_control_to, args=(
+                call.peer, {"op": "end", "id": call.id, "why": why},
+                "Voice call"), daemon=True).start()
+        ringer, self._ringer = self._ringer, None
+        tone = getattr(self, "_ringback_tone", None)
+        self._ringback_tone = None
+        for part in (ringer, tone):
+            if part is not None:
+                try:
+                    part.stop()
+                except Exception:
+                    log.exception("the ringing would not stop")
+        try:
+            (DATA_DIR / ".call_active").unlink()     # ends the call service
+        except OSError:
+            pass
+        if IS_ANDROID:
+            android_cancel_call_notification()
+
+    def _start_call_watchdog(self) -> None:
+        """While the app is away with a call on, the call's time limits are
+        kept by a thread: the screen's clock does not run then."""
+        if self._watchdog is not None and self._watchdog.is_alive():
+            return
+
+        def watch():
+            while not self.foreground:
+                call = self.call
+                if call is None or call.ended:
+                    return
+                why = self._call_overdue(call)
+                if why:
+                    self._halt_call_quietly(call, why)
+                    return
+                time.sleep(1.0)
+        self._watchdog = threading.Thread(target=watch, daemon=True,
+                                          name="fext-call-watch")
+        self._watchdog.start()
+
+    def _call_from_notification(self, action: str, call_id: str) -> None:
+        """A call's notification was tapped: 'answer' (or 'show') it."""
+        if not _CALL_ID_RE.match(call_id or ""):
+            return
+        if action == "answer":
+            self._answer_on_ring = call_id
+        call = self.call
+        if call is not None and call.id == call_id and not call.ended:
+            self.show_call()
+            if action == "answer" and call.state == "incoming":
+                self._answer_on_ring = None
+                self.answer_call()
+            return
+        self._check_pending_offer()
 
     def _sync_background_service(self) -> None:
         """Run the background service if the user wants delivery while the
@@ -11979,9 +21384,13 @@ class FextApp(MessagingMixin, App):
     def _on_new_intent(self, intent) -> None:
         try:
             peer = intent.getStringExtra("fext_peer")
+            action = intent.getStringExtra("fext_call_action")
+            call_id = intent.getStringExtra("fext_call")
         except Exception:
-            peer = None
-        if peer:
+            peer = action = call_id = None
+        if action and call_id:
+            run_on_ui(self._call_from_notification, str(action), str(call_id))
+        elif peer:
             run_on_ui(self._open_from_notification, str(peer))
 
     def _open_from_notification(self, peer: str) -> None:
@@ -12000,6 +21409,21 @@ class FextApp(MessagingMixin, App):
             return str(peer) if peer else None
         except Exception:
             return None
+
+    def _launch_call_action(self) -> tuple:
+        """(action, call id) a call's notification COLD-started us with."""
+        if not IS_ANDROID:
+            return None, None
+        try:
+            autoclass, _ = _jni()
+            intent = autoclass("org.kivy.android.PythonActivity"
+                               ).mActivity.getIntent()
+            if intent is None:
+                return None, None
+            return (intent.getStringExtra("fext_call_action"),
+                    intent.getStringExtra("fext_call"))
+        except Exception:
+            return None, None
 
     def _handle_needs_registration(self, message: str) -> None:
         """The relay does not recognise this identity — offer to register.
@@ -12046,6 +21470,9 @@ class FextApp(MessagingMixin, App):
 
     def on_pause(self) -> bool:
         self.foreground = False          # background: back off politely
+        self.conversation_screen.keep_draft()
+        if self.call is not None and not self.call.ended:
+            self._start_call_watchdog()
         return True
 
     def on_resume(self) -> None:
@@ -12070,6 +21497,11 @@ class FextApp(MessagingMixin, App):
                 android_clear_notification(peer)
             if self._auto_read(peer):
                 self.mark_peer_read(peer)
+        # The background service may have been sent pictures meanwhile, or
+        # a call that is still ringing.
+        if self.store is not None:
+            self._load_pictures()
+            self._check_pending_offer()
         android_style_system_bars()
         self._watch_system_theme(0)
 
@@ -12105,6 +21537,150 @@ class FextApp(MessagingMixin, App):
     def close_chat_info(self) -> None:
         self._navigate("conversation", "right")
         self.refresh_chat(self.current_peer)
+
+    def open_search(self) -> None:
+        if self.manager.current != "chats":
+            self.go_back_to_chats()
+        self.chats_screen.enter_search()
+
+    # ---- the menu and the pages it opens ---------------------------------------
+    def open_drawer(self) -> None:
+        # Made for the theme it opens in: a theme change rebuilds it.
+        if self.drawer is None or self.drawer.theme != T.name:
+            self.drawer = NavDrawer(self)
+        self.drawer.open()
+
+    def close_drawer(self) -> bool:
+        """Close the menu if it is open; True if it was."""
+        if self.drawer is not None and self.drawer.is_open:
+            self.drawer.close()
+            return True
+        return False
+
+    def open_profile(self) -> None:
+        if not self.keys.has_identity:
+            return
+        self._profile_from = self.manager.current
+        self.profile_screen.show()
+        self._navigate("profile", "left")
+
+    def close_profile(self) -> None:
+        back = getattr(self, "_profile_from", "chats")
+        if back not in self.manager.screen_names or back == "profile":
+            back = "chats"
+        if back == "settings":
+            self.settings_screen.show()
+        self._navigate(back, "right")
+        if back == "chats":
+            self.chats_screen.refresh_header()
+
+    # ---- pictures ------------------------------------------------------------------
+    def picture_menu(self, gid: Optional[str] = None) -> None:
+        """See, choose, take or remove a picture: this identity's own, or
+        (as its admin) a group's."""
+        peer = group_peer(gid) if gid else self.keys.address
+        has = bool(PICTURES.path(peer))
+        items = []
+        if has:
+            items.append(("image", "See the photo",
+                          lambda: self.view_picture(peer)))
+        items.append(("image", "Choose a photo",
+                      lambda: self._pick_picture(gid)))
+        items.append(("camera", "Take a photo",
+                      lambda: self._shoot_picture(gid)))
+        if has:
+            items.append(("delete", "Remove the photo",
+                          lambda: self.set_picture(None, gid), True))
+        MenuSheet(items, title="Group photo" if gid else
+                  "Profile photo").open()
+
+    def view_picture(self, peer: str) -> bool:
+        path = PICTURES.path(peer)
+        if path:
+            ImageViewer(path, nocache=True).open()
+            return True
+        return False
+
+    def _pick_picture(self, gid: Optional[str]) -> None:
+        if IS_ANDROID:
+            try:
+                android_pick_image(
+                    lambda path: self._frame_picture(path, gid, True))
+            except Exception:
+                log.exception("photo picker failed")
+                self._set_status("Couldn't open the photo picker", T.alert)
+        else:
+            ImageChooserModal(
+                lambda path: self._frame_picture(path, gid, False),
+                title="Group photo" if gid else "Profile photo").open()
+
+    def _shoot_picture(self, gid: Optional[str]) -> None:
+        if IS_ANDROID:
+            try:
+                android_take_photo(
+                    lambda path: self._frame_picture(path, gid, True))
+            except Exception:
+                log.exception("camera failed")
+                self._set_status("Couldn't open the camera", T.alert)
+        else:
+            open_desktop_camera(
+                lambda path: self._frame_picture(path, gid, True),
+                on_choose=lambda: self._pick_picture(gid))
+
+    def _frame_picture(self, path: str, gid: Optional[str],
+                       temporary: bool) -> None:
+        try:
+            PictureCropSheet(path, lambda data: self.set_picture(data, gid),
+                             title="Group photo" if gid else "Profile photo",
+                             temporary=temporary).open()
+        except Exception:
+            log.exception("could not open a photo to frame")
+            if temporary:
+                discard_media_file(path)
+            self._set_status("That photo could not be opened", T.alert)
+
+    def set_picture(self, data: Optional[bytes],
+                    gid: Optional[str] = None) -> bool:
+        """Make `data` (a JPEG from picture_jpeg; None removes it) the
+        picture of this identity — or of group `gid`, when we are its
+        admin — and send it to everyone concerned."""
+        if self.store is None or not self.keys.has_identity:
+            return False
+        if gid is not None:
+            group = self.store.group(gid)
+            if group is None or group["admin"] != self.keys.address or \
+                    group["state"] != "active":
+                self._set_status("Only the group's admin can change its "
+                                 "photo", T.accent)
+                return False
+            peer = group_peer(gid)
+            target = peer_picture_path(self.keys.address, peer)
+        else:
+            peer = self.keys.address
+            target = own_picture_path(peer)
+        path = None
+        if data:
+            if not write_picture(target, data):
+                self._set_status("The photo could not be saved", T.alert)
+                return False
+            path = str(target)
+        else:
+            discard_picture_file(target)
+        self.store.set_picture(
+            peer, next_picture_version(self.store.picture_version(peer)),
+            path)
+        self._on_picture(peer, path)
+        threading.Thread(target=self.broadcast_picture, args=(gid,),
+                         daemon=True).start()
+        if self.manager.current == "profile" and gid is None:
+            self.profile_screen.show()
+        elif self.manager.current == "group_info" and \
+                self.group_info_screen.gid == gid:
+            self.group_info_screen.show(gid)
+        what = "Group photo" if gid else "Profile photo"
+        self._set_status(f"{what} {'updated' if path else 'removed'}",
+                         COL_TEXT_DIM)
+        return True
 
     def open_settings(self) -> None:
         self._settings_from = self.manager.current
@@ -12174,15 +21750,176 @@ class FextApp(MessagingMixin, App):
 
     # ---- per-chat switches (chat info and the ⋮ menu) ------------------------
     def set_notify(self, peer: str, on: bool) -> None:
-        self.store.set_contact_setting(peer, "notify", int(on))
-        if not on and IS_ANDROID:
-            android_clear_notification(peer)
-        self.refresh_chat(peer)
+        """On: unmute. Off: muted until turned back on."""
+        self.set_mute([peer], None if on else LocalStore.MUTE_FOREVER)
+
+    def set_mute(self, peers: list, until: Optional[float]) -> None:
+        """v11: mute chats until `until` (epoch seconds), until turned back
+        on (LocalStore.MUTE_FOREVER), or — None — unmute them. Muted chats
+        still receive and show every message; they only stop notifying."""
+        for peer in peers:
+            self.store.set_mute(peer, until)
+            if until is not None and IS_ANDROID:
+                android_clear_notification(peer)
+        if until is None:
+            verb = "Notifications on" if len(peers) == 1 else "Unmuted"
+        else:
+            verb = mute_label(until, short=True)
+        self._after_list_change(peers, verb)
+        current = self.manager.current
+        if current == "info" and self.chat_info_screen.peer in peers:
+            self.chat_info_screen.show(self.chat_info_screen.peer)
+        elif current == "group_info" and self.current_peer in peers and \
+                gid_of(self.current_peer):
+            self.group_info_screen.show(gid_of(self.current_peer))
+
+    def choose_mute(self, peers: list) -> None:
+        """The mute choices for chats (unmuting them if all are muted)."""
+        MuteSheet(self, peers).open()
+
+    # ---- v11: disappearing messages ---------------------------------------------
+    def choose_timer(self, peer: str) -> None:
+        gid = gid_of(peer)
+        if gid and (self.store.group(gid) or {}).get("admin") != \
+                self.keys.address:
+            self._set_status("Only the group's admin sets this", T.accent)
+            return
+        TimerSheet(self, peer).open()
+
+    def timer_laggards(self, peer: str) -> str:
+        """Who in a chat runs an app that keeps disappearing messages."""
+        if self.conversation_kind(peer) == "dm":
+            contact = self.store.get_contact(peer) or {}
+            if contact.get("caps", 0) & LocalStore.CAP_TIMER:
+                return ""
+            return contact.get("username") or short_addr(peer, 10)
+        names = []
+        for address, _key in self.group_recipients(gid_of(peer) or ""):
+            contact = self.store.get_contact(address) or {}
+            if not contact.get("caps", 0) & LocalStore.CAP_TIMER:
+                names.append(contact.get("username") or short_addr(address, 8))
+        return ", ".join(names[:3]) + (" and others" if len(names) > 3
+                                       else "")
+
+    def set_chat_timer(self, peer: str, seconds: int) -> None:
+        """Set a chat's timer here and tell the other side (in a group,
+        every member): new messages carry it from now on."""
+        at = time.time()
+        if not self.store.set_chat_timer(peer, seconds, at):
+            return
+        self.store.add_event(peer, timer_event("You", seconds))
+        fallback = ("Turned on disappearing messages: " +
+                    timer_label(seconds).lower()) if seconds else \
+            "Turned off disappearing messages"
+        if self.conversation_kind(peer) in ("dm", "group"):
+            threading.Thread(target=self._send_control, args=(
+                peer, {"op": "timer", "s": seconds, "at": at}, fallback),
+                daemon=True).start()
+        self._after_list_change([peer], "Disappearing messages " + (
+            timer_label(seconds).lower() if seconds else "off"))
+        if self.manager.current == "info":
+            self.chat_info_screen.show(peer)
+        elif self.manager.current == "group_info" and gid_of(peer):
+            self.group_info_screen.show(gid_of(peer))
+
+    # ---- v11: verifying a contact -------------------------------------------------
+    def open_verify(self, peer: str) -> None:
+        if self.store is None or self.store.get_contact(peer) is None:
+            return
+        VerifySheet(self, peer).open()
+
+    def set_verified(self, peer: str, verified: bool) -> None:
+        self.store.set_verified(peer, verified)
+        name = (self.store.get_contact(peer) or {}).get("username") or \
+            short_addr(peer, 10)
+        self.store.add_event(peer, f"You verified {name}" if verified else
+                             f"You cleared {name}'s verification")
+        self._after_list_change([peer], "Verified" if verified
+                                else "Verification cleared")
+        if self.manager.current == "info":
+            self.chat_info_screen.show(peer)
+
+    # ---- v9.1.2: what a held chat can have done to it -------------------------
+    def set_chats_muted(self, peers: list, muted: bool) -> None:
+        if muted:
+            self.choose_mute(peers)
+        else:
+            self.set_mute(peers, None)
+
+    def set_chats_archived(self, peers: list, archived: bool) -> None:
+        self.store.set_chat_flag(peers, "archived", 1 if archived else 0)
+        self._after_list_change(peers, "Archived" if archived
+                                else "Back in your chats")
+
+    def set_chats_pinned(self, peers: list, pinned: bool) -> None:
+        now = time.time()
+        # the first picked ends up on top, as it was pinned last
+        for i, peer in enumerate(reversed(peers)):
+            self.store.set_chat_flag([peer], "pinned",
+                                     now + i / 1000 if pinned else None)
+        self._after_list_change(peers, "Pinned" if pinned else "Unpinned")
+
+    def mark_chats_unread(self, peers: list) -> None:
+        self.store.set_chat_flag(peers, "marked_unread", 1)
+        self._after_list_change(peers, "Marked as unread")
+
+    def mark_chats_read(self, peers: list) -> None:
+        for peer in peers:
+            self.mark_peer_read(peer, refresh=False)
+        self.store.set_chat_flag(peers, "marked_unread", 0)
+        self._after_list_change(peers, "Marked as read")
+
+    def set_blocked(self, peers: list, blocked: bool) -> None:
+        """Block: what they send is held, sealed, unseen and unannounced;
+        their calls are refused. Unblock: what was held arrives, in order
+        (v11; it used to be thrown away)."""
+        peers = [p for p in peers if self.conversation_kind(p) == "dm"]
+        self.store.set_chat_flag(peers, "blocked", 1 if blocked else 0)
+        if blocked and IS_ANDROID:
+            for peer in peers:
+                android_clear_notification(peer)
+        self._after_list_change(peers, "Blocked" if blocked else "Unblocked")
+        if self.current_peer in peers:
+            self.refresh_chat(self.current_peer)
+        worker = self.worker
+        if not blocked and worker is not None:
+            for peer in peers:
+                if self.store.held_count(peer):
+                    threading.Thread(target=worker.release_held, args=(peer,),
+                                     daemon=True).start()
+
+    def delete_chats(self, peers: list) -> None:
+        """Remove chats from this device (a group is left first) and from
+        the list, until something new arrives in them."""
+        for peer in peers:
+            if peer.startswith(GROUP_PREFIX):
+                group = self.store.group(gid_of(peer))
+                if group and group.get("state") == "active":
+                    self.leave_group(gid_of(peer))
+            self.store.clear_conversation(peer)
+            self.store.set_chat_flag([peer], "hidden", 1)
+            self.store.set_chat_flag([peer], "pinned", None)
+            self.store.set_chat_flag([peer], "archived", 0)
+            if IS_ANDROID:
+                android_clear_notification(peer)
+        if self.current_peer in peers:
+            self.go_back_to_chats()
+        self._after_list_change(peers, "Deleted")
+
+    def _after_list_change(self, peers: list, verb: str) -> None:
+        n = len(peers)
+        if n:
+            self._set_status(f"{verb}" + (f" · {n} chats" if n > 1 else ""),
+                             COL_OK)
+        self.refresh_sidebar()
+        if self.current_peer in peers and self.manager.current != "chats":
+            self.refresh_chat(self.current_peer)
 
     def toggle_notify(self, peer: str) -> None:
-        on = not (self.store.get_contact(peer) or {}).get("notify", 1)
-        self.set_notify(peer, on)
-        self._set_status("Notifications on" if on else "Chat muted", COL_OK)
+        if self.store.mute_state(peer)[0]:
+            self.set_mute([peer], None)
+        else:
+            self.choose_mute([peer])
 
     def set_ticks(self, peer: str, enabled: bool) -> None:
         """Both ends must agree for 2nd/3rd ticks; the relay enforces it, so
@@ -12223,6 +21960,10 @@ class HeadlessApp(MessagingMixin):
         self.api = ApiClient(keys)
         self.store = LocalStore(keys.store_path())
         self.ui_queue: "queue.Queue" = queue.Queue()
+        self._declined_calls: set = set()
+
+    def _set_status(self, text: str, color: Optional[str] = None) -> None:
+        log.info("service: %s", text)
 
     def close(self) -> None:
         self.store.close()
@@ -12233,34 +21974,92 @@ def notification_text(store: "LocalStore", peer: str, body: str, kind: str,
     """(title, text, muted) for a new message. A group's notification is
     titled with the group and names who wrote."""
     preview = "Photo" if kind == "image" else body
+    muted = store.mute_state(peer)[0] or store.is_blocked(peer)
     gid = gid_of(peer)
     if gid:
         group = store.group(gid) or {}
         who = (store.get_contact(author or "") or {}).get("username") or \
             short_addr(author or "", 10)
-        return (group.get("name") or "Group", f"{who}: {preview}",
-                not group.get("notify", 1))
+        return (group.get("name") or "Group", f"{who}: {preview}", muted)
     contact = store.get_contact(peer) or {}
-    return (contact.get("username") or short_addr(peer, 12), preview,
-            not contact.get("notify", 1))
+    return (contact.get("username") or short_addr(peer, 12), preview, muted)
+
+
+def _service_call_signal(app: HeadlessApp, sender: str, sig: dict) -> None:
+    """A call while the app is closed. The service cannot take it — only
+    the app has a screen and the sound — so it keeps the offer for the app
+    and says so; if the caller gives up first, it is a missed call."""
+    path = DATA_DIR / f"call_offer_{app.keys.address}.json"
+    name = (app.store.get_contact(sender) or {}).get("username") or \
+        short_addr(sender, 12)
+    if sig["op"] == "call":
+        if sig["id"] in app._declined_calls:
+            return
+        if sig.get("t") and time.time() - sig["t"] > CALL_OFFER_MAX_AGE:
+            app.store.add_event(sender, "Missed call")
+            app.ui_queue.put(("message_stored", sender))
+            return
+        if app.store.get_contact(sender) is None:
+            return
+        try:
+            path.write_text(json.dumps({"from": sender, "sig": sig,
+                                        "at": time.time()}), "utf-8")
+        except OSError:
+            log.exception("could not keep a call's offer")
+            return
+        # v11: it rings — over the lock screen, with Answer and Decline —
+        # rather than waiting for someone to open the app.
+        rang = False
+        if IS_ANDROID:
+            try:
+                rang = android_call_notification(app, sender, sig["id"], name)
+            except Exception:
+                log.exception("could not ring for a call")
+            if not rang:
+                try:
+                    android_notify(sender, name, "Incoming voice call")
+                except Exception:
+                    log.exception("could not post a call's notification")
+        else:
+            desktop_notify(name, "Incoming voice call")
+    elif sig["op"] == "end":
+        try:
+            pending = json.loads(path.read_text("utf-8"))
+        except (OSError, ValueError):
+            return
+        if (pending.get("sig") or {}).get("id") == sig["id"]:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            app.store.add_event(sender, "Missed call")
+            app.ui_queue.put(("message_stored", sender))
+            if IS_ANDROID:
+                android_cancel_call_notification()
+                try:
+                    android_notify(sender, name, "Missed call")
+                except Exception:
+                    log.exception("could not post a missed call")
+            else:
+                desktop_notify(name, "Missed call")
 
 
 def _service_handle(app: HeadlessApp, event: tuple) -> None:
+    # New messages and calls are announced from the sync thread itself
+    # (MessagingMixin.notify_incoming, call_signal_arrived).
     kind = event[0]
-    if kind == "incoming":
-        peer, body, msg_kind = event[1], event[2], event[3]
-        name, text, muted = notification_text(app.store, peer, body, msg_kind,
-                                              event[4] if len(event) > 4
-                                              else None)
-        if not muted:
-            try:
-                android_notify(peer, name, text[:160])
-            except Exception:
-                log.exception("service: notification failed")
+    if kind == "expired" and IS_ANDROID:
+        android_clear_notification(event[1])
     elif kind == "resend_request":
         app._on_resend_request(*event[1:4])
     elif kind == "group_publish":
         threading.Thread(target=app._publish_group_state, args=(event[1],),
+                         daemon=True).start()
+    elif kind == "picture_wanted":
+        threading.Thread(target=app.ask_for_picture, args=event[1:4],
+                         daemon=True).start()
+    elif kind == "picture_request":
+        threading.Thread(target=app.answer_picture_request, args=event[1:3],
                          daemon=True).start()
     # Everything else (status lines, repaint hints, media downloads) is for
     # a screen; the app catches up from the database when it next opens.

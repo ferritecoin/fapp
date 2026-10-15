@@ -399,7 +399,118 @@ def record_silent_check():
           M.media_suffix("image", "image/jpeg") == "jpg")
 
 
+def press(w):
+    """Mouse down on a widget, kept down: a hold (see release, drag)."""
+    x, y = centre(w)
+    h = Window.system_size[1]
+    Window.dispatch("on_mouse_down", x, h - y, "left", [])
+    HOLD.update(x=x, y=y)
+
+
+def drag(dx, dy, steps=6):
+    h = Window.system_size[1]
+    for i in range(1, steps + 1):
+        x, y = HOLD["x"] + dx * i / steps, HOLD["y"] + dy * i / steps
+        Window.dispatch("on_mouse_move", x, h - y, [])
+    HOLD.update(x=HOLD["x"] + dx, y=HOLD["y"] + dy)
+
+
+def release():
+    h = Window.system_size[1]
+    Window.dispatch("on_mouse_up", HOLD["x"], h - HOLD["y"], "left", [])
+
+
+HOLD = {}
+
+
+def hold_start():
+    print("\nHold to record")
+    M._capture_routes = capture_with(TONE)
+    SENT.clear()
+    press(screen().action_button)
+
+
+def hold_release():
+    s = screen()
+    check("holding the microphone records, red under the finger, with "
+          "the lock over it", s.recorder is not None and not s._rec_locked
+          and s.action_button._holding and s.lock_pill.parent is not None)
+    release()
+
+
+def hold_sent():
+    s = screen()
+    got = SENT.get("voice")
+    check("...letting go sends it", got is not None and got[1] >= 700 and
+          s.recorder is None, str(got and got[1]))
+    SENT.clear()
+    press(s.action_button)
+
+
+def hold_cancel():
+    drag(-(M.ConversationScreen.CANCEL_SLIDE + dp(20)), 0)
+
+
+def hold_cancelled():
+    s = screen()
+    check("sliding left deletes it: nothing sent, the composer back",
+          s.recorder is None and not SENT.get("voice") and
+          s.entry.parent is s.composer)
+    press(s.action_button)
+
+
+def hold_lock():
+    drag(0, M.ConversationScreen.LOCK_SLIDE + dp(20))
+
+
+def hold_locked():
+    s = screen()
+    check("sliding up locks it: hands-free, with delete, pause and send",
+          s.recorder is not None and s._rec_locked and
+          s.rec_cancel.parent is s.composer and
+          s.rec_pause.parent is s.composer and
+          s.rec_send.parent is s.composer)
+    release()
+    check("...and letting go then sends nothing", s.recorder is not None
+          and not SENT.get("voice"))
+    s.toggle_pause()
+    HOLD["paused_at"] = s.recorder.elapsed_ms
+
+
+def hold_paused():
+    s = screen()
+    check("paused, the clock holds still",
+          abs(s.recorder.elapsed_ms - HOLD["paused_at"]) < 150 and
+          s.rec_pause.icon == "mic", str((s.recorder.elapsed_ms,
+                                          HOLD["paused_at"])))
+    s.toggle_pause()
+
+
+def hold_resumed():
+    s = screen()
+    check("...and carries on once resumed",
+          s.recorder.elapsed_ms > HOLD["paused_at"] + 300)
+    x, y = centre(s.rec_send)
+    click(x, y)
+
+
+def hold_locked_sent():
+    got = SENT.get("voice")
+    check("...send sends it, without the paused part",
+          got is not None and got[1] < HOLD["paused_at"] + 2000)
+
+
 step(record_silent_check, 0.2)
+step(hold_start, 1.4)
+step(hold_release, 0.6)
+step(hold_sent, 0.9)
+step(hold_cancel, 0.5)
+step(hold_cancelled, 0.4)
+step(hold_lock, 0.5)
+step(hold_locked, 0.8)
+step(hold_paused, 0.8)
+step(hold_resumed, 0.6)
+step(hold_locked_sent, 0.4)
 
 
 class FakeCameraView(KivyImage):

@@ -58,7 +58,8 @@ events = []
 
 
 class FakeWorker:
-    """Records lifecycle; on start, delivers two 'incoming' events."""
+    """Records lifecycle; on start, announces two new messages, as the real
+    worker does from its own thread (v11)."""
 
     def __init__(self, app):
         import threading
@@ -67,8 +68,8 @@ class FakeWorker:
 
     def start(self):
         events.append(("start", self.app.keys.address, self.beat_owner))
-        self.app.ui_queue.put(("incoming", pal, "hello there", "text"))
-        self.app.ui_queue.put(("incoming", muted, "shh", "text"))
+        self.app.notify_incoming(pal, "hello there", "text")
+        self.app.notify_incoming(muted, "shh", "text")
 
     def join(self, timeout=None):
         events.append(("stopped",))
@@ -79,7 +80,11 @@ M.SyncWorker = FakeWorker
 M.android_notify = lambda peer, title, text: notified.append((title, text))
 script = iter([True, False, False, True])        # app heartbeat per cycle
 M.heartbeat_fresh = lambda owner: next(script)
-M.run_background_service(max_cycles=4, tick=0)
+M.IS_ANDROID = True          # the service only ever runs there
+try:
+    M.run_background_service(max_cycles=4, tick=0)
+finally:
+    M.IS_ANDROID = False
 starts = [e for e in events if e[0] == "start"]
 check("idles while the app's own worker is alive",
       events and events[0][0] == "start" and len(starts) == 1)
@@ -112,7 +117,8 @@ os.utime(M2._beat_path("app"))
 (M2._beat_path("app")).write_text("1")
 check("a stale heartbeat means gone", not M2.heartbeat_fresh("app"))
 
-print("\nManifest hook: service type (Android 14), camera FileProvider")
+print("\nManifest hook: service types (Android 14), camera FileProvider, "
+      "notification receiver")
 hook_spec = importlib.util.spec_from_file_location(
     "p4a_hook", ROOT / "tools" / "p4a_hook.py")
 hook = importlib.util.module_from_spec(hook_spec)
@@ -120,12 +126,15 @@ hook_spec.loader.exec_module(hook)
 work = Path(tempfile.mkdtemp(prefix="dist-"))
 (work / "src" / "main").mkdir(parents=True)
 manifest = work / "src" / "main" / "AndroidManifest.xml"
-# What p4a v2024.01.21's template renders for `services = Fextsync:...`:
+# What p4a v2024.01.21's template renders for `services = Fextsync:...,
+# Fextcall:...`:
 manifest.write_text('''<manifest><application>
         <service android:name="org.kivy.android.PythonService"
                  android:process=":pythonservice" />
         <service android:name="org.fext.fext.ServiceFextsync"
                  android:process=":service_fextsync" />
+        <service android:name="org.fext.fext.ServiceFextcall"
+                 android:process=":service_fextcall" />
 </application></manifest>''')
 cwd = os.getcwd()
 os.chdir(work)
@@ -136,9 +145,13 @@ try:
     twice = manifest.read_text()
 finally:
     os.chdir(cwd)
-check("declares foregroundServiceType on OUR service only",
+check("declares foregroundServiceType on OUR services only",
       once.count('foregroundServiceType="dataSync"') == 1 and
-      'ServiceFextsync" android:foregroundServiceType' in once)
+      'ServiceFextsync" android:foregroundServiceType="dataSync"' in once and
+      'PythonService" android:foregroundServiceType' not in once)
+check("...the call service as 'microphone', so a call keeps its microphone "
+      "off screen",
+      'ServiceFextcall" android:foregroundServiceType="microphone"' in once)
 check("running the hook twice changes nothing", once == twice)
 inside = once[once.index("<application>"):once.index("</application>")]
 check("declares the camera's FileProvider once, inside <application>",
@@ -154,6 +167,28 @@ check("...whose one folder ships, with the class it names",
       '<cache-path name="camera" path="camera/" />' in paths and
       "xml/fext_file_paths.xml" in spec_text and
       "androidx.core:core:" in spec_text)
+perms = next(line for line in spec_text.splitlines()
+             if line.startswith("android.permissions"))
+services = next(line for line in spec_text.splitlines()
+                if line.startswith("services"))
+check("calls: the service, its permission, and the audio helper ship",
+      "Fextcall:call_service.py:foreground" in services and
+      (ROOT / "call_service.py").is_file() and
+      all(p in perms for p in ("FOREGROUND_SERVICE_MICROPHONE",
+                                "MODIFY_AUDIO_SETTINGS", "RECORD_AUDIO",
+                                "WAKE_LOCK", "VIBRATE")) and
+      "android.add_src = src/android/java" in spec_text and
+      (ROOT / "src/android/java/org/fext/call/CallAudio.java").is_file())
+check("notifications: their receiver is declared once, not exported",
+      once.count("org.fext.notify.NotifyReceiver") == 1 and
+      "org.fext.notify.NotifyReceiver" in inside and
+      inside[inside.index("org.fext.notify.NotifyReceiver"):].split(
+          "/>")[0].count('android:exported="false"') == 1)
+check("...with the classes that draw and answer them, and a call's "
+      "full-screen permission",
+      (ROOT / "src/android/java/org/fext/notify/Notifier.java").is_file() and
+      (ROOT / "src/android/java/org/fext/notify/NotifyReceiver.java"
+       ).is_file() and "USE_FULL_SCREEN_INTENT" in perms)
 manifest.write_text("<manifest><application></application></manifest>")
 os.chdir(work)
 try:

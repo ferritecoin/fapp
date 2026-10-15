@@ -19,16 +19,104 @@ same key (see [Release signing](#release-signing)).
 
 ## Downloads
 
-Every push to the default branch is tested, built and published to a GitHub
-Release. Open the **Releases** page (or the **`v9.1.1`** tag) and take:
+Every push to the default branch is tested and built, and each new version is
+published to a GitHub Release, whose files never change afterwards. Open the
+**Releases** page (or the **`v11.0.0`** tag) and take:
 
 | Asset | For |
 | --- | --- |
-| `Ferritext-9.1.1.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r` |
-| `Ferritext-9.1.1-desktop.py` | Windows / macOS / Linux — one file with its fonts and icons inside. Run it with Python 3.11+ after `pip install kivy requests websocket-client cryptography qrcode pillow`. |
+| `Ferritext-11.0.0.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r` |
+| `Ferritext-11.0.0-desktop.py` | Windows / macOS / Linux — one file with its fonts and icons inside. Run it with Python 3.11+ after `pip install kivy requests websocket-client cryptography qrcode pillow`. |
 
 Both are also attached to each Actions run as the **`ferritext-release`**
 artifact. Pushes to other branches are tested and built, but publish nothing.
+
+On a computer, each of these adds something when it is installed, and
+nothing breaks without it:
+
+| Install | Adds |
+| --- | --- |
+| Opus — `apt install libopus0`, `brew install opus`, or `pip install pyogg` (Windows) | calls in Opus: clearer, on about half the data |
+| `pip install sounddevice` | the best call audio, and choosing the microphone and speaker |
+| `pip install numpy` | voice notes at 1.5× and 2× |
+| `pip install av` (or the `ffmpeg` program) | playing voice notes recorded on a phone |
+| `pip install opencv-python` (or `pyzbar`) | reading a contact's QR code from a picture |
+
+## What's in 11.0.0
+
+- **Notifications that arrive.** A new message is announced the moment it is
+  received, even while Android has the app paused or closed, in a
+  conversation-style notification you can **reply to** or **mark as read**
+  from the shade. On a computer, the system's own notification appears while
+  Ferritext's window is elsewhere.
+- **Mute** a chat for 12 hours, 3 days, or until you turn it back on. A
+  muted chat still receives and shows everything and counts what is unread;
+  only its notifications stop, and they come back by themselves when the
+  time is up.
+- **Blocking holds, unblocking delivers.** What a blocked contact sends is
+  kept on your device, still sealed, unseen and unannounced, and their calls
+  are refused. Unblock them and it all arrives, in order.
+- **Calls in Opus**, where both sides have it: clearer, on about half the
+  data, and losses concealed. **Bluetooth** headsets and a choice of where the
+  sound goes; an **incoming-call screen** over the lock screen with Answer
+  and Decline; a ringing tone for the caller; on a computer, echo cancelled
+  by the system, and the microphone and speaker chosen in Settings.
+- **Disappearing messages**: from five minutes to four weeks, set from a
+  chat's page by either of you (in a group, its admin).
+- **Verify a contact**: compare the code on both phones — read it aloud, or
+  scan the other phone's QR code — and the chat says *verified*.
+- **Links** are underlined, and a tap first shows where one really leads.
+  **Link previews** are off unless turned on in *Settings → Privacy*; then
+  your device fetches the preview as you write and sends it with the
+  message, and nobody reading it contacts the site.
+- **Back up to a file** sealed with a passphrase — identities, chats,
+  photos — and **restore** it on a new phone or computer.
+- **Swipes**: to the right goes back a page (on the chat list, it opens the
+  menu); to the left on a message replies to it.
+- **Search in a chat**, **drafts** that survive a restart, **voice notes at
+  1.5× and 2×** with a waveform to drag through, **keyboard shortcuts** on a
+  computer, and **paste or drop a picture** to send it.
+- **About** names the source code and the open-source work the app is made
+  with ([CREDITS.md](CREDITS.md)).
+- Fixed: tapping a message with a reaction, a quote or a photo could close
+  the app; long links left a blank line under a message on a computer; a
+  computer's file lists were invisible on the light theme.
+- **Coming from 9.1.1?** Everything in 9.1.2, below, is new to you too:
+  voice calls, profile and group pictures, the menu, search, holding chats,
+  hold to record, and tap to react.
+
+## What's in 9.1.2
+
+- **Voice calls.** Call anyone in a direct chat from the phone button in its
+  header, or from its page. The call is set up with sealed messages, and its
+  sound is sealed with keys made for that call alone. It goes straight
+  between the two devices whenever their networks allow, and otherwise
+  through the relay, which forwards what it cannot read. Ringing with answer
+  and decline, mute, the loudspeaker on a phone, and a line in the chat for
+  every call: how long it lasted, or that it was missed. Calls need relay v10
+  — see [Calls](#calls).
+- **Profile and group pictures.** Choose or take a photo and frame it in a
+  circle (drag to place, pinch or scroll to size); the people you write to
+  see it. A group's admin can give the group one. Pictures appear wherever a
+  disc does: the chat list, chats, pages, the menu, search, member lists.
+- **The menu.** ☰ beside the title opens a menu from the left: your
+  identities (switch, or add one), your profile, a new group, saved messages,
+  settings and about. 🔍 at the right searches chats and messages.
+- **Hold a chat** in the list to select it, then more with a tap: mute or
+  unmute, archive, delete, or from ⋮ pin, mark as unread or block. Archived
+  chats wait behind their own row at the top of the list.
+- **Hold to record** a voice message and release to send; slide left to
+  cancel; slide up to lock it and carry on hands-free, with pause, delete
+  and send.
+- **Tap a message** to react to it; hold it to select it, as before.
+- **Back goes back one step** — out of a selection, a sheet or a page — and
+  only leaves the app from the chat list.
+- **Quicker.** Chats open at once, with the rest of a long history filling in
+  behind; pages and sheets arrive in quick layers that fade, and motion is
+  on unless *Settings → Reduce motion* asks for a cross-fade.
+- The picture in a chat's header opens the chat's page, where the picture
+  can be seen full size.
+- Photos no longer turn white for the sender, or later for the recipient.
 
 ## What's in 9.1.1
 
@@ -126,6 +214,28 @@ been tested end to end against this app; media works once it is deployed.
 
 ## Compatibility
 
+**With 9.1.2 and earlier.** 11.0 talks to every earlier release; what
+they do not know, they ignore or show as text.
+
+| | 11.0 | 9.1.2 | 9.1.1 and earlier |
+| --- | --- | --- | --- |
+| A call | Opus when both have it, otherwise ADPCM | ADPCM | not offered |
+| Disappearing messages | deleted on time on both sides | kept: when the timer is set, 11.0 names whose app keeps them | kept |
+| A link preview | shown, if previews are on | the message's text | the message's text |
+
+Blocking, muting, drafts and the *verified* mark live on this device only;
+nothing about them is sent.
+
+**Pictures and calls with older phones.** Every 9.1.2 message says what its
+app can do and which version of its author's picture is current; older
+releases verify these fields and ignore them. Pictures go only to apps that
+keep them, and only those can be called.
+
+| | 9.1.2 | 9.1.1 and earlier |
+| --- | --- | --- |
+| Your picture | shown wherever your disc is | not sent (their app would not keep it) |
+| A call | rings | not offered: the call button says they need 9.1.2 |
+
 **Groups and reactions with older phones.** Groups need no new relay: each
 message is sealed separately for every member (see [Groups](#groups)), so a
 member still on an older release still receives it.
@@ -210,6 +320,52 @@ Long-term storage is the phones', never the relay's.
 This needs the **v9 relay** (`/api/blobs`, advertised in `/api/health`). On an
 older relay the app says so instead of failing; text features all work.
 
+## Calls
+
+A call is set up with end-to-end messages, like everything else: an offer,
+the other app saying it rings, the answer, the end. Each side makes a key
+pair for that call alone and the two agree a secret from them; the offer and
+the reply are signed and sealed, so not even the relay can put its own key
+in between, and from that secret comes one key for each direction.
+
+The sound travels as small UDP packets, 20 ms of 16 kHz speech each, every
+one sealed with AES-256-GCM and decodable on its own. Where both sides have
+it the codec is **Opus** at 24 kbit/s, with in-band FEC: a lost packet is
+rebuilt from the next one, or concealed. Otherwise (or with a 9.1.2 phone)
+it is IMA ADPCM, about 80 kbit/s each way, where a lost packet costs 20 ms
+and nothing more. A short buffer, growing only when the network is uneven,
+smooths out arrival. Android's Opus is libopus, built by the local recipe in
+`recipes/libopus`; a computer uses its system's.
+
+Each device learns from the relay the public address it is seen from, offers
+it to the other with its local ones, and both send to each other at once —
+which opens a direct path through most home routers, the shortest there is.
+Where that fails, packets go through the relay's call port, and where UDP is
+blocked altogether, over the relay's WebSocket. Every packet that arrives
+shows which way works; the most direct one heard from in the last few
+seconds is used, and that changes as the network does. The call screen
+shows which way the sound goes and the round-trip time.
+
+On Android the phone's own call audio is used — its echo cancelling, the
+earpiece, the loudspeaker, a wired or Bluetooth headset, chosen from the call
+screen — the screen darkens against the ear, and a small service
+(`call_service.py`) keeps the microphone on while the app is off screen,
+which Android allows only to a service of the *microphone* type. It starts
+when you dial, so the caller's microphone works even if they leave the app
+while it rings. An incoming call rings as a call notification with Answer
+and Decline, full screen over the lock screen where Android allows it.
+
+On a computer the sound goes through the `sounddevice` package where it is
+installed (with the microphone and speaker chosen in Settings), Windows' own
+audio otherwise, or `arecord`/`aplay` (or `parec`/`pacat`, or SoX) on Linux.
+Echo is cancelled by the system: a headset or a speakerphone that cancels
+it, or on Linux PulseAudio's or PipeWire's echo-cancel module, which is used
+whenever it is loaded.
+
+Calls need **relay v10**, which advertises them in `/api/health` and opens a
+UDP port for them (by default the same number as its HTTP port). On an older
+relay the call button says so.
+
 ## Background delivery
 
 Android closes apps in the background. While Ferritext's own process is alive
@@ -220,13 +376,55 @@ so only one ever holds the connection. It can be switched off under
 *Settings → Notifications*, at the cost of notifications only arriving while
 the app is open.
 
+Whichever holds the connection announces a message the moment it arrives,
+from the thread that received it — so a paused app, whose screen Android has
+stopped, still notifies at once. What is done in the shade (a reply typed
+into the notification, *Mark as read*, *Decline* on a call) is handed to the
+app as a small file by a receiver (`org.fext.notify.NotifyReceiver`), and
+acted on by whichever of the two is running.
+
 Android 14 requires such a service to declare its type, which
 python-for-android's manifest template cannot express;
 `tools/p4a_hook.py` adds it during the build (and fails the build, rather than
-the phone, if it cannot). The same hook declares the FileProvider through
-which the camera app hands over a photo (its one folder is
-`src/android/res/xml/fext_file_paths.xml`; the class comes from
+the phone, if it cannot) — *dataSync* for this service, *microphone* for the
+call service. The same hook declares the notifications' receiver and the
+FileProvider through which the camera app hands over a photo (its one folder
+is `src/android/res/xml/fext_file_paths.xml`; the class comes from
 `androidx.core`).
+
+## Privacy
+
+- **No typing indicators, no "online" or "last seen".** Nobody can be
+  pressed into turning them on, because they do not exist.
+- **Disappearing messages** are deleted by both apps, each copy that long
+  after it was read (the sender's, after it was sent); a deleted message
+  cannot be brought back by the relay sending it again.
+- **Verifying** compares a code worked out from both public keys (twelve
+  groups of five digits, the same on both phones only if each has the
+  other's real key), so a relay that handed out a false address would be
+  found out.
+- **Link previews** are off unless turned on. Then the sender's device
+  fetches them — only from public addresses, a little of each page, three
+  redirects at most — and sends them inside the sealed message; a preview
+  must be of a link the message holds, with a small JPEG. Every link, with
+  or without one, first shows where it really leads: letters borrowed from
+  other alphabets in their plain `xn--` form, and a note for bare numbers
+  and unencrypted pages.
+
+## Backup
+
+*Settings → Backup* writes one file: every identity on the device (its key,
+chats, contacts and groups), the pictures, and if you like the photos and
+voice notes. It is a tar stream sealed in 1 MiB chunks with AES-256-GCM,
+under a key that scrypt derives from your passphrase; each chunk's
+associated data carries its number and whether it is the last, so a file cut
+short, reordered or altered does not open. Without the passphrase nobody can
+open it.
+
+*Restore* (in the same place, or on first run) adds the identities in a
+backup to the device, with their chats; one already there keeps its own,
+unless it has none yet. Use each identity on one device at a time: the relay
+delivers to whichever device is connected.
 
 ## What's in here
 
@@ -234,14 +432,18 @@ which the camera app hands over a photo (its one folder is
 | --- | --- |
 | `main.py` | The complete client (Buildozer's entry point **must** be `main.py`). |
 | `service.py` | Android background sync service (imports `main.py`, no UI). |
+| `call_service.py` | Android call service: keeps a call's microphone on while the app is off screen. |
 | `buildozer.spec` | Android packaging: requirements, permissions, service, icons. |
 | `data/` | The Ferrite Text Messenger mark (`ferritext_logo.svg`, as supplied) and the images rendered from it, including the desktop window icons (`icon_desktop.png`, `.ico`). |
 | `data/fonts/` | Ferritext Serif (four styles), the capitals face `ui.ttf`, and their licences. |
 | `tools/make_logo.py` | Renders every image in `data/` from the SVG — no dependency beyond Pillow. |
 | `tools/build_fonts.py` | Rebuilds Ferritext Serif from EB Garamond and Noto Emoji (needs fontTools). |
 | `tools/bundle_desktop.py` | Builds the single-file desktop release, and `--verify` checks one against the source. |
-| `tools/p4a_hook.py` | Build hook: the service type Android 14 requires, and the camera's FileProvider. |
+| `tools/p4a_hook.py` | Build hook: the service types Android 14 requires, the notifications' receiver, and the camera's FileProvider. |
+| `recipes/libopus/` | A python-for-android recipe for libopus, for calls in Opus. |
 | `src/android/res/` | Android resources: cleartext policy for the relay, status-bar icon, the camera's folder. |
+| `src/android/java/` | `org.fext.call.CallAudio`: a call's microphone and speaker, on threads of their own, and where the sound goes; `org.fext.notify`: notifications, and what is done to them; `org.fext.qr.QrReader`: QR codes in photos. |
+| `CREDITS.md` | The open-source work Ferritext is made with, and its licences. |
 | `desktop/` | Desktop packaging (Nuitka) and the headless test suites. |
 | `.github/workflows/build-apk.yml` | Tests → signed APK → GitHub Release with both deliverables. |
 
@@ -259,6 +461,12 @@ xvfb-run -a python3 desktop/test_composer.py main.py
 xvfb-run -a python3 desktop/test_bundle.py main.py
 xvfb-run -a python3 desktop/smoke_desktop.py main.py
 xvfb-run -a python3 desktop/smoke_chat.py main.py
+xvfb-run -a python3 desktop/test_navigation.py main.py
+xvfb-run -a python3 desktop/test_pictures.py main.py
+xvfb-run -a python3 desktop/test_calls.py main.py
+xvfb-run -a python3 desktop/test_notify.py main.py
+xvfb-run -a python3 desktop/test_gestures.py main.py
+xvfb-run -a python3 desktop/test_privacy.py main.py
 ```
 
 | Suite | Covers |
@@ -271,6 +479,12 @@ xvfb-run -a python3 desktop/smoke_chat.py main.py
 | `test_service.py` | Headless import as the service runs it, app ⇄ service hand-over, the manifest hook |
 | `smoke_desktop.py` | Launch, branding and loading screen through the real `App.run()` path |
 | `smoke_chat.py` | Bottom-anchored short chats, scrolling, text selection and copy |
+| `test_navigation.py` | Pages in layers, a long chat opening at once, the menu, back one step at a time, search and jumping into history, tap to react, holding chats (mute, pin, archive, unread, block, delete) |
+| `test_pictures.py` | Making a picture (crop, size limit, nothing of the original file kept), refusing bad ones, versions, who is sent one and when, asking for a lost one, group pictures from the admin only, blocking, discs following a new picture, the framing sheet |
+| `test_calls.py` | The codecs (ADPCM bit for bit audioop's; Opus with FEC and concealment), the packet seal (replay, tamper, direction), the jitter buffer, two call engines finding each other directly, through a relay and over the WebSocket, and two apps calling: ring, answer, talk, mute, hang up, decline, busy, cancel, no answer, a stale offer, blocking |
+| `test_notify.py` | Notifications from the sync thread (a paused app still notifies), what they are made of, mute and its end, blocking that holds and releases, replying and marking read from a notification, drafts, a call while the app is away |
+| `test_gestures.py` | Real taps and swipes through the window: back, the menu, reply, taps that are not swipes, voice notes at speed and seeking |
+| `test_privacy.py` | Disappearing messages, verifying a contact, links and where they lead, link previews (off by default; fetched only from public addresses), encrypted backup and restore |
 
 To get `old.py`: `git show v9.1.0:main.py > old.py` (or the latest tag before
 the version under test).
@@ -283,7 +497,7 @@ on first run.
 
 ```bash
 python3 -m pip install --user buildozer cython
-buildozer android debug          # produces bin/fext-9.1.1-*-debug.apk
+buildozer android debug          # produces bin/fext-11.0.0-*-debug.apk
 ```
 
 The mark and icons are regenerated with `python3 tools/make_logo.py` (Pillow

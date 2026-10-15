@@ -26,18 +26,19 @@ source.include_exts = py,png,jpg,kv,atlas,ttf,txt
 source.exclude_exts = spec
 
 # (list) List of directory to exclude (let empty to not exclude anything)
-source.exclude_dirs = tests, bin, venv, .git, .github, .buildozer, __pycache__, desktop, tools
+source.exclude_dirs = tests, bin, venv, .git, .github, .buildozer, __pycache__, desktop, tools, recipes
 # desktop/ (Nuitka packaging + the headless test suites) and tools/ (the
 # logo generator) are build-time only. data/ is NOT excluded: the app
 # loads data/ferritext_logo.png at runtime for the loading screen.
 
 # (str) Application versioning (method 1)
-version = 9.1.1
+version = 11.0.0
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy
 # NOTE: sqlite3 ships with python3-for-android automatically.
-requirements = python3,kivy,pillow,requests,urllib3,charset-normalizer,idna,certifi,websocket-client,cryptography,qrcode,pyjnius,android
+# libopus (11.0): calls in Opus, built by recipes/libopus (p4a.local_recipes).
+requirements = python3,kivy,pillow,requests,urllib3,charset-normalizer,idna,certifi,websocket-client,cryptography,qrcode,pyjnius,android,libopus
 
 # (str) Presplash of the application
 # Shown by the platform before any Python runs; the in-app loading screen
@@ -74,10 +75,16 @@ fullscreen = 0
 # connectivity state to drive its online/offline status ribbon.
 # INTERNET/ACCESS_NETWORK_STATE: it is a messenger. POST_NOTIFICATIONS:
 # Android 13+ asks before any notification shows. RECORD_AUDIO: voice
-# notes (asked when first recording). FOREGROUND_SERVICE(+_DATA_SYNC): the
-# background sync service that delivers notifications while the app is
+# notes and calls (asked when first needed). FOREGROUND_SERVICE(+_DATA_SYNC):
+# the background sync service that delivers notifications while the app is
 # closed (Android 14 needs the typed permission too; see tools/p4a_hook.py).
-android.permissions = INTERNET,ACCESS_NETWORK_STATE,POST_NOTIFICATIONS,RECORD_AUDIO,FOREGROUND_SERVICE,FOREGROUND_SERVICE_DATA_SYNC
+# Calls (9.1.2): MODIFY_AUDIO_SETTINGS puts the phone in call mode and picks
+# earpiece or loudspeaker; FOREGROUND_SERVICE_MICROPHONE is the call service
+# that keeps the microphone on when the app leaves the screen; WAKE_LOCK
+# darkens the screen against the ear; VIBRATE for a ringing call.
+# 11.0: USE_FULL_SCREEN_INTENT lets an incoming call open the app over the
+# lock screen (Android 14 asks the user; earlier versions grant it).
+android.permissions = INTERNET,ACCESS_NETWORK_STATE,POST_NOTIFICATIONS,RECORD_AUDIO,FOREGROUND_SERVICE,FOREGROUND_SERVICE_DATA_SYNC,FOREGROUND_SERVICE_MICROPHONE,MODIFY_AUDIO_SETTINGS,WAKE_LOCK,VIBRATE,USE_FULL_SCREEN_INTENT
 
 # (list) Put these files or directories in the apk res directory.
 # Ships res/xml/network_security_config.xml, which permits cleartext for the
@@ -90,11 +97,21 @@ android.permissions = INTERNET,ACCESS_NETWORK_STATE,POST_NOTIFICATIONS,RECORD_AU
 # FileProvider may hand out (see tools/p4a_hook.py).
 android.add_resources = src/android/res/xml/network_security_config.xml:xml/network_security_config.xml,src/android/res/drawable/ic_stat_ferritext.png:drawable/ic_stat_ferritext.png,src/android/res/xml/fext_file_paths.xml:xml/fext_file_paths.xml
 
+# (list) Java sources compiled into the app: the call audio helper
+# (org.fext.call.CallAudio), which records and plays a call's sound on its
+# own threads.
+android.add_src = src/android/java
+
 # (list) Gradle dependencies: androidx.core, for its FileProvider — the camera
 # app writes a photo through it straight into the app's private cache, so a
 # photo taken for a chat never passes through the gallery. Pinned to an older,
-# small release: the app needs nothing else from it.
-android.gradle_dependencies = androidx.core:core:1.6.0
+# small release: the app needs nothing else from it. ZXing's core (11.0)
+# reads the QR code two people compare when they verify each other; 3.3.3 is
+# its last plain-Java-7 release.
+android.gradle_dependencies = androidx.core:core:1.6.0, com.google.zxing:core:3.3.3
+
+# (list) Gradle repositories beyond p4a's (google, jcenter): ZXing (11.0).
+android.add_gradle_repositories = mavenCentral()
 android.enable_androidx = True
 
 # NOTE: the <application> attribute that points at the config above is set via
@@ -150,12 +167,17 @@ android.debug_artifact = apk
 p4a.bootstrap = sdl2
 
 # (list) Background services: the sync service that keeps notifications
-# arriving after Android has closed the app (see service.py).
-services = Fextsync:service.py:foreground:sticky
+# arriving after Android has closed the app (see service.py), and the call
+# service that keeps a call's microphone on while the app is off screen
+# (see call_service.py).
+services = Fextsync:service.py:foreground:sticky,Fextcall:call_service.py:foreground
 
-# (str) Hook run during the p4a build: declares that service's type, which
+# (str) Hook run during the p4a build: declares the services' types, which
 # Android 14 requires and p4a's manifest template cannot express.
 p4a.hook = tools/p4a_hook.py
+
+# (str) Recipes of our own: libopus, for calls (11.0).
+p4a.local_recipes = ./recipes
 
 # (str) python-for-android branch/tag to use.
 # Pinned to a stable release: p4a's default (master) now targets CPython 3.14,

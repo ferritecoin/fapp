@@ -4,8 +4,8 @@ name: Build Android APK
 # ubuntu-latest runner (GitHub runners can reach the Android SDK host
 # dl.google.com that Buildozer downloads from), then a GitHub Release that
 # carries both deliverables: the Android APK and the desktop Python client.
-# Every branch is tested and built; only the default branch publishes, so a
-# copy of the code pushed elsewhere never replaces a release's files.
+# Every branch is tested and built; only the default branch publishes, and
+# each version only once, so a release's files never change after the fact.
 #
 # Signing:
 #   * If you set the repo secrets FEXT_KEYSTORE_B64 / FEXT_KEYSTORE_PASSWORD /
@@ -28,7 +28,10 @@ permissions:
 jobs:
   tests:
     name: Client test suites (headless)
-    runs-on: ubuntu-latest
+    # Pinned: the native Android build (python-for-android 2024.01.21 and the
+    # apt packages it needs) has only ever run on 24.04, and ubuntu-latest
+    # moves on. Both jobs use the same image.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Checkout (with tags, for the previous-release compatibility tests)
@@ -44,8 +47,10 @@ jobs:
       - name: Install a virtual display and the client's dependencies
         run: |
           sudo apt-get update
+          # libopus0: calls are tested in Opus (v11), as computers with it
+          # call; the APK builds its own (recipes/libopus).
           sudo apt-get install -y --no-install-recommends \
-            xvfb libgl1 libgl1-mesa-dri libmtdev1 xclip
+            xvfb libgl1 libgl1-mesa-dri libmtdev1 xclip libopus0
           python -m pip install --upgrade pip
           pip install "kivy[base]==2.3.1" requests urllib3 charset-normalizer \
             idna certifi websocket-client cryptography qrcode pillow
@@ -62,10 +67,18 @@ jobs:
           LIBGL_ALWAYS_SOFTWARE: "1"
         run: |
           set -euo pipefail
-          # The newest release tag before this version: compatibility is
-          # checked against that release's REAL code, in both directions.
+          # The newest release before this version: compatibility is checked
+          # against that release's REAL code, in both directions. A tag of
+          # this same version (a build of it published earlier) is not one.
+          VER="$(grep -E '^version' buildozer.spec | head -1 | sed -E 's/.*=[[:space:]]*//')"
           OLD=""
-          PREV=$(git tag --list 'v*' --sort=-v:refname | head -1 || true)
+          PREV=""
+          for t in $(git tag --list 'v*' --sort=-v:refname); do
+            if [ "${t#v}" != "$VER" ] &&
+               [ "$(printf '%s\n%s\n' "${t#v}" "$VER" | sort -V | head -1)" = "${t#v}" ]; then
+              PREV="$t"; break
+            fi
+          done
           if [ -n "$PREV" ] && git show "$PREV:main.py" > "$RUNNER_TEMP/old_main.py" 2>/dev/null; then
             OLD="$RUNNER_TEMP/old_main.py"; echo "compatibility baseline: $PREV"
           fi
@@ -77,11 +90,17 @@ jobs:
           xvfb-run -a python desktop/test_bundle.py main.py
           xvfb-run -a python desktop/smoke_desktop.py main.py
           xvfb-run -a python desktop/smoke_chat.py main.py
+          xvfb-run -a python desktop/test_navigation.py main.py
+          xvfb-run -a python desktop/test_pictures.py main.py
+          xvfb-run -a python desktop/test_calls.py main.py
+          xvfb-run -a python desktop/test_notify.py main.py
+          xvfb-run -a python desktop/test_gestures.py main.py
+          xvfb-run -a python desktop/test_privacy.py main.py
 
   build-android:
     name: Buildozer (release APK)
     needs: tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
 
     steps:
@@ -215,8 +234,8 @@ jobs:
           if-no-files-found: error
 
       - name: Publish to a GitHub Release
-        # Only from the default branch: a mirror branch (main, kept in step
-        # by hand) builds the same tree and must not replace these files.
+        # Only from the default branch: other branches are tested and built
+        # but publish nothing.
         if: success() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -226,10 +245,16 @@ jobs:
           set -euo pipefail
           TAG="v${VER}"
           NOTES="${TITLE} ${VER} (CI run #${{ github.run_number }}, commit ${GITHUB_SHA:0:7}). ${TITLE}-${VER}.apk: Android — sideload via 'Install unknown apps'. ${TITLE}-${VER}-desktop.py: the same client for Windows, macOS and Linux in one file, with its fonts and icons inside — run it with Python 3.11+ (see the README for the packages it needs)."
-          # Create the release if this tag is new; otherwise keep it and just
-          # refresh the title/notes, so a rebuild of the same version does not
-          # leave stale text (or a stale app name) on the downloads page.
+          # Each version is published once. Re-running the build of the commit
+          # it was published from refreshes its Release; a later commit that
+          # kept the version leaves it as it is, so a version's files never
+          # change once people have downloaded them.
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            TAGGED="$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha 2>/dev/null || true)"
+            if [ -n "$TAGGED" ] && [ "$TAGGED" != "$GITHUB_SHA" ]; then
+              echo "::notice::$TAG is already published, from ${TAGGED:0:7}, and stays as it is. Raise the version in buildozer.spec and main.py to publish this build."
+              exit 0
+            fi
             gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
               --title "$TITLE $TAG" --notes "$NOTES"
           else

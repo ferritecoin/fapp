@@ -242,6 +242,30 @@ with Image.open(row["media_path"]) as received:
     has_exif = bool(received.getexif())
 check("...with the location and camera metadata stripped", not has_exif)
 
+
+def photo_shown(app, peer, local_id):
+    """Is the photo bubble drawing a picture (not an empty white box)?"""
+    app.refresh_chat(peer)
+    bubble = app.conversation_screen._bubbles.get(local_id)
+    pic = bubble.media.picture if bubble is not None and bubble.media else None
+    return pic is not None and pic.texture is not None and \
+        tuple(pic.texture.size) == (media["w"], media["h"])
+
+
+alice.open_conversation(bob.keys.address)
+bob.open_conversation(alice.keys.address)
+shown = [photo_shown(alice, bob.keys.address, out["id"]),
+         photo_shown(bob, alice.keys.address, row["id"])]
+sid = alice.store.message(out["id"])["server_id"]
+for status in ("delivered", "read"):        # each tick repaints the bubble
+    alice.store.apply_receipt(sid, status)
+    shown.append(photo_shown(alice, bob.keys.address, out["id"]))
+bob.store.set_starred([row["id"]], True)    # so does a star
+shown += [photo_shown(bob, alice.keys.address, row["id"]) for _ in range(3)]
+shown.append(alice.store.message(out["id"])["status"] == 3)
+check("the photo stays a picture through every repaint, on both sides "
+      "(9.1.1 turned it white on the first)", all(shown), str(shown))
+
 blob_id = media.get("blob") or M.message_ext(out)["media"]["blob"]
 relay.expired.add(next(iter(relay.blobs)))
 alice._prepare_image(bob.keys.address, src, "", None)
@@ -289,17 +313,17 @@ M.android_notify = lambda peer, title, text: seen.append((peer, title, text))
 M.IS_ANDROID = True
 bob.foreground, bob.current_peer = False, None
 bob.manager.current = "chats"
-bob._notify_incoming(alice.keys.address, "ping", "text")
+bob.notify_incoming(alice.keys.address, "ping", "text")
 check("a message in the background raises a notification",
       seen and seen[-1][1] == "alice" and seen[-1][2] == "ping")
 bob.foreground, bob.current_peer = True, alice.keys.address
 bob.manager.current = "conversation"
 n = len(seen)
-bob._notify_incoming(alice.keys.address, "pong", "text")
+bob.notify_incoming(alice.keys.address, "pong", "text")
 check("...but not while that very chat is on screen", len(seen) == n)
 bob.foreground = False
 bob.store.set_contact_setting(alice.keys.address, "notify", 0)
-bob._notify_incoming(alice.keys.address, "muted?", "text")
+bob.notify_incoming(alice.keys.address, "muted?", "text")
 check("...nor for a muted chat", len(seen) == n)
 M.IS_ANDROID = False
 
@@ -317,7 +341,7 @@ check("...and is listed as the notes-to-self conversation",
 alice.open_conversation(me)
 screen = alice.conversation_screen
 check("the screen knows it is notes to self, and shows no ticks",
-      screen.kind == "self" and screen.peer_name.text == "Notes to self" and
+      screen.kind == "self" and screen.peer_name.text == "Saved messages" and
       all(b.ticks.width == 0 for b in screen._bubbles.values()))
 
 print("\nv9.1: three parties, a group, reactions")

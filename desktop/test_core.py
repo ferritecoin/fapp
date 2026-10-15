@@ -294,6 +294,17 @@ class StubApp:
         self.keys, self.crypto = party.keys, party.crypto
         self.store = M.LocalStore(db)
         self.ui_queue = queue.Queue()
+        self.notified = []
+
+    # v11: the worker announces from its own thread
+    def notify_incoming(self, peer, body, kind, author=None):
+        self.notified.append((peer, body, kind, author))
+
+    def call_signal_arrived(self, sender, sig):
+        self.ui_queue.put(("call_signal", sender, sig))
+
+    def run_commands(self, worker=None):
+        return 0
 
     def events(self):
         out = []
@@ -331,8 +342,10 @@ acked, first = deliver("first message")
 row = app.store.message_by_cid(sender.address, first)
 check("a plain message is stored and acked", acked and row and
       row["kind"] == "text")
-check("...and raises an 'incoming' event for notifications",
-      any(e[0] == "incoming" for e in app.events()))
+check("...and is announced for a notification, from the sync thread",
+      app.notified and app.notified[-1][:3] == (sender.address,
+                                                "first message", "text"))
+app.events()
 
 acked, reply = deliver("a reply", x={"k": "text", "reply": {
     "cid": first, "snip": "first message", "from": sender.address}})
@@ -413,6 +426,46 @@ if OLD is not None:
           acked and row["body"] == "from v8" and row["kind"] == "text")
     check("...and its sender is not marked v9-capable",
           app.store.get_contact(old_sender.address)["caps"] == 0)
+
+    # The other way: what every 9.1.2 message now carries (its app's
+    # features, the version of its author's picture) and the picture
+    # controls themselves, through the previous release's own sync code.
+    class OldStubApp(StubApp):
+        def __init__(self, party, db):
+            self.keys, self.crypto = party.keys, party.crypto
+            self.store = OLD.LocalStore(db)
+            self.ui_queue = queue.Queue()
+
+    old_receiver = Party(OLD, "old-receiver")
+    old_app = OldStubApp(old_receiver, DB_DIR / "old_sync.db")
+    old_worker = OLD.SyncWorker(old_app)
+
+    def deliver_old(body, x):
+        cid = uuid.uuid4().hex
+        env, _ = sender.crypto.build_envelope(
+            body, old_receiver.pub, x=x, recipient=old_receiver.address,
+            cid=cid)
+        _sid[0] += 1
+        acked = old_worker._ingest_message({"id": _sid[0],
+                                            "sender": sender.address,
+                                            "client_msg_id": cid,
+                                            "envelope": env})
+        return acked, cid
+
+    acked, c912 = deliver_old("hello from 9.1.2", {
+        "k": "text", "ft": M.FEATURES, "pv": 1760000000})
+    row = old_app.store.message_by_cid(sender.address, c912)
+    check("the previous release takes a 9.1.2 message as it always did",
+          acked and row and row["body"] == "hello from 9.1.2")
+    before = old_app.store.message_count(sender.address)
+    for ctl in ({"op": "pic", "v": 1760000001, "d": M.b64e(b"\xff\xd8" * 9)},
+                {"op": "picreq"}):
+        acked, _c = deliver_old("Updated their profile photo", {
+            "k": "ctl", "ctl": ctl, "ft": M.FEATURES})
+        check(f"...and acknowledges a '{ctl['op']}' it cannot use, showing "
+              "nothing", acked and
+              old_app.store.message_count(sender.address) == before)
+    old_app.store.close()
 app.store.close()
 
 
