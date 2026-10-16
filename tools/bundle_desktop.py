@@ -34,8 +34,9 @@ HEADER = """
 # =============================================================================
 #  The fonts and icons of this desktop release (unpacked on first start into
 #  ~/.fext/assets, see _unpack_bundled_assets): Ferritext Serif — EB Garamond
-#  with Noto Emoji — and Titillium Web, under the SIL Open Font License (its
-#  text is included), and the Ferritext mark. Built from data/ by
+#  with Noto Emoji, coloured with Twemoji's graphics (CC-BY 4.0) — and
+#  Titillium Web, under the SIL Open Font License (the licence texts are
+#  included), and the Ferritext mark. Built from data/ by
 #  tools/bundle_desktop.py; check this file against the source with
 #      python3 tools/bundle_desktop.py --verify <this file>
 # =============================================================================

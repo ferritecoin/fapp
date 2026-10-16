@@ -185,6 +185,67 @@ check("earlier messages join on above, never rebuilt",
 alice.go_back_to_chats()
 tick(0.3)
 
+print("\nOpening where the unread begin (v12)")
+# Laid out for real here: where a chat opens depends on the view's height.
+top = alice.manager
+while top.parent is not None and top.parent is not M.Window:
+    top = top.parent
+M.Window.size = (M.dp(400), M.dp(720))
+M.Window.add_widget(top)
+tick(0.5)
+pk, *_ = M.mine_identity()
+D = M.address_from_priv(pk)
+alice.store.upsert_contact(D, "dora", M.pub_to_compressed(
+    M.priv_to_pub(pk)).hex())
+t0 = datetime.now(timezone.utc) - timedelta(hours=3)
+for i in range(30):
+    alice.store.add_in(D, f"old news {i}", (t0 + timedelta(minutes=i))
+                       .isoformat(), 7000 + i, uuid.uuid4().hex, unread=False)
+for i in range(5):
+    alice.store.add_in(D, f"fresh {i}", (t0 + timedelta(minutes=60 + i))
+                       .isoformat(), 7100 + i, uuid.uuid4().hex)
+first = alice.store.unread_for(D)[0][0]
+alice.open_conversation(D)
+tick(0.6)
+line = screen._new_line
+order = [w for w in reversed(screen.messages.children)
+         if isinstance(w, (M.BubbleRow, M.NewMessagesLine))]
+at = order.index(line) if line in order else -1
+check("a 'New messages' line goes above the first unread, with the count",
+      line is not None and 0 <= at < len(order) - 1 and
+      order[at + 1].msg_id == first and
+      line.children[1].text.lower() == "5 new messages")
+check("...all of them in view: the chat opens at its end",
+      screen.at_bottom())
+alice.go_back_to_chats()
+tick(0.3)
+long = "and a line long enough to wrap " * 4
+for i in range(25):
+    alice.store.add_in(D, f"later {i} {long}", (t0 + timedelta(
+        minutes=90 + i)).isoformat(), 7200 + i, uuid.uuid4().hex)
+first = alice.store.unread_for(D)[0][0]
+alice.open_conversation(D)
+tick(0.8)
+line = screen._new_line
+drawn = sorted(screen._bubbles)
+check("more than a screen of them: the chat opens at the line, not the end",
+      line is not None and not screen.at_bottom() and
+      line.to_window(*line.pos)[1] <= screen.scroll.to_window(
+          *screen.scroll.pos)[1] + screen.scroll.height and
+      line.to_window(*line.pos)[1] >= screen.scroll.to_window(
+          *screen.scroll.pos)[1])
+check("...three messages of what was read before it, for context",
+      len([m for m in drawn if m < first]) == 3)
+alice.go_back_to_chats()
+tick(0.3)
+alice.open_conversation(D)
+tick(0.6)
+check("opened again with nothing unread: no line, and the end of the chat",
+      screen._new_line is None and screen.at_bottom())
+alice.go_back_to_chats()
+tick(0.3)
+M.Window.remove_widget(top)
+
 print("\nThe menu")
 alice.open_drawer()
 tick(0.4)

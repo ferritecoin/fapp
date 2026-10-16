@@ -162,7 +162,7 @@ from kivy.graphics import Canvas, ClearBuffers, ClearColor, Color, Ellipse, \
     SmoothRoundedRectangle, Translate, Triangle
 from kivy.graphics.texture import Texture
 from kivy.metrics import dp, sp
-from kivy.properties import NumericProperty
+from kivy.properties import ColorProperty, NumericProperty
 from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.boxlayout import BoxLayout
@@ -888,7 +888,7 @@ REQUIRE_TLS = _os.environ.get("FEXT_REQUIRE_TLS", "") not in ("", "0", "false")
 
 APP_NAME = "Ferritext"
 #: Must equal `version` in buildozer.spec — CI refuses to build if not.
-APP_VERSION = "11.0.0"
+APP_VERSION = "12.0.0"
 
 # The identity/QR payload keeps carrying the ORIGINAL tag. It is wire data
 # that older clients already produce and consume, so renaming the app must
@@ -1023,6 +1023,11 @@ IMAGE_MAX_EDGE = 1280                # photos are resized to fit this box…
 IMAGE_JPEG_QUALITY = 60              # …and re-encoded: ~100-200 KB typical
 THUMB_EDGE = 40                      # inline preview, travels in the message
 THUMB_QUALITY = 40
+# v12: a picture from elsewhere (a photo someone sent, a page's picture for
+# a preview) is measured before it is decoded, and refused past these.
+FOREIGN_MAX_EDGE = 8192
+FOREIGN_MAX_PIXELS = 4096 * 4096
+RECEIVED_KEEP_EDGE = 2 * IMAGE_MAX_EDGE  # bigger than any we send: redrawn
 VOICE_SAMPLE_RATE = 16000            # wideband speech
 VOICE_BITRATE = 24000                # AAC-LC: ~3 KB per second of speech
 MAX_VOICE_SECONDS = 300
@@ -1085,6 +1090,13 @@ THEMES = {
         "plate": "#FFFFF8",
     },
 }
+# v12: the dark theme on a black page (Settings › Black background): the
+# same type, gold and marks; every ground a step darker, the page black.
+THEMES["black"] = dict(
+    THEMES["dark"],
+    bg="#000000", surface="#0F0E0C", surface_hi="#1A1916", own="#1E1B17",
+    peer="#0F0E0C", rule="#1F1D1A", rule_strong="#33302A", press="#171614",
+    quote_own="#2A2620", quote_peer="#1A1916")
 #: Avatar colours, picked by address hash. Each carries a light initial at
 #: >= 3:1 (initials are large text).
 AVATAR_PALETTE = ["#3E5A8C", "#B4472E", "#3F7F73", "#A87A2A",
@@ -1104,7 +1116,7 @@ class _Tokens:
 
     @property
     def dark(self) -> bool:
-        return self.name == "dark"
+        return self.name in ("dark", "black")
 
 
 T = _Tokens()
@@ -1244,10 +1256,20 @@ class _Appearance:
         # Motion is on unless it is turned off in Settings: the fades are
         # what make moving between screens read as instant.
         self.reduce_motion = bool(prefs.get("reduce_motion", False))
+        # Black is the dark theme's default (v12); a choice of grey stays.
+        self.black = bool(prefs.get("black", True))
         if self.mode != "system":
-            return self.mode
-        dark = system_prefers_dark()
-        return "light" if dark is False else "dark"
+            return self.themed(self.mode == "dark")
+        return self.themed(system_prefers_dark() is not False)
+
+    black = True
+
+    def themed(self, dark: bool) -> str:
+        """The theme for a dark or light choice: dark on a black page
+        when Black background is on (v12)."""
+        if not dark:
+            return "light"
+        return "black" if self.black else "dark"
 
 
 APPEARANCE = _Appearance()
@@ -1318,6 +1340,22 @@ def sha256_hex(raw: bytes) -> str:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def sanitize_stamp(value, fallback: str) -> str:
+    """A time as a sender or the relay gave it, if it is one — ISO 8601,
+    at most 40 characters — and `fallback` otherwise (v12). It is signed
+    along with the message, but signed is not the same as well-formed: a
+    list or a number there made the message impossible to store, so it was
+    never acknowledged and came back on every connect."""
+    if isinstance(value, str) and 10 <= len(value) <= 40:
+        try:
+            datetime.fromisoformat(value[:-1] + "+00:00"
+                                   if value.endswith("Z") else value)
+            return value
+        except ValueError:
+            pass
+    return fallback
 
 
 def short_addr(address: str, n: int = 12) -> str:
@@ -1531,65 +1569,140 @@ def link_previews_enabled() -> bool:
     return bool(load_prefs().get("link_previews", False))
 
 
-def _public_host(host: str) -> bool:
-    """Whether every address a host name has is a public one: a preview
-    never reaches into the phone's own network."""
+def _public_addresses(host: str) -> list:
+    """Every address a host name has, if all of them are public ones, else
+    []: a preview never reaches into the phone's own network."""
     import ipaddress
     try:
-        infos = socket.getaddrinfo(host, None)
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
     except (OSError, UnicodeError):
-        return False
-    if not infos:
-        return False
+        return []
+    found = []
     for info in infos:
         try:
-            if not ipaddress.ip_address(info[4][0].split("%")[0]).is_global:
-                return False
+            address = ipaddress.ip_address(info[4][0].split("%")[0])
         except ValueError:
-            return False
-    return True
+            return []
+        if not address.is_global:
+            return []
+        if str(address) not in found:
+            found.append(str(address))
+    return found
+
+
+def _public_host(host: str) -> bool:
+    return bool(_public_addresses(host))
+
+
+def _opened(raw: bytes, encoding: str, limit: int) -> Optional[bytes]:
+    """A body as the site sent it, opened to at most `limit` bytes. Pages
+    are asked for uncompressed; one compressed anyway is opened only that
+    far, so a small download cannot swell into a huge one."""
+    import zlib
+    encoding = (encoding or "").strip().lower()
+    if encoding in ("", "identity"):
+        return raw[:limit]
+    if encoding in ("gzip", "x-gzip"):
+        tries = (16 + zlib.MAX_WBITS,)
+    elif encoding == "deflate":
+        tries = (zlib.MAX_WBITS, -zlib.MAX_WBITS)
+    else:
+        return None
+    for wbits in tries:
+        try:
+            return zlib.decompressobj(wbits).decompress(raw, limit)
+        except zlib.error:
+            continue
+    return None
 
 
 def _fetch_capped(url: str, limit: int, accept: str) -> Optional[tuple]:
     """(final url, content type, at most `limit` bytes) — following no
-    more than three redirects, each to a public address — or None."""
+    more than three redirects, each to a public address — or None.
+
+    The connection is made to an address that was checked, never to the
+    name looked up again: a name can answer with a public address first
+    and a private one a moment later, and so reach into the network this
+    device is on. Proxies are not used: the check is of where the page is.
+    """
     from urllib.parse import urljoin, urlsplit
+    import urllib3
     for _hop in range(4):
-        parts = urlsplit(url)
-        if parts.scheme not in ("http", "https") or not parts.hostname or \
-                not _public_host(parts.hostname):
+        try:
+            parts = urlsplit(url)
+            host = (parts.hostname or "").rstrip(".")
+            name = host.encode("idna").decode("ascii") if host else ""
+            port = parts.port
+        except (ValueError, UnicodeError):
+            return None
+        if parts.scheme not in ("http", "https") or not name:
+            return None
+        addresses = _public_addresses(name)
+        if not addresses:
+            return None
+        secure = parts.scheme == "https"
+        default = 443 if secure else 80
+        port = port or default
+        shown = f"[{name}]" if ":" in name else name
+        headers = {"Host": shown if port == default else f"{shown}:{port}",
+                   "User-Agent": "Mozilla/5.0 (link preview)",
+                   "Accept": accept, "Accept-Encoding": "identity"}
+        target = (parts.path or "/") + (f"?{parts.query}" if parts.query
+                                        else "")
+        r = pool = None
+        for address in addresses[:4]:
+            options = {"timeout": urllib3.Timeout(connect=3, read=4),
+                       "retries": False, "maxsize": 1}
+            if secure:
+                import certifi
+                pool = urllib3.HTTPSConnectionPool(
+                    address, port, cert_reqs="CERT_REQUIRED",
+                    ca_certs=certifi.where(), server_hostname=name,
+                    assert_hostname=name, **options)
+            else:
+                pool = urllib3.HTTPConnectionPool(address, port, **options)
+            try:
+                r = pool.urlopen("GET", target, headers=headers,
+                                 redirect=False, preload_content=False,
+                                 decode_content=False)
+                break
+            except urllib3.exceptions.ConnectTimeoutError:
+                pool.close()          # not reached there: try the next one
+            except (urllib3.exceptions.HTTPError, OSError, ValueError):
+                pool.close()
+                return None
+        if r is None:
             return None
         try:
-            r = requests.get(url, timeout=(3, 4), allow_redirects=False,
-                             stream=True, headers={
-                                 "User-Agent": "Mozilla/5.0 (link preview)",
-                                 "Accept": accept})
-        except requests.RequestException:
-            return None
-        if r.is_redirect or r.status_code in (301, 302, 303, 307, 308):
-            target = r.headers.get("location", "")
-            r.close()
-            if not target:
+            if r.status in (301, 302, 303, 307, 308):
+                location = r.headers.get("location", "")
+                if not location:
+                    return None
+                url = urljoin(url, location)
+                continue
+            if r.status != 200:
                 return None
-            url = urljoin(url, target)
-            continue
-        try:
-            if r.status_code != 200:
+            data = _opened(r.read(limit, decode_content=False),
+                           r.headers.get("content-encoding", ""), limit)
+            if data is None:
                 return None
-            data = r.raw.read(limit, decode_content=True)
             return url, r.headers.get("content-type", ""), data
-        except Exception:
+        except (urllib3.exceptions.HTTPError, OSError, ValueError):
             return None
         finally:
             r.close()
+            pool.close()
     return None
 
 
 def _page_meta(page: str) -> dict:
-    """og: and twitter: properties, and the <title>, of an HTML page."""
+    """og: and twitter: properties, and the <title>, of an HTML page. Each
+    search runs once over the page: a page made of endless unclosed tags
+    costs no more to read than any other."""
     import html as _html
     meta = {}
-    for tag in re.findall(r"<meta\b[^>]*>", page, re.IGNORECASE)[:300]:
+    for tag in re.findall(r"<meta\b[^>]{0,2000}>", page,
+                          re.IGNORECASE)[:300]:
         attrs = dict((k.lower(), _html.unescape(v2 or v1))
                      for k, v1, v2 in re.findall(
                          r'([a-zA-Z:_-]+)\s*=\s*(?:"([^"]*)"|\'([^\']*)\')',
@@ -1597,10 +1710,13 @@ def _page_meta(page: str) -> dict:
         key = (attrs.get("property") or attrs.get("name") or "").lower()
         if key and "content" in attrs and key not in meta:
             meta[key] = attrs["content"].strip()
-    title = re.search(r"<title[^>]*>(.*?)</title>", page,
-                      re.IGNORECASE | re.DOTALL)
-    if title:
-        meta.setdefault("title", _html.unescape(title.group(1)).strip())
+    start = re.search(r"<title\b", page, re.IGNORECASE)
+    opened = page.find(">", start.end()) if start else -1
+    close = re.compile(r"</title\s*>", re.IGNORECASE).search(page, opened) \
+        if opened >= 0 else None
+    if close:
+        meta.setdefault("title",
+                        _html.unescape(page[opened + 1:close.start()]).strip())
     return meta
 
 
@@ -1613,7 +1729,11 @@ def fetch_link_preview(url: str) -> Optional[dict]:
         return None
     final, ctype, data = got
     charset = re.search(r"charset=([\w-]+)", ctype)
-    page = data.decode(charset.group(1) if charset else "utf-8", "replace")
+    try:
+        page = data.decode(charset.group(1) if charset else "utf-8",
+                           "replace")
+    except LookupError:                 # a character set Python lacks
+        page = data.decode("utf-8", "replace")
     meta = _page_meta(page)
     title = meta.get("og:title") or meta.get("twitter:title") or \
         meta.get("title") or ""
@@ -1628,19 +1748,14 @@ def fetch_link_preview(url: str) -> Optional[dict]:
     if image:
         picture = _fetch_capped(urljoin(final, image), PREVIEW_IMAGE_BYTES,
                                 "image/*")
-        if picture is not None:
-            try:
-                import io as _io
-                from PIL import Image
-                with Image.open(_io.BytesIO(picture[2])) as im:
-                    im = im.convert("RGB")
-                    im.thumbnail((PREVIEW_THUMB_EDGE, PREVIEW_THUMB_EDGE))
-                    buf = _io.BytesIO()
-                    im.save(buf, "JPEG", quality=60, optimize=True)
-                if buf.tell() <= 16 * 1024:
-                    out["i"] = b64e(buf.getvalue())
-            except Exception:
-                pass
+        im = open_foreign_image(picture[2], PREVIEW_THUMB_EDGE) \
+            if picture is not None else None
+        if im is not None:
+            import io as _io
+            buf = _io.BytesIO()
+            im.save(buf, "JPEG", quality=60, optimize=True)
+            if buf.tell() <= 16 * 1024:
+                out["i"] = b64e(buf.getvalue())
     return out
 
 
@@ -1740,6 +1855,9 @@ _GID_RE = re.compile(r"^[0-9a-f]{32}$")
 #: Offered first in the reaction strip, in this order.
 QUICK_REACTIONS = ("\U0001F44D", "\u2764\ufe0f", "\U0001F602", "\U0001F62E",
                    "\U0001F622", "\U0001F64F")
+#: v12: how many reactions one person may give one message. A fourth
+#: replaces the oldest.
+MAX_REACTIONS = 3
 
 
 def group_peer(gid: str) -> str:
@@ -1774,6 +1892,19 @@ def sanitize_emoji(value) -> Optional[str]:
     if all(ch in "\u200d\ufe0f\ufe0e" for ch in value):
         return None
     return value
+
+
+def sanitize_reactions(value) -> Optional[list]:
+    """v12: all of someone's reactions to a message (a react control's
+    'es'), oldest first: a list of at most MAX_REACTIONS emoji, each as
+    sanitize_emoji takes it, none twice; [] takes them all back. Refused
+    whole (None) if it is anything else."""
+    if not isinstance(value, list) or len(value) > MAX_REACTIONS:
+        return None
+    emojis = [sanitize_emoji(e) for e in value]
+    if any(not e for e in emojis) or len(set(emojis)) != len(emojis):
+        return None
+    return emojis
 
 
 def sanitize_group_state(raw) -> Optional[dict]:
@@ -2614,6 +2745,74 @@ def clean_picture(raw: bytes) -> Optional[bytes]:
             return picture_jpeg(image.convert("RGB"))
     except Exception:
         return None
+
+
+def image_header(data: bytes) -> Optional[tuple]:
+    """(format, width, height) of a JPEG, PNG or WebP of a sane size, read
+    from its header alone — or None. Nothing is decoded: a few kilobytes
+    can claim enough pixels to fill a phone's memory."""
+    from PIL import Image
+    import io as _io
+    try:
+        with Image.open(_io.BytesIO(data)) as image:
+            kind, (width, height) = image.format, image.size
+    except Exception:
+        return None
+    if kind not in ("JPEG", "PNG", "WEBP") or \
+            not 1 <= width <= FOREIGN_MAX_EDGE or \
+            not 1 <= height <= FOREIGN_MAX_EDGE or \
+            width * height > FOREIGN_MAX_PIXELS:
+        return None
+    return kind, width, height
+
+
+def open_foreign_image(data: bytes, box: int):
+    """A picture from elsewhere as an RGB image no bigger than `box` pixels
+    a side — upright, transparency on white, a JPEG decoded at a reduced
+    scale from the start — or None if it is not one of a sane size."""
+    from PIL import Image, ImageOps
+    import io as _io
+    if image_header(data) is None:
+        return None
+    try:
+        with Image.open(_io.BytesIO(data)) as source:
+            source.draft("RGB", (box, box))
+            source.load()
+            try:
+                image = ImageOps.exif_transpose(source)
+            except Exception:                    # malformed EXIF: ignore it
+                image = source.copy()
+        if image.mode in ("RGBA", "LA", "P", "PA"):
+            image = image.convert("RGBA")
+            flat = Image.new("RGB", image.size, (255, 255, 255))
+            flat.paste(image, mask=image.split()[-1])
+            image = flat
+        else:
+            image = image.convert("RGB")
+        image.thumbnail((box, box), Image.LANCZOS)
+        return image
+    except Exception:
+        return None
+
+
+def safe_received_image(data: bytes) -> Optional[bytes]:
+    """A photo someone sent, made safe to show (v12): kept as it came if it
+    is a JPEG no bigger than RECEIVED_KEEP_EDGE, drawn again here at that
+    size if it is a bigger one or a PNG or WebP, and refused (None) if it
+    is not a picture of a sane size at all."""
+    import io as _io
+    header = image_header(data)
+    if header is None:
+        return None
+    kind, width, height = header
+    if kind == "JPEG" and max(width, height) <= RECEIVED_KEEP_EDGE:
+        return data
+    image = open_foreign_image(data, RECEIVED_KEEP_EDGE)
+    if image is None:
+        return None
+    out = _io.BytesIO()
+    image.save(out, "JPEG", quality=85, optimize=True, progressive=True)
+    return out.getvalue()
 
 
 def valid_username(name: str) -> bool:
@@ -7095,7 +7294,8 @@ class LocalStore:
     );
     CREATE INDEX IF NOT EXISTS idx_group_sends_sid ON group_sends (server_id);
     -- v9.1: reactions, one per person per message (choosing the same one
-    -- again takes it back). Keyed by conversation + the message's client id.
+    -- again takes it back); from v12 the latest of each person's, the rest
+    -- in reactions_more. Keyed by conversation + the message's client id.
     CREATE TABLE IF NOT EXISTS reactions (
         peer    TEXT NOT NULL,
         cid     TEXT NOT NULL,
@@ -7103,6 +7303,17 @@ class LocalStore:
         emoji   TEXT NOT NULL,
         at      TEXT NOT NULL,
         PRIMARY KEY (peer, cid, reactor)
+    );
+    -- v12: a person's other reactions to the same message (up to
+    -- MAX_REACTIONS in all). `reactions` keeps the latest of them, which
+    -- is what releases before 12 show.
+    CREATE TABLE IF NOT EXISTS reactions_more (
+        peer    TEXT NOT NULL,
+        cid     TEXT NOT NULL,
+        reactor TEXT NOT NULL,
+        emoji   TEXT NOT NULL,
+        at      TEXT NOT NULL,
+        PRIMARY KEY (peer, cid, reactor, emoji)
     );
     -- v9.1.2: how each chat sits in the list, on this device only: pinned
     -- (when: the latest pin goes first), archived, marked unread by hand,
@@ -7156,7 +7367,9 @@ class LocalStore:
     #:   5    v11.0: mute with an end, drafts, disappearing messages (a
     #:        chat's timer, each message's ttl and expiry), verified
     #:        contacts, held frames from blocked contacts
-    SCHEMA_VERSION = 5
+    #:   6    v12.0: reactions_more (several reactions per person) — a new
+    #:        table only
+    SCHEMA_VERSION = 6
 
     #: Additive migrations: (table, column, statements). Applied when the
     #: column is missing, decided by inspection rather than by catching the
@@ -8080,9 +8293,7 @@ class LocalStore:
             for row in rows:
                 self._tombstone(row["peer"], [row["client_msg_id"]])
                 if row["client_msg_id"]:
-                    self._db.execute(
-                        "DELETE FROM reactions WHERE peer = ? AND cid = ?",
-                        (row["peer"], row["client_msg_id"]))
+                    self._drop_reactions(row["peer"], [row["client_msg_id"]])
             self._db.executemany("DELETE FROM messages WHERE id = ?",
                                  [(r["id"],) for r in rows])
             self._db.executemany("DELETE FROM group_sends WHERE local_id = ?",
@@ -8117,6 +8328,8 @@ class LocalStore:
                     f"DELETE FROM group_sends WHERE local_id IN ({marks})", ids)
             self._db.execute("DELETE FROM messages WHERE peer = ?", (peer,))
             self._db.execute("DELETE FROM reactions WHERE peer = ?", (peer,))
+            self._db.execute("DELETE FROM reactions_more WHERE peer = ?",
+                             (peer,))
             self._db.commit()
         return len(ids)
 
@@ -8294,9 +8507,7 @@ class LocalStore:
             for row in rows:
                 self._tombstone(row["peer"], [row["client_msg_id"]])
                 if row["client_msg_id"]:
-                    self._db.execute(
-                        "DELETE FROM reactions WHERE peer = ? AND cid = ?",
-                        (row["peer"], row["client_msg_id"]))
+                    self._drop_reactions(row["peer"], [row["client_msg_id"]])
             self._db.executemany("DELETE FROM messages WHERE id = ?",
                                  [(r["id"],) for r in rows])
             self._db.executemany("DELETE FROM group_sends WHERE local_id = ?",
@@ -8334,9 +8545,7 @@ class LocalStore:
             if rows:
                 self._db.executemany("DELETE FROM messages WHERE id = ?",
                                      [(r["id"],) for r in rows])
-                self._db.executemany(
-                    "DELETE FROM reactions WHERE peer = ? AND cid = ?",
-                    [(peer, r["client_msg_id"]) for r in rows])
+                self._drop_reactions(peer, [r["client_msg_id"] for r in rows])
             self._db.commit()
         return rows
 
@@ -8448,34 +8657,71 @@ class LocalStore:
             self._db.commit()
             return cur.lastrowid
 
-    # ---- v9.1: reactions -------------------------------------------------------
+    # ---- v9.1: reactions (v12: several per person) ------------------------------
     def set_reaction(self, peer: str, cid: str, reactor: str,
                      emoji: str) -> bool:
-        """Record `reactor`'s reaction to message `cid` in `peer`'s chat;
-        an empty emoji takes it back. True if anything changed."""
+        """`reactor`'s reaction to message `cid` in `peer`'s chat is now
+        `emoji` alone; an empty emoji takes theirs back. What a release
+        before 12 says, having one reaction per person. True if anything
+        changed."""
+        return self.set_reactions(peer, cid, reactor, [emoji] if emoji
+                                  else [])
+
+    def set_reactions(self, peer: str, cid: str, reactor: str,
+                      emojis: list) -> bool:
+        """`reactor`'s reactions to message `cid` are now `emojis`, oldest
+        first: at most MAX_REACTIONS (the latest kept), none for an empty
+        list. One already given keeps its time. True if anything changed."""
+        emojis = list(dict.fromkeys(e for e in emojis if e))[-MAX_REACTIONS:]
         with self._lock:
-            old = self._db.execute(
-                "SELECT emoji FROM reactions WHERE peer = ? AND cid = ? "
-                "AND reactor = ?", (peer, cid, reactor)).fetchone()
-            if emoji:
-                if old is not None and old["emoji"] == emoji:
-                    return False
+            had = self._reactions_of(peer, cid, reactor)
+            if [e for e, _at in had] == emojis:
+                return False
+            since = dict(had)
+            base = datetime.now(timezone.utc)
+            stamped = [(e, since.get(e) or
+                        (base + timedelta(microseconds=i)).isoformat())
+                       for i, e in enumerate(emojis)]
+            stamped.sort(key=lambda pair: pair[1])
+            key = (peer, cid, reactor)
+            self._db.execute("DELETE FROM reactions WHERE peer = ? AND "
+                             "cid = ? AND reactor = ?", key)
+            self._db.execute("DELETE FROM reactions_more WHERE peer = ? AND "
+                             "cid = ? AND reactor = ?", key)
+            if stamped:
+                *more, (latest, at) = stamped
                 self._db.execute(
-                    """INSERT INTO reactions (peer, cid, reactor, emoji, at)
-                       VALUES (?, ?, ?, ?, ?)
-                       ON CONFLICT(peer, cid, reactor) DO UPDATE SET
-                           emoji = excluded.emoji, at = excluded.at""",
-                    (peer, cid, reactor, emoji, now_iso()))
-            else:
-                if old is None:
-                    return False
-                self._db.execute(
-                    "DELETE FROM reactions WHERE peer = ? AND cid = ? "
-                    "AND reactor = ?", (peer, cid, reactor))
+                    "INSERT INTO reactions (peer, cid, reactor, emoji, at) "
+                    "VALUES (?, ?, ?, ?, ?)", key + (latest, at))
+                self._db.executemany(
+                    "INSERT INTO reactions_more (peer, cid, reactor, emoji, "
+                    "at) VALUES (?, ?, ?, ?, ?)",
+                    [key + pair for pair in more])
             self._db.commit()
         return True
 
+    def _reactions_of(self, peer: str, cid: str, reactor: str) -> list:
+        """[(emoji, at), …] oldest first. Called with the lock held."""
+        rows = self._db.execute(
+            """SELECT emoji, at FROM reactions_more
+                   WHERE peer = ? AND cid = ? AND reactor = ?
+               UNION ALL
+               SELECT emoji, at FROM reactions
+                   WHERE peer = ? AND cid = ? AND reactor = ?""",
+            (peer, cid, reactor) * 2).fetchall()
+        # Each emoji once; the latest of a person's reactions is the one in
+        # `reactions` (what an older release would have changed).
+        found = dict(sorted(((r["emoji"], r["at"]) for r in rows),
+                            key=lambda pair: pair[1]))
+        return sorted(found.items(), key=lambda pair: pair[1])
+
+    def reactions_of(self, peer: str, cid: str, reactor: str) -> list:
+        """The emoji `reactor` gave message `cid`, oldest first."""
+        with self._lock:
+            return [e for e, _at in self._reactions_of(peer, cid, reactor)]
+
     def reaction_of(self, peer: str, cid: str, reactor: str) -> str:
+        """The latest reaction `reactor` gave message `cid` ('' for none)."""
         with self._lock:
             row = self._db.execute(
                 "SELECT emoji FROM reactions WHERE peer = ? AND cid = ? "
@@ -8492,13 +8738,29 @@ class LocalStore:
             for start in range(0, len(cids), 400):
                 chunk = cids[start:start + 400]
                 marks = ",".join("?" * len(chunk))
+                seen = set()
                 for row in self._db.execute(
                         f"""SELECT cid, emoji, reactor, at FROM reactions
-                            WHERE peer = ? AND cid IN ({marks})
-                            ORDER BY at, reactor""", [peer] + chunk):
+                                WHERE peer = ? AND cid IN ({marks})
+                            UNION ALL
+                            SELECT cid, emoji, reactor, at FROM reactions_more
+                                WHERE peer = ? AND cid IN ({marks})
+                            ORDER BY at, reactor""",
+                        [peer] + chunk + [peer] + chunk):
+                    key = (row["cid"], row["reactor"], row["emoji"])
+                    if key in seen:
+                        continue
+                    seen.add(key)
                     out.setdefault(row["cid"], []).append(
                         (row["emoji"], row["reactor"], row["at"]))
         return out
+
+    def _drop_reactions(self, peer: str, cids: list) -> None:
+        """Every reaction to these messages. Called with the lock held."""
+        for table in ("reactions", "reactions_more"):
+            self._db.executemany(
+                f"DELETE FROM {table} WHERE peer = ? AND cid = ?",
+                [(peer, c) for c in cids if c])
 
     # ---- plaintext chat import / export --------------------------------------
     def import_message(self, peer: str, direction: str, body: str,
@@ -8567,20 +8829,53 @@ class Endpoint:
     quietly trusting a bad certificate would show a padlock the user has no
     reason to believe. Never trade an honest downgrade for a dishonest
     upgrade.
+
+    v12: a relay that keeps its own certificate serves TLS on a port of its
+    own and names it in /api/health ("tls_port"), keeping plain HTTP where
+    it was for older apps. Reached over plain HTTP, the app tries that port;
+    once the certificate checks out against the roots the app ships, it
+    moves there and remembers it. If it does not check out, nothing changes
+    — and the port is not tried again for TLS_RETRY seconds.
     """
 
     PROBE_TIMEOUT = 6         # generous: mobile networks are slow to answer
     CACHE_NAME = "transport.json"
+    TLS_RETRY = 6 * 3600
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._base: Optional[str] = None
         self._secure = False
+        self._tls_port: Optional[int] = None
+        self._tls_skip_until = 0.0
         self._cache = DATA_DIR / self.CACHE_NAME
         self._load_cache()
 
     # ---- candidates ---------------------------------------------------------
+    @staticmethod
+    def _host_only(hostport: str) -> str:
+        """'1.2.3.4:50607' -> '1.2.3.4'; '[::1]:50607' -> '[::1]'."""
+        if hostport.startswith("["):
+            return hostport[:hostport.index("]") + 1]
+        return hostport.rsplit(":", 1)[0] if ":" in hostport else hostport
+
+    def _tls_candidate(self) -> Optional[str]:
+        """The relay's own TLS port, once it has named one (v12)."""
+        if not self._tls_port:
+            return None
+        base = (SERVER_URL_OVERRIDE.rstrip("/") if SERVER_URL_OVERRIDE
+                else SERVER_HOST.strip().rstrip("/"))
+        for prefix in ("https://", "http://"):
+            if base.startswith(prefix):
+                base = base[len(prefix):]
+        return f"https://{self._host_only(base)}:{self._tls_port}"
+
     def _candidates(self) -> list:
+        tls = self._tls_candidate()
+        return ([tls] if tls else []) + [
+            c for c in self._plain_candidates() if c != tls]
+
+    def _plain_candidates(self) -> list:
         if SERVER_URL_OVERRIDE:
             base = SERVER_URL_OVERRIDE.rstrip("/")
             if REQUIRE_TLS and base.startswith("http://"):
@@ -8602,6 +8897,10 @@ class Endpoint:
     def _load_cache(self) -> None:
         try:
             data = json.loads(self._cache.read_text("utf-8"))
+            port = data.get("tls_port")
+            if isinstance(port, int) and not isinstance(port, bool) and \
+                    0 < port < 65536:
+                self._tls_port = port
             base = data.get("base")
             if isinstance(base, str) and base in self._candidates():
                 self._base = base
@@ -8612,7 +8911,8 @@ class Endpoint:
     def _save_cache(self) -> None:
         try:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
-            self._cache.write_text(json.dumps({"base": self._base}), "utf-8")
+            self._cache.write_text(json.dumps(
+                {"base": self._base, "tls_port": self._tls_port}), "utf-8")
         except OSError:
             pass
 
@@ -8621,9 +8921,21 @@ class Endpoint:
         try:
             resp = requests.get(f"{base}/api/health",
                                 timeout=self.PROBE_TIMEOUT)
-            return resp.status_code < 500
+            if resp.status_code >= 500:
+                return False
         except requests.RequestException:
             return False
+        if base.startswith("http://"):
+            # v12: the relay may name a port where it serves TLS.
+            try:
+                port = resp.json().get("tls_port")
+            except (ValueError, AttributeError):
+                port = None
+            if isinstance(port, int) and not isinstance(port, bool) and \
+                    0 < port < 65536 and port != self._tls_port:
+                with self._lock:
+                    self._tls_port = port
+        return True
 
     def resolve(self, force: bool = False) -> Optional[str]:
         """Return a usable base URL, probing if we do not have one."""
@@ -8632,10 +8944,24 @@ class Endpoint:
                 return self._base
         chosen, errors = None, []
         for candidate in self._candidates():
+            if candidate == self._tls_candidate() and \
+                    time.time() < self._tls_skip_until:
+                continue
             if self._probe(candidate):
                 chosen = candidate
                 break
             errors.append(candidate)
+            if candidate == self._tls_candidate():
+                self._tls_skip_until = time.time() + self.TLS_RETRY
+        upgrade = self._tls_candidate()
+        if chosen is not None and chosen.startswith("http://") and upgrade \
+                and upgrade not in errors and \
+                time.time() >= self._tls_skip_until:
+            # Plain HTTP answered, and named a TLS port: try it now.
+            if self._probe(upgrade):
+                chosen = upgrade
+            else:
+                self._tls_skip_until = time.time() + self.TLS_RETRY
         with self._lock:
             if chosen is not None:
                 changed = chosen != self._base
@@ -8951,6 +9277,10 @@ class SyncWorker(threading.Thread):
         group_traffic = isinstance(x, dict) and (
             isinstance(x.get("grp"), dict) or (isinstance(ctl, dict) and (
                 ctl.get("grp") or ctl.get("op") in ("group", "leave"))))
+        # A picture, or a request for one, passes between the members of a
+        # group as well as between contacts: it puts nobody in the chats.
+        upkeep = isinstance(x, dict) and isinstance(ctl, dict) and \
+            ctl.get("op") in ("pic", "picreq")
         if self.app.store.is_blocked(sender):
             op = ctl.get("op") if isinstance(ctl, dict) else None
             if op in ("call", "ringing", "answer", "cands", "end"):
@@ -8980,7 +9310,8 @@ class SyncWorker(threading.Thread):
         try:
             self.app.store.upsert_contact(sender, inner.get("username"),
                                           inner["public_key"],
-                                          listed=not group_traffic)
+                                          listed=not (group_traffic or
+                                                      upkeep))
         except sqlite3.Error:
             log.exception("could not update contact record for %s", sender)
             MessageFlowLog.dropped(server_id, who, "contact upsert failed")
@@ -9024,8 +9355,9 @@ class SyncWorker(threading.Thread):
         ttl = sanitize_timer(x.get("ttl")) if x is not None else 0
         outcome = self.app.store.add_in(
             peer=conversation, body=body,
-            created_at=payload.get("sent_at",
-                                   msg.get("created_at", now_iso())),
+            created_at=sanitize_stamp(
+                payload.get("sent_at"),
+                sanitize_stamp(msg.get("created_at"), now_iso())),
             server_id=server_id, client_msg_id=cid, kind=kind, ext=ext,
             media_state=media_state, author=author, ttl=ttl or 0)
 
@@ -9254,12 +9586,20 @@ class SyncWorker(threading.Thread):
                 self.app.ui_queue.put(("message_stored", conversation))
             return server_id
         if op == "react":
+            # 'e' is their latest reaction, all a release before 12 sends
+            # or reads; 'es' (v12) is every one they gave, oldest first.
             target = _str(ctl.get("cid"), 64)
             emoji = sanitize_emoji(ctl.get("e"))
-            if target and _TOKEN_RE.match(target) and emoji is not None:
-                if store.set_reaction(conversation, target, sender, emoji):
+            emojis = sanitize_reactions(ctl.get("es")) \
+                if "es" in ctl else None
+            if emojis is None and emoji is not None and "es" not in ctl:
+                emojis = [emoji] if emoji else []
+            if target and _TOKEN_RE.match(target) and emojis is not None:
+                had = store.reactions_of(conversation, target, sender)
+                if store.set_reactions(conversation, target, sender, emojis):
+                    new = [e for e in emojis if e not in had]
                     self.app.ui_queue.put(("reaction", conversation, target,
-                                           sender, emoji))
+                                           sender, new[-1] if new else ""))
                     self.app.ui_queue.put(("message_stored", conversation))
             return server_id
         if op == "delete":
@@ -10728,7 +11068,7 @@ class Field(BoxLayout):
         if label:
             self.caption = CapsLabel(label, size=11, color=T.text_3)
             self.add_widget(self.caption)
-        self.input = TextInput(
+        self.input = InkTextInput(
             hint_text=hint, multiline=multiline, password=password,
             background_normal="", background_active="",
             background_color=(0, 0, 0, 0), foreground_color=C(T.text),
@@ -11417,7 +11757,9 @@ class BackupSheet(Sheet):
             target = folder / default_backup_name()
         else:
             target = Path(os.path.expanduser(self.path_field.text.strip()))
-            if not target.name.endswith(BACKUP_SUFFIX):
+            if target.is_dir():               # a folder: the file goes in it
+                target = target / default_backup_name()
+            elif not target.name.endswith(BACKUP_SUFFIX):
                 target = target.with_name(target.name + BACKUP_SUFFIX)
             if not target.parent.is_dir():
                 self.set_status(self.status, f"There is no folder "
@@ -13144,7 +13486,10 @@ OPEN_SOURCE = (
     ("Type", (
         ("EB Garamond", "the text: The EB Garamond Project Authors",
          "SIL Open Font License 1.1"),
-        ("Noto Emoji", "the emoji: Google", "SIL Open Font License 1.1"),
+        ("Noto Emoji", "the emoji's outlines: Google",
+         "SIL Open Font License 1.1"),
+        ("Twemoji", "the emoji in colour: Twitter, Inc and other "
+         "contributors", "CC-BY 4.0"),
         ("Titillium Web", "the capitals: Accademia di Belle Arti di Urbino",
          "SIL Open Font License 1.1"),
     )),
@@ -14548,7 +14893,52 @@ def measure_selectable(text: str, font_size: float,
     return min(width, wrap_width), height
 
 
-class SelectableText(TextInput):
+class InkTextInput(TextInput):
+    """A text field whose colour emoji keep their colours (v12).
+
+    Kivy draws a field's lines in white and tints them with the text colour,
+    which is right for letters but turns a colour glyph into a silhouette of
+    that colour (dark on the light page). Here each line is drawn in the
+    text colour itself and the tint is white; the hint and a disabled
+    field are drawn the same way, in their own colours."""
+
+    ink = ColorProperty([0, 0, 0, 1])
+    hint_ink = ColorProperty([.5, .5, .5, 1])
+
+    def __init__(self, **kw):
+        ink = kw.pop("foreground_color", None)
+        hint = kw.pop("hint_text_color", None)
+        super().__init__(**kw)
+        if ink is not None:
+            self.ink = ink
+        if hint is not None:
+            self.hint_ink = hint
+        self.foreground_color = (1, 1, 1, 1)
+        self.hint_text_color = (1, 1, 1, 1)
+        self.disabled_foreground_color = (1, 1, 1, .5)
+        self.bind(ink=self._reink, hint_ink=self._reink)
+
+    def _reink(self, *_a) -> None:
+        self._line_options = None
+        self._trigger_refresh_text()
+
+    def _get_line_options(self):
+        options = super()._get_line_options()
+        options["color"] = tuple(self.ink)
+        return options
+
+    def _create_line_label(self, text, hint=False):
+        if not hint:
+            return super()._create_line_label(text, hint)
+        options = self._get_line_options()
+        options["color"] = tuple(self.hint_ink)
+        try:
+            return super()._create_line_label(text, hint)
+        finally:
+            options["color"] = tuple(self.ink)
+
+
+class SelectableText(InkTextInput):
     """Message text you can highlight and copy (desktop).
 
     A READ-ONLY TextInput: drag to select, Ctrl+A / Ctrl+C. A ScrollView
@@ -14672,6 +15062,11 @@ def message_ext(msg: dict) -> dict:
 _INLINE_TEXTURES: dict = {}
 
 
+#: The largest inline picture shown: a photo's thumbnail is THUMB_EDGE, a
+#: link preview's PREVIEW_THUMB_EDGE (v12).
+INLINE_MAX_EDGE = 320
+
+
 def texture_from_b64(data: str):
     """Kivy texture for a small inline JPEG (the photo thumbnail).
 
@@ -14684,8 +15079,15 @@ def texture_from_b64(data: str):
         return _INLINE_TEXTURES[data]
     import io as _io
     try:
+        raw = b64d(data)
+        header = image_header(raw)
+        # Thumbnails and preview pictures are small JPEGs; anything else
+        # is not decoded at all (v12).
+        if header is None or header[0] != "JPEG" or \
+                max(header[1:]) > INLINE_MAX_EDGE:
+            return None
         from PIL import Image as _PIL
-        with _PIL.open(_io.BytesIO(b64d(data))) as im:
+        with _PIL.open(_io.BytesIO(raw)) as im:
             tex = texture_from_pil(im)
     except Exception:
         return None
@@ -14911,6 +15313,7 @@ class ImageContent(ButtonBehavior, FloatLayout):
             "requested": "Asked for it again",
             "failed": ("Not sent · tap to retry" if outgoing
                        else "Not downloaded · tap to retry"),
+            "unreadable": "This photo cannot be shown",
         }.get(state, "")
 
 
@@ -15063,6 +15466,72 @@ class SpeedChip(ButtonBehavior, Label):
         self.text_size = self.size
 
 
+#: Symbols below the emoji planes that are pictures by default; any other
+#: (an arrow, a tick, ©) is one only when it asks to be (U+FE0F).
+_EMOJI_BY_DEFAULT = set(
+    "\u231a\u231b\u23e9\u23ea\u23eb\u23ec\u23f0\u23f3\u25fd\u25fe"
+    "\u2614\u2615\u267f\u2693\u26a1\u26aa\u26ab\u26bd\u26be\u26c4"
+    "\u26c5\u26ce\u26d4\u26ea\u26f2\u26f3\u26f5\u26fa\u26fd\u2705"
+    "\u270a\u270b\u2728\u274c\u274e\u2753\u2754\u2755\u2757\u2795"
+    "\u2796\u2797\u27b0\u27bf\u2b1b\u2b1c\u2b50\u2b55"
+    + "".join(chr(c) for c in range(0x2648, 0x2654)))
+
+
+def _emoji_base(text: str, i: int) -> bool:
+    c = text[i]
+    if 0x1F000 <= ord(c) <= 0x1FAFF:
+        return True
+    if c in _EMOJI_BY_DEFAULT:
+        return True
+    following = text[i + 1:i + 2]
+    return 0x2000 <= ord(c) <= 0x2BFF and (
+        following == "\ufe0f" or "\U0001F3FB" <= following <= "\U0001F3FF")
+
+
+def emoji_only(text: str) -> int:
+    """How many emoji a message is, if it is nothing else but one to
+    three of them (spaces aside) — else 0 (v12). A flag, a keycap, a skin
+    tone and a family joined with zero-width joiners each count as one."""
+    s = "".join((text or "").split())
+    if not s or len(s) > 48:
+        return 0
+    count = i = 0
+    while i < len(s):
+        c = s[i]
+        if "\U0001F1E6" <= c <= "\U0001F1FF":                  # a flag
+            if i + 1 < len(s) and "\U0001F1E6" <= s[i + 1] <= "\U0001F1FF":
+                i += 2
+            else:
+                return 0
+        elif c in "0123456789#*":                               # a keycap
+            j = i + 1 + (s[i + 1:i + 2] == "\ufe0f")
+            if s[j:j + 1] != "\u20e3":
+                return 0
+            i = j + 1
+        elif _emoji_base(s, i):
+            i += 1
+            while i < len(s):
+                c = s[i]
+                if c == "\ufe0f" or "\U0001F3FB" <= c <= "\U0001F3FF" or \
+                        "\U000E0020" <= c <= "\U000E007F":
+                    i += 1                      # presentation, tone, tags
+                elif c == "\u200d" and i + 1 < len(s) and \
+                        _emoji_base(s, i + 1):
+                    i += 2                      # joined to the next
+                else:
+                    break
+        else:
+            return 0
+        count += 1
+        if count > 3:
+            return 0
+    return count
+
+
+#: How big a message of one, two or three emoji is drawn (v12).
+BIG_EMOJI_SIZES = {1: 44, 2: 38, 3: 32}
+
+
 def make_body(text: str, font_size, links: list = ()) -> Widget:
     """The message text: selectable on a desktop; on a phone a plain label
     (a long press there selects the whole message instead). Links in it
@@ -15209,14 +15678,34 @@ class MessageBubble(BoxLayout):
         self._text_w = self._text_h = 0.0
         self._body_floor = 0.0
         outgoing = msg["direction"] == "out"
+        self.outgoing = outgoing
         ext = message_ext(msg)
-        corners = ([dp(10), dp(10), dp(3), dp(10)] if outgoing
-                   else [dp(10), dp(10), dp(10), dp(3)])
-        paint_round(self, T.own if outgoing else T.peer, corners=corners)
-        if not outgoing and not T.dark:
+        # v12: a message of nothing but one to three emoji is drawn large,
+        # on the page itself, without a bubble.
+        self.big = 0
+        if msg.get("kind", "text") in ("text", None) and not (
+                ext.get("reply") or ext.get("fwd") or ext.get("lp")):
+            self.big = emoji_only(msg.get("body") or "")
+        # v12: a run of messages from one person reads as one: the corners
+        # on their side close up where a bubble meets the next, and only
+        # the last keeps the tail (the near-square corner at the bottom).
+        self.joined_above = self.joined_below = False
+        self._ground = None
+        if not self.big:
+            with self.canvas.before:
+                Color(*C(T.own if outgoing else T.peer))
+                self._ground = SmoothRoundedRectangle(pos=self.pos,
+                                                      size=self.size)
+        self._outline = None
+        if not outgoing and not T.dark and not self.big:
             # On the light page theirs are white cards with a hairline;
             # yours keep the warm ground.
-            paint_border(self, T.rule_strong, radius=dp(10))
+            with self.canvas.after:
+                Color(*C(T.rule_strong))
+                self._outline = SmoothLine(width=max(1.0, dp(1) / 2.0))
+        self.bind(pos=self._sync_ground, size=self._sync_ground)
+        if self.big:
+            self.padding = [dp(2), dp(2), dp(2), dp(4)]
 
         self.author = None
         author = msg.get("author")
@@ -15225,6 +15714,7 @@ class MessageBubble(BoxLayout):
                                     color=ink_color(author), tracking=0.14,
                                     size_hint=(None, None))
             self.add_widget(self.author)
+        self._author_index = None
 
         self.fwd = None
         if ext.get("fwd"):
@@ -15257,7 +15747,8 @@ class MessageBubble(BoxLayout):
 
         text = self._display_text(msg, media)
         self.links = link_spans(text) if text else []
-        self.body = make_body(text, fs(17), self.links) if text else None
+        size = fs(BIG_EMOJI_SIZES[self.big]) if self.big else fs(17)
+        self.body = make_body(text, size, self.links) if text else None
         if self.body is not None:
             if isinstance(self.body, SelectableText):
                 self.body.bind(minimum_height=self._body_min_height)
@@ -15303,7 +15794,68 @@ class MessageBubble(BoxLayout):
                                 height=line_height(12.5))
         meta_row.add_widget(self.meta_box)
         self.add_widget(meta_row)
+        self.meta_row = meta_row
+        if self.big:
+            # The time sits on a small pill of the page's surface, so it
+            # reads on any ground.
+            self.meta_box.padding = [dp(7), 0, dp(7), 0]
+            paint_round(self.meta_box, T.surface, radius=dp(8))
         self._draw_star()
+
+    # ---- v12: runs of messages ----------------------------------------------------
+    def _radii(self) -> list:
+        """[top-left, top-right, bottom-right, bottom-left]: round, with
+        the sender's side closed up where the run goes on, and the tail
+        (near square) at the bottom of the last."""
+        round_, joint, tail = dp(10), dp(4), dp(3)
+        top = joint if self.joined_above else round_
+        bottom = joint if self.joined_below else tail
+        if self.outgoing:
+            return [round_, top, bottom, round_]
+        return [top, round_, round_, bottom]
+
+    def _sync_ground(self, *_a) -> None:
+        cap = max(0.0, min(self.width, self.height) / 2.0)
+        radii = [min(r, cap) for r in self._radii()]
+        if self._ground is not None:
+            self._ground.pos, self._ground.size = self.pos, self.size
+            self._ground.radius = radii
+        if self._outline is not None:
+            self._outline.rounded_rectangle = (
+                self.x + .5, self.y + .5, self.width - 1, self.height - 1,
+                *radii)
+
+    def meta_key(self) -> tuple:
+        """What the time line says: within a run, a line that says the
+        same as the next one's is not repeated."""
+        return (self.meta.text, self.ticks._count, self.ticks._tint,
+                bool(self.msg.get("starred")))
+
+    def set_meta_shown(self, shown: bool) -> None:
+        if shown == (self.meta_row.parent is self):
+            return
+        if shown:
+            self.add_widget(self.meta_row, index=0)
+        else:
+            self.remove_widget(self.meta_row)
+        if self._last_width:
+            self.layout_for(self._last_width)
+
+    def set_joins(self, above: bool, below: bool) -> None:
+        """Whether the message above, and below, are the same person's,
+        moments apart. In a group only the first of a run names them."""
+        if (above, below) == (self.joined_above, self.joined_below):
+            return
+        relabel = above != self.joined_above
+        self.joined_above, self.joined_below = above, below
+        if relabel and self.author is not None:
+            if above and self.author.parent is self:
+                self.remove_widget(self.author)
+            elif not above and self.author.parent is None:
+                self.add_widget(self.author, index=len(self.children))
+            if self._last_width:
+                self.layout_for(self._last_width)
+        self._sync_ground()
 
     # ---- content -------------------------------------------------------------
     @staticmethod
@@ -15323,7 +15875,9 @@ class MessageBubble(BoxLayout):
         row = self._react_row
         if reactions and row.parent is None:
             # Just above the time: the meta row, when present, is last.
-            self.add_widget(row, index=1 if hasattr(self, "meta_box") else 0)
+            shown = getattr(self, "meta_row", None) is not None and \
+                self.meta_row.parent is self
+            self.add_widget(row, index=1 if shown else 0)
         elif not reactions and row.parent is not None:
             self.remove_widget(row)
 
@@ -15408,7 +15962,7 @@ class MessageBubble(BoxLayout):
         max_w = max(dp(150), available * 0.80 - dp(24))
         parts = []
         widest = dp(56)
-        if self.author is not None:
+        if self.author is not None and self.author.parent is self:
             self.author.size = (min(max_w, self.author.natural_width),
                                 self.author.height)
             widest = max(widest, self.author.width)
@@ -15453,8 +16007,11 @@ class MessageBubble(BoxLayout):
         self.meta.size = (self.meta.texture_size[0], line_height(12.5))
         meta_w = self.meta.width + self.ticks.width + self.star.width
         meta_w += dp(5) * (1 + (1 if self.ticks.width else 0))
+        meta_w += self.meta_box.padding[0] + self.meta_box.padding[2]
         self.meta_box.width = meta_w
-        widest = max(widest, meta_w)
+        meta_shown = self.meta_row.parent is self
+        if meta_shown:
+            widest = max(widest, meta_w)
         if self.quote is not None:
             self.quote.width = widest
             parts.append(self.quote.height)
@@ -15465,7 +16022,8 @@ class MessageBubble(BoxLayout):
             parts.append(self.card.layout_for(widest))
         if self._react_row.parent is not None:
             parts.append(rh)
-        parts.append(line_height(12.5))             # the meta row
+        if meta_shown:
+            parts.append(line_height(12.5))         # the meta row
         pad_l, pad_t, pad_r, pad_b = self.padding
         self.width = widest + pad_l + pad_r
         self.height = (sum(parts) + self.spacing * (len(self.children) - 1)
@@ -15506,6 +16064,9 @@ class BubbleRow(AnchorLayout):
 
     LONG_PRESS = 0.42                     # seconds
     shift = NumericProperty(0.0)          # v11: slid left, to reply
+    #: In a group, theirs share a gutter at the left, where the last
+    #: message of each run has its author's disc beside it (v12).
+    FACE, FACE_LEFT, FACE_GAP = dp(30), dp(10), dp(6)
 
     def __init__(self, bubble: MessageBubble, outgoing: bool, screen, **kw):
         kw.setdefault("size_hint_y", None)
@@ -15515,6 +16076,11 @@ class BubbleRow(AnchorLayout):
                          anchor_y="center", **kw)
         self.bubble, self.screen = bubble, screen
         self.msg_id = bubble.msg["id"]
+        self.author = bubble.msg.get("author") if not outgoing and \
+            getattr(screen, "kind", "") == "group" else None
+        self.face = None
+        self.face_room = (self.FACE_LEFT + self.FACE + self.FACE_GAP - dp(12)
+                          if self.author else 0.0)
         with self.canvas.before:
             self._tint = Color(*T.select)
             self._wash = Rectangle()
@@ -15524,9 +16090,49 @@ class BubbleRow(AnchorLayout):
         self.bind(pos=self._sync, size=self._sync,
                   shift=lambda *_a: self._trigger_layout())
         self.add_widget(bubble)
-        bubble.bind(height=lambda _w, v: setattr(self, "height", v + dp(6)))
-        self.bind(width=lambda _w, v: bubble.layout_for(v))
+        bubble.bind(height=lambda *_a: self._fit_height())
+        self.bind(width=lambda _w, v: bubble.layout_for(v - self.face_room))
         self._press = None
+        self._show_face(not bubble.joined_below)
+
+    #: The gap above and below a bubble (v12): wider between runs than it
+    #: was (3), narrow inside one, so a run reads as one.
+    GAP, RUN_GAP = dp(4), dp(1)
+
+    def _fit_height(self) -> None:
+        top = self.RUN_GAP if self.bubble.joined_above else self.GAP
+        bottom = self.RUN_GAP if self.bubble.joined_below else self.GAP
+        self.padding = [dp(12) + self.face_room, top, dp(12), bottom]
+        self.height = self.bubble.height + top + bottom
+
+    def set_joins(self, above: bool, below: bool) -> None:
+        self.bubble.set_joins(above, below)
+        self._fit_height()
+        self._show_face(not below)
+
+    def _show_face(self, show: bool) -> None:
+        """The author's disc beside this message: only the last of a run
+        has it, so a new message from them below takes it over."""
+        if not self.author:
+            return
+        if show and self.face is None:
+            self.face = Avatar(self.author,
+                               self.screen.author_name(self.author),
+                               diameter=self.FACE)
+        if self.face is None:
+            return
+        if show and self.face.parent is None:
+            self.add_widget(self.face)
+        elif not show and self.face.parent is self:
+            self.remove_widget(self.face)
+
+    def face_at(self, x: float, y: float) -> bool:
+        """Whether (x, y) — the row's own coordinates — falls on the disc,
+        or near enough beside it to mean it."""
+        face = self.face
+        return face is not None and face.parent is self and \
+            self.x <= x < self.bubble.x and \
+            face.y - dp(6) <= y <= face.top + dp(6)
 
     def _sync(self, *_a):
         self._wash.pos, self._wash.size = self.pos, self.size
@@ -15535,6 +16141,10 @@ class BubbleRow(AnchorLayout):
         super().do_layout(*args)
         if self.shift:
             self.bubble.x += self.shift
+        if self.face is not None and self.face.parent is self:
+            # Level with the bubble's foot, where the run ends.
+            self.face.pos = (self.x + self.FACE_LEFT + self.shift,
+                             self.bubble.y)
         self._draw_cue()
 
     def _draw_cue(self) -> None:
@@ -15599,7 +16209,11 @@ class BubbleRow(AnchorLayout):
             pending, self._press = self._press, None
             if pending:
                 pending[2].cancel()
-                if not touch.ud.get("fext_long_press") and not swiped(touch):
+                if touch.ud.get("fext_long_press") or swiped(touch):
+                    pass
+                elif self.face_at(*touch.pos):
+                    self.screen.on_face_tap(self.author)
+                else:
                     self.screen.on_bubble_tap(self.msg_id, touch)
             return True
         return super().on_touch_up(touch)
@@ -15637,6 +16251,27 @@ class DayDivider(BoxLayout):
         caps.width = caps.natural_width + dp(2)
         self.add_widget(caps)
         self.add_widget(Rule(pos_hint={"center_y": .5}))
+
+
+class NewMessagesLine(BoxLayout):
+    """Where what you have not read yet begins (v12): the count in gold
+    capitals between gold hairlines. The chat opens here."""
+
+    def __init__(self, count: int, **kw):
+        kw.setdefault("size_hint_y", None)
+        kw.setdefault("height", dp(40))
+        kw.setdefault("padding", [dp(16), 0])
+        kw.setdefault("spacing", dp(12))
+        super().__init__(**kw)
+        self.add_widget(Rule(color=T.accent, pos_hint={"center_y": .5}))
+        text = f"{count} new message{'s' if count != 1 else ''}" \
+            if count else "New messages"
+        caps = CapsLabel(text, size=10.5, color=T.accent, tracking=0.18,
+                         halign="center", size_hint=(None, None),
+                         pos_hint={"center_y": .5})
+        caps.width = caps.natural_width + dp(2)
+        self.add_widget(caps)
+        self.add_widget(Rule(color=T.accent, pos_hint={"center_y": .5}))
 
 
 class JumpToBottomButton(Concealable, ButtonBehavior, Widget):
@@ -15842,7 +16477,8 @@ class EmojiPanel(Concealable, BoxLayout):
 
 class ReactionStrip(Concealable, BoxLayout):
     """The quick reactions, floating over the message you held: tap one to
-    react (tap yours again to take it back); + opens every emoji."""
+    react (tap one of yours again to take it back; v12: up to three each,
+    each ringed); + opens every emoji."""
 
     def __init__(self, on_pick: Callable[[str], None],
                  on_more: Callable[[], None], **kw):
@@ -15865,15 +16501,22 @@ class ReactionStrip(Concealable, BoxLayout):
             self._shadow = RoundedRectangle(radius=[dp(27)])
             Color(*C(T.surface_hi))
             self._bg = SmoothRoundedRectangle(radius=[dp(27)])
-            self._mine_col = Color(0, 0, 0, 0)
-            self._mine = SmoothEllipse()
+            # One ring per reaction of yours that the strip offers. An
+            # unused one is made clear, not shrunk: a smooth ellipse sized
+            # to nothing goes on drawing its last shape.
+            self._mine = []
+            for _i in range(MAX_REACTIONS):
+                self._mine.append((Color(0, 0, 0, 0), SmoothEllipse()))
         with self.canvas.after:
             Color(*C(T.rule_strong))
             self._edge = SmoothLine(width=1.0)
         self.bind(pos=self._sync, size=self._sync)
+        # The rings follow the keys, which the box lays out after it moves.
+        for key in self.keys.values():
+            key.bind(pos=self._sync)
         self.opacity = 0
         self.conceal(True)
-        self._current = ""
+        self._current: list = []
 
     def _sync(self, *_a):
         self._shadow.pos = (self.x, self.y - dp(2))
@@ -15882,17 +16525,28 @@ class ReactionStrip(Concealable, BoxLayout):
         self._edge.rounded_rectangle = (self.x + .5, self.y + .5,
                                         self.width - 1, self.height - 1,
                                         dp(27))
-        key = self.keys.get(self._current)
-        if key is not None:
-            d = dp(40)
-            self._mine_col.rgba = C(mix(T.accent, T.surface_hi, .70))
-            self._mine.pos = ((key.x + key.width / 2) - d / 2, (key.y + key.height / 2) - d / 2)
-            self._mine.size = (d, d)
-        else:
-            self._mine_col.rgba = (0, 0, 0, 0)
+        keys = [self.keys[e] for e in self._current if e in self.keys]
+        tint = C(mix(T.accent, T.surface_hi, .70))
+        d = dp(40)
+        for i, (colour, ring) in enumerate(self._mine):
+            if i < len(keys):
+                key = keys[i]
+                ring.pos = ((key.x + key.width / 2) - d / 2,
+                            (key.y + key.height / 2) - d / 2)
+                ring.size = (d, d)
+                colour.rgba = tint
+            else:
+                colour.rgba = (0, 0, 0, 0)
 
-    def show(self, current: str) -> None:
-        self._current = current or ""
+    @property
+    def current(self) -> list:
+        return list(self._current)
+
+    def show(self, current) -> None:
+        """Raise it, ringing the reactions already given (`current`, a
+        list; a single emoji or '' as before)."""
+        self._current = [current] if isinstance(current, str) and current \
+            else [e for e in (current or ()) if isinstance(e, str)]
         self.conceal(False)
         self._sync()
         Animation.cancel_all(self, "opacity")
@@ -15941,7 +16595,7 @@ class ComposerInput(BoxLayout):
                               pos_hint={"center_y": .5},
                               on_release=lambda _w: action and action())
         self.emoji_button = key("smile", "Emoji", on_emoji)
-        self.input = TextInput(
+        self.input = InkTextInput(
             hint_text=hint, multiline=False, background_normal="",
             background_active="", background_color=(0, 0, 0, 0),
             foreground_color=C(T.text), hint_text_color=C(T.text_3),
@@ -16282,6 +16936,10 @@ class ConversationScreen(SwipeGestures, Screen):
         self.scroll.bind(
             on_scroll_start=lambda *_a: setattr(self, "_user_scrolling", True),
             on_scroll_stop=lambda *_a: setattr(self, "_user_scrolling", False))
+        # v12: the reader takes over from the "New messages" line.
+        self.scroll.bind(
+            on_scroll_start=lambda *_a: setattr(self, "_stick_to_line", False),
+            height=lambda *_a: self._line_soon())
         root.add_widget(self.stack)
 
         # ---- v11: a link's preview, to go with the message -------------------
@@ -16566,6 +17224,7 @@ class ConversationScreen(SwipeGestures, Screen):
         if rebuild:
             self._full_render(messages, ticks_enabled, on_tap_unread, peer)
             return
+        repainted = False
         for msg in messages:
             mid = msg["id"]
             previous = self._rendered_sigs.get(mid)
@@ -16574,6 +17233,7 @@ class ConversationScreen(SwipeGestures, Screen):
             bubble = self._bubbles.get(mid)
             if bubble is not None:
                 bubble.update(msg, ticks_enabled)
+                repainted = True
                 if mid in self.selected:
                     self.selected[mid] = msg
         was_at_bottom = self.at_bottom()
@@ -16584,6 +17244,8 @@ class ConversationScreen(SwipeGestures, Screen):
             appended += 1
             if msg["direction"] == "out":
                 sent_by_me = True
+        if repainted and not appended:
+            self._join_rows()          # ticks moved: time lines join or part
         self._rendered_ids = ids
         self._rendered_sigs = signatures
         if appended:
@@ -16593,11 +17255,54 @@ class ConversationScreen(SwipeGestures, Screen):
                 self.note_new_messages(appended)
         self._place_strip()
 
+    #: v12: the first message not yet read when the chat was opened, and
+    #: how many there were; the "New messages" line goes above it.
+    unread_from: Optional[int] = None
+    unread_count = 0
+    _new_line = None
+
+    def mark_new_from(self, message_id: Optional[int], count: int) -> None:
+        self.unread_from, self.unread_count = message_id, count
+
+    #: While the chat opens at its line, the line is kept at the top as
+    #: the page settles (bubbles taking their size, history joining on
+    #: above) — until the reader scrolls, or the chat is followed to its end.
+    _stick_to_line = False
+    _line_ev = None
+
+    def _line_soon(self) -> None:
+        """Place the line on the next frame, once the rows have moved."""
+        if self._stick_to_line and self._line_ev is None:
+            def go(_dt):
+                self._line_ev = None
+                if self._stick_to_line:
+                    self._place_line()
+            self._line_ev = Clock.schedule_once(go)
+
+    def _place_line(self) -> None:
+        """The "New messages" line at the top, what follows below it — or
+        the end of the chat, when all of that fits."""
+        line = self._new_line
+        view = self.scroll.height
+        if line is None or line.parent is None:
+            self._stick_to_line = False
+            return
+        if view <= 1:
+            return                         # not laid out yet: placed when it is
+        span = self.messages.height - view
+        below = line.top - self.messages.y + dp(8)
+        target = 0.0 if span <= 0 or below <= view else \
+            max(0.0, min(1.0, (below - view) / span))
+        if abs(self.scroll.scroll_y - target) > 1e-4:
+            self.scroll.scroll_y = target
+        self._sync_jump_button()
+
     def _full_render(self, messages: list, ticks_enabled: bool,
                      on_tap_unread: Callable, peer: Optional[str]) -> None:
         self.cancel_backfill()
         self.close_strip()
         self._render_gen += 1
+        self._new_line = None
         self.messages.clear_widgets()
         self.messages.add_widget(self._filler)
         self._bubbles.clear()
@@ -16611,14 +17316,23 @@ class ConversationScreen(SwipeGestures, Screen):
         if self.has_older:
             self.messages.add_widget(self._more_button)
         for msg in messages:
-            self._append_bubble(msg, ticks_enabled, on_tap_unread)
+            self._append_bubble(msg, ticks_enabled, on_tap_unread,
+                                join=False)
+        self._join_rows()
         self._rendered_ids = [m["id"] for m in messages]
         self._rendered_sigs = {m["id"]: self._signature(m)
                                for m in messages}
         self._rendered_peer = peer
         self._rendered_ticks = ticks_enabled
         self._unseen = 0
-        self.scroll_to_bottom(animate=False)
+        if self._new_line is not None:
+            # Open where the unread begin (v12), and stay there as it settles.
+            self._stick_to_bottom = False
+            self._stick_to_line = True
+            self._line_soon()
+        else:
+            self._stick_to_line = False
+            self.scroll_to_bottom(animate=False)
 
     @staticmethod
     def _signature(msg: dict) -> tuple:
@@ -16638,12 +17352,18 @@ class ConversationScreen(SwipeGestures, Screen):
         if msg.get("kind") == "event":
             out.append(EventRow(msg))
             return out, day or prev_day
+        if msg["id"] == self.unread_from and self._new_line is None:
+            self._new_line = NewMessagesLine(self.unread_count)
+            # Placed again whenever the layout moves it, while it leads.
+            self._new_line.bind(pos=lambda *_a: self._line_soon())
+            out.append(self._new_line)
         outgoing = msg["direction"] == "out"
         bubble = MessageBubble(msg, ticks_enabled, self)
         self._bubbles[msg["id"]] = bubble
         row = BubbleRow(bubble, outgoing, self)
         row.set_selected(msg["id"] in self.selected)
         self._rows[msg["id"]] = row
+        row._fit_height()
         out.append(row)
         pending = self.take_pending_pop(msg.get("client_msg_id"))
         if pending:
@@ -16653,7 +17373,7 @@ class ConversationScreen(SwipeGestures, Screen):
         return out, day or prev_day
 
     def _append_bubble(self, msg: dict, ticks_enabled: bool,
-                       on_tap_unread: Callable) -> None:
+                       on_tap_unread: Callable, join: bool = True) -> None:
         widgets, self._last_day = self._widgets_for(msg, ticks_enabled,
                                                     self._last_day)
         for widget in widgets:
@@ -16661,6 +17381,56 @@ class ConversationScreen(SwipeGestures, Screen):
                 self._first_divider = widget
                 self._first_day = self._last_day
             self.messages.add_widget(widget)
+        if join:
+            self._join_rows(tail=2)
+
+    #: Messages of one person this close together form a run (v12).
+    RUN_SECONDS = 180
+
+    @classmethod
+    def same_run(cls, a: Optional[dict], b: Optional[dict]) -> bool:
+        """Whether `b`, just below `a`, continues `a`'s run: the same
+        person, the same day, at most RUN_SECONDS later."""
+        if a is None or b is None or "event" in (a.get("kind"),
+                                                 b.get("kind")):
+            return False
+        if a["direction"] != b["direction"] or \
+                (a.get("author") or "") != (b.get("author") or ""):
+            return False
+        ta, tb = str(a.get("created_at", "")), str(b.get("created_at", ""))
+        if ta[:10] != tb[:10]:
+            return False
+        try:
+            gap = (datetime.fromisoformat(tb) -
+                   datetime.fromisoformat(ta)).total_seconds()
+        except (TypeError, ValueError):
+            return False
+        return 0 <= gap <= cls.RUN_SECONDS
+
+    def _join_rows(self, tail: int = 0) -> None:
+        """Close up the runs among the messages drawn: each row knows if
+        the one above and the one below are part of its run. With `tail`,
+        only the last rows (a message just arrived below them)."""
+        rows = [w for w in reversed(self.messages.children)
+                if isinstance(w, (BubbleRow, EventRow, DayDivider,
+                                  NewMessagesLine))]
+        for i, widget in enumerate(rows):
+            if not isinstance(widget, BubbleRow) or \
+                    (tail and i < len(rows) - tail):
+                continue
+            above = rows[i - 1] if i > 0 else None
+            below = rows[i + 1] if i + 1 < len(rows) else None
+            joined_below = isinstance(below, BubbleRow) and \
+                self.same_run(widget.bubble.msg, below.bubble.msg)
+            widget.set_joins(
+                isinstance(above, BubbleRow) and
+                self.same_run(above.bubble.msg, widget.bubble.msg),
+                joined_below)
+            # One time line for what was said in the same minute, unless
+            # the ticks or a star tell the two apart.
+            widget.bubble.set_meta_shown(
+                not joined_below or
+                widget.bubble.meta_key() != below.bubble.meta_key())
 
     def prepend_messages(self, older: list, ticks_enabled: bool) -> None:
         """Older messages above those shown (oldest first in `older`),
@@ -16686,6 +17456,7 @@ class ConversationScreen(SwipeGestures, Screen):
             top -= 1
         for widget in built:
             self.messages.add_widget(widget, index=top)
+        self._join_rows()
         self._rendered_ids = [m["id"] for m in older] + self._rendered_ids
         self._rendered_sigs.update({m["id"]: self._signature(m) for m in older})
         if self.content_height() <= self.scroll.height:
@@ -16875,9 +17646,9 @@ class ConversationScreen(SwipeGestures, Screen):
                         if self.searching else self.normal_bar)
         msgs = list(self.selected.values())
         if len(msgs) == 1 and self._reactable(msgs[0]):
-            self.strip.show(self.app.store.reaction_of(
+            self.strip.show(self.app.store.reactions_of(
                 msgs[0]["peer"], msgs[0]["client_msg_id"],
-                self.app.keys.address) if self.app.store else "")
+                self.app.keys.address) if self.app.store else [])
             self._place_strip()
         else:
             self.strip.hide()
@@ -17178,6 +17949,15 @@ class ConversationScreen(SwipeGestures, Screen):
                                  T.text_3)
 
     # ---- taps ------------------------------------------------------------------
+    def on_face_tap(self, address: Optional[str]) -> None:
+        """The disc beside a member's messages (v12): the menu their row on
+        the group's page opens, without leaving the chat."""
+        if not address or self.selecting:
+            return
+        self.close_strip()
+        name = self.author_name(address)
+        MenuSheet(person_items(self.app, address, name), title=name).open()
+
     def on_bubble_tap(self, msg_id: int, touch=None) -> None:
         """A tap on a message marks it read, and raises the reactions over
         it (v9.1.2) — unless it landed on something with a tap of its own:
@@ -17207,9 +17987,9 @@ class ConversationScreen(SwipeGestures, Screen):
             self.close_strip()
         elif self._reactable(msg):
             self._strip_for = msg_id
-            self.strip.show(self.app.store.reaction_of(
+            self.strip.show(self.app.store.reactions_of(
                 msg["peer"], msg["client_msg_id"], self.app.keys.address)
-                if self.app.store else "")
+                if self.app.store else [])
             self._place_strip()
 
     def on_link_tap(self, url: str) -> None:
@@ -17811,6 +18591,7 @@ class ConversationScreen(SwipeGestures, Screen):
         """Bring the newest message into view, once, on the frame after
         layout — one pending settle at a time."""
         self._stick_to_bottom = True
+        self._stick_to_line = False
 
         def _apply(_dt):
             self._scroll_trigger = None
@@ -17840,6 +18621,9 @@ class ConversationScreen(SwipeGestures, Screen):
         old_h, new_h = self._last_content_h, self.messages.height
         self._last_content_h = new_h
         view = self.scroll.height
+        if self._stick_to_line:
+            self._line_soon()
+            return
         if self._stick_to_bottom:
             if self.scroll.scroll_y != 0:
                 self.scroll.scroll_y = 0
@@ -17880,6 +18664,7 @@ class ConversationScreen(SwipeGestures, Screen):
             self._scroll_trigger = None
         Animation.cancel_all(self.scroll, "scroll_y")
         self._stick_to_bottom = False
+        self._stick_to_line = False
         effect = getattr(self.scroll, "effect_y", None)
         if effect is not None:
             try:
@@ -18196,6 +18981,17 @@ class NewGroupScreen(PageScreen):
         self.app.open_conversation(peer)
 
 
+def person_items(app: "FextApp", address: str, name: str) -> list:
+    """What a menu offers for someone in a group: a message, or, for
+    someone known only from the group, adding them to your contacts."""
+    contact = app.store.get_contact(address)
+    if contact and contact.get("listed", 1):
+        return [("send", f"Message {name}",
+                 lambda: app.open_conversation(address))]
+    return [("person_add", f"Add {name} to your contacts",
+             lambda: app.list_contact(address))]
+
+
 class GroupInfoScreen(PageScreen):
     """A group's page: its name (the admin may change it), its members
     (the admin may add and remove them), notifications, starred messages,
@@ -18307,14 +19103,7 @@ class GroupInfoScreen(PageScreen):
         return True
 
     def _member_menu(self, address: str, name: str, admin: bool = True):
-        items = []
-        if self.app.store.get_contact(address) and \
-                (self.app.store.get_contact(address) or {}).get("listed", 1):
-            items.append(("send", f"Message {name}",
-                          lambda: self.app.open_conversation(address)))
-        else:
-            items.append(("person_add", f"Add {name} to your contacts",
-                          lambda: self.app.list_contact(address)))
+        items = person_items(self.app, address, name)
         if admin:
             items.append(("delete", f"Remove {name} from the group",
                           lambda: self._remove(address), True))
@@ -18400,6 +19189,12 @@ class SettingsScreen(PageScreen):
             font_size=fs(17), padding=[0, dp(6)]))
         self.body.add_widget(pad)
         self.body.add_widget(rows_card([ListRow(
+            None, "Black background",
+            "The dark theme on a black page: deeper at night, and it saves "
+            "battery on OLED screens. Off: a warm dark grey",
+            control=ToggleSwitch(APPEARANCE.black,
+                                 lambda on: app.set_appearance(black=on))),
+            ListRow(
             None, "Reduce motion",
             "Pages cross-fade instead of sliding; sheets, reactions and "
             "scrolling move without animation",
@@ -19420,9 +20215,12 @@ class FextApp(MessagingMixin, App):
     # =========================================================================
     def set_appearance(self, theme: Optional[str] = None,
                        text_size: Optional[str] = None,
-                       reduce_motion: Optional[bool] = None) -> None:
+                       reduce_motion: Optional[bool] = None,
+                       black: Optional[bool] = None) -> None:
         if theme is not None:
             save_pref("theme", theme)
+        if black is not None:
+            save_pref("black", bool(black))
         if text_size is not None:
             save_pref("text_size", text_size)
         if reduce_motion is not None:
@@ -19447,7 +20245,7 @@ class FextApp(MessagingMixin, App):
             # A cheap JNI read, and pyjnius must not be used from a thread
             # that is never detached from the JVM — so on the UI thread.
             dark = system_prefers_dark()
-            if ("light" if dark is False else "dark") != T.name:
+            if APPEARANCE.themed(dark is not False) != T.name:
                 self.apply_appearance()
             return
         self._theme_probe = 1
@@ -19455,7 +20253,7 @@ class FextApp(MessagingMixin, App):
         def probe():
             try:
                 dark = system_prefers_dark()
-                want = "light" if dark is False else "dark"
+                want = APPEARANCE.themed(dark is not False)
                 if want != T.name:
                     run_on_ui(self.apply_appearance)
             finally:
@@ -19748,21 +20546,35 @@ class FextApp(MessagingMixin, App):
     def on_identity_created(self, address: str) -> None:
         self._activate_identity(address)
 
+    _pause_beat = None
+
     def pause_identity(self) -> Optional[str]:
         """Stop syncing and close the database, for a restore that is about
-        to change the files. Returns the identity that was in use."""
+        to change the files. Returns the identity that was in use.
+
+        The app's heartbeat goes on meanwhile (v12): it is what keeps the
+        background service from syncing, and a service that took over while
+        a restore ran would hold a database open as it was replaced, and
+        store what arrived in a file nobody would read again."""
         if self.worker is not None:
             self.worker.stop_event.set()
             self.worker = None
         if self.store is not None:
             self.store.close()
             self.store = None
+        write_heartbeat("app")
+        if self._pause_beat is None:
+            self._pause_beat = Clock.schedule_interval(
+                lambda _dt: write_heartbeat("app"), HEARTBEAT_EVERY)
         active = self.keys.active
         return active["address"] if active else None
 
     def resume_identity(self, previous: Optional[str]) -> None:
         """After a restore: back to the identity that was in use, or, on a
         new device, to the first one restored."""
+        if self._pause_beat is not None:
+            self._pause_beat.cancel()
+            self._pause_beat = None
         if previous is None and self.keys.has_identity:
             previous = self.keys.identities[0]["address"]
         if previous is not None:
@@ -19831,6 +20643,16 @@ class FextApp(MessagingMixin, App):
         self.current_peer = peer
         self._chat_anchor = None                # fresh window per chat
         self._chat_ceiling = None
+        # v12: with messages unread, the chat opens at the first of them,
+        # under a "New messages" line; more than the first paint holds and
+        # the window starts there (three messages before it, for context).
+        unread = self.store.unread_for(peer)
+        first = unread[0][0] if unread else None
+        self.conversation_screen.mark_new_from(first, len(unread))
+        if first is not None and len(unread) > FIRST_PAINT - 3:
+            self._chat_anchor, self._chat_ceiling = self.store.id_around(
+                peer, first, 3, CHAT_PAGE_SIZE)
+            self.conversation_screen._rendered_peer = None
         if (self.store.chat_flags().get(peer) or {}).get("marked_unread"):
             self.store.set_chat_flag([peer], "marked_unread", 0)
         if self._auto_read(peer):
@@ -20166,31 +20988,38 @@ class FextApp(MessagingMixin, App):
     #  Reactions (v9.1)
     # =========================================================================
     def react(self, local_id: int, emoji: str) -> None:
-        """React to a message, or take the reaction back: choosing the
-        reaction you already gave removes it. One per person per message.
-        Recorded here at once; the others hear about it in the background."""
+        """Add a reaction to a message, or take it back: choosing one you
+        already gave removes it. Up to MAX_REACTIONS per person (v12); one
+        more replaces the oldest. Recorded here at once; the others hear
+        about it in the background."""
         row = self.store.message(local_id) if self.store else None
+        emoji = sanitize_emoji(emoji)
         if not row or not row.get("client_msg_id") or \
-                row.get("kind") == "event":
+                row.get("kind") == "event" or not emoji:
             return
         peer, cid, me = row["peer"], row["client_msg_id"], self.keys.address
-        current = self.store.reaction_of(peer, cid, me)
-        emoji = "" if emoji == current else (sanitize_emoji(emoji) or "")
-        if not self.store.set_reaction(peer, cid, me, emoji):
+        mine = self.store.reactions_of(peer, cid, me)
+        adding = emoji not in mine
+        mine = (mine + [emoji])[-MAX_REACTIONS:] if adding else \
+            [e for e in mine if e != emoji]
+        if not self.store.set_reactions(peer, cid, me, mine):
             return
-        self.ui_queue.put(("reaction", peer, cid, me, emoji))
+        self.ui_queue.put(("reaction", peer, cid, me, emoji if adding
+                           else ""))
         self.refresh_chat(self.current_peer)
         if self.conversation_kind(peer) == "self":
             return
         snip = single_line_text(message_text(row) or {
             "image": "a photo", "voice": "a voice message"}.get(
                 row.get("kind"), "a message"), 40)
-        fallback = (f"Reacted {emoji} to \u201c{snip}\u201d" if emoji
+        fallback = (f"Reacted {emoji} to \u201c{snip}\u201d" if adding
                     else "Removed a reaction")
+        # 'e', the latest left, is what a release before 12 keeps.
+        ctl = {"op": "react", "cid": cid, "e": mine[-1] if mine else "",
+               "es": mine}
 
         def work():
-            if not self._send_control(peer, {"op": "react", "cid": cid,
-                                             "e": emoji}, fallback):
+            if not self._send_control(peer, ctl, fallback):
                 self.ui_queue.put(("status", "Couldn't send that reaction — "
                                    "it shows here only", COL_TICK_GOLD))
         threading.Thread(target=work, daemon=True).start()
@@ -20507,7 +21336,7 @@ class FextApp(MessagingMixin, App):
             return
         media = json.loads(row.get("ext") or "{}").get("media") or {}
         if not media.get("blob") or row.get("media_state") in (
-                "downloading", "ready"):
+                "downloading", "ready", "unreadable"):
             return
         self.store.set_media(local_id, state="downloading")
         peer = row["peer"]
@@ -20516,6 +21345,15 @@ class FextApp(MessagingMixin, App):
             try:
                 blob = self.api.download_blob(media["blob"])
                 data = open_media(blob, media["key"], media["sha"])
+                if row["kind"] == "image":
+                    # v12: measured before anything draws it.
+                    data = safe_received_image(data)
+                    if data is None:
+                        log.warning("a photo that is no picture of a sane "
+                                    "size was not kept")
+                        self.store.set_media(local_id, state="unreadable")
+                        self.ui_queue.put(("message_stored", peer))
+                        return
                 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
                 suffix = media_suffix(row["kind"], media.get("mime"))
                 target = MEDIA_DIR / f"{row.get('client_msg_id') or uuid.uuid4().hex}.{suffix}"

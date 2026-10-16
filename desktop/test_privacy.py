@@ -538,6 +538,26 @@ PAGE = ("<html><head><title>Fallback title</title>"
         "</head><body>" + "x" * 2000 + "</body></html>").encode()
 picture = io.BytesIO()
 Image.new("RGB", (900, 600), (120, 150, 90)).save(picture, "PNG")
+import gzip                                                    # noqa: E402
+import struct                                                  # noqa: E402
+import zlib                                                    # noqa: E402
+# 64 MB of page in 64 KB: what a site could send to swell in a phone.
+SWELLING = gzip.compress(b"<title>Swollen</title>" + b" " * (64 << 20), 9)
+
+
+def claimed_png(width, height):
+    """A PNG of a few bytes that claims to be `width` by `height`."""
+    def chunk(kind, body):
+        return (struct.pack(">I", len(body)) + kind + body +
+                struct.pack(">I", zlib.crc32(kind + body) & 0xffffffff))
+    return (b"\x89PNG\r\n\x1a\n" +
+            chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0,
+                                       0, 0)) +
+            chunk(b"IDAT", zlib.compress(b"\x00" * 64)) +
+            chunk(b"IEND", b""))
+
+
+VAST_PNG = claimed_png(30000, 20000)
 
 
 class Site(http.server.BaseHTTPRequestHandler):
@@ -567,7 +587,27 @@ class Site(http.server.BaseHTTPRequestHandler):
             except OSError:
                 pass
             return
-        if path == "/pic.png":
+        if path == "/gzip":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(SWELLING)))
+            self.end_headers()
+            self.wfile.write(SWELLING)
+            return
+        if path == "/named":
+            data = (b"<title>Asked for " + self.headers.get("Host", "").encode()
+                    + b"</title>")
+            kind = "text/html"
+        elif path == "/odd-charset":
+            data, kind = (b"<title>Still read</title>",
+                          "text/html; charset=no-such-charset")
+        elif path == "/vast.png":
+            data, kind = VAST_PNG, "image/png"
+        elif path == "/vast":
+            data, kind = (b"<title>Vast</title><meta property='og:image' "
+                          b"content='/vast.png'>", "text/html")
+        elif path == "/pic.png":
             data, kind = picture.getvalue(), "image/png"
         elif path == "/plain":
             data, kind = b"just text", "text/plain"
@@ -583,8 +623,11 @@ class Site(http.server.BaseHTTPRequestHandler):
 server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Site)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 base = f"http://127.0.0.1:{server.server_address[1]}"
-real_public = M._public_host
-M._public_host = lambda host: host == "127.0.0.1"   # this test's "public" site
+real_addresses = M._public_addresses
+# This test's "public" site: 127.0.0.1, and a name no DNS knows that is
+# checked as being there too (see "rebinding" below).
+M._public_addresses = lambda host: ["127.0.0.1"] if host in (
+    "127.0.0.1", "walks.invalid") else []
 lp = M.fetch_link_preview(base + "/page")
 check("a page's title, line, site and picture make its preview",
       lp and lp["t"] == "The Ridge & the Vale" and
@@ -609,8 +652,222 @@ t0 = time.time()
 huge = M.fetch_link_preview(base + "/huge")
 check("only the first half megabyte of a page is read",
       huge and huge["t"] == "Huge" and time.time() - t0 < 10)
-M._public_host = real_public
+port = server.server_address[1]
+named = M.fetch_link_preview(f"http://walks.invalid:{port}/named")
+check("the page comes from the very address that was checked, by its own "
+      "name (a second look-up could be answered differently)",
+      named and named["t"] == f"Asked for walks.invalid:{port}", named)
+got = M._fetch_capped(base + "/gzip", M.PREVIEW_PAGE_BYTES, "text/html")
+check("a compressed page is opened only as far as the limit",
+      got is not None and len(got[2]) <= M.PREVIEW_PAGE_BYTES and
+      got[2].startswith(b"<title>Swollen"))
+check("...pages are asked for uncompressed",
+      M._opened(b"plain", "", 3) == b"pla" and
+      M._opened(b"x", "br", 10) is None)
+check("a page in a character set Python lacks is still read",
+      (M.fetch_link_preview(base + "/odd-charset") or {}).get("t") ==
+      "Still read")
+vast = M.fetch_link_preview(base + "/vast")
+check("a preview picture claiming 600 million pixels is never decoded",
+      vast and vast["t"] == "Vast" and "i" not in vast, vast)
+t0 = time.time()
+M._page_meta("<meta name=x " * 60000 + "<title>" * 60000)
+check("a page of endless unclosed tags is read as fast as any other",
+      time.time() - t0 < 2, f"{time.time() - t0:.1f}s")
 server.shutdown()
+
+
+def tls_site(name):
+    """A local HTTPS site with a certificate for `name`, from a CA of its
+    own: (port, the CA's file, the hosts and SNI names it was asked for)."""
+    import datetime
+    import ssl
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    def make(cn, issuer_key=None, issuer=None):
+        key = ec.generate_private_key(ec.SECP256R1())
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        built = (x509.CertificateBuilder().subject_name(subject)
+                 .issuer_name(issuer.subject if issuer else subject)
+                 .public_key(key.public_key())
+                 .serial_number(x509.random_serial_number())
+                 .not_valid_before(now - datetime.timedelta(days=1))
+                 .not_valid_after(now + datetime.timedelta(days=2)))
+        built = built.add_extension(
+            x509.BasicConstraints(ca=True, path_length=None), critical=True) \
+            if issuer is None else built.add_extension(
+                x509.SubjectAlternativeName([x509.DNSName(cn)]),
+                critical=False)
+        return key, built.sign(issuer_key or key, hashes.SHA256())
+
+    folder = tempfile.mkdtemp()
+    ca_key, ca = make("Test CA")
+    key, cert = make(name, ca_key, ca)
+    pem = serialization.Encoding.PEM
+    with open(f"{folder}/ca.pem", "wb") as fh:
+        fh.write(ca.public_bytes(pem))
+    with open(f"{folder}/site.pem", "wb") as fh:
+        fh.write(cert.public_bytes(pem) + key.private_bytes(
+            pem, serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption()))
+    asked = []
+
+    class Secure(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_a):
+            pass
+
+        def do_GET(self):
+            asked.append(("host", self.headers.get("Host")))
+            body = b"<title>Over TLS</title>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    site = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Secure)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(f"{folder}/site.pem")
+    context.sni_callback = lambda _s, sni, _c: asked.append(("sni", sni))
+    site.socket = context.wrap_socket(site.socket, server_side=True)
+    threading.Thread(target=site.serve_forever, daemon=True).start()
+    return site, f"{folder}/ca.pem", asked
+
+
+import certifi                                                 # noqa: E402
+secure, ca_file, asked = tls_site("walks.invalid")
+real_where, certifi.where = certifi.where, (lambda: ca_file)
+M._public_addresses = lambda host: ["127.0.0.1"] if host in (
+    "walks.invalid", "elsewhere.invalid") else []
+port = secure.server_address[1]
+over = M.fetch_link_preview(f"https://walks.invalid:{port}/")
+check("over https too, by the link's own name: its certificate checked for "
+      "that name, and the name sent ahead (SNI)",
+      over and over["t"] == "Over TLS" and
+      ("sni", "walks.invalid") in asked and
+      ("host", f"walks.invalid:{port}") in asked, (over, asked))
+check("...a certificate for another name is refused",
+      M.fetch_link_preview(f"https://elsewhere.invalid:{port}/") is None)
+certifi.where = real_where
+check("...and one from an authority not trusted",
+      M.fetch_link_preview(f"https://walks.invalid:{port}/") is None)
+secure.shutdown()
+M._public_addresses = real_addresses
+
+print("\nPictures from elsewhere are measured before they are decoded")
+check("a picture's size is read from its header alone",
+      M.image_header(picture.getvalue()) == ("PNG", 900, 600) and
+      M.image_header(VAST_PNG) is None and
+      M.image_header(claimed_png(9000, 10)) is None and
+      M.image_header(b"GIF89a" + b"\x00" * 40) is None)
+sent = io.BytesIO()
+Image.new("RGB", (1280, 960), (90, 110, 140)).save(sent, "JPEG", quality=70)
+check("a photo as this app sends it is kept as it came",
+      M.safe_received_image(sent.getvalue()) == sent.getvalue())
+large = io.BytesIO()
+Image.new("RGBA", (4000, 3000), (10, 200, 30, 128)).save(large, "PNG")
+redrawn = M.safe_received_image(large.getvalue())
+with Image.open(io.BytesIO(redrawn or sent.getvalue())) as im:
+    redrawn_size, redrawn_kind = im.size, im.format
+check("...a bigger one, or a PNG, is drawn again here, smaller",
+      redrawn is not None and redrawn_kind == "JPEG" and
+      max(redrawn_size) == M.RECEIVED_KEEP_EDGE, redrawn_size)
+check("...and one claiming too many pixels is refused",
+      M.safe_received_image(VAST_PNG) is None and
+      M.safe_received_image(b"not a picture") is None)
+small = io.BytesIO()
+Image.new("RGB", (40, 30), (1, 2, 3)).save(small, "JPEG")
+thumb_png = io.BytesIO()
+Image.new("RGB", (40, 30), (1, 2, 3)).save(thumb_png, "PNG")
+thumb_big = io.BytesIO()
+Image.new("RGB", (400, 300), (1, 2, 3)).save(thumb_big, "JPEG")
+check("an inline thumbnail is drawn only if it is a small JPEG",
+      M.texture_from_b64(base64.b64encode(small.getvalue()).decode())
+      is not None and
+      M.texture_from_b64(base64.b64encode(thumb_png.getvalue()).decode())
+      is None and
+      M.texture_from_b64(base64.b64encode(thumb_big.getvalue()).decode())
+      is None and
+      M.texture_from_b64(base64.b64encode(VAST_PNG).decode()) is None)
+
+
+class BlobApi(StubApi):
+    blobs = {}
+
+    def download_blob(self, blob_id):
+        return self.blobs[blob_id]
+
+
+bob.api = BlobApi(relay, bob.keys)
+
+
+def photo_arrives(data, label):
+    """A photo message from alice, sealed as the app seals one, on bob's
+    phone; returns its state once bob has fetched it."""
+    import uuid
+    blob, key, sha = M.seal_media(data)
+    blob_id = uuid.uuid4().hex
+    BlobApi.blobs[blob_id] = blob
+    cid = uuid.uuid4().hex
+    lid = bob.store.add_out(A, label, M.now_iso(), cid)   # a row to fill
+    with bob.store._lock:
+        bob.store._db.execute(
+            "UPDATE messages SET direction = 'in', kind = 'image', ext = ?, "
+            "media_state = 'pending' WHERE id = ?",
+            (json.dumps({"media": {"kind": "image", "blob": blob_id,
+                                   "key": key, "sha": sha,
+                                   "mime": "image/jpeg", "size": len(blob)}}),
+             lid))
+        bob.store._db.commit()
+    bob.fetch_media(lid)
+    wait_for(lambda: bob.store.message(lid)["media_state"] not in (
+        "pending", "downloading"), 10)
+    return bob.store.message(lid)
+
+
+row = photo_arrives(sent.getvalue(), "a fair photo")
+check("a photo someone sends is kept, and shown",
+      row["media_state"] == "ready" and row.get("media_path") and
+      open(row["media_path"], "rb").read() == sent.getvalue())
+row = photo_arrives(VAST_PNG, "a photo that is not")
+check("...one that claims a vast size is not kept, and says it cannot be "
+      "shown (and is not fetched again)",
+      row["media_state"] == "unreadable" and not row.get("media_path"))
+content = M.ImageContent(row, json.loads(row["ext"])["media"], None)
+check("...in those words", content.chip.text == "This photo cannot be shown",
+      content.chip.text)
+bob.api = StubApi(relay, bob.keys)
+
+print("\nA message's time must be a time")
+real_now = M.now_iso
+M.now_iso = lambda: ["not", "a", "time"]
+try:
+    envelope, _at = bob.crypto.build_envelope(
+        "Odd times", alice.keys.public_key_hex,
+        x={"cid": "c" * 32}, recipient=A, cid="c" * 32)
+finally:
+    M.now_iso = real_now
+odd = {"id": 9001, "sender": B, "recipient": A, "envelope": envelope,
+       "client_msg_id": "c" * 32, "created_at": "2026-10-15T09:30:00+00:00"}
+acked = alice.worker._ingest_message(odd)
+kept = [m for m in alice.store.messages_for(B) if m["body"] == "Odd times"]
+check("a message whose time is not one is stored with the relay's, and "
+      "acknowledged (it used to come back on every connect)",
+      acked == 9001 and kept and
+      kept[0]["created_at"] == "2026-10-15T09:30:00+00:00",
+      (acked, kept and kept[0]["created_at"]))
+check("...times are taken as they are written, Z or offset",
+      M.sanitize_stamp("2026-10-15T09:30:00Z", "x") ==
+      "2026-10-15T09:30:00Z" and
+      M.sanitize_stamp("2026-10-15T09:30:00.5+02:00", "x") ==
+      "2026-10-15T09:30:00.5+02:00" and
+      M.sanitize_stamp(1760520600, "x") == "x" and
+      M.sanitize_stamp("soon", "x") == "x" and
+      M.sanitize_stamp("2026-10-15T09:30:00+00:00" + " " * 30, "x") == "x")
 
 # =============================================================================
 print("\nEncrypted backup")
@@ -772,6 +1029,16 @@ check("...then it is sealed, and saved where asked",
       wait_for(lambda: sheet.status.text.startswith("Saved"), 30) and
       os.path.isfile(os.path.join(backups, "from the screen" +
                                   M.BACKUP_SUFFIX)), sheet.status.text)
+folder = os.path.join(backups, "a folder")
+os.makedirs(folder)
+sheet.status.text = ""
+sheet.path_field.text = folder
+sheet._start()
+check("...and a folder given as the place: the file goes in it",
+      wait_for(lambda: sheet.status.text.startswith("Saved"), 30) and
+      os.listdir(folder) == [M.default_backup_name()] and
+      not os.path.exists(folder + M.BACKUP_SUFFIX),
+      (sheet.status.text, os.listdir(backups)))
 sheet.dismiss(animation=False)
 restore = M.RestoreSheet(alice)
 restore.open()
@@ -781,13 +1048,130 @@ check("restoring: the chosen backup says when it was made",
       restore.made.text.startswith("Made ") and "Ferritext" in
       restore.made.text)
 restore.passphrase.text = "not it at all"
+M.HEARTBEAT_EVERY, every = 0.2, M.HEARTBEAT_EVERY
+beat = M._beat_path("app")
+beat.write_text(f"{time.time() - 3600:.1f}")       # as if long gone
 restore._start()
+M.HEARTBEAT_EVERY = every
+check("while a restore runs, the app's heartbeat goes on, so the "
+      "background service does not open the files being replaced",
+      alice.worker is None and alice._pause_beat is not None and
+      M.heartbeat_fresh("app"))
 check("...a wrong passphrase is said, and the app carries on as it was",
       wait_for(lambda: restore.status.text == "Wrong passphrase.", 30) and
       alice.store is not None and alice.keys.address == A)
+check("...its own worker beating again, the stand-in stopped",
+      alice._pause_beat is None and alice.worker is not None)
 restore.dismiss(animation=False)
 alice.close_settings()
 tick(0.3)
+
+print("\nTLS on the relay's own port (v12)")
+import http.server                                            # noqa: E402
+import ssl                                                    # noqa: E402
+import subprocess                                             # noqa: E402
+
+pki = M.Path(tempfile.mkdtemp(prefix="fext-tls-"))
+(pki / "leaf.ext").write_text(
+    "subjectAltName=IP:127.0.0.1\nbasicConstraints=CA:FALSE\n"
+    "keyUsage=digitalSignature\nextendedKeyUsage=serverAuth\n"
+    "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n")
+for argv in (
+        ["req", "-x509", "-newkey", "ec", "-pkeyopt",
+         "ec_paramgen_curve:P-256", "-nodes", "-keyout", "ca.key", "-out",
+         "ca.pem", "-days", "2", "-subj", "/CN=Test Relay CA"],
+        ["req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+         "-nodes", "-keyout", "leaf.key", "-out", "leaf.csr", "-subj",
+         "/CN=127.0.0.1"],
+        ["x509", "-req", "-in", "leaf.csr", "-CA", "ca.pem", "-CAkey",
+         "ca.key", "-CAcreateserial", "-out", "leaf.pem", "-days", "2",
+         "-extfile", "leaf.ext"]):
+    subprocess.run(["openssl"] + argv, cwd=pki, check=True,
+                   capture_output=True)
+announce = {"tls_port": None}
+handshakes = [0]
+
+
+class Health(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = {"status": "ok", "version": "12.0.0"}
+        if announce["tls_port"] and not isinstance(self.connection,
+                                                   ssl.SSLSocket):
+            body["tls_port"] = announce["tls_port"]
+        data = json.dumps(body).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *_a):
+        pass
+
+
+class Counting(http.server.ThreadingHTTPServer):
+    def get_request(self):
+        handshakes[0] += 1
+        return super().get_request()
+
+
+plain = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Health)
+secure = Counting(("127.0.0.1", 0), Health)
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain(pki / "leaf.pem", pki / "leaf.key")
+secure.socket = context.wrap_socket(secure.socket, server_side=True)
+for server in (plain, secure):
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+P, T = plain.server_address[1], secure.server_address[1]
+
+
+class Endpoint(M.Endpoint):
+    CACHE_NAME = "transport-test.json"
+
+
+override = M.SERVER_URL_OVERRIDE
+M.SERVER_URL_OVERRIDE = f"http://127.0.0.1:{P}"
+(M.DATA_DIR / Endpoint.CACHE_NAME).unlink(missing_ok=True)
+try:
+    ep = Endpoint()
+    check("a relay on plain HTTP alone: plain HTTP, said to be unencrypted",
+          ep.resolve() == f"http://127.0.0.1:{P}" and not ep.secure)
+    announce["tls_port"] = T
+    os.environ["REQUESTS_CA_BUNDLE"] = str(pki / "ca.pem")
+    ep = Endpoint()
+    check("a relay that names its TLS port: the app moves there once the "
+          "certificate checks out against the roots it trusts",
+          ep.resolve(force=True) == f"https://127.0.0.1:{T}" and ep.secure
+          and ep.ws_url() == f"wss://127.0.0.1:{T}/ws")
+    again = Endpoint()
+    check("...and remembers it: the next start goes straight there",
+          again.resolved and again.base == f"https://127.0.0.1:{T}" and
+          again.secure)
+    (M.DATA_DIR / Endpoint.CACHE_NAME).unlink(missing_ok=True)
+    del os.environ["REQUESTS_CA_BUNDLE"]           # the test CA: unknown
+    ep = Endpoint()
+    before = handshakes[0]
+    check("a certificate it cannot verify is never accepted: plain HTTP "
+          "still, and said so", ep.resolve() == f"http://127.0.0.1:{P}"
+          and not ep.secure and handshakes[0] > before)
+    before = handshakes[0]
+    ep.invalidate()
+    check("...and that port is left alone for a while, not tried on every "
+          "reconnect", ep.resolve() == f"http://127.0.0.1:{P}" and
+          handshakes[0] == before)
+    os.environ["REQUESTS_CA_BUNDLE"] = str(pki / "ca.pem")
+    ep = Endpoint()
+    ep.resolve(force=True)
+    secure.shutdown()
+    secure.server_close()
+    ep.invalidate()
+    check("when TLS stops answering, the app goes back to plain HTTP, and "
+          "says so", ep.resolve() == f"http://127.0.0.1:{P}" and
+          not ep.secure)
+finally:
+    M.SERVER_URL_OVERRIDE = override
+    os.environ.pop("REQUESTS_CA_BUNDLE", None)
+    plain.shutdown()
 
 passed = sum(1 for _n, ok in RESULTS if ok)
 print(f"\n  {passed}/{len(RESULTS)} passed")

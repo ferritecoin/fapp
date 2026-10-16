@@ -6,7 +6,8 @@
   * every text/ground pair either theme uses meets WCAG AA (4.5:1 for text,
     3:1 for large text and for marks such as ticks);
   * the bundled fonts are present, registered as Kivy's default family, and
-    packaged into the APK with their licences;
+    packaged into the APK with their licences; the emoji are drawn in
+    colour, a flag or a family as one picture, in labels and text fields;
   * the theme follows the system unless chosen, and a status colour from
     the other theme is translated;
   * capitals are tracked and end in an ellipsis rather than overflowing;
@@ -100,7 +101,8 @@ print("\nType")
 fonts = os.path.join(ROOT, "data", "fonts")
 needed = list(M.SERIF_FILES.values()) + ["ui.ttf", "OFL-EBGaramond.txt",
                                          "OFL-NotoEmoji.txt",
-                                         "OFL-TitilliumWeb.txt"]
+                                         "OFL-TitilliumWeb.txt",
+                                         "CC-BY-Twemoji.txt"]
 missing = [f for f in needed if not os.path.isfile(os.path.join(fonts, f))]
 check("the serif (four styles), the capitals face and their licences ship",
       not missing, str(missing))
@@ -134,11 +136,30 @@ prefs(theme="system")
 os.environ["FEXT_THEME"] = "light"
 check("'System' follows the system (light)", M.APPEARANCE.resolve() == "light")
 os.environ["FEXT_THEME"] = "dark"
-check("'System' follows the system (dark)", M.APPEARANCE.resolve() == "dark")
+check("'System' follows the system (dark, on black by default)",
+      M.APPEARANCE.resolve() == "black")
 os.environ.pop("FEXT_THEME")
 M.system_prefers_dark = lambda: None
 check("with no answer from the system, the dark theme",
+      M.APPEARANCE.resolve() == "black")
+prefs(theme="system")
+M.system_prefers_dark = lambda: True
+check("Black background (v12): the dark theme on a black page, by default",
+      M.APPEARANCE.resolve() == "black" and M.THEMES["black"]["bg"] ==
+      "#000000")
+prefs(theme="system", black=False)
+check("...a dark grey page when it is turned off",
       M.APPEARANCE.resolve() == "dark")
+prefs(theme="system", black=True)
+M.system_prefers_dark = lambda: False
+check("...and in light, the light theme still",
+      M.APPEARANCE.resolve() == "light")
+prefs(theme="dark", black=True)
+M.apply_theme(M.APPEARANCE.resolve())
+check("...chosen dark too; it counts as dark everywhere a widget asks",
+      M.T.name == "black" and M.T.dark and M.T.text == M.THEMES["dark"]["text"])
+M.apply_theme("dark")
+M.system_prefers_dark = lambda: None
 prefs(theme="system", text_size="large", reduce_motion=True)
 M.APPEARANCE.resolve()
 check("text size and reduced motion are read from the preferences",
@@ -160,6 +181,19 @@ from kivy.clock import Clock                                  # noqa: E402
 from kivy.core.window import Window                           # noqa: E402
 from kivy.metrics import dp                                   # noqa: E402
 from kivy.uix.boxlayout import BoxLayout                      # noqa: E402
+from kivy.core.text import Label as CoreLabel                 # noqa: E402
+
+
+def hues(pixels) -> int:
+    """How many solid pixels are in colour (not a grey of any shade)."""
+    return sum(1 for i in range(0, len(pixels), 4) if pixels[i + 3] > 200
+               and max(pixels[i:i + 3]) - min(pixels[i:i + 3]) > 60)
+
+
+def drawn(text, color=(1, 1, 1, 1), **style):
+    core = CoreLabel(text=text, font_size=dp(40), color=color, **style)
+    core.refresh()
+    return core.texture.width, hues(core.texture.pixels)
 
 
 class Harness(App):
@@ -170,6 +204,7 @@ class Harness(App):
         return self.root_box
 
     def parts(self, _dt):
+        self.colour()
         caps = M.CapsLabel("Section", size=11, size_hint_x=None,
                            width=dp(300))
         check("capitals are set in upper case", caps.text == "SECTION")
@@ -191,7 +226,45 @@ class Harness(App):
         self.sheet = sheet
         Clock.schedule_once(self.settle, 1.2)
 
+    def colour(self):
+        face, face_hues = drawn("\U0001F600")
+        check("emoji are drawn in colour", face_hues > 200, str(face_hues))
+        check("...whatever the colour of the text around them",
+              drawn("\U0001F600", color=(0, 0, 0, 1))[1] > 200 and
+              drawn("\U0001F600", color=(.9, .1, .1, 1))[1] > 200)
+        styles = [drawn("\U0001F600", bold=b, italic=i)[1]
+                  for b in (False, True) for i in (False, True)]
+        check("...in all four styles of the serif", min(styles) > 200,
+              str(styles))
+        joined = {name: drawn(text) for name, text in (
+            ("flag", "\U0001F1EC\U0001F1E7"),
+            ("skin tone", "\U0001F44D\U0001F3FD"),
+            ("family", "\U0001F468\u200D\U0001F469\u200D\U0001F467"),
+            ("keycap", "1\uFE0F\u20E3"),
+            ("heart on fire", "\u2764\uFE0F\u200D\U0001F525"))}
+        apart = {k: v for k, v in joined.items()
+                 if abs(v[0] - face) > 2 or v[1] < 100}
+        check("a flag, a skin tone, a family or a keycap is one picture",
+              not apart, f"{apart} (one emoji is {face} wide)")
+        check("letters keep the colour of the text", drawn("Aa \u00A9")[1] == 0)
+        self.ink = M.InkTextInput(text="Ink \U0001F600",
+                                  foreground_color=(.3, .3, .3, 1),
+                                  font_size=dp(40), size_hint=(None, None),
+                                  size=(dp(300), dp(70)))
+        self.root_box.add_widget(self.ink)
+
     def settle(self, _dt):
+        lines = [t for t in (self.ink._lines_labels or ()) if t]
+        pixels = lines[0].pixels if lines else b""
+        inked = sum(1 for i in range(0, len(pixels), 4)
+                    if pixels[i + 3] > 200 and
+                    all(abs(c - 77) < 6 for c in pixels[i:i + 3]))
+        check("a text field draws emoji in colour too, not as a silhouette",
+              hues(pixels) > 200 and
+              tuple(self.ink.foreground_color) == (1, 1, 1, 1),
+              f"{hues(pixels)} in colour")
+        check("...and its letters in the colour it is given", inked > 20,
+              str(inked))
         check("buttons whose labels will not fit side by side stack",
               self.row.orientation == "vertical" and
               self.row.height >= 2 * M.TOUCH)

@@ -32,7 +32,7 @@ source.exclude_dirs = tests, bin, venv, .git, .github, .buildozer, __pycache__, 
 # loads data/ferritext_logo.png at runtime for the loading screen.
 
 # (str) Application versioning (method 1)
-version = 11.0.0
+version = 12.0.0
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy
@@ -150,7 +150,9 @@ android.accept_sdk_license = True
 android.archs = arm64-v8a, armeabi-v7a
 
 # (bool) enables Android auto backup feature (Android API >=23)
-android.allow_backup = True
+# Off: the keys and chats leave the phone only in a backup made and sealed
+# in the app (Settings > Backup), never in Android's own cloud backup.
+android.allow_backup = False
 
 # (str) The format used to package the app for release mode (aab or apk or aar).
 # We ship a directly-installable APK, not a Play-Store bundle.

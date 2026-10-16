@@ -408,6 +408,56 @@ check("the admin's group messages say which group picture is current",
       grp.get("pv") == alice.store.picture_version(gpeer))
 settle(relay, parties)
 
+# v12: someone met only in the group. Bob and dee are not each other's
+# contacts; dee's picture must still reach bob (and stay end to end).
+dee = make_party("dee", relay)
+parties[dee.keys.address] = dee
+D = dee.keys.address
+for p, q in ((alice, dee), (dee, alice)):
+    p.store.upsert_contact(q.keys.address, q.keys.username,
+                           q.keys.public_key_hex)
+    p.store.add_caps(q.keys.address, M.LocalStore.CAP_PIC
+                     | M.LocalStore.CAP_V9)
+alice.add_group_members(gid, [D])
+wait_for(lambda: relay.mail, 3)
+settle(relay, parties)
+check("someone met only in a group is known to bob, but not listed",
+      (dee.store.group(gid) or {}).get("state") == "active" and
+      bob.store.get_contact(D) and not bob.store.get_contact(D)["listed"])
+dee._on_picture = lambda *_a: None         # keep dee's own copy out of the book
+dee.set_picture(M.picture_jpeg(photo(400, 400, 80)))
+settle(relay, parties)
+bob.send_text(gpeer, "bob writes to the group")
+wait_for(lambda: relay.mail)
+settle(relay, parties)
+dee.send_text(gpeer, "dee writes to the group")
+wait_for(lambda: len(relay.mail) >= 4, 3)
+to_bob = [opened(bob, m)["x"].get("ctl", {}).get("op")
+          for m in relay.mail if m["recipient"] == B]
+check("a member's picture goes before their group message to the members "
+      "whose apps keep pictures, contacts or not ('pic')",
+      to_bob == ["pic", None], str(to_bob))
+settle(relay, parties)
+check("...bob keeps it at dee's version, in a file of his own",
+      bob.store.picture_version(D) == dee.store.picture_version(D) and
+      bob.store.picture(D)["path"] and
+      os.path.isfile(bob.store.picture(D)["path"]))
+check("...and cara, whose app dee had not heard from, asked for it and has "
+      "it too", cara.store.picture_version(D) == dee.store.picture_version(D)
+      and cara.store.picture(D)["path"])
+lost = bob.store.picture(D)["path"]
+M.discard_picture_file(lost)
+bob.store._db.execute("DELETE FROM pictures WHERE peer = ?", (D,))
+bob.store._db.commit()
+dee.send_text(gpeer, "still there?")
+wait_for(lambda: relay.mail)
+settle(relay, parties)
+check("...a member who lost it asks again and is answered, in the group too",
+      bob.store.picture_version(D) == dee.store.picture_version(D) and
+      os.path.isfile(bob.store.picture(D)["path"]))
+check("...and dee is still not in bob's chat list for all that",
+      not bob.store.get_contact(D)["listed"])
+
 print("\nScreens")
 bob._load_pictures()
 disc = M.Avatar(gpeer, "Walkers", kind="group")
@@ -431,6 +481,12 @@ check("discs already on screen follow a new picture as it arrives",
       not before and cara_disc.has_picture and
       M.PICTURES.path(K) == bob.store.picture(K)["path"])
 
+bob.open_conversation(gpeer)
+wait_for(lambda: False, 0.6)
+faces = [r.face for r in bob.conversation_screen._rows.values()
+         if r.author == D and r.face is not None and r.face.parent is r]
+check("in the group, the disc beside dee's messages shows dee's picture",
+      faces and faces[-1].has_picture)
 bob.open_conversation(A)
 header = bob.conversation_screen.peer_avatar_holder.children[0]
 check("the chat's disc is a button", isinstance(header, M.AvatarButton))

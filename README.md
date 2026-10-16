@@ -21,12 +21,12 @@ same key (see [Release signing](#release-signing)).
 
 Every push to the default branch is tested and built, and each new version is
 published to a GitHub Release, whose files never change afterwards. Open the
-**Releases** page (or the **`v11.0.0`** tag) and take:
+**Releases** page (or the **`v12.0.0`** tag) and take:
 
 | Asset | For |
 | --- | --- |
-| `Ferritext-11.0.0.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r` |
-| `Ferritext-11.0.0-desktop.py` | Windows / macOS / Linux — one file with its fonts and icons inside. Run it with Python 3.11+ after `pip install kivy requests websocket-client cryptography qrcode pillow`. |
+| `Ferritext-12.0.0.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r` |
+| `Ferritext-12.0.0-desktop.py` | Windows / macOS / Linux — one file with its fonts and icons inside. Run it with Python 3.11+ after `pip install kivy requests websocket-client cryptography qrcode pillow`. |
 
 Both are also attached to each Actions run as the **`ferritext-release`**
 artifact. Pushes to other branches are tested and built, but publish nothing.
@@ -41,6 +41,38 @@ nothing breaks without it:
 | `pip install numpy` | voice notes at 1.5× and 2× |
 | `pip install av` (or the `ffmpeg` program) | playing voice notes recorded on a phone |
 | `pip install opencv-python` (or `pyzbar`) | reading a contact's QR code from a picture |
+
+## What's in 12.0.0
+
+- **Emoji in colour**, everywhere: in messages, reactions, the chat list,
+  the emoji panel and as you type. Flags, skin tones, families and keycaps
+  are one picture each.
+- **Big emoji.** A message of only one to three emoji is drawn large, on the
+  page itself.
+- **Runs of messages.** What one person sends within a few minutes reads as
+  one run: closer together, with their name and the time once.
+- **Open where you left off.** A chat with unread messages opens at the first
+  of them, under a *New messages* line that counts them.
+- **A black background** for the dark theme, now its default (*Settings →
+  Appearance*; turned off, a warm dark grey).
+- **Faces in groups.** The last message of each person's run has their
+  picture beside it, or their initial until they have one; tap it to message
+  them, or to add them to your contacts.
+- **Up to three reactions each.** Choose another to add it, and one of yours
+  again to take it back.
+- **TLS by itself.** Where the relay serves TLS on a port of its own, the app
+  moves there once the certificate checks out, and remembers it.
+- **Your keys stay out of Android's cloud backup.** Android's automatic
+  backup no longer copies the app's data; move phones with the app's own
+  sealed backup (*Settings → Backup*).
+- Fixed: a photo claiming enormous dimensions could fill a phone's memory;
+  a link preview could be steered at your local network; restoring a backup
+  could race the background service; a message whose time was not a time
+  came back on every connect; backing up to a folder on a computer saved
+  beside it; someone known only from a group appeared in your chat list
+  once their picture arrived; the reaction strip marked your reaction in
+  the wrong place.
+- **Coming from 9.1.x?** Everything in 11.0.0, below, is new to you too.
 
 ## What's in 11.0.0
 
@@ -214,6 +246,17 @@ been tested end to end against this app; media works once it is deployed.
 
 ## Compatibility
 
+**With 11.0 and earlier.** 12.0 talks to every earlier release.
+
+| | 12.0 | 11.0 and earlier |
+| --- | --- | --- |
+| Reactions | up to three each | each person's latest |
+| A reaction from them | replaces all of theirs (they have one) | — |
+| The relay's own TLS port | used once its certificate checks out | not used: the relay keeps its usual port for them |
+
+Emoji in colour, runs, faces in groups and the black background are drawn
+by each app for itself; nothing about them is sent.
+
 **With 9.1.2 and earlier.** 11.0 talks to every earlier release; what
 they do not know, they ignore or show as text.
 
@@ -289,16 +332,18 @@ read it.
 
 The serif is **EB Garamond**, merged with **Noto Emoji** into the four-style
 family *Ferritext Serif* (Kivy draws a label with one font file and cannot fall
-back to another, so the emoji must live in the same file). Emoji are
-monochrome, taking the colour of the text: Kivy cannot draw colour fonts.
-Combined emoji (family groups, flags with modifiers) appear as their separate
-parts, because Android's build of Kivy does not shape text.
+back to another, so the emoji must live in the same file). The emoji are drawn
+in colour, from **Twemoji**'s graphics, laid over Noto Emoji's outlines as the
+font's colour layers (COLR/CPAL), which FreeType draws at any size. Flags, skin
+tones, families and keycaps are joined into one picture by the font itself. A
+system that cannot draw colour fonts draws the outlines instead, in the colour
+of the text.
 
 Capitals are set in the supplied `data/fonts/ui.ttf` (Titillium Web Light),
 with letter-spacing the app adds itself, since Kivy's text has none.
 
-All three are under the SIL Open Font License 1.1; the licence texts ship
-beside the fonts and inside the APK. `tools/build_fonts.py` rebuilds the merged
+All three are under the SIL Open Font License 1.1, and Twemoji's graphics
+under CC-BY 4.0; the licence texts ship beside the fonts and inside the APK. `tools/build_fonts.py` rebuilds the merged
 family from pinned, checksummed upstream files.
 
 The two themes are sets of colour tokens at the top of the client's design
@@ -426,6 +471,9 @@ backup to the device, with their chats; one already there keeps its own,
 unless it has none yet. Use each identity on one device at a time: the relay
 delivers to whichever device is connected.
 
+Android's own cloud backup does not copy Ferritext: its keys and chats leave
+a phone only in a backup you make and seal here.
+
 ## What's in here
 
 | Path | Purpose |
@@ -437,7 +485,7 @@ delivers to whichever device is connected.
 | `data/` | The Ferrite Text Messenger mark (`ferritext_logo.svg`, as supplied) and the images rendered from it, including the desktop window icons (`icon_desktop.png`, `.ico`). |
 | `data/fonts/` | Ferritext Serif (four styles), the capitals face `ui.ttf`, and their licences. |
 | `tools/make_logo.py` | Renders every image in `data/` from the SVG — no dependency beyond Pillow. |
-| `tools/build_fonts.py` | Rebuilds Ferritext Serif from EB Garamond and Noto Emoji (needs fontTools). |
+| `tools/build_fonts.py` | Rebuilds Ferritext Serif from EB Garamond, Noto Emoji and Twemoji (needs fontTools). |
 | `tools/bundle_desktop.py` | Builds the single-file desktop release, and `--verify` checks one against the source. |
 | `tools/p4a_hook.py` | Build hook: the service types Android 14 requires, the notifications' receiver, and the camera's FileProvider. |
 | `recipes/libopus/` | A python-for-android recipe for libopus, for calls in Opus. |
@@ -497,7 +545,7 @@ on first run.
 
 ```bash
 python3 -m pip install --user buildozer cython
-buildozer android debug          # produces bin/fext-11.0.0-*-debug.apk
+buildozer android debug          # produces bin/fext-12.0.0-*-debug.apk
 ```
 
 The mark and icons are regenerated with `python3 tools/make_logo.py` (Pillow
@@ -579,7 +627,11 @@ A signing key is **never committed to this repository.**
 
 - **Relay**: pinned in `main.py` (`SERVER_HOST`, overridable with
   `FEXT_SERVER_HOST`). The client probes `https://` first and falls back to
-  `http://`, caching the winner and re-probing when it stops working.
+  `http://`, caching the winner and re-probing when it stops working. A relay
+  that serves TLS on a port of its own names it in `/api/health`
+  (`tls_port`, from 12.0.0); reached over `http://`, the client tries that
+  port and moves there once the certificate verifies against the roots it
+  ships (certifi), and never accepts one that does not.
 - **Cleartext is scoped, not blanket.** Android blocks cleartext by default, so
   `src/android/res/xml/network_security_config.xml` permits it for the relay
   host only. It is wired up via `android.add_resources` plus a `p4a.extra_args`

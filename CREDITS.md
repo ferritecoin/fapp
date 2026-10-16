@@ -51,5 +51,6 @@ None of these is needed; each adds what it says.
 | Font | Used for | Licence |
 |---|---|---|
 | [EB Garamond](https://github.com/octaviopardo/EBGaramond12), by The EB Garamond Project Authors | the text | SIL Open Font License 1.1 |
-| [Noto Emoji](https://github.com/googlefonts/noto-emoji), by Google | the emoji | SIL Open Font License 1.1 |
+| [Noto Emoji](https://github.com/googlefonts/noto-emoji), by Google | the emoji's outlines | SIL Open Font License 1.1 |
+| [Twemoji](https://github.com/jdecked/twemoji), by Twitter, Inc and other contributors, from [twemoji-colr-font](https://github.com/mrdrogdrog/twemoji-color-font) | the emoji in colour | CC-BY 4.0 (the graphics), SIL Open Font License 1.1 (the font) |
 | [Titillium Web](https://www.fontsquirrel.com/fonts/titillium-web), by Accademia di Belle Arti di Urbino | the capitals | SIL Open Font License 1.1 |

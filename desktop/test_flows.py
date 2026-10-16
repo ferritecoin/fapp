@@ -425,6 +425,55 @@ check("...and picking from it reacts and closes the strip",
       alice.store.reaction_of(gpeer, cid, A) == "🙏" and
       screen.strip.disabled and not screen.selecting)
 deliver(relay, parties)
+
+# v12: several reactions each, up to three; a fourth replaces the oldest.
+for emoji in ("❤️", "😂"):
+    alice.react(bubble.msg["id"], emoji)
+    wait_for(lambda: len(relay.mail) >= 2)
+    to_bob = [m for m in relay.mail if m["recipient"] == B]
+    deliver(relay, parties)
+check("several reactions from one person reach everyone, in order (v12)",
+      all(p.store.reactions_of(gpeer, cid, A) == ["🙏", "❤️", "😂"]
+          for p in (alice, bob, cara)))
+ctl = bob.crypto.open_envelope(to_bob[-1]["envelope"], A,
+                               cid=to_bob[-1]["client_msg_id"])["x"]["ctl"]
+check("...each 'react' carries all of them, and the latest alone for older "
+      "apps", ctl.get("es") == ["🙏", "❤️", "😂"] and ctl.get("e") == "😂",
+      str(ctl))
+alice.refresh_chat(gpeer)
+pump(alice)
+bubble = next(b for b in alice.conversation_screen._bubbles.values()
+              if b.msg.get("client_msg_id") == cid)
+check("...each shows under the message as a chip of its own",
+      [c.emoji for c in bubble.reactions.chips] == ["🙏", "❤️", "😂"])
+screen.start_selection(bubble.msg["id"])
+wait_for(lambda: False, 0.4)
+# Placed over another message, the strip moves before its keys are laid out
+# again: the rings must follow the keys (they were left behind, before 12).
+screen.strip.pos = (screen.strip.x + M.dp(30), screen.strip.y + M.dp(40))
+wait_for(lambda: False, 0.4)
+check("...and the strip rings each one already given",
+      screen.strip.current == ["🙏", "❤️", "😂"] and
+      sorted(r.pos for c, r in screen.strip._mine if c.a > 0) ==
+      sorted(((k.x + k.width / 2) - M.dp(20), (k.y + k.height / 2) - M.dp(20))
+             for e, k in screen.strip.keys.items() if e in ("🙏", "❤️", "😂")),
+      f"{screen.strip.current} {[(r.pos, c.a) for c, r in screen.strip._mine]}")
+screen.clear_selection()
+screen.strip.show([])
+check("...and none is left over when the strip next rises where you have "
+      "given none", not any(c.a > 0 for c, _r in screen.strip._mine))
+screen.strip.hide()
+alice.react(bubble.msg["id"], "😮")
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+check("a fourth replaces the oldest of the three",
+      bob.store.reactions_of(gpeer, cid, A) == ["❤️", "😂", "😮"])
+alice.react(bubble.msg["id"], "😂")
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+check("choosing one of yours again takes back that one only",
+      cara.store.reactions_of(gpeer, cid, A) == ["❤️", "😮"] and
+      cara.store.reaction_of(gpeer, cid, A) == "😮")
 screen.open_emoji()
 screen.entry.text = ""
 screen.emoji_panel._pick("🙂")
@@ -478,7 +527,8 @@ check("a larger text size scales every font",
       abs(M.APPEARANCE.scale - 1.3) < 1e-9 and
       abs(M.fs(10) - M.sp(13)) < 0.01)
 alice.set_appearance(theme="dark", text_size="default")
-check("...and back", M.T.name == "dark" and M.APPEARANCE.scale == 1.0)
+check("...and back (dark, on black by default)",
+      M.T.name == "black" and M.T.dark and M.APPEARANCE.scale == 1.0)
 
 print("\nIdentity rename")
 old_user = alice.keys.username

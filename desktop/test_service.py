@@ -179,6 +179,8 @@ check("calls: the service, its permission, and the audio helper ship",
                                 "WAKE_LOCK", "VIBRATE")) and
       "android.add_src = src/android/java" in spec_text and
       (ROOT / "src/android/java/org/fext/call/CallAudio.java").is_file())
+check("Android's own cloud backup does not copy the keys and chats",
+      "\nandroid.allow_backup = False" in spec_text)
 check("notifications: their receiver is declared once, not exported",
       once.count("org.fext.notify.NotifyReceiver") == 1 and
       "org.fext.notify.NotifyReceiver" in inside and

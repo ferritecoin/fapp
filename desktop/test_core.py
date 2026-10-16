@@ -465,6 +465,14 @@ if OLD is not None:
         check(f"...and acknowledges a '{ctl['op']}' it cannot use, showing "
               "nothing", acked and
               old_app.store.message_count(sender.address) == before)
+    acked, _c = deliver_old("Reacted", {
+        "k": "ctl", "ft": M.FEATURES, "ctl": {
+            "op": "react", "cid": c912, "e": "\u2764\ufe0f",
+            "es": ["\U0001F44D", "\u2764\ufe0f"]}})
+    check("...and takes several reactions (v12) as the latest of them",
+          acked and old_app.store.reaction_of(sender.address, c912,
+                                              sender.address) ==
+          "\u2764\ufe0f")
     old_app.store.close()
 app.store.close()
 
@@ -545,6 +553,38 @@ check("one reaction per person per message",
 st.set_reaction(GPEER, "ann1" * 8, ME, "")
 check("taking a reaction back removes it",
       st.reaction_of(GPEER, "ann1" * 8, ME) == "")
+# v12: several reactions per person.
+C1 = "ann2" * 8
+TH, HE, LA, WO = "\U0001F44D", "\u2764\ufe0f", "\U0001F602", "\U0001F62E"
+st.add_in(GPEER, "react to me", M.now_iso(), None, C1, author=B)
+check("several reactions per person (v12), oldest first",
+      st.set_reactions(GPEER, C1, B, [TH, HE]) and
+      st.reactions_of(GPEER, C1, B) == [TH, HE] and
+      not st.set_reactions(GPEER, C1, B, [TH, HE]))
+check("...the latest where a release before 12 reads its one",
+      st.reaction_of(GPEER, C1, B) == HE and st._db.execute(
+          "SELECT COUNT(*) FROM reactions WHERE cid = ?", (C1,)
+      ).fetchone()[0] == 1)
+st.set_reactions(GPEER, C1, B, [TH, HE, LA, WO])
+check("...at most three, the latest kept",
+      st.reactions_of(GPEER, C1, B) == [HE, LA, WO])
+st.set_reactions(GPEER, C1, B, [HE, WO])
+check("...one taken back leaves the others, in their order",
+      st.reactions_of(GPEER, C1, B) == [HE, WO] and
+      st.reaction_of(GPEER, C1, B) == WO)
+st.set_reaction(GPEER, C1, ME, LA)
+got = [(e, r) for e, r, _a in st.reactions_for(GPEER, [C1])[C1]]
+check("...everyone's together, in the order they were given",
+      got == [(HE, B), (WO, B), (LA, ME)], str(got))
+check("one reaction from a release before 12 stands for all of theirs",
+      st.set_reaction(GPEER, C1, B, TH) and
+      st.reactions_of(GPEER, C1, B) == [TH])
+st.set_reactions(GPEER, C1, B, [HE, WO])
+st.delete_messages([st.message_by_cid(GPEER, C1)["id"]])
+check("deleting a message takes all its reactions with it",
+      not st.reactions_for(GPEER, [C1]) and not st._db.execute(
+          "SELECT COUNT(*) FROM reactions_more WHERE cid = ?", (C1,)
+      ).fetchone()[0])
 event = st.add_event(GPEER, "Ann added Ben")
 check("group events are stored as readable, already-read rows",
       st.message(event)["kind"] == "event" and st.message(event)["read"] == 1)
@@ -563,6 +603,15 @@ if OLD is not None:
         check("the previous release still opens a 9.1 database", False,
               f"{type(exc).__name__}: {exc}")
 
+check("several reactions are validated whole (v12)",
+      M.sanitize_reactions(["\U0001F44D", "\u2764\ufe0f"]) ==
+      ["\U0001F44D", "\u2764\ufe0f"] and M.sanitize_reactions([]) == [] and
+      M.sanitize_reactions(["\U0001F44D"] * 2) is None and
+      M.sanitize_reactions(["\U0001F600", "\U0001F601", "\U0001F602",
+                            "\U0001F603"]) is None and
+      M.sanitize_reactions(["\U0001F44D", "ok"]) is None and
+      M.sanitize_reactions(["\U0001F44D", ""]) is None and
+      M.sanitize_reactions("\U0001F44D") is None)
 check("emoji reactions are validated",
       M.sanitize_emoji("\U0001F44D\U0001F3FD") and
       M.sanitize_emoji("") == "" and M.sanitize_emoji("ok") is None and
@@ -667,6 +716,26 @@ gdeliver("Removed", carol, x={"k": "ctl", "ctl": {
     "op": "react", "cid": gm, "e": "", "grp": GID2}})
 check("a reaction can be taken back",
       gapp.store.reaction_of(GP2, gm, carol.address) == "")
+gdeliver("Reacted", carol, x={"k": "ctl", "ctl": {
+    "op": "react", "cid": gm, "e": "\u2764\ufe0f",
+    "es": ["\U0001F44D", "\u2764\ufe0f"], "grp": GID2}})
+check("a 12 app's several reactions are all recorded (v12)",
+      gapp.store.reactions_of(GP2, gm, carol.address) ==
+      ["\U0001F44D", "\u2764\ufe0f"])
+gdeliver("Reacted", carol, x={"k": "ctl", "ctl": {
+    "op": "react", "cid": gm, "e": "\U0001F602",
+    "es": ["\U0001F602", "\U0001F602"], "grp": GID2}})
+check("...a list that is not a valid one is refused whole, whatever its 'e'",
+      gapp.store.reactions_of(GP2, gm, carol.address) ==
+      ["\U0001F44D", "\u2764\ufe0f"])
+gdeliver("Reacted", carol, x={"k": "ctl", "ctl": {
+    "op": "react", "cid": gm, "e": "\U0001F602", "grp": GID2}})
+check("...and one from an older app replaces them all",
+      gapp.store.reactions_of(GP2, gm, carol.address) == ["\U0001F602"])
+gdeliver("Removed", carol, x={"k": "ctl", "ctl": {
+    "op": "react", "cid": gm, "e": "", "es": [], "grp": GID2}})
+check("...an empty list takes every one back",
+      gapp.store.reactions_of(GP2, gm, carol.address) == [])
 gdeliver("Deleted", dan, x={"k": "ctl", "ctl": {
     "op": "delete", "cids": [gm], "grp": GID2}})
 check("another member cannot delete someone's group message",
