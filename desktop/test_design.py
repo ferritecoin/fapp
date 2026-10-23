@@ -205,6 +205,7 @@ class Harness(App):
 
     def parts(self, _dt):
         self.colour()
+        self.reactions()
         caps = M.CapsLabel("Section", size=11, size_hint_x=None,
                            width=dp(300))
         check("capitals are set in upper case", caps.text == "SECTION")
@@ -253,6 +254,43 @@ class Harness(App):
                                   size=(dp(300), dp(70)))
         self.root_box.add_widget(self.ink)
 
+    def reactions(self):
+        thumbs_up, heart = "\U0001F44D", "\u2764\ufe0f"
+        names = {"FecMe": "ann", "FecA": "ben", "FecB": "cy", "FecC": "dee",
+                 "FecD": "eli"}
+        given = [(thumbs_up, a, f"2026-10-15T10:0{i}:00+00:00")
+                 for i, a in enumerate(("FecA", "FecMe", "FecB"))]
+        given += [(heart, a, f"2026-10-15T11:0{i}:00+00:00")
+                  for i, a in enumerate(("FecA", "FecB", "FecC", "FecD"))]
+        bar = M.ReactionBar()
+        bar.set(given, "FecMe", lambda _e: None, name_of=names.get,
+                under=M.T.peer)
+        self.root_box.add_widget(bar)
+        bar.layout_for(dp(320))
+        mine, many = bar.chip_for(thumbs_up), bar.chip_for(heart)
+        mine._sync()
+        drawn_lines = [type(i).__name__ for c in bar.chips
+                       for i in c.canvas.before.children
+                       if type(i).__name__ in ("Line", "SmoothLine")]
+        check("reactions have no outline (v13): a fill a shade off the "
+              "bubble, gold for yours", not drawn_lines and
+              mine.fill == M.mix(M.T.peer, M.T.accent, .30) and
+              many.fill == M.mix(M.T.peer, M.T.text, .09), drawn_lines)
+        check("...in a group, up to three who gave one show as faces, the "
+              "latest first, inside the reaction",
+              [f.disc.seed for f in mine.faces] == ["FecB", "FecMe", "FecA"]
+              and mine.label.text == thumbs_up and
+              mine.faces[-1].right <= mine.right - dp(8),
+              [f.disc.seed for f in mine.faces])
+        check("...four or more as a count", not many.faces and
+              many.label.text == f"{heart} 4")
+        direct = M.ReactionBar()
+        direct.set(given[:2], "FecMe", lambda _e: None)
+        check("in a direct chat, the count alone",
+              not direct.chips[0].faces and
+              direct.chips[0].label.text == f"{thumbs_up} 2")
+        self.root_box.remove_widget(bar)
+
     def settle(self, _dt):
         lines = [t for t in (self.ink._lines_labels or ()) if t]
         pixels = lines[0].pixels if lines else b""
@@ -280,6 +318,15 @@ class Harness(App):
     def closed(self, _dt):
         check("Back closes the open sheet first",
               self.handled and self.sheet.parent is None)
+        looks = [M.tick_look(s) for s in (0, 1, 2, 3)]
+        marks = [M.TickMarks(count=c, tint=t, clock=k) for c, t, k in looks]
+        check("two ticks at most: a clock while on this phone, one grey tick "
+              "on the relay, two grey on their phone, two gold once read",
+              [(c, t == M.T.tick, k) for c, t, k in looks] ==
+              [(0, False, True), (1, False, False), (2, False, False),
+               (2, True, False)] and marks[0].width > 0 and
+              marks[1].width < marks[2].width == marks[3].width,
+              str([(c, t, k) for c, t, k in looks]))
         avatars = [M.Avatar("FecX", "Ann", kind=k) for k in
                    ("dm", "group", "self")]
         check("people, groups and notes to self have distinct discs",

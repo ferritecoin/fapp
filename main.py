@@ -45,13 +45,14 @@
 #      silently alter messages: forgery fails ECDSA verification, tampering
 #      fails AES-GCM authentication.
 #
-#  Tick system (0/3 .. 3/3), rendered on every outgoing bubble:
-#      0/3  ✓ grey    queued locally, not yet on the server
-#      1/3  ✓ gold    ciphertext stored by the relay
-#      2/3  ✓✓ gold   recipient downloaded the ciphertext
-#      3/3  ✓✓✓ gold  recipient actively marked it read
+#  Delivery states (0/3 .. 3/3, as the relay counts them), shown on every
+#  outgoing bubble as two ticks at most:
+#      0/3  clock     queued locally, not yet on the server
+#      1/3  ✓ grey    ciphertext stored by the relay
+#      2/3  ✓✓ grey   recipient downloaded the ciphertext
+#      3/3  ✓✓ gold   recipient actively marked it read
 #  Per-contact privacy (tap the chat title bar): if EITHER side selects
-#  "No ticks status" the server relays nothing and both sides cap at 1 gold
+#  "No ticks status" the server relays nothing and both sides cap at one
 #  tick. "Auto mark all as read" (default on) controls whether merely
 #  viewing a chat emits the 3/3 receipt or whether you mark manually.
 #
@@ -67,12 +68,41 @@
 
 from __future__ import annotations
 
+# ---- Android services -------------------------------------------------------
+# Android starts the app's two services from this file too, each in a process
+# of its own, and python-for-android names which in PYTHON_NAME, as
+# buildozer.spec's `services =` does (the app's own process is "python").
+import os
+import time
+
+SERVICE_NAME = "fextsync"          # must match `services =` in buildozer.spec
+CALL_SERVICE_NAME = "fextcall"     # likewise
+ANDROID_SERVICE = os.environ.get("PYTHON_NAME", "").lower()
+if ANDROID_SERVICE == CALL_SERVICE_NAME:
+    # Android lets a call's microphone stay on off screen only while the app
+    # runs a foreground service of the 'microphone' type (android_call_service
+    # starts this one). It shows "Call in progress" and does nothing else: it
+    # waits while the flag file the app named exists, six hours at most, and
+    # ends before anything below is imported.
+    _flag = os.environ.get("PYTHON_SERVICE_ARGUMENT", "")
+    _until = time.time() + 6 * 3600
+    while _flag and os.path.exists(_flag) and time.time() < _until:
+        time.sleep(1.0)
+    raise SystemExit
+if ANDROID_SERVICE == SERVICE_NAME:
+    # The sync service (run_background_service) has no window: Kivy must not
+    # make one, and is given the metrics it would otherwise ask a window for
+    # (dp() is evaluated while this file is imported).
+    os.environ.update({"KIVY_WINDOW": "none", "KIVY_DPI": "160",
+                       "KIVY_METRICS_DENSITY": "1",
+                       "KIVY_METRICS_FONTSCALE": "1", "KIVY_NO_ARGS": "1",
+                       "KIVY_NO_CONSOLELOG": "1"})
+
 import base64
 import io
 import json
 import logging
 import math
-import os
 import platform
 import queue
 import re
@@ -87,7 +117,6 @@ import sys
 import tarfile
 import tempfile
 import threading
-import time
 import unicodedata
 import uuid
 import weakref
@@ -888,7 +917,7 @@ REQUIRE_TLS = _os.environ.get("FEXT_REQUIRE_TLS", "") not in ("", "0", "false")
 
 APP_NAME = "Ferritext"
 #: Must equal `version` in buildozer.spec — CI refuses to build if not.
-APP_VERSION = "12.0.0"
+APP_VERSION = "13.0.0"
 
 # The identity/QR payload keeps carrying the ORIGINAL tag. It is wire data
 # that older clients already produce and consume, so renaming the app must
@@ -986,6 +1015,7 @@ def _resolve_asset_dir() -> Path:
 
 ASSET_DIR = _resolve_asset_dir()
 LOGO_FILE = ASSET_DIR / "ferritext_logo.png"
+LOGO_FILE_DARK = ASSET_DIR / "ferritext_logo_dark.png"   # on its plate
 DESKTOP_ICON = ASSET_DIR / "icon_desktop.png"      # title bar, taskbar, dock
 DESKTOP_ICO = ASSET_DIR / "icon_desktop.ico"       # Windows' own sizes
 IDENTITIES_PATH = DATA_DIR / "identities.json"
@@ -3496,11 +3526,11 @@ def android_take_photo(callback: Callable[[str], None]) -> None:
 # Notifications only reach someone if something is listening for messages.
 # While the app's process is alive, its own SyncWorker does that. Android
 # kills background apps freely, though, so a small foreground service (a
-# separate process, see service.py and run_background_service) takes over
+# separate process started from this file, see ANDROID_SERVICE at the top
+# and run_background_service) takes over
 # whenever the app's worker has gone quiet, and steps aside again the moment
 # it is back. Each side proves it is alive by touching a heartbeat file; two
 # processes never hold a connection for the same identity at once.
-SERVICE_NAME = "fextsync"          # must match `services =` in buildozer.spec
 HEARTBEAT_EVERY = 10.0             # seconds between beats
 HEARTBEAT_STALE = 35.0             # older than this: that process is gone
 
@@ -3627,14 +3657,11 @@ def android_service(start: bool) -> None:
 
 
 # ---- calls (Android) ---------------------------------------------------------
-CALL_SERVICE_NAME = "fextcall"     # must match `services =` in buildozer.spec
-
-
 def android_call_service(start: bool) -> None:
     """While a call is on, a small foreground service of the 'microphone'
     type: Android lets an app keep using the microphone in the background
-    only while it runs one (see call_service.py). It lives as long as the
-    flag file does."""
+    only while it runs one (the call service at the top of this file). It
+    lives as long as the flag file does."""
     autoclass, _ = _jni()
     ctx = android_context()
     service = autoclass(f"{ctx.getPackageName()}.Service"
@@ -5297,7 +5324,7 @@ class CallAudio:
 
 class AndroidCallAudio(CallAudio):
     """The phone's own call audio, through org.fext.call.CallAudio (see
-    src/android/java): the platform's voice-call microphone, with echo
+    android/CallAudio.java): the platform's voice-call microphone, with echo
     cancelling where the phone has it, and the earpiece or loudspeaker.
     It runs its own two threads, so speech keeps flowing whatever Python
     is doing; frames cross over as base64 text, which pyjnius hands across
@@ -8720,6 +8747,20 @@ class LocalStore:
         with self._lock:
             return [e for e, _at in self._reactions_of(peer, cid, reactor)]
 
+    def favourite_reactions(self, reactor: str, limit: int = 6) -> list:
+        """The emoji `reactor` reacts with most, the latest first among
+        equals (v12)."""
+        with self._lock:
+            rows = self._db.execute(
+                """SELECT emoji, COUNT(*) AS n, MAX(at) AS last FROM (
+                       SELECT emoji, at FROM reactions WHERE reactor = ?
+                       UNION ALL
+                       SELECT emoji, at FROM reactions_more
+                           WHERE reactor = ?)
+                   GROUP BY emoji ORDER BY n DESC, last DESC LIMIT ?""",
+                (reactor, reactor, limit)).fetchall()
+        return [row["emoji"] for row in rows]
+
     def reaction_of(self, peer: str, cid: str, reactor: str) -> str:
         """The latest reaction `reactor` gave message `cid` ('' for none)."""
         with self._lock:
@@ -10377,10 +10418,13 @@ def offscreen_texture(key, width_px: int, height_px: int,
 
 
 def draw_icon(name: str, cx: float, cy: float, size: float, rgba,
-              width: Optional[float] = None, scale: float = 1.0) -> None:
+              width: Optional[float] = None, scale: float = 1.0,
+              state: Optional[float] = None) -> None:
     """Draw one icon into the CURRENT canvas context: it fits a `size`
     square centred on (cx, cy), tinted `rgba`. `scale` shrinks the drawing
-    (an animation) without rendering the icon again at every step.
+    (an animation) without rendering the icon again at every step. `state`
+    (0 to 1) is what a setting's icon shows of its setting (StateIcon); an
+    icon in a state is drawn as it is, not kept.
 
     Icons are drawn, not typed: no font has the whole set, and drawing keeps
     them crisp at any density.
@@ -10388,6 +10432,10 @@ def draw_icon(name: str, cx: float, cy: float, size: float, rgba,
     # Kivy's Line width is HALF the stroke: this draws one 1/16 of the icon
     # thick (1.5 units of the 24-unit grid), never thinner than 1.2dp.
     w = width or max(dp(0.6), size * 0.031)
+    if state is not None:
+        Color(*rgba)
+        icon_geometry(name, cx, cy, size, rgba, w, dp(1), state)
+        return
     side = int(math.ceil(size * 1.25)) + 4
     tex = offscreen_texture(
         ("icon", name, round(size, 2), round(w, 3)), side, side,
@@ -10406,9 +10454,10 @@ def draw_icon(name: str, cx: float, cy: float, size: float, rgba,
 
 
 def icon_geometry(name: str, cx: float, cy: float, size: float, rgba,
-                  w: float, u: float) -> None:
+                  w: float, u: float, state: Optional[float] = None) -> None:
     """The geometry of one icon, in the current colour and canvas: it fits a
     `size` square centred on (cx, cy), stroked `w` wide; `u` is one dp.
+    `state`: see draw_icon (None: the icon's usual look).
 
     The newer icons are laid out on a 24-unit grid with y running down, as
     icon artwork usually is; `G` maps grid points onto the canvas.
@@ -10777,6 +10826,73 @@ def icon_geometry(name: str, cx: float, cy: float, size: float, rgba,
                       10.5, 6), **line)
         Line(points=G(14.5, 3, 21, 3, 21, 9.5), **line)
         Line(points=G(10, 14, 21, 3), **line)
+    elif name == "moon":                       # a crescent
+        # The disc (x1, y1, r1) less the one that covers it (x2, y2, r2):
+        # its rim the long way round, then the covering disc's edge back.
+        (x1, y1, r1), (x2, y2, r2) = (11.2, 12.8, 8.6), (16.6, 7.6, 7.4)
+        d = math.hypot(x2 - x1, y2 - y1)
+        a = (r1 * r1 - r2 * r2 + d * d) / (2 * d)
+        k = math.sqrt(max(0.0, r1 * r1 - a * a))
+        mx, my = x1 + a * (x2 - x1) / d, y1 + a * (y2 - y1) / d
+        ends = ((mx + k * (y2 - y1) / d, my - k * (x2 - x1) / d),
+                (mx - k * (y2 - y1) / d, my + k * (x2 - x1) / d))
+
+        def sweep(x0, y0, via):
+            a0, a1 = (math.degrees(math.atan2(py - y0, px - x0))
+                      for px, py in ends)
+            up = a1 if a1 > a0 else a1 + 360
+            t = via if via > a0 else via + 360
+            return (a0, up) if t <= up else (a0, up - 360)
+        away = math.degrees(math.atan2(y1 - y2, x1 - x2))
+        outer = arc(x1, y1, r1, *sweep(x1, y1, away))
+        inner = arc(x2, y2, r2, *sweep(x2, y2, away))
+        back = [v for i in range(len(inner) - 2, -1, -2)
+                for v in inner[i:i + 2]]       # the inner edge, end to start
+        if state:                              # filled as it turns on
+            # The lune between the two edges, as a strip of pairs: both
+            # edges run from one tip to the other, at the same steps.
+            ao, bo = sweep(x1, y1, away)
+            ai, bi = sweep(x2, y2, away)
+            verts = []
+            for i in range(41):
+                f = i / 40
+                for (x0, y0, r), a0, a1 in (((x1, y1, r1), ao, bo),
+                                            ((x2, y2, r2), ai, bi)):
+                    t = math.radians(a0 + (a1 - a0) * f)
+                    verts += [*G(x0 + r * math.cos(t), y0 + r * math.sin(t)),
+                              0, 0]
+            Color(rgba[0], rgba[1], rgba[2], rgba[3] * state)
+            Mesh(vertices=verts, indices=list(range(len(verts) // 4)),
+                 mode="triangle_strip")
+            Color(*rgba)
+        Line(points=outer + back, close=True, width=w, joint="round")
+    elif name == "motion":                     # a ball, and its wake
+        # state 1 (motion reduced): the ball at rest in the middle, no wake.
+        f = state or 0.0
+        bx = 16.4 - 4.4 * f
+        Line(circle=(*G(bx, 12), 4.6 * s), width=w)
+        for y, x0 in ((8.2, 5.5), (12, 2.6), (15.8, 5.5)):
+            length = (10.2 - x0) * (1 - f)
+            if length > 0.3:
+                end = bx - 6.2
+                Line(points=G(end - length, y, end, y), **line)
+    elif name == "theme":                      # a disc, dark by its state
+        # 0 light, .5 the system's (half), 1 dark.
+        f = 0.5 if state is None else state
+        Line(circle=(*G(12, 12), 8.6 * s), width=w)
+        if f > 0.01:
+            fill(G(12, 12) + arc(12, 12, 8.6, -90, -90 + 360 * f))
+    elif name == "text_size":                  # a large A and a small one
+        # The large A grows with the size chosen (state 0 smallest .. 1).
+        k = 1.0 if state is None else 0.7 + 0.3 * state
+
+        def big(*xy):
+            return G(*[v for i in range(0, len(xy), 2) for v in
+                       (8.4 + (xy[i] - 8.4) * k, 19.5 + (xy[i + 1] - 19.5) * k)])
+        Line(points=big(2.8, 19.5, 8.4, 4.8, 14, 19.5), **line)
+        Line(points=big(5, 14, 11.8, 14), **line)
+        Line(points=G(14.4, 19.5, 17.7, 11.4, 21, 19.5), **line)
+        Line(points=G(15.6, 16.6, 19.8, 16.6), **line)
 
 
 _HANDSET: list = []
@@ -10909,20 +11025,32 @@ class IconButton(ButtonBehavior, Widget):
                           scale=self.icon_scale)
 
 
+def tick_look(status: int) -> tuple:
+    """How a delivery state is drawn (v13): (ticks, colour, clock). A clock
+    while it is still on this phone; one grey tick once on the relay; two
+    grey once on their phone; two gold once read."""
+    if status <= 0:
+        return 0, T.tick_grey, True
+    if status >= 3:
+        return 2, T.tick, False
+    return status, T.tick_grey, False
+
+
 class TickMarks(Widget):
     """Delivery ticks, drawn (no font has a dependable check mark).
 
-    0 grey = still on this phone; 1 = on the relay; 2 = on their phone;
-    3 = read. In a group, the count is the slowest member's. Ticks overlap
-    so two and three read as one mark.
+    Up to two ticks, overlapping so they read as one mark, or a small
+    clock while the message is still on this phone (see tick_look). In a
+    group, the state is the slowest member's.
     """
 
     def __init__(self, count: int = 0, tint: Optional[str] = None,
-                 mark: float = None, **kw):
+                 mark: float = None, clock: bool = False, **kw):
         kw.setdefault("size_hint", (None, None))
         self._mark = mark or dp(9.5)
         self._step = self._mark * 0.52
         self._count, self._tint = max(0, min(int(count), 3)), tint or T.tick
+        self._clock = bool(clock) and self._count == 0
         kw.setdefault("size", (self._width_for(self._count), self._mark))
         super().__init__(**kw)
         self.bind(pos=self._redraw, size=self._redraw)
@@ -10930,19 +11058,28 @@ class TickMarks(Widget):
 
     def _width_for(self, count: int) -> float:
         if count <= 0:
-            return 0.0
+            return self._mark * 0.92 if self._clock else 0.0
         return self._mark * 0.92 + self._step * (count - 1)
 
-    def set_state(self, count: int, tint: str) -> None:
+    def set_state(self, count: int, tint: str, clock: bool = False) -> None:
         count = max(0, min(int(count), 3))
-        if count == self._count and tint == self._tint:
+        clock = bool(clock) and count == 0
+        if count == self._count and tint == self._tint and \
+                clock == self._clock:
             return
-        self._count, self._tint = count, tint
+        self._count, self._tint, self._clock = count, tint, clock
         self.width = self._width_for(count)
         self._redraw()
 
     def _paint_marks(self, x0: float, y0: float, k: float) -> None:
         h, w = self._mark * k, max(dp(.7), self._mark * .08) * k
+        if self._clock:
+            r = h * 0.42
+            cx, cy = x0 + h * 0.46, y0 + h * 0.46
+            Line(circle=(cx, cy, r), width=w)
+            Line(points=[cx, cy + r * 0.62, cx, cy, cx + r * 0.5, cy],
+                 width=w, cap="round", joint="round")
+            return
         for i in range(self._count):
             x = x0 + i * self._step * k
             Line(points=[x, y0 + h * 0.45, x + h * 0.34, y0 + h * 0.06,
@@ -10951,13 +11088,14 @@ class TickMarks(Widget):
 
     def _redraw(self, *_a):
         self.canvas.clear()
-        if self._count <= 0:
+        if self._count <= 0 and not self._clock:
             return
         pad = int(math.ceil(dp(2)))
         tw = int(math.ceil(self._width_for(self._count))) + 2 * pad
         th = int(math.ceil(self._mark)) + 2 * pad
         tex = offscreen_texture(
-            ("ticks", self._count, round(self._mark, 2)), tw, th,
+            ("clock" if self._clock else "ticks", self._count,
+             round(self._mark, 2)), tw, th,
             lambda k: self._paint_marks(pad * k, pad * k, k))
         with self.canvas:
             Color(*C(self._tint))
@@ -11227,23 +11365,65 @@ class SectionHead(BoxLayout):
         self.add_widget(self.caps)
 
 
+class StateIcon(Widget):
+    """A setting's icon that shows its setting: `state` from 0 to 1 (see
+    icon_geometry), and go() moves it to a new one, in a third of a second
+    (at once when motion is reduced). A screen built again after a change
+    starts its icon where the last one was, so the move is seen."""
+
+    state = NumericProperty(0.0)
+    #: name -> the state last drawn, kept across rebuilt screens.
+    _shown: dict = {}
+
+    def __init__(self, name: str, state: float, tint: str, **kw):
+        kw.setdefault("size_hint", (None, None))
+        kw.setdefault("size", (dp(24), dp(24)))
+        super().__init__(**kw)
+        self.name, self.tint = name, tint
+        self.state = StateIcon._shown.get(name, state)
+        self.bind(pos=self._draw, size=self._draw, state=self._draw)
+        self.go(state)
+
+    def go(self, target: float) -> None:
+        Animation.cancel_all(self, "state")
+        if APPEARANCE.reduce_motion or abs(self.state - target) < 1e-3:
+            self.state = target
+        else:
+            Animation(state=target, d=0.32, t="out_cubic").start(self)
+        self._draw()
+
+    def _draw(self, *_a) -> None:
+        StateIcon._shown[self.name] = self.state
+        self.canvas.clear()
+        with self.canvas:
+            draw_icon(self.name, self.center_x, self.center_y, dp(22),
+                      C(self.tint), state=self.state)
+
+
 class ListRow(ButtonBehavior, BoxLayout):
     """Icon · title over an optional hint · a control or a chevron.
 
     The whole row is the tap target; hints wrap rather than being cut off.
+    With `state`, the icon is a StateIcon (`.glyph`) that shows it.
     """
 
     def __init__(self, icon: Optional[str], title: str, hint: str = "",
                  control: Optional[Widget] = None,
                  on_tap: Optional[Callable] = None, danger: bool = False,
                  chevron: bool = False, title_color: Optional[str] = None,
-                 **kw):
+                 state: Optional[float] = None, **kw):
         kw.setdefault("size_hint_y", None)
         kw.setdefault("padding", [dp(20), dp(10), dp(16), dp(10)])
         kw.setdefault("spacing", dp(16))
         super().__init__(**kw)
         tint = T.alert if danger else T.text_2
-        if icon:
+        self.icon, self.glyph = icon, None
+        if icon and state is not None:
+            self.glyph = StateIcon(icon, state, tint)
+            mark = AnchorLayout(size_hint_x=None, width=dp(24))
+            mark.add_widget(self.glyph)
+            self.add_widget(mark)
+        elif icon:
             glyph = Widget(size_hint_x=None, width=dp(24))
             glyph.bind(pos=lambda w, *_a: self._glyph(w, icon, tint),
                        size=lambda w, *_a: self._glyph(w, icon, tint))
@@ -14120,8 +14300,8 @@ class ConversationRow(ButtonBehavior, BoxLayout):
             status = int(conv.get("last_status") or 0)
             if not conv.get("ticks_enabled", 1) and kind == "dm":
                 status = min(status, 1)
-            ticks = TickMarks(count=max(1, min(status, 3)),
-                              tint=T.tick if status > 0 else T.tick_grey,
+            count, tint, clock = tick_look(status)
+            ticks = TickMarks(count=count, tint=tint, clock=clock,
                               pos_hint={"center_y": .5})
             bottom.add_widget(ticks)
         text = single_line(preview, fs(15.5), T.text_2 if unread else T.text_3,
@@ -15547,49 +15727,95 @@ def make_body(text: str, font_size, links: list = ()) -> Widget:
     return body
 
 
+class ChipFace(Widget):
+    """A face inside a reaction (v13): the giver's disc, set in a ring of
+    the reaction's own colour so that faces can overlap cleanly."""
+
+    def __init__(self, seed: str, name: str, diameter: float, ring: str,
+                 **kw):
+        kw.setdefault("size_hint", (None, None))
+        kw.setdefault("size", (diameter, diameter))
+        super().__init__(**kw)
+        with self.canvas:
+            Color(*C(ring))
+            self._ring = SmoothEllipse()
+        self.disc = Avatar(seed, name, diameter=diameter - dp(3))
+        self.add_widget(self.disc)
+        self.bind(pos=self._sync, size=self._sync)
+
+    def _sync(self, *_a):
+        self._ring.pos, self._ring.size = self.pos, self.size
+        self.disc.center = self.center
+
+
 class ReactionChip(ButtonBehavior, Widget):
-    """One reaction under a message — the emoji and how many gave it. Your
-    own is ringed in gold; tap it to take it back (or to add yours)."""
+    """One reaction under a message: the emoji, and how many gave it — or,
+    in a group, while FACES or fewer have, their faces, the latest first
+    (v13). No outline (v13): a fill a shade off what it sits on (`under`),
+    gold for yours. Tap it to take yours back (or to add it), hold it to
+    see who gave it (v13)."""
 
     pop = NumericProperty(1.0)
+    FACES, FACE, FACE_STEP = 3, dp(20), dp(13)
 
-    def __init__(self, emoji: str, count: int, mine: bool, on_tap, **kw):
+    def __init__(self, emoji: str, count: int, mine: bool, on_tap,
+                 faces: Optional[list] = None, under: Optional[str] = None,
+                 **kw):
         kw.setdefault("size_hint", (None, None))
         super().__init__(**kw)
         self.emoji, self.mine = emoji, mine
-        self.label = Label(text=emoji if count < 2 else f"{emoji} {count}",
-                           font_size=fs(15), color=C(T.text),
-                           size_hint=(None, None))
+        faces = list(faces or [])
+        if len(faces) > self.FACES:
+            faces = []
+        under = under or (T.surface if T.dark else T.bg)
+        self.fill = mix(under, T.accent, .30) if mine else \
+            mix(under, T.text, .09)
+        self.label = Label(text=emoji if faces or count < 2 else
+                           f"{emoji} {count}", font_size=fs(15),
+                           color=C(T.text), size_hint=(None, None))
         self.label.texture_update()
-        self.size = (max(dp(40), self.label.texture_size[0] + dp(18)),
-                     max(dp(30), round(fs(15) * 1.7)))
         self.label.size = self.label.texture_size
         self.add_widget(self.label)
+        self.faces = [ChipFace(seed, name, self.FACE, self.fill)
+                      for seed, name in faces]
+        pile = self.FACE + self.FACE_STEP * (len(faces) - 1) + dp(5) \
+            if faces else 0
+        self.size = (max(dp(40), self.label.texture_size[0] + pile + dp(18)),
+                     max(dp(30), round(fs(15) * 1.7)))
         with self.canvas.before:
             PushMatrix()
             self._scale = Scale(1, 1, 1)
-            ground = T.bg if T.dark else T.surface_hi
-            self._ground_col = Color(*C(mix(T.accent, ground, .80) if mine
-                                        else ground))
+            self._ground_col = Color(*C(self.fill))
             self._ground = SmoothRoundedRectangle(radius=[dp(15)])
-            Color(*C(T.accent if mine else T.rule_strong))
-            self._edge = SmoothLine(width=1.0)
         with self.canvas.after:
             PopMatrix()
+        for face in reversed(self.faces):       # the first on top
+            self.add_widget(face)
         self.bind(pos=self._sync, size=self._sync, pop=self._sync,
                   state=lambda _w, s: setattr(self, "opacity",
                                               .7 if s == "down" else 1))
-        self.bind(on_release=lambda _w: on_tap(emoji))
+        self.bind(on_release=lambda _w: None if self._held() else
+                  on_tap(emoji))
+
+    def _held(self) -> bool:
+        """Let go after a hold, which showed who gave it: no tap (v13)."""
+        touch = self.last_touch
+        return bool(touch is not None and touch.ud.get("fext_long_press"))
 
     def _sync(self, *_a):
-        self._scale.origin = (self.x + self.width / 2, self.y + self.height / 2)
+        cx, cy = self.x + self.width / 2, self.y + self.height / 2
+        self._scale.origin = (cx, cy)
         self._scale.x = self._scale.y = self.pop
         self._ground.pos, self._ground.size = self.pos, self.size
         self._ground.radius = [self.height / 2]
-        self._edge.rounded_rectangle = (self.x + .5, self.y + .5,
-                                        self.width - 1, self.height - 1,
-                                        self.height / 2 - .5)
-        self.label.center = ((self.x + self.width / 2), (self.y + self.height / 2) + dp(.5))
+        if not self.faces:
+            self.label.center = (cx, cy + dp(.5))
+            return
+        self.label.pos = (self.x + dp(9), cy - self.label.height / 2 + dp(.5))
+        x = self.label.right + dp(5)
+        for face in self.faces:
+            face.pos = (x, cy - face.height / 2)
+            x += self.FACE_STEP
 
     def animate_in(self) -> None:
         if not motion(1):
@@ -15611,19 +15837,31 @@ class ReactionBar(Widget):
         self.chips: list = []
         self.bind(pos=self._place)
 
-    def set(self, reactions: list, me: str, on_tap) -> None:
+    def set(self, reactions: list, me: str, on_tap,
+            name_of: Optional[Callable] = None,
+            under: Optional[str] = None) -> None:
+        """Given `name_of` (in a group), the chips show who gave them as
+        faces (v13); `under` is the colour they sit on."""
         for chip in self.chips:
             self.remove_widget(chip)
         groups: dict = {}
         for emoji, reactor, _at in reactions:
             groups.setdefault(emoji, []).append(reactor)
-        self.chips = [ReactionChip(e, len(who), me in who, on_tap)
-                      for e, who in groups.items()]
+        self.chips = [ReactionChip(
+            e, len(who), me in who, on_tap, under=under,
+            faces=None if name_of is None else
+            [(a, name_of(a)) for a in reversed(who)])
+            for e, who in groups.items()]
         for chip in self.chips:
             self.add_widget(chip)
 
     def chip_for(self, emoji: str) -> Optional[ReactionChip]:
         return next((c for c in self.chips if c.emoji == emoji), None)
+
+    def chip_at(self, wx: float, wy: float) -> Optional[ReactionChip]:
+        """The chip at a point in window coordinates, if one is there."""
+        return next((c for c in self.chips
+                     if c.collide_point(*c.to_widget(wx, wy))), None)
 
     def layout_for(self, max_w: float) -> tuple:
         """Size for `max_w`: (width, height); 0 high when there are none."""
@@ -15655,6 +15893,102 @@ class ReactionBar(Widget):
                 x, y = self.x, y - h - self.GAP
             chip.pos = (x, y)
             x += chip.width + self.GAP
+
+
+class ReactorsSheet(Sheet):
+    """Who reacted to a message, and with what (v13): held on one of its
+    reactions, or right-clicked on a computer. A row for each, the newest
+    first. With more than one kind, the reactions along the top, in their
+    order under the message, choose which are listed. A tap on yours takes
+    it back; on anyone else's, it opens what their disc beside a group's
+    messages does."""
+
+    def __init__(self, screen, msg: dict, only: str = "", **kw):
+        words = message_text(msg) or {"image": "Photo", "voice":
+                                      "Voice message"}.get(msg.get("kind"),
+                                                           "")
+        quote = f"\u201c{single_line_text(words, 48)}\u201d" if words else ""
+        super().__init__("Reactions", subtitle=quote, **kw)
+        self.screen, self.msg, self.only = screen, msg, only
+        self.card.padding = [0, dp(8), 0, dp(14)]
+        self.title_label.padding = [dp(22), 0]
+        if self.subtitle_label is not None:
+            self.subtitle_label.padding = [dp(22), 0]
+        self.kinds_row = BoxLayout(size_hint=(None, 1), spacing=dp(6),
+                                   padding=[dp(20), 0])
+        self.kinds_row.bind(minimum_width=self.kinds_row.setter("width"))
+        self.kinds = ScrollView(size_hint_y=None, do_scroll_y=False,
+                                bar_width=0, height=max(dp(30),
+                                                        round(fs(15) * 1.7)))
+        self.kinds.add_widget(self.kinds_row)
+        self.rows: list = []
+        self.render()
+
+    def _reactions(self) -> list:
+        store, cid = self.screen.app.store, self.msg.get("client_msg_id")
+        if store is None or not cid:
+            return []
+        peer = self.msg.get("peer") or self.screen.peer
+        return store.reactions_for(peer, [cid]).get(cid, [])
+
+    def render(self) -> None:
+        reactions = self._reactions()
+        if not reactions:
+            self.dismiss()
+            return
+        counts: dict = {}
+        for emoji, _who, _at in reactions:
+            counts[emoji] = counts.get(emoji, 0) + 1
+        if self.only not in counts:
+            self.only = ""
+        self.kinds_row.clear_widgets()
+        if len(counts) > 1:
+            card = T.surface if T.dark else T.bg
+            self.kinds_row.add_widget(ReactionChip(
+                "All", len(reactions), not self.only,
+                lambda _e: self._choose(""), under=card))
+            for emoji, count in counts.items():
+                self.kinds_row.add_widget(ReactionChip(
+                    emoji, count, emoji == self.only,
+                    lambda _e, e=emoji: self._choose(e), under=card))
+            if self.kinds.parent is None:
+                self.card.add_widget(self.kinds, index=1)
+        elif self.kinds.parent is not None:
+            self.card.remove_widget(self.kinds)
+        app = self.screen.app
+        me = app.keys.address
+        self.rows = []
+        for emoji, who, at in sorted(reactions, key=lambda r: r[2],
+                                     reverse=True):
+            if self.only and emoji != self.only:
+                continue
+            mine = who == me
+            name = self.screen.author_name(who)
+            glyph = Label(text=emoji, font_size=fs(24), color=C(T.text),
+                          size_hint=(None, None), size=(dp(40), dp(40)))
+            row = PersonRow(
+                who, name, "Tap to take it back" if mine else pretty_day(at),
+                on_tap=(lambda e=emoji: self._take_back(e)) if mine else
+                (lambda a=who: self._person(a)), trailing=glyph,
+                initial_from=app.keys.username if mine else name)
+            row.emoji, row.reactor = emoji, who
+            self.rows.append(row)
+        self.body.clear_widgets()
+        self.body.add_widget(rows_card(self.rows, inset=dp(76)))
+        self._fit()
+
+    def _choose(self, emoji: str) -> None:
+        self.only = emoji
+        self.render()
+
+    def _take_back(self, emoji: str) -> None:
+        self.screen.app.react(self.msg["id"], emoji)
+        self.render()
+
+    def _person(self, address: str) -> None:
+        self.dismiss()
+        Clock.schedule_once(lambda _dt: self.screen.on_face_tap(address),
+                            0.05)
 
 
 class MessageBubble(BoxLayout):
@@ -15776,10 +16110,10 @@ class MessageBubble(BoxLayout):
                           font_size=fs(12.5), color=C(T.text_3),
                           halign="right", valign="middle",
                           size_hint=(None, None), height=line_height(12.5))
-        count, tint = self._tick_state(msg, outgoing, ticks_enabled)
+        count, tint, clock = self._tick_state(msg, outgoing, ticks_enabled)
         if screen.kind == "self":
-            count = 0                    # nothing is sent, so nothing to tick
-        self.ticks = TickMarks(count=count, tint=tint,
+            count, clock = 0, False      # nothing is sent, so nothing to tick
+        self.ticks = TickMarks(count=count, tint=tint, clock=clock,
                                pos_hint={"center_y": .5})
         self.star = Widget(size_hint=(None, None),
                            size=(dp(12), line_height(12.5)))
@@ -15870,8 +16204,15 @@ class MessageBubble(BoxLayout):
 
     def _set_reactions(self, msg: dict) -> None:
         reactions = msg.get("reactions") or []
-        self.reactions.set(reactions, self.screen.app.keys.address,
-                           lambda e, m=msg: self.screen.on_reaction_tap(m, e))
+        screen, keys = self.screen, self.screen.app.keys
+        name_of = None
+        if screen.kind == "group":              # who gave them, as faces
+            name_of = (lambda a: keys.username if a == keys.address
+                       else screen.author_name(a))
+        self.reactions.set(reactions, keys.address,
+                           lambda e, m=msg: screen.on_reaction_tap(m, e),
+                           name_of=name_of, under=T.bg if self.big else
+                           T.own if self.outgoing else T.peer)
         row = self._react_row
         if reactions and row.parent is None:
             # Just above the time: the meta row, when present, is last.
@@ -15903,19 +16244,18 @@ class MessageBubble(BoxLayout):
 
     @staticmethod
     def _tick_state(msg: dict, outgoing: bool, ticks_enabled: bool) -> tuple:
-        """(tick count, colour). Outgoing ticks come from the relay's
-        receipts (in a group: the slowest member's); incoming ones from
-        what this phone knows — it holds the message (2), and whether you
-        read it (3). Either side turning ticks off caps both at one."""
+        """(ticks, colour, clock), from tick_look. Outgoing ticks come from
+        the relay's receipts (in a group: the slowest member's); incoming
+        ones from what this phone knows — it holds the message (2), and
+        whether you read it (3). Either side turning ticks off caps both
+        at one."""
         if outgoing:
             status = msg["status"]
         else:
             status = 3 if msg["read"] else 2
         if not ticks_enabled:
             status = min(status, 1)
-        if status <= 0:
-            return 1, T.tick_grey
-        return min(status, 3), T.tick
+        return tick_look(status)
 
     def update(self, msg: dict, ticks_enabled: bool) -> None:
         """Repaint in place after a status/read/star/media/reaction change."""
@@ -16180,7 +16520,8 @@ class BubbleRow(AnchorLayout):
             self.screen.toggle_selection(self.msg_id)
             return True
         if getattr(touch, "button", "left") == "right":
-            self.screen.start_selection(self.msg_id)
+            if not self._reactors_at(touch.pos):
+                self.screen.start_selection(self.msg_id)
             return True
         touch.grab(self)
         touch.ud["fext_row"] = True
@@ -16191,9 +16532,19 @@ class BubbleRow(AnchorLayout):
 
     def _long_press(self, touch):
         if self._press and self._press[0] == touch.uid and not swiped(touch):
-            self._press = None
+            pos, self._press = self._press[1], None
             touch.ud["fext_long_press"] = True
-            self.screen.start_selection(self.msg_id)
+            if not self._reactors_at(pos):
+                self.screen.start_selection(self.msg_id)
+
+    def _reactors_at(self, pos) -> bool:
+        """Held, or right-clicked, on one of its reactions: who gave them
+        (v13), in place of selecting the message."""
+        chip = self.bubble.reactions.chip_at(*self.to_window(*pos))
+        if chip is None:
+            return False
+        self.screen.show_reactors(self.msg_id, chip.emoji)
+        return True
 
     def on_touch_move(self, touch):
         if self._press and self._press[0] == touch.uid:
@@ -16244,6 +16595,7 @@ class DayDivider(BoxLayout):
         kw.setdefault("padding", [dp(28), 0])
         kw.setdefault("spacing", dp(12))
         super().__init__(**kw)
+        self.day_text = text
         self.add_widget(Rule(pos_hint={"center_y": .5}))
         caps = CapsLabel(text, size=10.5, color=T.text_3, tracking=0.18,
                          halign="center", size_hint=(None, None),
@@ -16251,6 +16603,62 @@ class DayDivider(BoxLayout):
         caps.width = caps.natural_width + dp(2)
         self.add_widget(caps)
         self.add_widget(Rule(pos_hint={"center_y": .5}))
+
+
+class DayFloat(Widget):
+    """The day of the messages at the top of the view, floating over them
+    while you scroll (v12), so you know where you are in a long chat."""
+
+    def __init__(self, **kw):
+        kw.setdefault("size_hint", (None, None))
+        kw.setdefault("size", (dp(80), dp(28)))
+        super().__init__(**kw)
+        self.caps = CapsLabel("", size=10.5, color=T.text_2, tracking=0.18,
+                              halign="center", size_hint=(None, None))
+        self.add_widget(self.caps)
+        self.opacity = 0
+        self.shown = False
+        self.bind(pos=self._sync, size=self._sync)
+
+    def _sync(self, *_a) -> None:
+        self.canvas.before.clear()
+        r = self.height / 2
+        with self.canvas.before:
+            Color(*C(T.surface_hi))
+            SmoothRoundedRectangle(pos=self.pos, size=self.size, radius=[r])
+            Color(*C(T.rule_strong))
+            SmoothLine(rounded_rectangle=(self.x + .5, self.y + .5,
+                                          self.width - 1, self.height - 1,
+                                          r - .5), width=1.0)
+        self.caps.size = (self.caps.natural_width + dp(2), self.height)
+        self.caps.center = self.center
+
+    def show(self, text: str) -> None:
+        if text.upper() != self.caps.text:
+            self.caps.text = text
+            self.width = self.caps.natural_width + dp(30)
+            if self.parent is not None:
+                # A float layout places a child again when its hints
+                # change, not its size: keep it centred.
+                self.center_x = self.parent.center_x
+            self._sync()
+        if not self.shown:
+            self.shown = True
+            Animation.cancel_all(self, "opacity")
+            if motion(1):
+                Animation(opacity=1, d=0.12).start(self)
+            else:
+                self.opacity = 1
+
+    def hide(self, *_a) -> None:
+        if not self.shown:
+            return
+        self.shown = False
+        Animation.cancel_all(self, "opacity")
+        if motion(1):
+            Animation(opacity=0, d=0.25).start(self)
+        else:
+            self.opacity = 0
 
 
 class NewMessagesLine(BoxLayout):
@@ -16486,15 +16894,12 @@ class ReactionStrip(Concealable, BoxLayout):
         kw.setdefault("height", dp(54))
         kw.setdefault("padding", [dp(6), dp(3)])
         super().__init__(**kw)
+        self._on_pick = on_pick
         self.keys = {}
-        for emoji in QUICK_REACTIONS:
-            key = EmojiKey(emoji, on_pick, size=(dp(46), dp(48)))
-            key.font_size = sp(24)
-            self.keys[emoji] = key
-            self.add_widget(key)
-        self.add_widget(IconButton("plus", label="More reactions",
+        self.more_key = IconButton("plus", label="More reactions",
                                    size=(dp(46), dp(48)),
-                                   on_release=lambda _w: on_more()))
+                                   on_release=lambda _w: on_more())
+        self.set_choices(QUICK_REACTIONS)
         self.width = dp(46) * (len(QUICK_REACTIONS) + 1) + dp(12)
         with self.canvas.before:
             Color(0, 0, 0, .30 if T.dark else .10)
@@ -16511,9 +16916,6 @@ class ReactionStrip(Concealable, BoxLayout):
             Color(*C(T.rule_strong))
             self._edge = SmoothLine(width=1.0)
         self.bind(pos=self._sync, size=self._sync)
-        # The rings follow the keys, which the box lays out after it moves.
-        for key in self.keys.values():
-            key.bind(pos=self._sync)
         self.opacity = 0
         self.conceal(True)
         self._current: list = []
@@ -16541,6 +16943,25 @@ class ReactionStrip(Concealable, BoxLayout):
     @property
     def current(self) -> list:
         return list(self._current)
+
+    def set_choices(self, emojis) -> None:
+        """The reactions offered, in order (v12: yours first)."""
+        emojis = list(dict.fromkeys(emojis))[:len(QUICK_REACTIONS)]
+        if emojis == list(self.keys):
+            return
+        self.clear_widgets()
+        self.keys = {}
+        for emoji in emojis:
+            key = EmojiKey(emoji, self._on_pick, size=(dp(46), dp(48)))
+            key.font_size = sp(24)
+            # The rings follow the keys, which the box lays out after it
+            # moves.
+            key.bind(pos=self._sync)
+            self.keys[emoji] = key
+            self.add_widget(key)
+        self.add_widget(self.more_key)
+        if hasattr(self, "_mine"):
+            self._sync()
 
     def show(self, current) -> None:
         """Raise it, ringing the reactions already given (`current`, a
@@ -16928,6 +17349,8 @@ class ConversationScreen(SwipeGestures, Screen):
                                               pos_hint={"right": 0.97,
                                                         "y": 0.02})
         self.stack.add_widget(self.jump_button)
+        self.day_float = DayFloat(pos_hint={"center_x": .5, "top": .985})
+        self.stack.add_widget(self.day_float)
         self.strip = ReactionStrip(self._strip_pick, self._strip_more)
         self.stack.add_widget(self.strip)
         self.scroll.bind(scroll_y=lambda *_a: self._on_scrolled())
@@ -17544,10 +17967,28 @@ class ConversationScreen(SwipeGestures, Screen):
                     return
         self._pending_pop[cid] = emoji
 
+    def quick_reactions(self) -> list:
+        """The strip's reactions: the ones you give most, then the usual
+        ones, six in all (v12)."""
+        store = self.app.store
+        mine = store.favourite_reactions(self.app.keys.address) \
+            if store is not None else []
+        return list(dict.fromkeys(mine + list(QUICK_REACTIONS)))[
+            :len(QUICK_REACTIONS)]
+
     def on_reaction_tap(self, msg: dict, emoji: str) -> None:
         if self.selecting:
             return
         self.app.react(msg["id"], emoji)
+
+    def show_reactors(self, msg_id: int, emoji: str = "") -> None:
+        """Who gave a message's reactions (v13), those of `emoji` first
+        listed when it has company."""
+        bubble = self._bubbles.get(msg_id)
+        if bubble is None or not bubble.msg.get("reactions"):
+            return
+        self.close_strip()
+        ReactorsSheet(self, bubble.msg, emoji).open()
 
     def _reactable(self, msg: dict) -> bool:
         return bool(msg.get("client_msg_id")) and msg.get("kind") != "event" \
@@ -17646,6 +18087,7 @@ class ConversationScreen(SwipeGestures, Screen):
                         if self.searching else self.normal_bar)
         msgs = list(self.selected.values())
         if len(msgs) == 1 and self._reactable(msgs[0]):
+            self.strip.set_choices(self.quick_reactions())
             self.strip.show(self.app.store.reactions_of(
                 msgs[0]["peer"], msgs[0]["client_msg_id"],
                 self.app.keys.address) if self.app.store else [])
@@ -17949,6 +18391,11 @@ class ConversationScreen(SwipeGestures, Screen):
                                  T.text_3)
 
     # ---- taps ------------------------------------------------------------------
+    def open_message_info(self, msg: dict) -> "MessageInfoSheet":
+        sheet = MessageInfoSheet(self, msg)
+        sheet.open()
+        return sheet
+
     def on_face_tap(self, address: Optional[str]) -> None:
         """The disc beside a member's messages (v12): the menu their row on
         the group's page opens, without leaving the chat."""
@@ -17973,6 +18420,14 @@ class ConversationScreen(SwipeGestures, Screen):
         if touch is not None and row is not None:
             # The row's handler passed its own view of the touch on.
             wx, wy = window_pos(row, *touch.pos)
+            meta = bubble.meta_row
+            if self.kind == "group" and bubble.outgoing and \
+                    meta.parent is bubble and meta.width > 0 and \
+                    meta.collide_point(*meta.to_widget(wx, wy)):
+                # v12: the time and ticks of yours in a group: who has it.
+                self.close_strip()
+                self.open_message_info(msg)
+                return
             for part in (bubble.media, bubble.quote, bubble.card,
                          bubble.reactions):
                 if part is not None and part.width > 0 and part.height > 0 \
@@ -17987,6 +18442,7 @@ class ConversationScreen(SwipeGestures, Screen):
             self.close_strip()
         elif self._reactable(msg):
             self._strip_for = msg_id
+            self.strip.set_choices(self.quick_reactions())
             self.strip.show(self.app.store.reactions_of(
                 msg["peer"], msg["client_msg_id"], self.app.keys.address)
                 if self.app.store else [])
@@ -18637,7 +19093,41 @@ class ConversationScreen(SwipeGestures, Screen):
         """Is a window short of the conversation's end showing?"""
         return getattr(self.app, "_chat_ceiling", None) is not None
 
+    #: How long the floating day stays once scrolling stops (v12).
+    DAY_FLOAT_HOLD = 1.4
+
+    def float_day(self) -> None:
+        """The day of the topmost message in view, floating over the top of
+        the chat — unless that day's own divider is showing there."""
+        if self.content_height() <= self.scroll.height:
+            self.day_float.hide()
+            return
+        # The rows' places are the content's own (the view slides over it):
+        # the top of what is in view, in those terms.
+        top = self.scroll.scroll_y * max(
+            0.0, self.messages.height - self.scroll.height) + \
+            self.scroll.height
+        day, first = None, None
+        for widget in reversed(self.messages.children):
+            if isinstance(widget, DayDivider):
+                day = widget.day_text
+            if widget.y < top - dp(2) and isinstance(
+                    widget, (DayDivider, BubbleRow, EventRow,
+                             NewMessagesLine)):
+                first = widget
+                break
+        if first is None or day is None or (
+                isinstance(first, DayDivider) and
+                first.top > top - dp(40)):
+            self.day_float.hide()
+            return
+        self.day_float.show(day)
+        Clock.unschedule(self.day_float.hide)
+        Clock.schedule_once(self.day_float.hide, self.DAY_FLOAT_HOLD)
+
     def _on_scrolled(self) -> None:
+        if getattr(self, "_user_scrolling", False) or self.day_float.shown:
+            self.float_day()
         if self.reading_back():                     # a window further back
             self._stick_to_bottom = False
             self._sync_jump_button()
@@ -19114,6 +19604,38 @@ class GroupInfoScreen(PageScreen):
             self.show(self.gid)
 
 
+class MessageInfoSheet(Sheet):
+    """Where a message of yours in a group has got to (v12): who has read
+    it, who has it, who it is on its way to."""
+
+    TIERS = ((3, "Read by"), (2, "Delivered to"), (1, "On its way to"),
+             (0, "Not sent yet to"))
+
+    def __init__(self, screen, msg: dict) -> None:
+        text = single_line_text(message_text(msg) or {
+            "image": "Photo", "voice": "Voice message"}.get(
+                msg.get("kind"), "Message"), 60)
+        super().__init__("Message info", subtitle=f"\u201c{text}\u201d")
+        store = screen.app.store
+        sends = store.group_sends(msg["id"]) if store is not None else []
+        self.counts = {}
+        for tier, heading in self.TIERS:
+            people = [r["member"] for r in sends
+                      if min(3, int(r.get("status") or 0)) == tier]
+            self.counts[tier] = len(people)
+            if not people:
+                continue
+            self.add(CapsLabel(f"{heading} \u00b7 {len(people)}", size=10.5,
+                               color=T.accent))
+            self.add(rows_card([PersonRow(m, screen.author_name(m),
+                                          short_addr(m, 18))
+                                for m in people], inset=dp(76)))
+        if sends and not self.counts.get(3):
+            self.add(InfoLabel("Someone who has turned read receipts off "
+                               "shows here as delivered, at most.",
+                               color=T.text_3, italic=True))
+
+
 class AddMembersSheet(Sheet):
     """The admin adds contacts to a group."""
 
@@ -19164,43 +19686,50 @@ class SettingsScreen(PageScreen):
         self.body.clear_widgets()
         app = self.app
         self.body.add_widget(SectionHead("Appearance"))
-        pad = BoxLayout(orientation="vertical", size_hint_y=None,
-                        padding=[dp(20), dp(4), dp(20), dp(8)],
-                        spacing=dp(4))
-        pad.bind(minimum_height=pad.setter("height"))
-        pad.add_widget(CapsLabel("Theme", size=10.5, color=T.text_3))
-        pad.add_widget(Segmented(THEME_CHOICES, APPEARANCE.mode,
-                                 lambda v: app.set_appearance(theme=v)))
         sys_dark = system_prefers_dark()
-        pad.add_widget(InfoLabel(
+        # What each choice shows in its icon (StateIcon).
+        theme_at = {"light": 0.0, "system": 0.5, "dark": 1.0}
+        size_at = {k: i / (len(TEXT_SCALES) - 1)
+                   for i, (k, _l, _s) in enumerate(TEXT_SCALES)}
+
+        def chose(what, glyph_of, value, at):
+            app.set_appearance(**{what: value})
+            glyph_of().go(at)
+        theme = self._picker("theme", "Theme", Segmented(
+            THEME_CHOICES, APPEARANCE.mode,
+            lambda v: chose("theme", lambda: theme.row.glyph, v,
+                            theme_at[v])), theme_at[APPEARANCE.mode])
+        theme.add_widget(InfoLabel(
             "System follows your phone's setting" +
             ("" if sys_dark is None else
              f" (now {'dark' if sys_dark else 'light'})") + ".",
             color=T.text_3, italic=True, font_size=fs(14.5)))
-        pad.add_widget(Widget(size_hint_y=None, height=dp(10)))
-        pad.add_widget(CapsLabel("Text size", size=10.5, color=T.text_3))
         current = next((k for k, _l, s in TEXT_SCALES
                         if abs(s - APPEARANCE.scale) < .01), "default")
-        pad.add_widget(Segmented([(k, label) for k, label, _s in TEXT_SCALES],
-                                 current,
-                                 lambda v: app.set_appearance(text_size=v)))
-        pad.add_widget(InfoLabel(
-            "“See you at nine?” — a sample at this size, 14:05 👍",
+        size = self._picker("text_size", "Text size", Segmented(
+            [(k, label) for k, label, _s in TEXT_SCALES], current,
+            lambda v: chose("text_size", lambda: size.row.glyph, v,
+                            size_at[v])), size_at[current])
+        size.add_widget(InfoLabel(
+            "“See you at nine?” — this size, 14:05 👍",
             font_size=fs(17), padding=[0, dp(6)]))
-        self.body.add_widget(pad)
-        self.body.add_widget(rows_card([ListRow(
-            None, "Black background",
+        self.body.add_widget(rows_card([theme.row, size.row]))
+        self.body.add_widget(Rule(inset=dp(60)))
+        black = ListRow(
+            "moon", "Black background",
             "The dark theme on a black page: deeper at night, and it saves "
             "battery on OLED screens. Off: a warm dark grey",
-            control=ToggleSwitch(APPEARANCE.black,
-                                 lambda on: app.set_appearance(black=on))),
-            ListRow(
-            None, "Reduce motion",
+            control=ToggleSwitch(APPEARANCE.black, lambda on: chose(
+                "black", lambda: black.glyph, on, float(on))),
+            state=float(APPEARANCE.black))
+        motion = ListRow(
+            "motion", "Reduce motion",
             "Pages cross-fade instead of sliding; sheets, reactions and "
             "scrolling move without animation",
-            control=ToggleSwitch(APPEARANCE.reduce_motion,
-                                 lambda on: app.set_appearance(
-                                     reduce_motion=on)))]))
+            control=ToggleSwitch(APPEARANCE.reduce_motion, lambda on: chose(
+                "reduce_motion", lambda: motion.glyph, on, float(on))),
+            state=float(APPEARANCE.reduce_motion))
+        self.body.add_widget(rows_card([black, motion]))
         self.body.add_widget(SectionHead("Notifications"))
         if IS_ANDROID or os.environ.get("FEXT_SHOW_ANDROID_SETTINGS"):
             rows = [ListRow(
@@ -19281,6 +19810,30 @@ class SettingsScreen(PageScreen):
         self.body.add_widget(rows_card([ListRow(
             "info", f"{APP_NAME} {APP_VERSION}", "Version, relay and type",
             chevron=True, on_tap=lambda: AboutSheet(app).open())]))
+
+    @staticmethod
+    def _picker(icon: str, title: str, control: Widget,
+                state: float) -> BoxLayout:
+        """A setting chosen from a few, laid out as a row is: its icon in
+        the rows' column, showing the choice (StateIcon), its heading and
+        choices where their titles go. Returns the column to add to;
+        `.row` is the whole, `.row.glyph` the icon."""
+        row = BoxLayout(size_hint_y=None, spacing=dp(16),
+                        padding=[dp(20), dp(10), dp(16), dp(8)])
+        mark = AnchorLayout(anchor_y="top", size_hint_x=None, width=dp(24))
+        glyph = StateIcon(icon, state, T.text_2)
+        mark.add_widget(glyph)
+        row.add_widget(mark)
+        col = BoxLayout(orientation="vertical", size_hint_y=None,
+                        spacing=dp(4))
+        col.bind(minimum_height=col.setter("height"))
+        col.add_widget(CapsLabel(title, size=10.5, color=T.text_3))
+        col.add_widget(control)
+        row.add_widget(col)
+        col.bind(height=lambda *_a: setattr(row, "height", col.height +
+                                            dp(18)))
+        row.icon, row.glyph, col.row = icon, glyph, row
+        return col
 
     def _on_delivery(self, on: bool) -> None:
         save_pref("background_delivery", bool(on))
@@ -19426,7 +19979,8 @@ class SettingsModal:
 
 
 class SplashOverlay(FloatLayout):
-    """The loading screen: the mark above the wordmark, on white.
+    """The loading screen: the mark above the wordmark — on white, or in a
+    dark theme on the theme's own ground, the mark on its white plate.
 
     It covers the first paint (the screens being built, the identity read
     off disk, the transport probe going out) and then fades. It is a widget
@@ -19440,24 +19994,36 @@ class SplashOverlay(FloatLayout):
     def __init__(self, **kw):
         super().__init__(**kw)
         # White, as specified — the ground of the launcher icon and the
-        # platform presplash, so the three hand over seamlessly.
-        paint_round(self, "#FFFFFF", radius=0)
+        # platform presplash, so the three hand over seamlessly. In a dark
+        # theme the platform presplash is black too (res/values-night and
+        # res/drawable-night), so a phone at night is never lit up white.
+        dark = T.dark
+        self.ground = T.bg if dark else "#FFFFFF"
+        paint_round(self, self.ground, radius=0)
         column = BoxLayout(orientation="vertical", spacing=dp(18),
                            size_hint=(None, None), width=dp(280),
-                           height=dp(320),
                            pos_hint={"center_x": 0.5, "center_y": 0.5})
-        if LOGO_FILE.exists():
-            column.add_widget(KivyImage(source=str(LOGO_FILE),
-                                        allow_stretch=True, keep_ratio=True,
-                                        size_hint_y=None, height=dp(180)))
+        column.bind(minimum_height=column.setter("height"))
+        logo = LOGO_FILE_DARK if dark and LOGO_FILE_DARK.exists() \
+            else LOGO_FILE
+        self.logo = None
+        if logo.exists():
+            self.logo = KivyImage(source=str(logo), allow_stretch=True,
+                                  keep_ratio=True, size_hint_y=None,
+                                  height=dp(180))
+            column.add_widget(self.logo)
+        # As tall as its two lines: a fixed height a pixel short of them
+        # made Kivy drop "Messenger" without a word.
         wordmark = Label(
             text="Ferrite Text\nMessenger", halign="center", valign="top",
-            font_size=sp(26), color=C("#1B1915"), line_height=1.1,
-            size_hint_y=None, height=dp(74))
-        wordmark.bind(size=lambda w, v: setattr(w, "text_size", v))
+            font_size=sp(26), color=C(T.text if dark else "#1B1915"),
+            line_height=1.1, size_hint_y=None)
+        wordmark.bind(width=lambda w, v: setattr(w, "text_size", (v, None)),
+                      texture_size=lambda w, v: setattr(w, "height", v[1]))
         column.add_widget(wordmark)
         byline = Label(text="by koh-gt", italic=True, font_size=sp(15),
-                       color=C("#6F685C"), size_hint_y=None, height=dp(24))
+                       color=C(T.text_3 if dark else "#6F685C"),
+                       size_hint_y=None, height=dp(24))
         column.add_widget(byline)
         self.add_widget(column)
 
@@ -22959,4 +23525,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if ANDROID_SERVICE == SERVICE_NAME:
+        run_background_service()
+    else:
+        main()

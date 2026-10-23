@@ -19,7 +19,7 @@ option for either of these.
 
 * The receiver for what is done to a notification from the shade — a
   reply typed into it, Mark as read, Decline on a call — which hands each
-  to the app as a small file (src/android/java/org/fext/notify). Not
+  to the app as a small file (android/NotifyReceiver.java). Not
   exported: only the app's own notifications can reach it.
 """
 import re

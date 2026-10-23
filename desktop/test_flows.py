@@ -383,6 +383,42 @@ check("it arrives in the group, signed by its author",
       row["body"] == "Chapter four next week? 📖" and row["author"] == B)
 check("bob's copy tracks delivery per member",
       len(bob.store.group_sends(gm)) == 2)
+# v12 (S9): where it has got to, member by member, from its ticks.
+for member, tier in ((A, 3), (K, 2)):
+    bob.store._db.execute("UPDATE group_sends SET status = ? WHERE "
+                          "local_id = ? AND member = ?", (tier, gm, member))
+bob.store._db.commit()
+bob.open_conversation(gpeer)
+pump(bob)
+bscreen = bob.conversation_screen
+bbubble = bscreen._bubbles[gm]
+wait_for(lambda: bbubble.meta_row.width > 0, 1.0)
+
+
+class Tap:
+    pos = bbubble.meta_row.center
+
+
+bscreen.on_bubble_tap(gm, Tap())
+infos = [w for w in M.Window.children if isinstance(w, M.MessageInfoSheet)]
+check("in a group, the time and ticks of your message show where it has "
+      "got to: read by alice, delivered to cara (S9)",
+      infos and infos[0].counts == {3: 1, 2: 1, 1: 0, 0: 0},
+      str(infos[0].counts if infos else None))
+for sheet in infos:
+    sheet.dismiss(animation=False)
+
+
+class Elsewhere:
+    pos = (bbubble.body.center_x, bbubble.body.center_y)
+
+
+bscreen.on_bubble_tap(gm, Elsewhere())
+check("...while a tap anywhere else on it still raises the reactions",
+      bscreen._strip_for == gm and not [
+          w for w in M.Window.children
+          if isinstance(w, M.MessageInfoSheet)])
+bscreen.close_strip()
 title, text, muted = M.notification_text(cara.store, gpeer, row["body"],
                                          "text", row["author"])
 check("a group notification is titled with the group and names the writer",
@@ -474,6 +510,26 @@ deliver(relay, parties)
 check("choosing one of yours again takes back that one only",
       cara.store.reactions_of(gpeer, cid, A) == ["❤️", "😮"] and
       cara.store.reaction_of(gpeer, cid, A) == "😮")
+
+# v12 (S8): the reactions you give most come first in the strip.
+for n, emojis in enumerate((["🍝"], ["🍝", "🎉"], ["🍝"])):
+    alice.store.set_reactions(gpeer, f"fav{n}" * 8, A, emojis)
+screen.start_selection(bubble.msg["id"])
+offered = list(screen.strip.keys)
+check("the reactions you give most come first in the strip (S8)",
+      offered[0] == "🍝" and offered[1] in ("🎉", "❤️", "😮") and
+      len(offered) == 6 and "🎉" in offered, str(offered))
+favourites = alice.store.favourite_reactions(A)
+rest = [e for e in offered if e not in favourites]
+check("...the usual ones fill the rest, in their order",
+      offered[:len(offered) - len(rest)] == favourites[:6 - len(rest)] and
+      rest == [e for e in M.QUICK_REACTIONS if e not in favourites][
+          :len(rest)], f"{offered} {favourites}")
+screen.strip.keys["🍝"].dispatch("on_release")
+wait_for(lambda: len(relay.mail) >= 2)
+check("...and a key of the strip so made reacts as any other",
+      "🍝" in alice.store.reactions_of(gpeer, cid, A))
+deliver(relay, parties)
 screen.open_emoji()
 screen.entry.text = ""
 screen.emoji_panel._pick("🙂")

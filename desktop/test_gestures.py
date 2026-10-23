@@ -11,6 +11,9 @@ a real app controller, its real input pipeline and its screens.
     a tap, and a vertical drag is a scroll, not a swipe;
   * real taps through the input pipeline: a message, a message with a
     reaction, elsewhere with reactions up (9.1.2 crashed on the last two);
+  * holding a reaction (on a computer, a right-click) lists who gave it
+    and lets you take yours back; a tap on it still gives or takes back
+    yours, and a hold elsewhere still selects the message (v13);
   * a mouse drag on a computer is not a swipe (it selects text);
   * search in a chat counts its matches and steps through them, back in
     time and forward, to messages far beyond the ones drawn;
@@ -288,6 +291,99 @@ except Exception as exc:                    # pragma: no cover - the bug
 check("a tap on a message that has a reaction does not crash it either",
       crashed is None, repr(crashed))
 screen.close_strip()
+
+print("\nWho reacted (v13)")
+peer, cid = msg["peer"], msg["client_msg_id"]
+THUMBS, HEART = "\U0001F44D", "\u2764\ufe0f"
+app.store.set_reactions(peer, cid, me, [])      # the tap above gave one
+app.react(row.msg_id, HEART)
+pump(0.4)
+
+
+def reactors_sheets():
+    return [w for w in Window.children if isinstance(w, M.ReactorsSheet)]
+
+
+def listed(sheet):
+    return [(r.emoji, r.reactor) for r in sheet.rows]
+
+
+row = screen._rows[row.msg_id]
+down(*centre(row.bubble.reactions.chip_for(THUMBS)))
+pump(M.BubbleRow.LONG_PRESS + 0.25)
+up()
+pump(0.4)
+sheet = (reactors_sheets() or [None])[0]
+check("holding a reaction shows who gave it: no selection, and nothing "
+      "reacted on letting go", sheet is not None and not screen.selecting
+      and app.store.reactions_of(peer, cid, me) == [HEART])
+check("...those of the one held listed, the others there to choose from",
+      sheet is not None and sheet.only == THUMBS and
+      listed(sheet) == [(THUMBS, other)] and
+      [c.emoji for c in reversed(sheet.kinds_row.children)] ==
+      ["All", THUMBS, HEART], sheet and listed(sheet))
+everyone = next(c for c in sheet.kinds_row.children if c.emoji == "All")
+down(*centre(everyone))
+up()
+pump(0.3)
+check("...'All' lists every one, the newest first, yours said to be yours",
+      listed(sheet) == [(HEART, me), (THUMBS, other)] and
+      sheet.rows[0].children[1].children[-1].text == "You",
+      listed(sheet))
+down(*centre(sheet.rows[0]))
+up()
+pump(0.3)
+check("...a tap on yours takes it back, and the list follows",
+      app.store.reactions_of(peer, cid, me) == [] and
+      listed(sheet) == [(THUMBS, other)] and sheet.kinds.parent is None,
+      listed(sheet))
+sheet.dismiss(animation=False)
+pump(0.3)
+row = screen._rows[row.msg_id]
+down(*centre(row.bubble.reactions.chip_for(THUMBS)))
+up()
+pump(0.4)
+check("a tap on a reaction still gives yours", app.store.reactions_of(
+    peer, cid, me) == [THUMBS] and not reactors_sheets())
+
+
+class RightClick:
+    """A right-click as Kivy's mouse input hands it to a widget."""
+    button, is_mouse_scrolling = "right", False
+
+    def __init__(self, widget, at):
+        self.ud = {}
+        self.pos = widget.to_widget(*at)
+        self.x, self.y = self.pos
+
+
+row = screen._rows[row.msg_id]
+row.on_touch_down(RightClick(row, centre(
+    row.bubble.reactions.chip_for(THUMBS))))
+pump(0.4)
+check("on a computer a right-click on a reaction shows who gave it too",
+      len(reactors_sheets()) == 1 and not screen.selecting)
+for each in reactors_sheets():
+    each.dismiss(animation=False)
+pump(0.3)
+row.on_touch_down(RightClick(row, centre(row.bubble.body)))
+pump(0.3)
+check("...elsewhere on the message, it selects it as before",
+      screen.selecting and not reactors_sheets())
+for each in reactors_sheets():
+    each.dismiss(animation=False)
+screen.clear_selection()
+pump(0.3)
+row = screen._rows[row.msg_id]
+down(*centre(row.bubble.body))
+pump(M.BubbleRow.LONG_PRESS + 0.25)
+up()
+pump(0.3)
+check("...and so does holding it there", screen.selecting and
+      not reactors_sheets())
+screen.clear_selection()
+app.react(row.msg_id, THUMBS)
+pump(0.3)
 
 print("\nThe menu by swiping")
 app.go_back_to_chats()

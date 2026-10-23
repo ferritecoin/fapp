@@ -3,23 +3,25 @@
 
     python3 desktop/test_service.py main.py
 
-Runs WITHOUT a display, the way service.py runs on a phone: the
-environment below is the one service.py sets, and importing main.py must
-work under it. The service loop is driven for a scripted few cycles with
-the network worker replaced by a recorder.
+Runs WITHOUT a display, the way the sync service runs on a phone: Android
+starts it from main.py, python-for-android names it in PYTHON_NAME, and
+main.py must then import with no window. The service loop is driven for a
+scripted few cycles with the network worker replaced by a recorder; both
+services are also started from main.py as processes of their own.
 """
 import importlib.util
 import os
+import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
-os.environ.update({"KIVY_WINDOW": "none", "KIVY_DPI": "160",
-                   "KIVY_METRICS_DENSITY": "1", "KIVY_METRICS_FONTSCALE": "1",
-                   "KIVY_NO_ARGS": "1", "KIVY_NO_CONSOLELOG": "1"})
+os.environ["PYTHON_NAME"] = "Fextsync"        # as python-for-android sets it
 os.environ.pop("DISPLAY", None)
 os.environ["HOME"] = tempfile.mkdtemp(prefix="fext-svc-")
 ROOT = Path(__file__).resolve().parent.parent
+MAIN = Path(sys.argv[1] if len(sys.argv) > 1 else "main.py").resolve()
 
 RESULTS = []
 
@@ -30,8 +32,7 @@ def check(name, cond, detail=""):
           + (f" — {detail}" if detail and not cond else ""))
 
 
-spec = importlib.util.spec_from_file_location(
-    "main", sys.argv[1] if len(sys.argv) > 1 else "main.py")
+spec = importlib.util.spec_from_file_location("main", MAIN)
 M = importlib.util.module_from_spec(spec)
 sys.modules["main"] = M
 spec.loader.exec_module(M)
@@ -105,9 +106,7 @@ M.save_pref("background_delivery", True)
 
 print("\nHeartbeats")
 importlib.reload  # (real heartbeat functions, not the scripted one)
-spec2 = importlib.util.spec_from_file_location("main2", sys.argv[1]
-                                               if len(sys.argv) > 1
-                                               else "main.py")
+spec2 = importlib.util.spec_from_file_location("main2", MAIN)
 M2 = importlib.util.module_from_spec(spec2)
 spec2.loader.exec_module(M2)
 check("no heartbeat means not alive", not M2.heartbeat_fresh("app"))
@@ -116,6 +115,49 @@ check("a fresh heartbeat means alive", M2.heartbeat_fresh("app"))
 os.utime(M2._beat_path("app"))
 (M2._beat_path("app")).write_text("1")
 check("a stale heartbeat means gone", not M2.heartbeat_fresh("app"))
+
+print("\nBoth services start from main.py, as Android starts them")
+
+
+def service(name, argument=""):
+    """main.py run as python-for-android runs a service: its name in
+    PYTHON_NAME, a home of its own, every import it makes listed."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("KIVY_")}
+    env.update(PYTHON_NAME=name, PYTHON_SERVICE_ARGUMENT=argument,
+               HOME=tempfile.mkdtemp(prefix="fext-svc-"))
+    return subprocess.Popen([sys.executable, "-X", "importtime", str(MAIN)],
+                            env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+
+
+flag = Path(tempfile.mkdtemp(prefix="fext-call-")) / ".call_active"
+started = time.time()
+_out, err = service("Fextcall", str(flag)).communicate(timeout=120)
+took = time.time() - started
+check("the call service ends at once with no flag file, having imported "
+      "nothing of the app's (no Kivy, no requests)",
+      b"Traceback" not in err and b"kivy" not in err and
+      b"requests" not in err, err[-300:])
+flag.write_text("1")
+call = service("Fextcall", str(flag))
+time.sleep(took + 3)
+waited = call.poll() is None
+flag.unlink()
+try:
+    _out, err = call.communicate(timeout=10)
+except subprocess.TimeoutExpired:
+    call.kill()
+    _out, err = call.communicate()
+check("...and waits while its flag file is there, ending when it goes",
+      waited and call.returncode == 0, err[-300:])
+sync = service("Fextsync")
+time.sleep(8)
+running = sync.poll() is None
+sync.terminate()
+_out, err = sync.communicate(timeout=10)
+check("the sync service runs its loop, windowless",
+      running and b"background service: started" in err and
+      b"Traceback" not in err, err[-300:])
 
 print("\nManifest hook: service types (Android 14), camera FileProvider, "
       "notification receiver")
@@ -160,27 +202,46 @@ check("declares the camera's FileProvider once, inside <application>",
       'android:authorities="${applicationId}.fileprovider"' in inside and
       'android:exported="false"' in inside and
       'android:resource="@xml/fext_file_paths"' in inside)
-paths = (ROOT / "src" / "android" / "res" / "xml" /
-         "fext_file_paths.xml").read_text()
+paths = (ROOT / "android" / "fext_file_paths.xml").read_text()
 spec_text = (ROOT / "buildozer.spec").read_text()
 check("...whose one folder ships, with the class it names",
       '<cache-path name="camera" path="camera/" />' in paths and
-      "xml/fext_file_paths.xml" in spec_text and
+      "android/fext_file_paths.xml:xml/fext_file_paths.xml" in spec_text and
       "androidx.core:core:" in spec_text)
 perms = next(line for line in spec_text.splitlines()
              if line.startswith("android.permissions"))
 services = next(line for line in spec_text.splitlines()
                 if line.startswith("services"))
 check("calls: the service, its permission, and the audio helper ship",
-      "Fextcall:call_service.py:foreground" in services and
-      (ROOT / "call_service.py").is_file() and
+      "Fextcall:main.py:foreground" in services and
+      "Fextsync:main.py:foreground:sticky" in services and
       all(p in perms for p in ("FOREGROUND_SERVICE_MICROPHONE",
                                 "MODIFY_AUDIO_SETTINGS", "RECORD_AUDIO",
                                 "WAKE_LOCK", "VIBRATE")) and
-      "android.add_src = src/android/java" in spec_text and
-      (ROOT / "src/android/java/org/fext/call/CallAudio.java").is_file())
+      "\nandroid.add_src = android\n" in spec_text and
+      (ROOT / "android" / "CallAudio.java").is_file())
 check("Android's own cloud backup does not copy the keys and chats",
       "\nandroid.allow_backup = False" in spec_text)
+check("in dark mode the platform loading screen is black with the mark on "
+      "its plate: values-night overrides presplash_color, drawable-night "
+      "holds the picture, and both ship",
+      '<string name="presplash_color">#000000</string>' in (
+          ROOT / "android" / "strings_night.xml").read_text() and
+      (ROOT / "android" / "presplash_night.png").is_file() and
+      "android/strings_night.xml:values-night/strings.xml" in spec_text and
+      "android/presplash_night.png:drawable-night/presplash.png"
+      in spec_text and "\nandroid.presplash_color = #FFFFFF" in spec_text)
+shipped = next(line for line in spec_text.splitlines()
+               if line.startswith("android.add_resources")).split("=", 1)[1]
+shipped = {pair.split(":")[0].strip() for pair in shipped.split(",")}
+excluded = next(line for line in spec_text.splitlines()
+                if line.startswith("source.exclude_dirs"))
+check("android/: each file in it ships, as Java or as a resource, and "
+      "none among the app's own files",
+      all(f.suffix == ".java" or f"android/{f.name}" in shipped
+          for f in (ROOT / "android").iterdir()) and
+      all((ROOT / s).is_file() for s in shipped) and
+      "android" in [d.strip() for d in excluded.split("=")[1].split(",")])
 check("notifications: their receiver is declared once, not exported",
       once.count("org.fext.notify.NotifyReceiver") == 1 and
       "org.fext.notify.NotifyReceiver" in inside and
@@ -188,9 +249,9 @@ check("notifications: their receiver is declared once, not exported",
           "/>")[0].count('android:exported="false"') == 1)
 check("...with the classes that draw and answer them, and a call's "
       "full-screen permission",
-      (ROOT / "src/android/java/org/fext/notify/Notifier.java").is_file() and
-      (ROOT / "src/android/java/org/fext/notify/NotifyReceiver.java"
-       ).is_file() and "USE_FULL_SCREEN_INTENT" in perms)
+      (ROOT / "android" / "Notifier.java").is_file() and
+      (ROOT / "android" / "NotifyReceiver.java").is_file() and
+      "USE_FULL_SCREEN_INTENT" in perms)
 manifest.write_text("<manifest><application></application></manifest>")
 os.chdir(work)
 try:

@@ -81,6 +81,34 @@ try:
           any("by koh-gt" in getattr(w, "text", "")
               for w in app.splash.walk()),
           "wordmark not found")
+    mark = next(w for w in app.splash.walk()
+                if "Messenger" in getattr(w, "text", ""))
+    mark.width = mark.parent.width          # as the column lays it out
+    mark.texture_update()
+    drawn = [" ".join(word.text for word in line.words)
+             for line in mark._label._cached_lines]
+    check("...both of its lines: \"Messenger\" is drawn, not dropped for "
+          "want of a pixel", drawn == ["Ferrite Text", "Messenger"],
+          str(drawn))
+    # The loading screen follows the theme: white with the plain mark on a
+    # light phone, as the launcher icon; on a dark one the theme's ground
+    # and the mark on its white plate, so a phone at night is not lit up.
+    seen = {}
+    for theme in ("light", "black", "dark"):
+        mod.apply_theme(theme)
+        shown = mod.SplashOverlay()
+        seen[theme] = (shown.ground, shown.logo.source if shown.logo else "")
+    mod.apply_theme(app._theme_name)
+    check("the loading screen is white with the plain mark in the light "
+          "theme, and the theme's own ground with the mark on its plate in "
+          "the dark ones",
+          seen["light"][0] == "#FFFFFF" and
+          seen["light"][1].endswith("ferritext_logo.png") and
+          seen["black"][0] == mod.THEMES["black"]["bg"] == "#000000" and
+          seen["dark"][0] == mod.THEMES["dark"]["bg"] and
+          all(seen[t][1].endswith("ferritext_logo_dark.png")
+              for t in ("black", "dark")) and
+          mod.LOGO_FILE_DARK.exists(), str(seen))
     # the loading screen hands over to the first-run dialog when it goes
     app._splash_gone()
     check("loading screen is removed once it has faded",

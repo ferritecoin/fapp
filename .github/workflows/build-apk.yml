@@ -13,8 +13,10 @@ name: Build Android APK
 #     keystore (a persistent key you own — required so future updates install
 #     over this one; this is the proper production setup).
 #   * Otherwise the workflow generates an ephemeral keystore just for the build,
-#     so you still get a properly release-signed, installable APK. No key
-#     material is ever committed to the repo.
+#     so you still get a properly release-signed, installable APK, as the
+#     run's artifact. The default branch publishes no Release with it: no later
+#     release could install over one. No key material is ever committed to the
+#     repo.
 
 on:
   push:
@@ -199,6 +201,7 @@ jobs:
               -keyalg RSA -keysize 2048 -validity 10000 \
               -storepass "$STOREPASS" -keypass "$KEYPASS" \
               -dname "CN=FEXT Client, OU=FEXT, O=FEXT, C=SG"
+            echo "FEXT_THROWAWAY_KEY=1" >> "$GITHUB_ENV"
           fi
           export P4A_RELEASE_KEYSTORE="$KS"
           export P4A_RELEASE_KEYSTORE_PASSWD="$STOREPASS"
@@ -228,10 +231,14 @@ jobs:
       - name: Upload the deliverables as a workflow artifact
         if: success()
         uses: actions/upload-artifact@v4
+        # Kept a week: the Releases keep every version. A full artifact quota
+        # leaves a warning here, not a failed build without its Release.
+        continue-on-error: true
         with:
           name: ferritext-release
           path: release/*
           if-no-files-found: error
+          retention-days: 7
 
       - name: Publish to a GitHub Release
         # Only from the default branch: other branches are tested and built
@@ -244,6 +251,10 @@ jobs:
         run: |
           set -euo pipefail
           TAG="v${VER}"
+          if [ "${FEXT_THROWAWAY_KEY:-}" = 1 ]; then
+            echo "::error::Not publishing $TAG: this APK is signed with a throwaway key, and no later release could install over it. Add the FEXT_KEYSTORE_B64, FEXT_KEYSTORE_PASSWORD, FEXT_KEY_ALIAS and FEXT_KEY_PASSWORD secrets (README: Release signing), then re-run this build."
+            exit 1
+          fi
           NOTES="${TITLE} ${VER} (CI run #${{ github.run_number }}, commit ${GITHUB_SHA:0:7}). ${TITLE}-${VER}.apk: Android — sideload via 'Install unknown apps'. ${TITLE}-${VER}-desktop.py: the same client for Windows, macOS and Linux in one file, with its fonts and icons inside — run it with Python 3.11+ (see the README for the packages it needs)."
           # Each version is published once. Re-running the build of the commit
           # it was published from refreshes its Release; a later commit that

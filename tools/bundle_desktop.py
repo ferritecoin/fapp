@@ -28,7 +28,8 @@ MARK = "# FERRITEXT-ASSETS "
 #: for the loading screen, and the window icons.
 FILES = sorted(["fonts/" + p.name for p in (DATA / "fonts").iterdir()
                 if p.suffix in (".ttf", ".txt")]) + [
-    "ferritext_logo.png", "icon_desktop.png", "icon_desktop.ico"]
+    "ferritext_logo.png", "ferritext_logo_dark.png", "icon_desktop.png",
+    "icon_desktop.ico"]
 
 HEADER = """
 # =============================================================================

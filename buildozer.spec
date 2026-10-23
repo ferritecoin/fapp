@@ -26,13 +26,14 @@ source.include_exts = py,png,jpg,kv,atlas,ttf,txt
 source.exclude_exts = spec
 
 # (list) List of directory to exclude (let empty to not exclude anything)
-source.exclude_dirs = tests, bin, venv, .git, .github, .buildozer, __pycache__, desktop, tools, recipes
+source.exclude_dirs = tests, bin, venv, .git, .github, .buildozer, __pycache__, desktop, tools, recipes, android
 # desktop/ (Nuitka packaging + the headless test suites) and tools/ (the
-# logo generator) are build-time only. data/ is NOT excluded: the app
+# logo generator) are build-time only; android/ reaches the APK through
+# android.add_src and android.add_resources. data/ is NOT excluded: the app
 # loads data/ferritext_logo.png at runtime for the loading screen.
 
 # (str) Application versioning (method 1)
-version = 12.0.0
+version = 13.0.0
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy
@@ -44,7 +45,7 @@ requirements = python3,kivy,pillow,requests,urllib3,charset-normalizer,idna,cert
 # Shown by the platform before any Python runs; the in-app loading screen
 # (SplashOverlay) then takes over with the same mark on the same white, so
 # the handover is invisible. Every PNG here is rendered from
-# data/ferritext_logo.svg by tools/make_logo.py.
+# data/ferritext_logo_packet.svg by tools/make_logo.py.
 presplash.filename = %(source.dir)s/data/presplash.png
 
 # (str) Icon of the application (legacy launchers, Android < 8)
@@ -57,7 +58,9 @@ icon.adaptive_foreground.filename = %(source.dir)s/data/icon_fg.png
 icon.adaptive_background.filename = %(source.dir)s/data/icon_bg.png
 
 # (str) Presplash background colour: white, matching the icon and the
-# in-app loading screen.
+# in-app loading screen. While the phone is in dark mode Android takes black
+# instead, and the mark on its white plate, from res/values-night and
+# res/drawable-night (android.add_resources below).
 android.presplash_color = #FFFFFF
 
 # (str) Supported orientation (one of landscape, sensorLandscape, portrait or all)
@@ -95,12 +98,12 @@ android.permissions = INTERNET,ACCESS_NETWORK_STATE,POST_NOTIFICATIONS,RECORD_AU
 # to a blanket android:usesCleartextTraffic="true".
 # Also res/xml/fext_file_paths.xml: the one cache folder the camera's
 # FileProvider may hand out (see tools/p4a_hook.py).
-android.add_resources = src/android/res/xml/network_security_config.xml:xml/network_security_config.xml,src/android/res/drawable/ic_stat_ferritext.png:drawable/ic_stat_ferritext.png,src/android/res/xml/fext_file_paths.xml:xml/fext_file_paths.xml
+android.add_resources = android/network_security_config.xml:xml/network_security_config.xml,android/ic_stat_ferritext.png:drawable/ic_stat_ferritext.png,android/fext_file_paths.xml:xml/fext_file_paths.xml,android/strings_night.xml:values-night/strings.xml,android/presplash_night.png:drawable-night/presplash.png
 
-# (list) Java sources compiled into the app: the call audio helper
-# (org.fext.call.CallAudio), which records and plays a call's sound on its
-# own threads.
-android.add_src = src/android/java
+# (list) Java sources compiled into the app, from android/ (its Java files
+# keep their packages): the call audio helper (org.fext.call.CallAudio),
+# the notifications (org.fext.notify) and the QR reader (org.fext.qr).
+android.add_src = android
 
 # (list) Gradle dependencies: androidx.core, for its FileProvider — the camera
 # app writes a photo through it straight into the app's private cache, so a
@@ -168,11 +171,11 @@ android.debug_artifact = apk
 # (str) The name of the bootstrap to use
 p4a.bootstrap = sdl2
 
-# (list) Background services: the sync service that keeps notifications
-# arriving after Android has closed the app (see service.py), and the call
-# service that keeps a call's microphone on while the app is off screen
-# (see call_service.py).
-services = Fextsync:service.py:foreground:sticky,Fextcall:call_service.py:foreground
+# (list) Background services, each started from main.py in a process of its
+# own (main.py reads which from PYTHON_NAME): the sync service that keeps
+# notifications arriving after Android has closed the app, and the call
+# service that keeps a call's microphone on while the app is off screen.
+services = Fextsync:main.py:foreground:sticky,Fextcall:main.py:foreground
 
 # (str) Hook run during the p4a build: declares the services' types, which
 # Android 14 requires and p4a's manifest template cannot express.

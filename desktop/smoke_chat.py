@@ -284,6 +284,51 @@ class Harness(App):
         check("...a forwarded one, or words with it, stay in a bubble",
               b[2].big == 0 and b[3].big == 0 and
               b[2].body.font_size == M.fs(17))
+        Clock.schedule_once(self.days, 0.1)
+
+    # -- v12 (S7): the day floats over a long chat as you scroll ---------------
+    def days(self, _dt):
+        from datetime import datetime, timedelta
+        now = datetime.now().replace(microsecond=0)
+        msgs = []
+        for i in range(24):
+            when = now - timedelta(days=1 if i < 12 else 0, minutes=30 - i)
+            msgs.append({"id": 400 + i, "server_id": None,
+                         "direction": "in" if i % 3 else "out",
+                         "body": f"day message {i} " + "lorem ipsum " * 6,
+                         "status": 3, "read": 1,
+                         "created_at": when.isoformat()})
+        s = self.screen
+        s._rendered_peer = None
+        s.render(msgs, True, lambda *a: None, peer=PEER + "d")
+        Clock.schedule_once(self.check_days, 0.8)
+
+    def check_days(self, _dt):
+        s = self.screen
+        s._user_scrolling = True
+        s.scroll.scroll_y = 0.62
+        s.float_day()
+        self.mid = (s.day_float.shown, s.day_float.caps.text)
+        s.scroll.scroll_y = 1.0
+        s.float_day()
+        self.top = s.day_float.shown
+        s.scroll.scroll_y = 0.15
+        s.float_day()
+        self.late = s.day_float.caps.text
+        s._user_scrolling = False
+        Clock.schedule_once(self.check_days_gone,
+                            M.ConversationScreen.DAY_FLOAT_HOLD + 0.4)
+
+    def check_days_gone(self, _dt):
+        s = self.screen
+        check("scrolled back, the day of the messages at the top floats "
+              "over them", self.mid == (True, "YESTERDAY"), str(self.mid))
+        check("...not where that day's own divider is showing",
+              self.top is False)
+        check("...it follows the scrolling into the next day",
+              self.late == "TODAY", self.late)
+        check("...and fades once the scrolling stops",
+              not s.day_float.shown)
         Clock.schedule_once(self.faces, 0.1)
 
     # -- v12: in a group, a disc beside each run of theirs -------------------

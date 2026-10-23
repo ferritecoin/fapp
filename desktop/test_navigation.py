@@ -265,6 +265,46 @@ check("back closes it", not drawer.is_open and drawer.parent is None)
 print("\nBack, one level at a time")
 alice.open_settings()
 tick(0.3)
+
+
+def settings_rows(w):
+    for c in w.children:
+        if hasattr(c, "icon") and isinstance(c, M.BoxLayout):
+            yield c
+        yield from settings_rows(c)
+
+
+marked = list(settings_rows(alice.settings_screen.body))
+check("every row in Settings has its icon, in one column",
+      len(marked) >= 6 and all(r.icon for r in marked) and
+      {"theme", "text_size", "moon", "motion"} <=
+      {r.icon for r in marked}, str([r.icon for r in marked]))
+
+
+def row_of(name):
+    return next(r for r in settings_rows(alice.settings_screen.body)
+                if r.icon == name)
+
+
+def control_in(row, kind):
+    return next(w for w in row.walk() if isinstance(w, kind))
+
+
+if M.APPEARANCE.reduce_motion:
+    control_in(row_of("motion"), M.ToggleSwitch).flip()
+    tick(0.6)
+switch = control_in(row_of("motion"), M.ToggleSwitch)
+before = row_of("motion").glyph.state
+switch.flip()                                  # motion reduced: at once
+at_once = row_of("motion").glyph.state
+switch.flip()                                  # and back: the ball sets off
+tick(0.05)
+moving = row_of("motion").glyph.state
+tick(0.6)
+check("a Settings icon shows its setting: reduced, the ball is still at "
+      "once; back on, it moves off again",
+      before == 0.0 and at_once == 1.0 and 0.0 < moving < 1.0 and
+      row_of("motion").glyph.state == 0.0, (before, at_once, moving))
 alice._on_keyboard(None, 27)
 tick(0.3)
 check("settings -> the list", alice.manager.current == "chats")
@@ -416,6 +456,25 @@ check("a deleted chat's messages are gone, and so is its row",
 alice.store.add_in(C, "me again", M.now_iso(), 9001, uuid.uuid4().hex)
 convs = {c["peer"]: c for c in alice.store.conversations(me=A)}
 check("...until something new arrives", C in convs)
+
+print("\nA theme changed in Settings (last: it builds every screen again)")
+alice.open_settings()
+tick(0.3)
+was = M.APPEARANCE.mode
+start = row_of("theme").glyph.state
+other = "light" if was != "light" else "dark"
+control_in(row_of("theme"), M.Segmented).choose(other)
+seen = []
+for _ in range(60):                         # each frame of the move
+    Clock.tick()
+    time.sleep(0.01)
+    seen.append(row_of("theme").glyph.state)
+done = seen[-1]
+check("the theme's disc moves to the new choice, though Settings is built "
+      "again for it", any(0.0 < abs(v - start) < abs(done - start)
+                          for v in seen)
+      and done == {"light": 0.0, "dark": 1.0}[other] and
+      alice.manager.current == "settings", (start, seen[:8], done))
 
 for app in (alice, bob):
     app.store.close()

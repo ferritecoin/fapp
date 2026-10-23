@@ -21,15 +21,16 @@ same key (see [Release signing](#release-signing)).
 
 Every push to the default branch is tested and built, and each new version is
 published to a GitHub Release, whose files never change afterwards. Open the
-**Releases** page (or the **`v12.0.0`** tag) and take:
+**Releases** page (or the **`v13.0.0`** tag) and take:
 
 | Asset | For |
 | --- | --- |
-| `Ferritext-12.0.0.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r` |
-| `Ferritext-12.0.0-desktop.py` | Windows / macOS / Linux — one file with its fonts and icons inside. Run it with Python 3.11+ after `pip install kivy requests websocket-client cryptography qrcode pillow`. |
+| `Ferritext-13.0.0.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r` |
+| `Ferritext-13.0.0-desktop.py` | Windows / macOS / Linux — one file with its fonts and icons inside. Run it with Python 3.11+ after `pip install kivy requests websocket-client cryptography qrcode pillow`. |
 
 Both are also attached to each Actions run as the **`ferritext-release`**
-artifact. Pushes to other branches are tested and built, but publish nothing.
+artifact, kept for a week. Pushes to other branches are tested and built, but
+publish nothing.
 
 On a computer, each of these adds something when it is installed, and
 nothing breaks without it:
@@ -41,6 +42,34 @@ nothing breaks without it:
 | `pip install numpy` | voice notes at 1.5× and 2× |
 | `pip install av` (or the `ffmpeg` program) | playing voice notes recorded on a phone |
 | `pip install opencv-python` (or `pyzbar`) | reading a contact's QR code from a picture |
+
+## What's in 13.0.0
+
+- **A new mark.** The bead on its wire now travels in a rounded
+  parallelogram, a packet on its way: on the launcher, the loading screen,
+  notifications and the window icons. On dark grounds it sits on a white
+  plate of its own shape.
+- **The loading screen follows dark mode**, Android's own launch screen
+  included: black at night, with the mark on its plate.
+- **Two ticks at most.** A clock while a message is still on your phone,
+  one grey tick once the relay has it, two grey once it is on their phone,
+  and two gold once it is read.
+- **An icon for every setting**, showing what it is set to, that moves when
+  you change it (it does not move when motion is reduced).
+- **Who reacted.** Hold a reaction to see who gave it. In a group, the faces
+  of up to three people sit beside it. Reactions are a soft fill now,
+  without an outline.
+- **Your most-used reactions come first** in the strip.
+- **Where a group message has got to.** Hold its time to see who has it and
+  who has read it.
+- **The day floats over a long chat** as you scroll.
+- **Quieter emoji colours**, to sit better with the text.
+- Fixed: the loading screen could drop its second line, "Messenger".
+- For developers: the app and both of its Android services start from
+  `main.py`, and Android's Java code and resources sit in one folder,
+  `android/`.
+- **Coming from an earlier version?** Everything in 12.0.0 and 11.0.0,
+  below, is new to you too.
 
 ## What's in 12.0.0
 
@@ -246,6 +275,11 @@ been tested end to end against this app; media works once it is deployed.
 
 ## Compatibility
 
+**With 12.0 and earlier.** Nothing on the wire changed in 13.0. It talks to
+every earlier release as 12.0 does, and to every relay 12.0 can use, relay
+12.2 included. Its two ticks are drawn from the same three states the relay
+reports.
+
 **With 11.0 and earlier.** 12.0 talks to every earlier release.
 
 | | 12.0 | 11.0 and earlier |
@@ -324,9 +358,9 @@ and nothing about who is in which group. That is also why a group holds at
 most 32 people: each message costs one relay request per member, and the
 relay limits how many requests one connection may make a minute.
 
-Each copy has its own delivery and read receipt. The sender's tick shows the
-slowest member: two ticks once it is on every phone, three once everyone has
-read it.
+Each copy has its own delivery and read receipt. The sender's ticks show the
+slowest member: two grey ticks once it is on every phone, two gold once
+everyone has read it.
 
 ## Type and themes
 
@@ -393,11 +427,11 @@ shows which way the sound goes and the round-trip time.
 
 On Android the phone's own call audio is used — its echo cancelling, the
 earpiece, the loudspeaker, a wired or Bluetooth headset, chosen from the call
-screen — the screen darkens against the ear, and a small service
-(`call_service.py`) keeps the microphone on while the app is off screen,
-which Android allows only to a service of the *microphone* type. It starts
-when you dial, so the caller's microphone works even if they leave the app
-while it rings. An incoming call rings as a call notification with Answer
+screen — the screen darkens against the ear, and a small service (started
+from `main.py`, as the app is) keeps the microphone on while the app is off
+screen, which Android allows only to a service of the *microphone* type. It
+starts when you dial, so the caller's microphone works even if they leave the
+app while it rings. An incoming call rings as a call notification with Answer
 and Decline, full screen over the lock screen where Android allows it.
 
 On a computer the sound goes through the `sounddevice` package where it is
@@ -415,11 +449,11 @@ relay the call button says so.
 
 Android closes apps in the background. While Ferritext's own process is alive
 it listens for messages itself; once Android has closed it, a small
-foreground service (`service.py`, a separate process) takes over, and steps
-aside again when the app returns. The two coordinate through heartbeat files
-so only one ever holds the connection. It can be switched off under
-*Settings → Notifications*, at the cost of notifications only arriving while
-the app is open.
+foreground service (a separate process, started from `main.py` too) takes
+over, and steps aside again when the app returns. The two coordinate through
+heartbeat files so only one ever holds the connection. It can be switched off
+under *Settings → Notifications*, at the cost of notifications only arriving
+while the app is open.
 
 Whichever holds the connection announces a message the moment it arrives,
 from the thread that received it — so a paused app, whose screen Android has
@@ -434,7 +468,7 @@ python-for-android's manifest template cannot express;
 the phone, if it cannot) — *dataSync* for this service, *microphone* for the
 call service. The same hook declares the notifications' receiver and the
 FileProvider through which the camera app hands over a photo (its one folder
-is `src/android/res/xml/fext_file_paths.xml`; the class comes from
+is `android/fext_file_paths.xml`; the class comes from
 `androidx.core`).
 
 ## Privacy
@@ -478,19 +512,16 @@ a phone only in a backup you make and seal here.
 
 | Path | Purpose |
 | --- | --- |
-| `main.py` | The complete client (Buildozer's entry point **must** be `main.py`). |
-| `service.py` | Android background sync service (imports `main.py`, no UI). |
-| `call_service.py` | Android call service: keeps a call's microphone on while the app is off screen. |
+| `main.py` | The complete client (Buildozer's entry point **must** be `main.py`), and its two Android services: Android starts them from it too, the sync service and the call service that keeps a call's microphone on while the app is off screen. |
 | `buildozer.spec` | Android packaging: requirements, permissions, service, icons. |
-| `data/` | The Ferrite Text Messenger mark (`ferritext_logo.svg`, as supplied) and the images rendered from it, including the desktop window icons (`icon_desktop.png`, `.ico`). |
+| `data/` | The Ferrite Text Messenger mark (`ferritext_logo_packet.svg`; `ferritext_logo.svg` is the supplied disc it came from) and the images rendered from it, including the desktop window icons (`icon_desktop.png`, `.ico`). |
 | `data/fonts/` | Ferritext Serif (four styles), the capitals face `ui.ttf`, and their licences. |
-| `tools/make_logo.py` | Renders every image in `data/` from the SVG — no dependency beyond Pillow. |
+| `tools/make_logo.py` | Renders every image in `data/`, and the notification icon, from the SVG — no dependency beyond Pillow. |
 | `tools/build_fonts.py` | Rebuilds Ferritext Serif from EB Garamond, Noto Emoji and Twemoji (needs fontTools). |
 | `tools/bundle_desktop.py` | Builds the single-file desktop release, and `--verify` checks one against the source. |
 | `tools/p4a_hook.py` | Build hook: the service types Android 14 requires, the notifications' receiver, and the camera's FileProvider. |
 | `recipes/libopus/` | A python-for-android recipe for libopus, for calls in Opus. |
-| `src/android/res/` | Android resources: cleartext policy for the relay, status-bar icon, the camera's folder. |
-| `src/android/java/` | `org.fext.call.CallAudio`: a call's microphone and speaker, on threads of their own, and where the sound goes; `org.fext.notify`: notifications, and what is done to them; `org.fext.qr.QrReader`: QR codes in photos. |
+| `android/` | What Android compiles or ships beside the Python, in one folder. Java: `CallAudio` (a call's microphone and speaker, on threads of their own, and where the sound goes), `Notifier` and `NotifyReceiver` (notifications, and what is done to them), `QrReader` (QR codes in photos). Resources: the cleartext policy for the relay, the status-bar icon, the camera's folder, the launch screen at night. |
 | `CREDITS.md` | The open-source work Ferritext is made with, and its licences. |
 | `desktop/` | Desktop packaging (Nuitka) and the headless test suites. |
 | `.github/workflows/build-apk.yml` | Tests → signed APK → GitHub Release with both deliverables. |
@@ -524,7 +555,7 @@ xvfb-run -a python3 desktop/test_privacy.py main.py
 | `test_design.py` | WCAG AA contrast of every text/ground pair in both themes, fonts registered and packaged with their licences, following the system theme, tracked capitals, stacking buttons, Back closing a sheet |
 | `test_composer.py` | Real mouse clicks reaching the message field and its keys, hidden parts never swallowing a touch, the composer's two states, recording through a capture command into WAV, photos from a camera, icons drawn smooth |
 | `test_bundle.py` | The single-file desktop release: built, verified, run from an empty folder (fonts and icons unpacked, checked, reused, repaired) |
-| `test_service.py` | Headless import as the service runs it, app ⇄ service hand-over, the manifest hook |
+| `test_service.py` | Both services started from `main.py` as Android starts them, app ⇄ service hand-over, the manifest hook |
 | `smoke_desktop.py` | Launch, branding and loading screen through the real `App.run()` path |
 | `smoke_chat.py` | Bottom-anchored short chats, scrolling, text selection and copy |
 | `test_navigation.py` | Pages in layers, a long chat opening at once, the menu, back one step at a time, search and jumping into history, tap to react, holding chats (mute, pin, archive, unread, block, delete) |
@@ -545,7 +576,7 @@ on first run.
 
 ```bash
 python3 -m pip install --user buildozer cython
-buildozer android debug          # produces bin/fext-12.0.0-*-debug.apk
+buildozer android debug          # produces bin/fext-13.0.0-*-debug.apk
 ```
 
 The mark and icons are regenerated with `python3 tools/make_logo.py` (Pillow
@@ -619,7 +650,9 @@ place.
 
 **No secrets set.** The workflow then generates a throwaway keystore for each
 build. That is still a valid, installable release APK, but every build's
-signature differs, so no build can update another.
+signature differs, so no build can update another. Such a build is only the
+run's artifact: the default branch publishes no Release signed with a
+throwaway key, and its run fails, naming the secrets to add.
 
 A signing key is **never committed to this repository.**
 
@@ -633,7 +666,7 @@ A signing key is **never committed to this repository.**
   port and moves there once the certificate verifies against the roots it
   ships (certifi), and never accepts one that does not.
 - **Cleartext is scoped, not blanket.** Android blocks cleartext by default, so
-  `src/android/res/xml/network_security_config.xml` permits it for the relay
+  `android/network_security_config.xml` permits it for the relay
   host only. It is wired up via `android.add_resources` plus a `p4a.extra_args`
   entry in `buildozer.spec` (**not** `android.extra_manifest_application_arguments`,
   which buildozer 1.5.0 mangles). Once the relay serves HTTPS everywhere,

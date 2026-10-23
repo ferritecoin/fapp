@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The platform loading screen's ground while the phone is in dark mode:
+     python-for-android reads presplash_color from the resources, so this
+     overrides buildozer.spec's android.presplash_color (white) at night.
+     Its picture is presplash_night.png (tools/make_logo.py); buildozer.spec
+     ships the two as values-night/strings.xml and drawable-night/presplash.png. -->
+<resources>
+    <string name="presplash_color">#000000</string>
+</resources>

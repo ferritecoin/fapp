@@ -80,7 +80,9 @@ License 1.1.
 
 Changes: Ferritext Serif draws these graphics as the colour layers of its
 emoji. They are scaled and placed to fit its own emoji outlines and set to
-their width (tools/build_fonts.py). The package's licence follows as it came.
+their width, and their colours are made a little quieter (each colour's
+chroma reduced, its lightness and hue kept) (tools/build_fonts.py). The
+package's licence follows as it came.
 
 """
 #: Colour layer glyphs are named with this prefix (so a rebuild can find
@@ -310,7 +312,52 @@ def add_colour(font: TTFont, twemoji: TTFont) -> int:
         _add_sequences(font, mapping)
     font["COLR"] = buildCOLR(colr, version=0)
     font["CPAL"] = copy.deepcopy(twemoji["CPAL"])
+    soften(font["CPAL"])
     return singles + len(mapping)
+
+
+#: The emoji's colours, a little quieter than Twemoji's own: chroma (in
+#: OKLCH) scaled by this, lightness kept, hue untouched — so skin tones and
+#: flags stay what they are, only less loud beside the text.
+SOFT_CHROMA = 0.78
+
+
+def _oklab(r, g, b):
+    def lin(c):
+        c /= 255
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = lin(r), lin(g), lin(b)
+    l_ = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b) ** (1 / 3)
+    m_ = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b) ** (1 / 3)
+    s_ = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b) ** (1 / 3)
+    return (0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+            1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+            0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_)
+
+
+def _srgb(L, a, b):
+    l_ = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3
+    m_ = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3
+    s_ = (L - 0.0894841775 * a - 1.2914855480 * b) ** 3
+    rgb = (4.0767416621 * l_ - 3.3077115913 * m_ + 0.2309699292 * s_,
+           -1.2684380046 * l_ + 2.6097574011 * m_ - 0.3413193965 * s_,
+           -0.0041960863 * l_ - 0.7034186147 * m_ + 1.7076147010 * s_)
+
+    def enc(c):
+        c = min(1.0, max(0.0, c))
+        c = 12.92 * c if c <= 0.0031308 else 1.055 * c ** (1 / 2.4) - 0.055
+        return round(c * 255)
+    return tuple(enc(c) for c in rgb)
+
+
+def soften(cpal) -> None:
+    """Scale every palette colour's chroma by SOFT_CHROMA."""
+    for palette in cpal.palettes:
+        for i, colour in enumerate(palette):
+            L, a, b = _oklab(colour.red, colour.green, colour.blue)
+            r, g, b2 = _srgb(L, a * SOFT_CHROMA, b * SOFT_CHROMA)
+            palette[i] = type(colour)(red=r, green=g, blue=b2,
+                                      alpha=colour.alpha)
 
 
 def build(garamond: bytes, emoji: bytes, weight: int, emoji_weight: int,
