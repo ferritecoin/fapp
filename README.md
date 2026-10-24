@@ -625,6 +625,16 @@ key, kept in repository secrets.
    | `FEXT_KEY_ALIAS` | The `-alias` from step 1 (`fext` in that command); `keytool -list` shows it |
    | `FEXT_KEY_PASSWORD` | The key password. For PKCS12, the keystore password |
 
+4. **Pin the key** (optional). Under **Variables** on the same page, add
+   `FEXT_KEY_SHA256` with the key's SHA-256 fingerprint as `keytool -list -v`
+   prints it. A build whose keystore holds any other key then stops within
+   seconds, before it makes an APK that could not update anyone's install.
+
+**Publishing from more than one repository** (a mirror, or a copy you
+release from): give each one the same four secrets and the same
+`FEXT_KEY_SHA256`. GitHub cannot copy a secret or show it again, so the
+values come from the keystore file and your password store.
+
 The workflow checks the key before it spends 20 minutes building. If the
 keystore will not open, or the key password is wrong, the build fails within
 seconds and names the secret to fix. If the alias names no key, a keystore

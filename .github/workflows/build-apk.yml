@@ -175,6 +175,9 @@ jobs:
           FEXT_KEYSTORE_PASSWORD: ${{ secrets.FEXT_KEYSTORE_PASSWORD }}
           FEXT_KEY_ALIAS: ${{ secrets.FEXT_KEY_ALIAS }}
           FEXT_KEY_PASSWORD: ${{ secrets.FEXT_KEY_PASSWORD }}
+          # A repository variable, not a secret: the fingerprint of the one
+          # key every repository that publishes Ferritext signs with.
+          FEXT_KEY_SHA256: ${{ vars.FEXT_KEY_SHA256 }}
         run: |
           set -euo pipefail
           KS="$RUNNER_TEMP/fext-release.keystore"

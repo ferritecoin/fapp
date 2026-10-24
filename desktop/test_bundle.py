@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The single-file desktop release: main.py carrying its fonts and icons.
+"""The release files: the single-file desktop client, and the APK's key.
 
     xvfb-run -a python3 desktop/test_bundle.py main.py
 
@@ -9,7 +9,10 @@
     icons into ~/.fext/assets, makes the serif — which carries the emoji —
     Kivy's default font, registers the capitals, and finds its window icons;
   * a second start reuses what it unpacked; a damaged file is replaced;
-  * main.py run from a checkout uses data/ and unpacks nothing.
+  * main.py run from a checkout uses data/ and unpacks nothing;
+  * tools/check_keystore.sh, which the release build runs first, accepts
+    the key that FEXT_KEY_SHA256 names, written either way, and refuses
+    any other (needs keytool; skipped without it).
 """
 import hashlib
 import json
@@ -127,6 +130,51 @@ plain = probe(CLIENT, work / "home2")
 check("main.py beside data/ uses data/ and unpacks nothing",
       plain.get("assets") == str(data) and
       not (work / "home2" / ".fext" / "assets").exists(), str(plain))
+
+print("\nThe signing key's check")
+KEYTOOL = shutil.which("keytool")
+
+
+def keystore(name: str) -> str:
+    """A fresh PKCS12 key; returns its SHA-256 as keytool prints it."""
+    ks = work / f"{name}.p12"
+    subprocess.run([KEYTOOL, "-genkeypair", "-keystore", str(ks),
+                    "-storetype", "PKCS12", "-alias", "fext", "-keyalg",
+                    "RSA", "-keysize", "2048", "-validity", "10000",
+                    "-storepass", "pw-test-1", "-dname", f"CN={name}"],
+                   capture_output=True, check=True)
+    info = subprocess.run([KEYTOOL, "-list", "-v", "-keystore", str(ks),
+                           "-storepass", "pw-test-1", "-alias", "fext"],
+                          capture_output=True, text=True).stdout
+    return next(line.split("SHA256:", 1)[1].strip()
+                for line in info.splitlines() if "SHA256:" in line)
+
+
+def check_key(expected: str):
+    """Run check_keystore on the 'project' key with FEXT_KEY_SHA256 set."""
+    script = (f'. "{ROOT / "tools" / "check_keystore.sh"}"; '
+              f'STOREPASS=pw-test-1; KEYPASS=pw-test-1; '
+              f'check_keystore "{work / "project.p12"}" fext')
+    out = subprocess.run(["bash", "-c", script], capture_output=True,
+                         text=True, env=dict(os.environ,
+                                             FEXT_KEY_SHA256=expected))
+    return out.returncode, out.stdout + out.stderr
+
+
+if KEYTOOL is None:
+    print("  (skipped: no keytool here)")
+else:
+    ours, theirs = keystore("project"), keystore("another")
+    rc, out = check_key("")
+    check("without FEXT_KEY_SHA256 any working key is accepted", rc == 0, out)
+    rc, out = check_key(ours)
+    check("...with it, the key it names is accepted",
+          rc == 0 and "the key FEXT_KEY_SHA256 names" in out, out)
+    rc, out = check_key(ours.replace(":", "").lower())
+    check("...written in lower case without colons too", rc == 0, out)
+    rc, out = check_key(theirs)
+    check("...and any other key stops the build, naming the variable",
+          rc != 0 and "::error::" in out and "FEXT_KEY_SHA256" in out, out)
 
 shutil.rmtree(work, ignore_errors=True)
 passed = sum(1 for _n, c in RESULTS if c)

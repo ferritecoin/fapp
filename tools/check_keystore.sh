@@ -7,10 +7,12 @@
 # shell and may correct two things there: KEYPASS becomes STOREPASS for a
 # PKCS12 keystore (it has a single password), and ALIAS becomes the
 # keystore's only key when the configured alias names none. Both corrections
-# are announced as warnings. Never prints a password. Returns non-zero on
-# failure.
+# are announced as warnings. With FEXT_KEY_SHA256 set (a repository variable,
+# not a secret), the key must be that one: every repository that publishes
+# Ferritext signs with the same key. Never prints a password. Returns
+# non-zero on failure.
 check_keystore() {
-  local ks="$1" alias="$2" list info type until_raw until_s names
+  local ks="$1" alias="$2" list info type until_raw until_s names sha
   if [ ! -s "$ks" ]; then
     echo "::error::FEXT_KEYSTORE_B64 decoded to nothing. Encode the .keystore file again (README: Release signing)."
     return 1
@@ -50,10 +52,24 @@ check_keystore() {
   echo "Signing key ($type):"
   printf '%s\n' "$info" | grep -E '^(Alias name|Owner|Valid from):|^[[:space:]]*SHA256:' \
     | sed 's/^[[:space:]]*/  /'
+  if [ -n "${FEXT_KEY_SHA256:-}" ]; then
+    sha="$(printf '%s\n' "$info" | sed -n 's/^[[:space:]]*SHA256: *//p' | head -1)"
+    if [ "$(_fingerprint "$sha")" != "$(_fingerprint "$FEXT_KEY_SHA256")" ]; then
+      echo "::error::This keystore's key (SHA-256 $sha) is not the one FEXT_KEY_SHA256 names. Its APKs would not install over earlier releases: put the project's keystore in FEXT_KEYSTORE_B64 (README: Release signing)."
+      return 1
+    fi
+    echo "  the key FEXT_KEY_SHA256 names"
+  fi
   until_raw="$(printf '%s\n' "$info" | sed -n 's/^Valid from: .* until: //p' | head -1)"
   until_s="$(date -d "$until_raw" +%s 2>/dev/null || echo 0)"
   if [ "$until_s" -lt "$(( $(date +%s) + 20 * 365 * 86400 ))" ]; then
     echo "::warning::The signing certificate is valid only until ${until_raw:-an unknown date}. Every future update must be signed with this key, so the convention is 25+ years (keytool -validity 10000); keytool's default is 90 days."
   fi
   return 0
+}
+
+# A fingerprint as hex digits only, upper case: keytool writes
+# "A5:54:…", and a pasted variable may have lower case or no colons.
+_fingerprint() {
+  printf '%s' "$1" | tr -d ': \r\n\t' | tr 'a-f' 'A-F'
 }
