@@ -7,8 +7,9 @@ here into an `.apk` with [Buildozer](https://buildozer.readthedocs.io) /
 on Windows, macOS and Linux.
 
 Its security model is transparency: no plaintext ever leaves the device.
-Messages are signed (secp256k1 ECDSA), sealed (ephemeral ECDH → HKDF-SHA256 →
-AES-256-GCM), and only opaque ciphertext is transmitted. Photos and voice notes
+Messages are signed (secp256k1 ECDSA), sealed (ephemeral ECDH, with ML-KEM-768
+once the recipient's post-quantum key is known → HKDF-SHA256 → AES-256-GCM),
+and only opaque ciphertext is transmitted. Photos and voice notes
 are sealed with a fresh key per file before they are uploaded.
 
 The Android application id stays `org.fext.fext` (`package.domain` +
@@ -21,12 +22,12 @@ same key (see [Release signing](#release-signing)).
 
 Every push to the default branch is tested and built, and each new version is
 published to a GitHub Release, whose files never change afterwards. Open the
-**Releases** page (or the **`v13.0.0`** tag) and take:
+**Releases** page (or the **`v15.0.0`** tag) and take:
 
 | Asset | For |
 | --- | --- |
-| `Ferritext-13.0.0.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r` |
-| `Ferritext-13.0.0-desktop.py` | Windows / macOS / Linux — one file with its fonts and icons inside. Run it with Python 3.11+ after `pip install kivy requests websocket-client cryptography qrcode pillow`. |
+| `Ferritext-15.0.0.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r` |
+| `Ferritext-15.0.0-desktop.py` | Windows / macOS / Linux — one file with its fonts and icons inside. Run it with Python 3.11+ after `pip install kivy requests websocket-client cryptography qrcode pillow`. |
 
 Both are also attached to each Actions run as the **`ferritext-release`**
 artifact, kept for a week. Pushes to other branches are tested and built, but
@@ -42,6 +43,44 @@ nothing breaks without it:
 | `pip install numpy` | voice notes at 1.5× and 2× |
 | `pip install av` (or the `ffmpeg` program) | playing voice notes recorded on a phone |
 | `pip install opencv-python` (or `pyzbar`) | reading a contact's QR code from a picture |
+
+## What's in 15.0.0
+
+15.0.0 carries 14.0's changes too: 14.0 was never published on its own.
+
+- **Post-quantum encryption.** A message to someone whose post-quantum key
+  your app holds is sealed with ML-KEM-768 as well as the usual key, so a
+  recording made today cannot be read by breaking the usual key later. Keys
+  pass in your messages: a chat is post-quantum both ways once each of you
+  has written from 15.0, and *About this chat* shows which way it is on.
+  Groups, calls, photos and voice notes are covered the same way; the
+  README's *Post-quantum encryption* has more.
+- **Copy WIF works with Ferrite Core.** It gives Ferrite Core's own key
+  format, which its `importprivkey` takes. Keys copied from earlier versions
+  still import into Ferritext.
+- **Messages that wait.** A message the relay did not take stays on your
+  phone at its clock and goes by itself when the relay answers; after a day
+  it reads "Not sent · tap to try again". A photo waits the same way when
+  the relay has no room for it.
+- **Message requests.** The first messages from someone new wait under
+  *Message requests*: no notification text, no download, no call, and they
+  see one tick until you accept. *Decline* is not a block. *Report* tells
+  the relay's operator who and why, never what they wrote, and can block
+  them. *Settings → Privacy → Blocked* lists everyone blocked.
+- **Download rules.** Under *Settings → Downloads*, photos and voice notes on
+  mobile data, and photos in groups of more than 20, can wait for a tap; on
+  mobile data the app can ask first.
+- **Lighter on the relay.** With relay 12.2, a group message goes to every
+  member in one request, an upload says how many people will fetch it so it
+  is freed sooner, and a relay restarting for an update tells phones when to
+  come back.
+- **A faster chat list** on a phone with a long history.
+- Fixed: photos and voice notes in a disappearing chat were sent without
+  the chat's timer.
+- For developers: `desktop/capture.py` captures the app's screens and
+  `desktop/bench.py` times its work, to compare a change before and after.
+- **Coming from an earlier version?** Everything in 13.0.0 and before,
+  below, is new to you too.
 
 ## What's in 13.0.0
 
@@ -275,6 +314,27 @@ been tested end to end against this app; media works once it is deployed.
 
 ## Compatibility
 
+**With 14.0 and earlier.** Earlier releases read every 15.0 message: the
+post-quantum key in its signed block is ignored. 15.0 seals a message
+post-quantum only to someone whose key it holds, and only 15.0 sends one,
+so nothing changes for anyone on an earlier release. Every relay carries
+the larger envelopes. The local database gains three columns (schema 8),
+which earlier releases ignore.
+
+**With 13.0 and earlier.** Nothing in the messages changed in 14.0; what is
+new is how the app uses the relay, and it asks the relay first.
+
+| | Relay 12.2 | Relays before 12.2 |
+| --- | --- | --- |
+| A group message | one request for every member | one request a member, as before |
+| An upload's count of readers | the file is freed once they have it | ignored: kept its usual time |
+| A report | reaches the relay's operator | not offered: *Report* only blocks |
+| Restarting for an update | phones wait as the relay asks | phones reconnect at once, as before |
+
+Someone on 13.0 or earlier who writes to you first is a message request
+like anyone else, and sees one tick until you accept. The local database
+gains one column (schema 7), which earlier releases ignore.
+
 **With 12.0 and earlier.** Nothing on the wire changed in 13.0. It talks to
 every earlier release as 12.0 does, and to every relay 12.0 can use, relay
 12.2 included. Its two ticks are drawn from the same three states the relay
@@ -399,6 +459,22 @@ Long-term storage is the phones', never the relay's.
 This needs the **v9 relay** (`/api/blobs`, advertised in `/api/health`). On an
 older relay the app says so instead of failing; text features all work.
 
+Each upload says how many people will fetch it (`X-Fext-Expect`), and relay
+12.2 frees the file an hour after the last of them has it. A relay with no
+room left refuses the upload (507) instead of deleting anyone's media: the
+file waits on the sender's phone, with its clock, and goes when there is
+room.
+
+**Download rules** (*Settings → Downloads*). A photo or voice note that
+arrives downloads by itself, except:
+
+- in a message request;
+- a photo in a group of more than 20, which waits for a tap;
+- on mobile data, whatever has been turned off there.
+
+Its small preview shows at once. A tap on mobile data asks first, unless
+*Ask before using mobile data* is off. Computers count as on Wi-Fi.
+
 ## Calls
 
 A call is set up with end-to-end messages, like everything else: an offer,
@@ -445,6 +521,25 @@ Calls need **relay v10**, which advertises them in `/api/health` and opens a
 UDP port for them (by default the same number as its HTTP port). On an older
 relay the call button says so.
 
+## Sending, and the outbox
+
+A message is stored on the phone first, at 0/3 (the clock), then sent. If
+the relay does not take it — no network, the relay restarting or full — it
+stays there, at its clock, and the **outbox** sends it by itself: when the
+app next reaches the relay, and every 30 seconds while connected. Sending
+twice is harmless: a receiving app keeps one copy per message id. After 24
+hours the outbox stops trying, and the message reads *Not sent · tap to try
+again*.
+
+A group message goes to every member in **one request** (`send_many`, up to
+32 members a request) on a relay that offers it (12.2), and one request a
+member on older relays. A member whose copy the relay refused gets it from
+the outbox later; the others are not sent it twice.
+
+When a relay stops for an update it tells connected phones when to come
+back, and they wait that long, plus a few seconds at random, so they do
+not all return at once.
+
 ## Background delivery
 
 Android closes apps in the background. While Ferritext's own process is alive
@@ -471,8 +566,52 @@ FileProvider through which the camera app hands over a photo (its one folder
 is `android/fext_file_paths.xml`; the class comes from
 `androidx.core`).
 
+## Post-quantum encryption
+
+What is sent today can be recorded and kept until a quantum computer can
+break secp256k1 ("store now, decrypt later"). From 15.0, a message to
+someone whose post-quantum key the app holds is sealed with both the usual
+key agreement and ML-KEM-768 (FIPS 203): its AES-256-GCM key comes from the
+two secrets together, so reading it takes breaking both.
+
+- **Keys travel in messages.** Each identity has an ML-KEM key made from
+  its own random seed, kept beside its private key and never derived from
+  it. Every message's signed block names that key, and carries the key
+  itself (1,184 bytes) until the other side shows it holds it by sealing a
+  message to it. A chat is post-quantum both ways once each side has
+  written from 15.0; *About this chat* shows which way it is on.
+- **Groups** seal each member's copy as that member's own chat is sealed.
+- **Calls** exchange their keys inside the call's own messages, so a call
+  in a chat that is post-quantum both ways is too.
+- **Photos and voice notes** are sealed with their own AES-256 key, which
+  travels inside the message, so they are covered with it.
+- **A new install from the private key alone** (WIF) has a new ML-KEM key.
+  A message sealed to the old one is asked for again, with the new key;
+  the sender's app sends that message again once, if it is under a week
+  old. A backup carries the key, so an identity restored from one keeps it.
+- **Not changed:** signatures are still ECDSA, since forging one takes a
+  quantum computer at the time, not later. The relay connection is TLS as
+  before, so what the relay sees (who writes to whom, and when) is not
+  post-quantum.
+- **Cost**, from `desktop/bench.py`: sealing a message 5.2 → 8.6 ms,
+  opening one 5.1 → 9.3 ms, and an envelope 1,005 → 2,473 bytes (4,625
+  while it carries our key).
+
+The ML-KEM code is pure Python in `main.py`: the Android build's
+cryptography library is too old to have it. `test_core.py` checks it
+against NIST's test vectors (`desktop/mlkem768_vectors.json`) and, where it
+is installed, against the `cryptography` library's own ML-KEM.
+
 ## Privacy
 
+- **Message requests.** The first messages from someone you have never
+  talked to wait under *Message requests*: no notification text, no
+  download, no call. Until you answer, the relay is told to send them no
+  receipts, so they see one tick. *Accept* turns receipts on and gives you
+  the composer. *Decline* removes the request without blocking them: if
+  they write again, it is a request again. *Report* tells the relay's
+  operator who and why (never what they wrote), and can block them too.
+  *Settings → Privacy → Blocked* lists everyone blocked, to unblock.
 - **No typing indicators, no "online" or "last seen".** Nobody can be
   pressed into turning them on, because they do not exist.
 - **Disappearing messages** are deleted by both apps, each copy that long
@@ -523,7 +662,7 @@ a phone only in a backup you make and seal here.
 | `recipes/libopus/` | A python-for-android recipe for libopus, for calls in Opus. |
 | `android/` | What Android compiles or ships beside the Python, in one folder. Java: `CallAudio` (a call's microphone and speaker, on threads of their own, and where the sound goes), `Notifier` and `NotifyReceiver` (notifications, and what is done to them), `QrReader` (QR codes in photos). Resources: the cleartext policy for the relay, the status-bar icon, the camera's folder, the launch screen at night. |
 | `CREDITS.md` | The open-source work Ferritext is made with, and its licences. |
-| `desktop/` | Desktop packaging (Nuitka) and the headless test suites. |
+| `desktop/` | Desktop packaging (Nuitka), the headless test suites, and the tools that capture and time the app. |
 | `.github/workflows/build-apk.yml` | Tests → signed APK → GitHub Release with both deliverables. |
 
 ## Testing
@@ -550,8 +689,8 @@ xvfb-run -a python3 desktop/test_privacy.py main.py
 
 | Suite | Covers |
 | --- | --- |
-| `test_core.py` | Envelope extension (incl. replay/tamper refusal), wire compatibility with the previous release, migrations both ways, delete-for-both authorisation, tombstones, extension sanitising, group membership rules (who may invite, change and remove), per-member receipts, reactions |
-| `test_flows.py` | Three real app controllers over an in-memory relay: replies, forwards, stars, delete for both, photos (EXIF stripping, rotation), expiry → ask again → re-upload, voice notes, notification rules, notes to self, groups (create, write, rename, remove, leave), reactions and taking them back, the reaction strip and emoji panel, switching theme and text size |
+| `test_core.py` | Envelope extension (incl. replay/tamper refusal), wire compatibility with the previous release, migrations both ways, delete-for-both authorisation, tombstones, extension sanitising, group membership rules (who may invite, change and remove), per-member receipts, reactions, ML-KEM-768 against NIST's vectors and the `cryptography` library, post-quantum envelopes (tampering, keys this device does not hold) |
+| `test_flows.py` | Three real app controllers over an in-memory relay: replies, forwards, stars, delete for both, photos (EXIF stripping, rotation), expiry → ask again → re-upload, voice notes, notification rules, notes to self, groups (create, write, rename, remove, leave), reactions and taking them back, the reaction strip and emoji panel, switching theme and text size, post-quantum keys passing between people and groups, a new install asking for a message again |
 | `test_design.py` | WCAG AA contrast of every text/ground pair in both themes, fonts registered and packaged with their licences, following the system theme, tracked capitals, stacking buttons, Back closing a sheet |
 | `test_composer.py` | Real mouse clicks reaching the message field and its keys, hidden parts never swallowing a touch, the composer's two states, recording through a capture command into WAV, photos from a camera, icons drawn smooth |
 | `test_bundle.py` | The single-file desktop release: built, verified, run from an empty folder (fonts and icons unpacked, checked, reused, repaired) |
@@ -568,6 +707,36 @@ xvfb-run -a python3 desktop/test_privacy.py main.py
 To get `old.py`: `git show v9.1.0:main.py > old.py` (or the latest tag before
 the version under test).
 
+### Looking at a change, and measuring it
+
+Capture every change that alters a screen before and after, and measure
+every change that might cost time. Both tools run whichever `main.py` they
+are given. The version before your change runs from a git worktree, which
+has its own fonts in `data/`:
+
+```bash
+git worktree add ../before HEAD~1        # the version before your change
+xvfb-run -a python3 desktop/capture.py ../before/main.py shots/before
+xvfb-run -a python3 desktop/capture.py main.py shots/after
+xvfb-run -a python3 desktop/bench.py ../before/main.py > before.json
+xvfb-run -a python3 desktop/bench.py main.py > after.json
+git worktree remove ../before
+```
+
+- **`capture.py`** saves 21 screens (`shots/after/black_chat.png`, …),
+  built from the same chats on every run. `--theme` picks `black` (the
+  default), `dark` or `light`. It lists any layout problem it finds (text
+  cut off or overflowing, parts outside their box, touch targets under
+  40 dp) and then exits 1. Compare the two folders screen by screen.
+- **`bench.py`** times drawing text, the store's reads on 50,000
+  messages, and sealing and opening a message, each the median of five
+  runs. Compare the two files. A
+  difference under a tenth is noise, and timings differ between machines,
+  so compare only runs from the same one.
+- In the change's description, say which screens changed and which
+  numbers moved. The pictures and numbers that go to review come from
+  these two tools, so anyone can make them again.
+
 ## Building it yourself
 
 Requirements: Linux (or WSL) with Python 3, a JDK, and `git zip unzip gcc make
@@ -576,7 +745,7 @@ on first run.
 
 ```bash
 python3 -m pip install --user buildozer cython
-buildozer android debug          # produces bin/fext-13.0.0-*-debug.apk
+buildozer android debug          # produces bin/fext-15.0.0-*-debug.apk
 ```
 
 The mark and icons are regenerated with `python3 tools/make_logo.py` (Pillow

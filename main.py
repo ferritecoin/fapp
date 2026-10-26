@@ -21,7 +21,7 @@
 #
 #  Audit checklist for reviewers (all in this one file):
 #    * IdentityManager — secp256k1 private keys (Bitcoin-compatible; the same
-#                        key imports into FEXT Core to spend coins) are
+#                        key imports into Ferrite Core to spend coins) are
 #                        generated/imported locally and stored ONLY in
 #                        ~/.fext/identities.json (chmod 600). Multiple
 #                        identities are supported; switching never restarts
@@ -105,6 +105,7 @@ import logging
 import math
 import platform
 import queue
+import random
 import re
 import select
 import socket
@@ -231,7 +232,8 @@ _G  = (_GX, _GY)
 
 FEXT_ADDR_VERSION = 0x24        # 36 decimal -> every address starts with 'F'
 FEXT_ADDR_PREFIX  = "Fec"       # proof-of-work requirement (client mines this)
-WIF_VERSION       = 0x80        # Bitcoin/FEXT-Core compatible WIF
+WIF_VERSION       = 0xA3        # 163: Ferrite Core's private keys (mainnet)
+WIF_VERSION_OLD   = 0x80        # Bitcoin's, which releases before 15.0 wrote
 
 _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
@@ -472,7 +474,7 @@ def mine_identity(should_stop=None, progress=None):
         point = _ec_add(point, _G)
 
 
-# ---- WIF import / export (FEXT Core & Bitcoin Core compatible) --------------
+# ---- WIF import / export (Ferrite Core compatible) --------------------------
 def priv_to_wif(priv: int, compressed: bool = True) -> str:
     payload = priv.to_bytes(32, "big") + (b"\x01" if compressed else b"")
     return b58check_encode(WIF_VERSION, payload)
@@ -480,7 +482,7 @@ def priv_to_wif(priv: int, compressed: bool = True) -> str:
 
 def wif_to_priv(wif: str) -> int:
     version, payload = b58check_decode(wif)
-    if version != WIF_VERSION:
+    if version not in (WIF_VERSION, WIF_VERSION_OLD):
         raise ValueError("not a WIF private key (wrong version byte)")
     if len(payload) == 33 and payload[-1] == 1:
         payload = payload[:-1]
@@ -493,7 +495,8 @@ def wif_to_priv(wif: str) -> int:
 
 
 def parse_private_key(text: str) -> int:
-    """Accept 64-char raw hex OR WIF (both formats FEXT Core understands)."""
+    """Accept 64-char raw hex OR WIF (Ferrite Core's, or the Bitcoin-style
+    one releases before 15.0 exported)."""
     text = text.strip()
     if len(text) == 64:
         try:
@@ -917,7 +920,7 @@ REQUIRE_TLS = _os.environ.get("FEXT_REQUIRE_TLS", "") not in ("", "0", "false")
 
 APP_NAME = "Ferritext"
 #: Must equal `version` in buildozer.spec — CI refuses to build if not.
-APP_VERSION = "13.0.0"
+APP_VERSION = "15.0.0"
 
 # The identity/QR payload keeps carrying the ORIGINAL tag. It is wire data
 # that older clients already produce and consume, so renaming the app must
@@ -1039,6 +1042,22 @@ BACKFILL_CHUNK = 5              # the rest follow, this many a frame
 # this can never be confirmed, because the routing row it needs is gone.
 RECEIPT_RETRY_WINDOW_SECONDS = 7 * 86400
 HKDF_INFO = b"fext.v2.secp256k1-ecdh-hkdf-sha256.aes256gcm"
+# v15: a post-quantum envelope carries its ML-KEM ciphertext at the front of
+# the one ciphertext field, after this mark and the key's id: relays keep
+# only the envelope fields they know, so a new field would never arrive.
+PQ_MAGIC = b"FXQ1"
+HKDF_INFO_PQ = b"fext.v3.secp256k1-ecdh+mlkem768-hkdf-sha256.aes256gcm"
+# A message sealed to the key of an earlier install (an identity restored
+# from its WIF alone) is asked for again: at most this many at once, and
+# only messages this recent are sent again.
+RESEAL_MAX = 50
+RESEAL_WINDOW = 7 * 86400
+
+# ---- v14: the relay's newer routes, the outbox, restarts --------------------
+SEND_MANY_MAX = 32          # members per group request (relay 12.2's limit)
+OUTBOX_EVERY = 30.0         # seconds between outbox passes while connected
+OUTBOX_DAY = 24 * 3600      # after this, an unsent message waits for a tap
+RESTART_WAIT_MAX = 300      # the longest "come back in" a relay is obeyed for
 
 # ---- v9 media ---------------------------------------------------------------
 # Photos and voice notes are sealed with a fresh per-file AES-256-GCM key,
@@ -3582,6 +3601,67 @@ def background_delivery_enabled() -> bool:
 
 def desktop_notifications_enabled() -> bool:
     return bool(load_prefs().get("desktop_notifications", True))
+
+
+# ---- v14: download rules (B14) ----------------------------------------------------
+# A photo or voice note that arrives downloads by itself, or waits for a tap
+# with its small preview showing. Settings › Downloads changes these.
+LARGE_GROUP = 20                    # more members: its photos wait for a tap
+DOWNLOAD_PREFS = {
+    "dl_photos_metered": True,      # photos download by themselves on data
+    "dl_voice_metered": True,       # ...and voice messages
+    "dl_large_groups_tap": True,    # a large group's photos wait for a tap
+    "ask_metered": True,            # ask before a tap downloads on data
+}
+
+
+def download_pref(key: str) -> bool:
+    return bool(load_prefs().get(key, DOWNLOAD_PREFS[key]))
+
+
+_metered_seen = (0.0, False)
+
+
+def on_metered_network() -> bool:
+    """Mobile data, or a network Android counts as metered (a hotspot).
+    Asked at most every few seconds. A computer is taken to be on Wi-Fi or
+    a cable."""
+    global _metered_seen
+    if not IS_ANDROID:
+        return False
+    at, metered = _metered_seen
+    if time.monotonic() - at < 5.0:
+        return metered
+    try:
+        autoclass, cast = _jni()
+        Context = autoclass("android.content.Context")
+        manager = cast("android.net.ConnectivityManager",
+                       android_context().getSystemService(
+                           Context.CONNECTIVITY_SERVICE))
+        metered = bool(manager.isActiveNetworkMetered())
+    except Exception:
+        metered = False
+    _metered_seen = (time.monotonic(), metered)
+    return metered
+
+
+def downloads_by_itself(store: "LocalStore", row: dict) -> bool:
+    """Whether a photo or voice note that has arrived downloads now, or
+    waits for a tap: always in a message request; a photo in a group of more
+    than LARGE_GROUP; on mobile data, as Settings › Downloads says."""
+    peer = row.get("peer") or ""
+    gid = gid_of(peer)
+    if not gid and store.is_request(peer):
+        return False
+    metered = on_metered_network()
+    if row.get("kind") == "image":
+        if gid and download_pref("dl_large_groups_tap") and \
+                len((store.group(gid) or {}).get("members", [])) > LARGE_GROUP:
+            return False
+        return not metered or download_pref("dl_photos_metered")
+    if row.get("kind") == "voice":
+        return not metered or download_pref("dl_voice_metered")
+    return True
 
 
 def android_style_system_bars() -> None:
@@ -6499,6 +6579,19 @@ def pretty_time(iso: str) -> str:
         return iso[11:16]
 
 
+def waits_for_tap(msg: dict) -> bool:
+    """v14 (B15): an outgoing message the relay never took, written over
+    OUTBOX_DAY ago. The outbox no longer tries it by itself; its bubble
+    reads "Not sent · tap to try again"."""
+    if msg.get("direction") != "out" or msg.get("status", 0) > 0:
+        return False
+    try:
+        written = datetime.fromisoformat(msg["created_at"]).timestamp()
+    except (KeyError, TypeError, ValueError):
+        return False
+    return time.time() - written > OUTBOX_DAY
+
+
 def pretty_day(iso: str) -> str:
     try:
         stamp = datetime.fromisoformat(iso).astimezone()
@@ -6510,15 +6603,265 @@ def pretty_day(iso: str) -> str:
         return ""
 
 # =============================================================================
+#  Post-quantum key encapsulation (v15) — ML-KEM-768, FIPS 203, pure Python
+# =============================================================================
+# Store now, decrypt later: whatever is sent today can be recorded and kept
+# until a quantum computer can solve secp256k1, starting from the public key
+# every identity publishes. v15 adds ML-KEM-768 (FIPS 203, the lattice KEM
+# NIST standardised in 2024) to every message whose recipient has a key: the
+# message key comes from BOTH the ECDH secret and an ML-KEM secret
+# (CryptoEngine), so reading a message takes breaking both.
+#
+# Pure Python, like the rest of this file's cryptography: the Android build
+# carries cryptography 2.8, years older than any library's ML-KEM. Each
+# function follows the FIPS 203 algorithm it names. Desktop tests check it
+# against NIST's test vectors and against cryptography's own ML-KEM. It is
+# not constant-time: its timing varies by microseconds, opening a message
+# takes milliseconds, and the only signal that leaves the phone (its
+# acknowledgement to the relay) crosses a network with far more jitter.
+_KEM_Q, _KEM_N, _KEM_K = 3329, 256, 3              # ML-KEM-768
+_KEM_ETA, _KEM_DU, _KEM_DV = 2, 10, 4
+MLKEM_EK_LEN = 384 * _KEM_K + 32                   # 1184 bytes
+MLKEM_DK_LEN = 768 * _KEM_K + 96                   # 2400 bytes
+MLKEM_CT_LEN = 32 * (_KEM_DU * _KEM_K + _KEM_DV)   # 1088 bytes
+MLKEM_KID_LEN = 8                                  # a key's short id
+
+
+def _kem_bitrev7(i: int) -> int:
+    return int(f"{i:07b}"[::-1], 2)
+
+
+#: ζ^BitRev7(i) for the NTT, and ζ^(2·BitRev7(i)+1) for multiplying in it.
+_KEM_ZETAS = [pow(17, _kem_bitrev7(i), _KEM_Q) for i in range(128)]
+_KEM_GAMMAS = [pow(17, 2 * _kem_bitrev7(i) + 1, _KEM_Q) for i in range(128)]
+
+
+def _kem_ntt(f: list) -> list:
+    """FIPS 203, Algorithm 9."""
+    f, q, i, length = list(f), _KEM_Q, 1, 128
+    while length >= 2:
+        for start in range(0, _KEM_N, 2 * length):
+            zeta = _KEM_ZETAS[i]
+            i += 1
+            for j in range(start, start + length):
+                t = zeta * f[j + length] % q
+                f[j + length] = (f[j] - t) % q
+                f[j] = (f[j] + t) % q
+        length >>= 1
+    return f
+
+
+def _kem_ntt_inv(f: list) -> list:
+    """FIPS 203, Algorithm 10 (3303 is 128⁻¹ mod q)."""
+    f, q, i, length = list(f), _KEM_Q, 127, 2
+    while length <= 128:
+        for start in range(0, _KEM_N, 2 * length):
+            zeta = _KEM_ZETAS[i]
+            i -= 1
+            for j in range(start, start + length):
+                t = f[j]
+                f[j] = (t + f[j + length]) % q
+                f[j + length] = zeta * (f[j + length] - t) % q
+        length <<= 1
+    return [x * 3303 % q for x in f]
+
+
+def _kem_mul(f: list, g: list) -> list:
+    """FIPS 203, Algorithms 11 and 12: the product of two NTT forms."""
+    h, q = [0] * _KEM_N, _KEM_Q
+    for i in range(128):
+        a0, a1, b0, b1 = f[2 * i], f[2 * i + 1], g[2 * i], g[2 * i + 1]
+        h[2 * i] = (a0 * b0 + a1 * b1 * _KEM_GAMMAS[i]) % q
+        h[2 * i + 1] = (a0 * b1 + a1 * b0) % q
+    return h
+
+
+def _kem_add(f: list, g: list) -> list:
+    return [(a + b) % _KEM_Q for a, b in zip(f, g)]
+
+
+def _kem_sample_ntt(seed: bytes) -> list:
+    """FIPS 203, Algorithm 7: uniform coefficients from SHAKE128, by
+    rejection (840 bytes are almost always enough; more are read if not)."""
+    out, size, pos = [], 840, 0
+    stream = hashlib.shake_128(seed).digest(size)
+    while len(out) < _KEM_N:
+        if pos + 3 > len(stream):
+            size *= 2
+            stream = hashlib.shake_128(seed).digest(size)
+        c0, c1, c2 = stream[pos], stream[pos + 1], stream[pos + 2]
+        pos += 3
+        d1, d2 = c0 + 256 * (c1 & 15), (c1 >> 4) + 16 * c2
+        if d1 < _KEM_Q:
+            out.append(d1)
+        if d2 < _KEM_Q and len(out) < _KEM_N:
+            out.append(d2)
+    return out
+
+
+def _kem_cbd(data: bytes) -> list:
+    """FIPS 203, Algorithm 8, with η = 2: small noise coefficients."""
+    bits, out = int.from_bytes(data, "little"), []
+    for i in range(_KEM_N):
+        a = (bits >> 4 * i) & 3             # two bits summed, minus the
+        b = (bits >> (4 * i + 2)) & 3       # next two summed
+        out.append(((a & 1) + (a >> 1) - (b & 1) - (b >> 1)) % _KEM_Q)
+    return out
+
+
+def _kem_prf(seed: bytes, n: int) -> bytes:
+    return hashlib.shake_256(seed + bytes([n])).digest(64 * _KEM_ETA)
+
+
+def _kem_encode(f: list, d: int) -> bytes:
+    """FIPS 203, Algorithm 5: d bits per coefficient, little-endian."""
+    acc = 0
+    for i, x in enumerate(f):
+        acc |= x << (i * d)
+    return acc.to_bytes(32 * d, "little")
+
+
+def _kem_decode(data: bytes, d: int) -> list:
+    """FIPS 203, Algorithm 6."""
+    acc, mask = int.from_bytes(data, "little"), (1 << d) - 1
+    return [(acc >> (i * d)) & mask for i in range(_KEM_N)]
+
+
+def _kem_compress(f: list, d: int) -> list:
+    return [(((x << d) + _KEM_Q // 2) // _KEM_Q) & ((1 << d) - 1) for x in f]
+
+
+def _kem_decompress(f: list, d: int) -> list:
+    return [(y * _KEM_Q + (1 << (d - 1))) >> d for y in f]
+
+
+def _kem_g(data: bytes) -> tuple:
+    digest = hashlib.sha3_512(data).digest()
+    return digest[:32], digest[32:]
+
+
+def _kem_matrix(rho: bytes) -> list:
+    """Â, with Â[i][j] = SampleNTT(ρ ‖ j ‖ i) as FIPS 203 orders it."""
+    return [[_kem_sample_ntt(rho + bytes([j, i])) for j in range(_KEM_K)]
+            for i in range(_KEM_K)]
+
+
+def _kpke_keygen(d: bytes) -> tuple:
+    """FIPS 203, Algorithm 13: (ek_PKE, dk_PKE)."""
+    rho, sigma = _kem_g(d + bytes([_KEM_K]))
+    a = _kem_matrix(rho)
+    s = [_kem_ntt(_kem_cbd(_kem_prf(sigma, i))) for i in range(_KEM_K)]
+    e = [_kem_ntt(_kem_cbd(_kem_prf(sigma, _KEM_K + i)))
+         for i in range(_KEM_K)]
+    t = []
+    for i in range(_KEM_K):
+        acc = e[i]
+        for j in range(_KEM_K):
+            acc = _kem_add(acc, _kem_mul(a[i][j], s[j]))
+        t.append(acc)
+    return (b"".join(_kem_encode(x, 12) for x in t) + rho,
+            b"".join(_kem_encode(x, 12) for x in s))
+
+
+def _kpke_encrypt(ek: bytes, m: bytes, r: bytes) -> bytes:
+    """FIPS 203, Algorithm 14."""
+    t = [_kem_decode(ek[384 * i:384 * (i + 1)], 12) for i in range(_KEM_K)]
+    a = _kem_matrix(ek[384 * _KEM_K:])
+    y = [_kem_ntt(_kem_cbd(_kem_prf(r, i))) for i in range(_KEM_K)]
+    e1 = [_kem_cbd(_kem_prf(r, _KEM_K + i)) for i in range(_KEM_K)]
+    e2 = _kem_cbd(_kem_prf(r, 2 * _KEM_K))
+    u = []
+    for i in range(_KEM_K):
+        acc = [0] * _KEM_N
+        for j in range(_KEM_K):
+            acc = _kem_add(acc, _kem_mul(a[j][i], y[j]))
+        u.append(_kem_add(_kem_ntt_inv(acc), e1[i]))
+    acc = [0] * _KEM_N
+    for j in range(_KEM_K):
+        acc = _kem_add(acc, _kem_mul(t[j], y[j]))
+    mu = _kem_decompress(_kem_decode(m, 1), 1)
+    v = _kem_add(_kem_add(_kem_ntt_inv(acc), e2), mu)
+    return (b"".join(_kem_encode(_kem_compress(x, _KEM_DU), _KEM_DU)
+                     for x in u)
+            + _kem_encode(_kem_compress(v, _KEM_DV), _KEM_DV))
+
+
+def _kpke_decrypt(dk_pke: bytes, c: bytes) -> bytes:
+    """FIPS 203, Algorithm 15."""
+    step = 32 * _KEM_DU
+    u = [_kem_decompress(_kem_decode(c[step * i:step * (i + 1)], _KEM_DU),
+                         _KEM_DU) for i in range(_KEM_K)]
+    v = _kem_decompress(_kem_decode(c[step * _KEM_K:], _KEM_DV), _KEM_DV)
+    acc = [0] * _KEM_N
+    for i in range(_KEM_K):
+        s = _kem_decode(dk_pke[384 * i:384 * (i + 1)], 12)
+        acc = _kem_add(acc, _kem_mul(s, _kem_ntt(u[i])))
+    w = [(a - b) % _KEM_Q for a, b in zip(v, _kem_ntt_inv(acc))]
+    return _kem_encode(_kem_compress(w, 1), 1)
+
+
+def mlkem_keygen(seed: bytes) -> tuple:
+    """(ek, dk) from a 64-byte seed d ‖ z (FIPS 203, Algorithm 16): the same
+    seed always gives the same keys, so only the seed is stored."""
+    if len(seed) != 64:
+        raise ValueError("an ML-KEM seed is 64 bytes")
+    ek, dk_pke = _kpke_keygen(seed[:32])
+    return ek, dk_pke + ek + hashlib.sha3_256(ek).digest() + seed[32:]
+
+
+def mlkem_ek_ok(ek: bytes) -> bool:
+    """FIPS 203, 7.2: the length, then every coefficient below q."""
+    if len(ek) != MLKEM_EK_LEN:
+        return False
+    for i in range(_KEM_K):
+        chunk = ek[384 * i:384 * (i + 1)]
+        if _kem_encode([x % _KEM_Q for x in _kem_decode(chunk, 12)],
+                       12) != chunk:
+            return False
+    return True
+
+
+def mlkem_encaps(ek: bytes, m: Optional[bytes] = None) -> tuple:
+    """(shared secret, ciphertext) for `ek` (FIPS 203, Algorithms 17, 20).
+    `m`, the 32 random bytes, is given only by tests (NIST's vectors)."""
+    if not mlkem_ek_ok(ek):
+        raise ValueError("not an ML-KEM-768 encapsulation key")
+    if m is None:
+        m = os.urandom(32)
+    secret, r = _kem_g(m + hashlib.sha3_256(ek).digest())
+    return secret, _kpke_encrypt(ek, m, r)
+
+
+def mlkem_decaps(dk: bytes, c: bytes) -> bytes:
+    """The shared secret in ciphertext `c` (FIPS 203, Algorithms 18, 21). A
+    ciphertext that was tampered with gives a different, unrelated secret
+    (implicit rejection), so the message's AES-GCM check fails."""
+    if len(dk) != MLKEM_DK_LEN or len(c) != MLKEM_CT_LEN:
+        raise ValueError("not an ML-KEM-768 key or ciphertext")
+    k = _KEM_K
+    dk_pke, ek = dk[:384 * k], dk[384 * k:768 * k + 32]
+    h, z = dk[768 * k + 32:768 * k + 64], dk[768 * k + 64:]
+    m = _kpke_decrypt(dk_pke, c)
+    secret, r = _kem_g(m + h)
+    if _kpke_encrypt(ek, m, r) == c:
+        return secret
+    return hashlib.shake_256(z + c).digest(32)
+
+
+def mlkem_kid(ek: bytes) -> str:
+    """A key's short id: the first 8 bytes of SHA3-256(ek), as hex."""
+    return hashlib.sha3_256(ek).digest()[:MLKEM_KID_LEN].hex()
+
+# =============================================================================
 #  IdentityManager — multi-identity secp256k1 key storage (~/.fext)
 # =============================================================================
 class IdentityManager:
     """Owns ~/.fext/identities.json (chmod 600): a list of secp256k1
     identities the user can switch between WITHOUT restarting the app.
 
-    Each identity is Bitcoin-compatible by construction — the private key
-    exported here (hex or WIF) imports directly into FEXT Core to spend
-    coins. New identities are either MINED (grinding until the version-0x24
+    Each identity is Bitcoin-compatible by construction — the private key,
+    exported as WIF, imports directly into Ferrite Core to spend coins. New
+    identities are either MINED (grinding until the version-0x24
     Base58Check address starts with 'Fec') or IMPORTED from a raw-hex / WIF
     private key the user already controls.
 
@@ -6529,6 +6872,7 @@ class IdentityManager:
     def __init__(self) -> None:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self._data: dict = {"version": 2, "active": None, "identities": []}
+        self._pq: dict = {}          # address -> (ek, dk, kid), derived once
         self._load()
 
     # ---- persistence ---------------------------------------------------------
@@ -6595,7 +6939,7 @@ class IdentityManager:
         if address != record.get("address") or self.find(address):
             raise ValueError("not an identity this device can add")
         username = record.get("username")
-        self._data.setdefault("identities", []).append({
+        restored = {
             "label": str(record.get("label") or "")[:64].strip() or
             short_addr(address),
             "address": address,
@@ -6604,7 +6948,13 @@ class IdentityManager:
             "username": username if isinstance(username, str) and
             valid_username(username) else None,
             "created_at": str(record.get("created_at") or now_iso())[:40],
-        })
+        }
+        # v15: its post-quantum key comes back too, so contacts holding it
+        # can keep writing to it.
+        seed = record.get("pq_seed_hex")
+        if isinstance(seed, str) and re.fullmatch(r"[0-9a-f]{128}", seed):
+            restored["pq_seed_hex"] = seed
+        self._data.setdefault("identities", []).append(restored)
         if not self._data.get("active"):
             self._data["active"] = address
         self._save()
@@ -6726,15 +7076,46 @@ class IdentityManager:
         return ecdh_shared_secret(self._priv,
                                   compressed_to_pub(peer_pub_compressed))
 
+    # ---- v15: the post-quantum key -------------------------------------------
+    def _pq_keys(self) -> tuple:
+        """(ek, dk, kid) of the active identity's ML-KEM-768 key.
+
+        Its seed is random and stored beside the private key, never derived
+        from it: a quantum computer that recovers the secp256k1 key from the
+        public one must not get this key with it. An identity made before
+        15.0 gets its seed the first time it is needed.
+        """
+        ident = self._require_active()
+        cached = self._pq.get(ident["address"])
+        if cached is None:
+            if not ident.get("pq_seed_hex"):
+                ident["pq_seed_hex"] = os.urandom(64).hex()
+                self._save()
+            ek, dk = mlkem_keygen(bytes.fromhex(ident["pq_seed_hex"]))
+            cached = self._pq[ident["address"]] = (ek, dk, mlkem_kid(ek))
+        return cached
+
+    @property
+    def pq_public(self) -> bytes:
+        """This identity's ML-KEM encapsulation key, for contacts."""
+        return self._pq_keys()[0]
+
+    @property
+    def pq_kid(self) -> str:
+        return self._pq_keys()[2]
+
+    def pq_decaps(self, kem_ct: bytes) -> bytes:
+        return mlkem_decaps(self._pq_keys()[1], kem_ct)
+
     # ---- exposure for the Settings UI ----------------------------------------
     def private_export(self) -> str:
-        """Click-to-show private key text (hex + WIF, FEXT Core compatible).
+        """Click-to-show private key text (hex + WIF, Ferrite Core compatible).
         Handled ONLY by the Settings screen; never leaves the machine."""
         priv = self._priv
         return json.dumps({
             "private_key_hex": "%064x" % priv,
             "private_key_wif": priv_to_wif(priv, compressed=True),
-            "note": "Import either format into FEXT Core to spend coins.",
+            "note": "Import the WIF into Ferrite Core to spend coins.",
         }, indent=2)
 
     def public_bundle(self) -> dict:
@@ -6811,6 +7192,18 @@ class CryptoEngine:
                     backend=default_backend()).derive(shared_secret)
 
     @staticmethod
+    def _derive_hybrid(ecdh_secret: bytes, pq_secret: bytes,
+                       transcript: bytes) -> bytes:
+        """v15: the AES key from BOTH secrets, so it stays secret while
+        either one does. The salt binds everything public about this
+        message's keys: both curve points, the key id and the ML-KEM
+        ciphertext."""
+        return HKDF(algorithm=SHA256(), length=32,
+                    salt=hashlib.sha256(transcript).digest(),
+                    info=HKDF_INFO_PQ,
+                    backend=default_backend()).derive(ecdh_secret + pq_secret)
+
+    @staticmethod
     def _canonical(version: int, msg_type: str, body: str,
                    sent_at: str, sender_address: str) -> bytes:
         # Signing a canonical string (not raw JSON) sidesteps every JSON
@@ -6849,7 +7242,8 @@ class CryptoEngine:
     def build_envelope(self, body: str, recipient_pub_hex: str,
                        x: Optional[dict] = None,
                        recipient: Optional[str] = None,
-                       cid: Optional[str] = None) -> tuple:
+                       cid: Optional[str] = None,
+                       pq: Optional[tuple] = None) -> tuple:
         """Returns (envelope, sent_at). `envelope` is the ONLY thing that is
         transmitted; it is opaque ciphertext to everyone but the recipient.
 
@@ -6860,6 +7254,11 @@ class CryptoEngine:
         message could re-encrypt it to a third party and it would verify as
         genuinely from its author. An `x` block names exactly one recipient
         and one message, and v9 clients refuse a block addressed elsewhere.
+
+        `pq`, the recipient's (ML-KEM key, key id) when known, makes the
+        envelope post-quantum (v15): the ciphertext field starts with
+        PQ_MAGIC, the key id and the ML-KEM ciphertext, and the AES key
+        comes from both secrets (_derive_hybrid).
         """
         sent_at = now_iso()
         sender_address = self._keys.address
@@ -6894,10 +7293,19 @@ class CryptoEngine:
         eph_priv = int.from_bytes(os.urandom(32), "big") % (_N - 1) + 1
         eph_pub_raw = pub_to_compressed(priv_to_pub(eph_priv))
         shared = ecdh_shared_secret(eph_priv, recipient_point)
-        aes_key = self._derive_key(shared)
         nonce = os.urandom(12)
         aad = eph_pub_raw + recipient_pub_raw
-        ciphertext = AESGCM(aes_key).encrypt(nonce, plaintext, aad)
+        frame = b""
+        if pq is None:
+            aes_key = self._derive_key(shared)
+        else:
+            ek, kid = pq
+            pq_secret, kem_ct = mlkem_encaps(ek)
+            head = PQ_MAGIC + bytes.fromhex(kid)
+            frame = head + kem_ct
+            aes_key = self._derive_hybrid(shared, pq_secret, aad + frame)
+            aad += head
+        ciphertext = frame + AESGCM(aes_key).encrypt(nonce, plaintext, aad)
 
         # ---- step 3: (caller) SEND -------------------------------------------
         envelope = {
@@ -6919,6 +7327,10 @@ class CryptoEngine:
         body and drop the extras": a v9 sender always produces a valid block,
         so an invalid one means tampering or a replay, and quietly showing
         the body would hand the replay its payoff.
+
+        A post-quantum envelope (v15) is opened with this identity's ML-KEM
+        key as well, and the payload returned says so: its "_pq" is the id
+        of the key it was sealed to (never sent; set here only).
         """
         try:
             eph_pub_raw = bytes.fromhex(envelope["ephemeral_public_key"])
@@ -6929,12 +7341,30 @@ class CryptoEngine:
 
         my_pub_raw = bytes.fromhex(self._keys.public_key_hex)
         aad = eph_pub_raw + my_pub_raw
+        head = len(PQ_MAGIC) + MLKEM_KID_LEN
+        marked = ciphertext[:len(PQ_MAGIC)] == PQ_MAGIC and \
+            len(ciphertext) > head + MLKEM_CT_LEN
+        # A classic envelope starts with the mark by chance once in 2³²; the
+        # key id must match too before it is read as post-quantum.
+        pq_kid = ciphertext[len(PQ_MAGIC):head].hex() if marked else None
+        if pq_kid != self._keys.pq_kid:
+            pq_kid = None
         try:
             shared = self._keys.ecdh(eph_pub_raw)
-            aes_key = self._derive_key(shared)
-            plaintext = AESGCM(aes_key).decrypt(nonce, ciphertext, aad)
+            if pq_kid:
+                frame = ciphertext[:head + MLKEM_CT_LEN]
+                aes_key = self._derive_hybrid(
+                    shared, self._keys.pq_decaps(frame[head:]), aad + frame)
+                plaintext = AESGCM(aes_key).decrypt(
+                    nonce, ciphertext[len(frame):], aad + frame[:head])
+            else:
+                aes_key = self._derive_key(shared)
+                plaintext = AESGCM(aes_key).decrypt(nonce, ciphertext, aad)
             payload = json.loads(plaintext.decode("utf-8"))
         except Exception:
+            if marked and not pq_kid:
+                raise self.EnvelopeError(
+                    "sealed to a post-quantum key this device does not hold")
             raise self.EnvelopeError("decryption failed (wrong key or tampering)")
 
         # ---- verify authorship ----------------------------------------------
@@ -6971,6 +7401,9 @@ class CryptoEngine:
             raise
         except (KeyError, ValueError, TypeError):
             raise self.EnvelopeError("signature verification failed")
+        payload.pop("_pq", None)       # only ever set here, never sent
+        if pq_kid:
+            payload["_pq"] = pq_kid
         return payload
 
 
@@ -7070,10 +7503,15 @@ class ApiClient:
                                 "server returned non-JSON response")
         if resp.status_code >= 400:
             err = data.get("error", {}) if isinstance(data, dict) else {}
+            detail = {k: v for k, v in err.items()
+                      if k not in ("code", "message")}
+            # v14: a relay that is full, paused or restarting says when to
+            # come back.
+            wait = resp.headers.get("Retry-After", "")
+            if wait.isdigit():
+                detail["retry_after"] = int(wait)
             raise self.ApiError(resp.status_code, err.get("code", "unknown"),
-                                err.get("message", "request failed"),
-                                {k: v for k, v in err.items()
-                                 if k not in ("code", "message")})
+                                err.get("message", "request failed"), detail)
         return data
 
     def _attempt(self, call) -> dict:
@@ -7160,6 +7598,28 @@ class ApiClient:
                 "client_msg_id": client_msg_id}
         return self._post_signed("/api/messages/send", body, "send")
 
+    def send_many(self, items: list) -> list:
+        """v14 (relay 12.2, B1): one group message to up to SEND_MANY_MAX
+        members in one request. `items`: [{recipient, envelope,
+        client_msg_id}]. Returns one result per item, in order: {server_id,
+        created_at}, or {error: {code, message}} for one not stored."""
+        data = self._post_signed("/api/messages/send_many",
+                                 {"items": items}, "send_many")
+        results = data.get("results") if isinstance(data, dict) else None
+        if not isinstance(results, list) or len(results) != len(items):
+            raise self.ApiError(502, "bad_response",
+                                "the relay answered for the wrong number "
+                                "of members")
+        return results
+
+    def report(self, address: str, reason: str, note: str = "") -> dict:
+        """v14 (B16): ask the relay's operator to look at `address`. The
+        relay never sees what they sent: a report is who, why and a note."""
+        body = {"address": address, "reason": reason}
+        if note:
+            body["note"] = note[:500]
+        return self._post_signed("/api/reports", body, "report")
+
     def sync(self, since_id: int = 0) -> dict:
         headers = self._auth_headers(f"sync.{since_id}")
         return self._get("/api/messages/sync", {"since_id": since_id}, headers)
@@ -7202,6 +7662,10 @@ class ApiClient:
                 "calls": isinstance(feats, list) and "calls" in feats,
                 "call_udp": int(data.get("call_udp") or 0)
                 if isinstance(data, dict) else 0,
+                # v14 (relay 12.2): a group message in one request, and
+                # reports.
+                "send_many": isinstance(feats, list) and "send_many" in feats,
+                "reports": isinstance(feats, list) and "reports" in feats,
                 "version": str(data.get("version", "")) if isinstance(
                     data, dict) else ""}
         return self._features
@@ -7213,13 +7677,19 @@ class ApiClient:
         headers = self._auth_headers("call.ticket")
         return self._get("/api/calls/ticket", {}, headers)
 
-    def upload_blob(self, blob: bytes) -> dict:
+    def upload_blob(self, blob: bytes, expect: int = 0) -> dict:
         """Store one sealed media file on the relay; returns {'blob': id,
-        'expires_at': ...}. The signature binds the exact bytes."""
+        'expires_at': ...}. The signature binds the exact bytes.
+
+        `expect` (v14, B2): how many people will fetch it. Relay 12.2 frees
+        the file an hour after the last of them has it, instead of keeping
+        it its full time; older relays ignore the header."""
         if len(blob) > MAX_MEDIA_BYTES:
             raise self.ApiError(413, "too_large", "media is too large")
         headers = self._auth_headers(f"blob.{sha256_hex(blob)}")
         headers["Content-Type"] = "application/octet-stream"
+        if expect > 0:
+            headers["X-Fext-Expect"] = str(int(expect))
         return self._attempt(lambda base: self._handle(
             self._session.post(f"{base}/api/blobs", data=blob,
                                headers=headers,
@@ -7286,6 +7756,10 @@ class LocalStore:
     );
     CREATE INDEX IF NOT EXISTS idx_local_msgs_peer ON messages (peer, id);
     CREATE INDEX IF NOT EXISTS idx_local_msgs_cmid ON messages (client_msg_id);
+    -- v14: only the unread, so the chat list counts them without reading
+    -- every message (conversations()).
+    CREATE INDEX IF NOT EXISTS idx_msgs_unread ON messages (peer)
+        WHERE direction = 'in' AND read = 0;
     -- v9: client ids of messages deleted on this device, so a message the
     -- relay re-pushes (an ack lost to a dropped socket) or one that arrives
     -- AFTER its author's delete-for-both cannot come back from the dead.
@@ -7396,7 +7870,9 @@ class LocalStore:
     #:        contacts, held frames from blocked contacts
     #:   6    v12.0: reactions_more (several reactions per person) — a new
     #:        table only
-    SCHEMA_VERSION = 6
+    #:   7    v14.0: contacts.accepted (message requests)
+    #:   8    v15.0: contacts.pq_key, pq_kid, pq_mine (post-quantum keys)
+    SCHEMA_VERSION = 8
 
     #: Additive migrations: (table, column, statements). Applied when the
     #: column is missing, decided by inspection rather than by catching the
@@ -7490,6 +7966,26 @@ class LocalStore:
             "DEFAULT 0",
             "CREATE INDEX IF NOT EXISTS idx_msgs_expiry ON messages "
             "(expires_at) WHERE expires_at > 0")),
+        # ---- schema 7 (v14.0) -----------------------------------------------
+        # 0: someone who wrote first and has not been accepted, so their chat
+        # waits under Message requests. Everyone known before 14.0 is
+        # accepted (the default).
+        ("contacts", "accepted", (
+            "ALTER TABLE contacts ADD COLUMN accepted INTEGER NOT NULL "
+            "DEFAULT 1",)),
+        # ---- schema 8 (v15.0) -----------------------------------------------
+        # Their ML-KEM-768 key (base64) and its id, as their own signed
+        # messages gave it; and the id of OUR key they have shown they hold,
+        # by sealing a message to it. '' while there is none.
+        ("contacts", "pq_key", (
+            "ALTER TABLE contacts ADD COLUMN pq_key TEXT NOT NULL "
+            "DEFAULT ''",)),
+        ("contacts", "pq_kid", (
+            "ALTER TABLE contacts ADD COLUMN pq_kid TEXT NOT NULL "
+            "DEFAULT ''",)),
+        ("contacts", "pq_mine", (
+            "ALTER TABLE contacts ADD COLUMN pq_mine TEXT NOT NULL "
+            "DEFAULT ''",)),
     )
 
     #: contacts.caps bit: this peer has sent us a valid v9 extension block,
@@ -7566,23 +8062,110 @@ class LocalStore:
 
     # ---- contacts ------------------------------------------------------------
     def upsert_contact(self, address: str, username: Optional[str],
-                       public_key: str, listed: bool = True) -> None:
+                       public_key: str, listed: bool = True,
+                       accepted: bool = True) -> None:
         """Add or refresh a contact. `listed=False` is for someone known only
         from a group: their key is kept (it verifies their messages, and lets
         you message them later) but they are not put in the chat list. A
         later listed upsert, or a direct message, lists them; nothing ever
-        unlists a contact."""
+        unlists a contact.
+
+        `accepted=False` (v14) is for someone met because they wrote — first
+        to you, or in a group: until you accept them, write to them or add
+        them yourself, what they send you directly is a message request.
+        Like `listed`, it only ever goes up."""
         with self._lock:
             self._db.execute(
                 """INSERT INTO contacts (address, username, public_key, added_at,
-                                         listed)
-                   VALUES (?, ?, ?, ?, ?)
+                                         listed, accepted)
+                   VALUES (?, ?, ?, ?, ?, ?)
                    ON CONFLICT(address) DO UPDATE SET
                        username = COALESCE(excluded.username, contacts.username),
                        public_key = excluded.public_key,
-                       listed = MAX(contacts.listed, excluded.listed)""",
-                (address, username, public_key, now_iso(), 1 if listed else 0))
+                       listed = MAX(contacts.listed, excluded.listed),
+                       accepted = MAX(contacts.accepted, excluded.accepted)""",
+                (address, username, public_key, now_iso(), 1 if listed else 0,
+                 1 if accepted else 0))
             self._db.commit()
+
+    # ---- v14: message requests (B16) -------------------------------------------
+    def is_request(self, address: str) -> bool:
+        """Their direct messages wait under Message requests."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT accepted FROM contacts WHERE address = ?",
+                (address,)).fetchone()
+        return row is not None and not row["accepted"]
+
+    def set_accepted(self, address: str) -> None:
+        with self._lock:
+            self._db.execute(
+                "UPDATE contacts SET accepted = 1 WHERE address = ?",
+                (address,))
+            self._db.commit()
+
+    # ---- v15: post-quantum keys ------------------------------------------------
+    def pq_key(self, address: str) -> Optional[tuple]:
+        """(their ML-KEM key, its id), or None while they have sent none."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT pq_key, pq_kid FROM contacts WHERE address = ?",
+                (address,)).fetchone()
+        if row is None or not row["pq_key"]:
+            return None
+        return b64d(row["pq_key"]), row["pq_kid"]
+
+    def set_pq_key(self, address: str, ek: Optional[bytes],
+                   kid: str = "") -> None:
+        """Hold their key (or, with None, forget it)."""
+        with self._lock:
+            self._db.execute(
+                "UPDATE contacts SET pq_key = ?, pq_kid = ? WHERE address = ?",
+                (b64e(ek) if ek else "", kid if ek else "", address))
+            self._db.commit()
+
+    def pq_mine(self, address: str) -> str:
+        """The id of our key they have shown they hold, or ''."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT pq_mine FROM contacts WHERE address = ?",
+                (address,)).fetchone()
+        return row["pq_mine"] if row is not None else ""
+
+    def set_pq_mine(self, address: str, kid: str) -> None:
+        with self._lock:
+            self._db.execute(
+                "UPDATE contacts SET pq_mine = ? WHERE address = ?",
+                (kid, address))
+            self._db.commit()
+
+    def shared_groups(self, address: str) -> list:
+        """The names of the active groups `address` is in with us."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT name, members FROM groups WHERE state = 'active' "
+                "ORDER BY name").fetchall()
+        names = []
+        for row in rows:
+            try:
+                members = json.loads(row["members"] or "[]")
+            except ValueError:
+                continue
+            if any(isinstance(m, dict) and m.get("a") == address
+                   for m in members):
+                names.append(row["name"])
+        return names
+
+    def blocked_contacts(self) -> list:
+        """[{address, username}] of everyone blocked, by name."""
+        with self._lock:
+            rows = self._db.execute(
+                """SELECT f.peer AS address, c.username FROM chat_flags f
+                   LEFT JOIN contacts c ON c.address = f.peer
+                   WHERE f.blocked = 1 AND f.peer NOT LIKE ?
+                   ORDER BY LOWER(COALESCE(c.username, f.peer))""",
+                (GROUP_PREFIX + "%",)).fetchall()
+        return [dict(r) for r in rows]
 
     def get_contact(self, address: str) -> Optional[dict]:
         with self._lock:
@@ -7846,12 +8429,53 @@ class LocalStore:
                           local_id, member)
             return False
 
+    def outgoing_by_cid(self, cid: str) -> Optional[dict]:
+        """v15: our message with client id `cid`, in whatever chat."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM messages WHERE client_msg_id = ? AND "
+                "direction = 'out' ORDER BY id DESC LIMIT 1",
+                (cid,)).fetchone()
+        return dict(row) if row else None
+
+    def received_cid(self, sender: str, cid: str) -> bool:
+        """v15: whether message `cid` from `sender` is held, in their chat
+        or a group's."""
+        with self._lock:
+            return self._db.execute(
+                "SELECT 1 FROM messages WHERE client_msg_id = ? AND "
+                "direction = 'in' AND (peer = ? OR author = ?) LIMIT 1",
+                (cid, sender, sender)).fetchone() is not None
+
     def group_sends(self, local_id: int) -> list:
         with self._lock:
             rows = self._db.execute(
                 "SELECT * FROM group_sends WHERE local_id = ? ORDER BY member",
                 (local_id,)).fetchall()
         return [dict(r) for r in rows]
+
+    def outbox(self, newer_than: float = 0.0) -> list:
+        """v14 (B15): outgoing messages the relay has not wholly taken,
+        oldest first, written since `newer_than` (a Unix time; 0: any).
+        Each has `members`: in a group, those still owed a copy; None for a
+        direct message."""
+        since = datetime.fromtimestamp(newer_than, timezone.utc).isoformat() \
+            if newer_than else ""
+        with self._lock:
+            rows = [dict(r) for r in self._db.execute(
+                """SELECT * FROM messages
+                   WHERE direction = 'out' AND created_at >= ? AND (
+                       (peer NOT LIKE ? AND server_id IS NULL AND status = 0)
+                       OR id IN (SELECT local_id FROM group_sends
+                                 WHERE server_id IS NULL))
+                   ORDER BY id""", (since, GROUP_PREFIX + "%")).fetchall()]
+            for row in rows:
+                row["members"] = [r[0] for r in self._db.execute(
+                    """SELECT member FROM group_sends WHERE local_id = ?
+                       AND server_id IS NULL ORDER BY member""",
+                    (row["id"],))] \
+                    if row["peer"].startswith(GROUP_PREFIX) else None
+        return rows
 
     # Outcomes of add_in(). The caller must be able to tell these apart,
     # because only two of the three make it safe to acknowledge delivery.
@@ -8398,28 +9022,32 @@ class LocalStore:
         direction, kind, status and author come along, so the list can show
         "You: …" and its tick without a query per row.
         """
+        # v14: each chat's newest message comes from the (peer, id) index and
+        # its unread count from idx_msgs_unread, so neither reads every
+        # message: about 15x faster at 50,000 messages (desktop/bench.py).
         with self._lock:
             rows = self._db.execute(
-                """SELECT m.peer, c.username, c.ticks_enabled, c.notify,
-                          c.mute_until, c.verified,
+                """SELECT a.peer, c.username, c.ticks_enabled, c.notify,
+                          c.mute_until, c.verified, c.accepted,
                           g.name AS group_name, g.notify AS group_notify,
                           g.mute_until AS group_mute_until,
                           g.state AS group_state,
                           l.body AS preview, l.created_at AS last_at,
                           l.direction AS last_direction, l.kind AS last_kind,
                           l.status AS last_status, l.author AS last_author,
-                          SUM(CASE WHEN m.direction = 'in' AND m.read = 0
-                              THEN 1 ELSE 0 END) AS unread,
-                          MAX(m.id) AS last_id
-                   FROM messages m
-                   LEFT JOIN contacts c ON c.address = m.peer
-                   LEFT JOIN groups g ON 'g:' || g.gid = m.peer
-                   JOIN messages l ON l.id = (SELECT MAX(id) FROM messages
-                                              WHERE peer = m.peer)
-                   GROUP BY m.peer ORDER BY last_id DESC""").fetchall()
+                          (SELECT COUNT(*) FROM messages u
+                           WHERE u.peer = a.peer AND u.direction = 'in'
+                             AND u.read = 0) AS unread,
+                          a.last_id
+                   FROM (SELECT peer, MAX(id) AS last_id FROM messages
+                         GROUP BY peer) a
+                   JOIN messages l ON l.id = a.last_id
+                   LEFT JOIN contacts c ON c.address = a.peer
+                   LEFT JOIN groups g ON 'g:' || g.gid = a.peer
+                   ORDER BY a.last_id DESC""").fetchall()
             contact_only = self._db.execute(
                 """SELECT address AS peer, username, ticks_enabled, notify,
-                          mute_until, verified,
+                          mute_until, verified, accepted,
                           NULL AS preview, added_at AS last_at,
                           0 AS unread, 0 AS last_id
                    FROM contacts
@@ -8456,6 +9084,9 @@ class LocalStore:
                 row["kind"] = "self"
             else:
                 row["kind"] = "dm"
+            # v14: someone who wrote first, not yet accepted (B16).
+            row["request"] = row["kind"] == "dm" and \
+                row.get("accepted") == 0
             row["muted"] = self.muted_now(row.get("notify"),
                                           row.get("mute_until"), now)
             row["draft"] = f.get("draft") or ""
@@ -9117,6 +9748,11 @@ class SyncWorker(threading.Thread):
         self._last_chores = 0.0
         self._last_sweep = 0.0
         self._release_lock = threading.Lock()
+        # v14: the outbox's pass, on a thread of its own, and how long the
+        # relay asked phones to stay away while it restarts (P3).
+        self._outbox_thread: Optional[threading.Thread] = None
+        self._last_outbox = 0.0
+        self._restart_in = 0
 
     def _beat(self) -> None:
         if self.beat_owner and time.monotonic() - self._last_beat \
@@ -9127,6 +9763,24 @@ class SyncWorker(threading.Thread):
     def nudge(self) -> None:
         """Cut any pending backoff short and re-dial immediately."""
         self.wake_event.set()
+
+    def _outbox_soon(self, due_only: bool = False) -> None:
+        """v14 (B15): send what waits in the outbox — now, or (`due_only`)
+        if OUTBOX_EVERY has passed — on a thread of its own, so frames keep
+        flowing while it sends."""
+        if due_only and time.monotonic() - self._last_outbox < OUTBOX_EVERY:
+            return
+        self._last_outbox = time.monotonic()
+        if self._outbox_thread is not None and self._outbox_thread.is_alive():
+            return
+
+        def run():
+            try:
+                self.app.flush_outbox()
+            except Exception:
+                log.exception("the outbox could not be sent")
+        self._outbox_thread = threading.Thread(target=run, daemon=True)
+        self._outbox_thread.start()
 
     # ---- v11: chores between frames ----------------------------------------------
     def _chores(self, force: bool = False) -> None:
@@ -9309,7 +9963,7 @@ class SyncWorker(threading.Thread):
                                                     sender, cid=cid)
         except CryptoEngine.EnvelopeError as exc:
             return self._handle_undecryptable(server_id, sender, who,
-                                              fragment, exc)
+                                              fragment, exc, cid)
 
         inner = payload["sender"]
         x = payload.get("x")
@@ -9352,11 +10006,18 @@ class SyncWorker(threading.Thread):
             self.app.store.upsert_contact(sender, inner.get("username"),
                                           inner["public_key"],
                                           listed=not (group_traffic or
-                                                      upkeep))
+                                                      upkeep),
+                                          accepted=False)
         except sqlite3.Error:
             log.exception("could not update contact record for %s", sender)
             MessageFlowLog.dropped(server_id, who, "contact upsert failed")
             return None
+        self._pq_learn(sender, x, payload.get("_pq"))
+        if not (group_traffic or upkeep) and \
+                self.app.store.is_request(sender):
+            handled, ack = self._as_request(server_id, sender, who, ctl)
+            if handled:
+                return ack
 
         conversation, author = sender, None
         kind, ext, media_state = "text", None, ""
@@ -9473,6 +10134,31 @@ class SyncWorker(threading.Thread):
             return None
         return gid
 
+    def _as_request(self, server_id, sender: str, who: str,
+                    ctl: Optional[dict]) -> tuple:
+        """v14 (B16): a direct frame from someone not yet accepted. Their
+        chat waits under Message requests, and until then they see one tick
+        and no read receipt: the relay is told to send them none (it sends
+        receipts only while both sides allow them) BEFORE anything is
+        acknowledged. Returns (handled here, relay id to acknowledge or
+        None); not handled: store it as usual."""
+        op = ctl.get("op") if isinstance(ctl, dict) else None
+        if op in ("call", "ringing", "answer", "cands", "end"):
+            MessageFlowLog.let_go(server_id, who,
+                                  "refused: a call from a message request")
+            return True, server_id
+        contact = self.app.store.get_contact(sender) or {}
+        if contact.get("ticks_enabled", 1):
+            try:
+                self.app.api.set_ticks(sender, False)
+            except (requests.RequestException, ApiClient.ApiError) as exc:
+                # Not yet: the relay keeps the message and offers it again.
+                MessageFlowLog.dropped(server_id, who, "a message request, "
+                                       f"waiting to turn its ticks off ({exc})")
+                return True, None
+            self.app.store.set_contact_setting(sender, "ticks_enabled", 0)
+        return False, None
+
     def _who(self, address: str, start: bool = True) -> str:
         if address == self.app.keys.address:
             return "You" if start else "you"
@@ -9501,7 +10187,8 @@ class SyncWorker(threading.Thread):
             for member in state["members"]:
                 if member["a"] != me:
                     store.upsert_contact(member["a"], member.get("u"),
-                                         member["k"], listed=False)
+                                         member["k"], listed=False,
+                                         accepted=False)
             store.add_event(peer, f"{self._who(sender)} added you to "
                                   f"\u201c{state['name']}\u201d")
             self.app.ui_queue.put(("message_stored", peer))
@@ -9515,7 +10202,8 @@ class SyncWorker(threading.Thread):
         for member in state["members"]:
             if member["a"] != me:
                 store.upsert_contact(member["a"], member.get("u"),
-                                     member["k"], listed=False)
+                                     member["k"], listed=False,
+                                     accepted=False)
         who = self._who(sender)
         if state["name"] != local["name"]:
             store.add_event(peer, f"{who} renamed the group "
@@ -9577,6 +10265,17 @@ class SyncWorker(threading.Thread):
             return server_id
         if op == "leave":
             self._apply_leave(sender, sanitize_gid(ctl.get("grp")))
+            return server_id
+        if op == "reseal":
+            # v15: they could not open what we sealed to their earlier
+            # post-quantum key; this control brought the new one (its x.pqe,
+            # learnt before we got here).
+            cids = ctl.get("cids") if isinstance(ctl.get("cids"), list) \
+                else []
+            cids = [c for c in cids[:RESEAL_MAX]
+                    if isinstance(c, str) and _TOKEN_RE.match(c)]
+            if cids:
+                self.app.reseal(sender, cids)
             return server_id
         if op in ("call", "ringing", "answer", "cands", "end"):
             # Calls are between two people: never in a group's name.
@@ -9674,6 +10373,39 @@ class SyncWorker(threading.Thread):
         return server_id
 
     # ---- v9.1.2: features and pictures --------------------------------------------
+    def _pq_learn(self, sender: str, x, sealed_to: Optional[str]) -> None:
+        """v15: what one verified message says about post-quantum keys.
+
+        Sealed to our key, it shows they hold it, and we stop attaching it.
+        A classic one from someone who held it shows they lost it (a new
+        install), so ours is offered again. Its x-block names their key, and
+        carries the key itself until they see we hold it: a key whose id
+        does not match is ignored, and a new id we have no key for drops the
+        old key, since they no longer read messages sealed to it.
+        """
+        store = self.app.store
+        try:
+            if sealed_to:
+                store.set_pq_mine(sender, sealed_to)
+            elif store.pq_mine(sender):
+                store.set_pq_mine(sender, "")
+            kid = x.get("pq") if isinstance(x, dict) else None
+            if not isinstance(kid, str) or \
+                    not re.fullmatch(r"[0-9a-f]{16}", kid):
+                return
+            held = store.pq_key(sender)
+            try:
+                ek = b64d(x["pqe"]) if isinstance(x.get("pqe"), str) else None
+            except ValueError:
+                ek = None
+            if ek is not None and mlkem_kid(ek) == kid and mlkem_ek_ok(ek):
+                if held is None or held[1] != kid:
+                    store.set_pq_key(sender, ek, kid)
+            elif held is not None and held[1] != kid:
+                store.set_pq_key(sender, None)
+        except sqlite3.Error:
+            log.exception("could not record post-quantum keys of %s", sender)
+
     @staticmethod
     def caps_of(x: dict) -> int:
         """contacts.caps bits a verified extension block proves: v9 itself,
@@ -9744,7 +10476,8 @@ class SyncWorker(threading.Thread):
         self.app.ui_queue.put(("picture", peer, path))
 
     def _handle_undecryptable(self, server_id, sender: str, who: str,
-                              fragment: str, exc: Exception) -> Optional[int]:
+                              fragment: str, exc: Exception,
+                              cid: Optional[str] = None) -> Optional[int]:
         """An envelope that will not open.
 
         Usually a stale contact key — the sender encrypted to an identity
@@ -9757,6 +10490,18 @@ class SyncWorker(threading.Thread):
         """
         attempts = self._decrypt_failures.get(server_id, 0) + 1
         self._decrypt_failures[server_id] = attempts
+        # v15: sealed to the post-quantum key of this identity's earlier
+        # install. It will never open here, so the sender is sent our key
+        # now and asked for the message again.
+        earlier_key = "post-quantum key" in str(exc)
+        if earlier_key and cid and _TOKEN_RE.match(cid):
+            if self.app.store.received_cid(sender, cid):
+                self._decrypt_failures.pop(server_id, None)
+                MessageFlowLog.let_go(server_id, who, "already held: it was "
+                                      "sent again to our current key")
+                return server_id
+            if attempts == 1:
+                self.app.ask_reseal(sender, cid)
         if attempts < self.MAX_DECRYPT_ATTEMPTS:
             MessageFlowLog.dropped(
                 server_id, who,
@@ -9766,7 +10511,10 @@ class SyncWorker(threading.Thread):
         log.error("giving up on relay message %s from %s after %d attempts: "
                   "%s — recording it as unreadable", server_id, sender,
                   attempts, exc)
-        placeholder = ("⚠ A message arrived that this device could not "
+        placeholder = ("⚠ A message arrived sealed to this identity's "
+                       "post-quantum key from an earlier install. It has "
+                       "been asked for again." if earlier_key else
+                       "⚠ A message arrived that this device could not "
                        "decrypt. It was most likely encrypted to an older "
                        "identity key. Ask the sender to try again.")
         # Stored as ALREADY READ so no read receipt is ever emitted for it:
@@ -9785,6 +10533,15 @@ class SyncWorker(threading.Thread):
     def _handle_frame(self, frame: dict) -> Optional[dict]:
         """Process one pushed frame; returns an ack frame to send, if any."""
         kind = frame.get("type")
+        if kind == "restart":
+            # v14 (P3): the relay stops for an update and asks every phone
+            # to come back in `seconds`; the session ends and _run waits.
+            try:
+                seconds = int(frame.get("seconds") or 15)
+            except (TypeError, ValueError):
+                seconds = 15
+            self._restart_in = max(1, min(RESTART_WAIT_MAX, seconds))
+            return None
         if kind == "cmedia":
             # A call's sound, forwarded by the relay when UDP cannot pass.
             on_packet = getattr(self.app, "call_ws_packet", None)
@@ -9836,6 +10593,9 @@ class SyncWorker(threading.Thread):
             fields = self.app.api.auth_fields("ws.connect")
             ws.send(json.dumps({"type": "auth", **fields}))
             hello = json.loads(ws.recv())
+            if hello.get("type") == "restart":
+                self._handle_frame(hello)        # draining: come back later
+                return True
             if hello.get("type") != "auth_ok":
                 if hello.get("type") == "auth_error":
                     code = hello.get("code", "")
@@ -9857,9 +10617,11 @@ class SyncWorker(threading.Thread):
             with self._ws_lock:
                 self._ws = ws
             # A reconnect is the first honest chance to discover that
-            # receipts written to the PREVIOUS socket never landed.
+            # receipts written to the PREVIOUS socket never landed — and
+            # (v14) to send what waited in the outbox.
             threading.Thread(target=self._flush_read_receipts,
                              daemon=True).start()
+            self._outbox_soon()
             # Say what is actually true. Message bodies are end-to-end
             # encrypted on every transport, but on cleartext the metadata
             # around them is not — and the user is entitled to know which
@@ -9883,6 +10645,7 @@ class SyncWorker(threading.Thread):
             while not self.stop_event.is_set():
                 self._beat()
                 self._chores()
+                self._outbox_soon(due_only=True)
                 if time.monotonic() - last_outbound >= WS_IDLE_TIMEOUT:
                     if not self.send_ws({"type": "ping"}):
                         break
@@ -9906,6 +10669,8 @@ class SyncWorker(threading.Thread):
                         if not self.send_ws(reply):
                             break
                         last_outbound = time.monotonic()
+                    if self._restart_in:
+                        break
             return True
         except Exception:
             return True
@@ -9984,17 +10749,29 @@ class SyncWorker(threading.Thread):
                 break
             if had_ws:
                 # A live session just ended (server restart, network blip):
-                # skip the HTTP sweep and re-dial fast.
+                # skip the HTTP sweep and re-dial fast — unless the relay
+                # asked to be left alone while it restarts (v14, P3). Then
+                # wait as long as it asked, plus a little at random, so the
+                # phones do not all come back in the same second.
                 online = None
                 backoff = WS_RECONNECT_MIN
-                self.app.ui_queue.put(("status", "Reconnecting…",
-                                       COL_TEXT_DIM))
-                self._sleep(WS_RECONNECT_MIN)
+                wait, self._restart_in = self._restart_in, 0
+                if wait:
+                    wait += random.uniform(0, min(10.0, wait / 2))
+                    self.app.ui_queue.put((
+                        "status", f"The relay is restarting · back in about "
+                        f"{round(wait)} s", COL_TEXT_DIM))
+                else:
+                    self.app.ui_queue.put(("status", "Reconnecting…",
+                                           COL_TEXT_DIM))
+                self._sleep(wait or WS_RECONNECT_MIN)
                 continue
             reachable = False
+            asked_wait = 0
             try:
                 self._http_poll_once()
                 reachable = True
+                self._outbox_soon(due_only=online is True)
                 if online is not True:
                     online = True
                     if _websocket_mod is None:
@@ -10013,6 +10790,9 @@ class SyncWorker(threading.Thread):
                     self.stop_event.set()
                     self.app.ui_queue.put(("needs_registration", exc.message))
                     break
+                # v14 (P3): a relay that is paused or restarting says when.
+                asked_wait = min(RESTART_WAIT_MAX,
+                                 exc.detail.get("retry_after") or 0)
                 if online is not False:
                     online = False
                     self.app.ui_queue.put(("status", f"Sync error: "
@@ -10027,7 +10807,7 @@ class SyncWorker(threading.Thread):
                 backoff = WS_RECONNECT_MIN
                 self._sleep(POLL_INTERVAL_SECONDS)
             else:
-                self._sleep(backoff)
+                self._sleep(max(backoff, asked_wait))
                 # While the app is on screen the user is WATCHING for their
                 # messages, so a 30s blind window reads as "the app is
                 # broken". QA saw exactly that after a relay restart or a
@@ -12147,6 +12927,106 @@ class MuteSheet(MenuSheet):
 def hint(text: str) -> InfoLabel:
     """A quiet explanatory paragraph."""
     return InfoLabel(text, color=T.text_3, font_size=fs(15))
+
+
+class ReportSheet(Sheet):
+    """v14 (B16): report someone to the relay's operator, and if you like
+    block them too. The operator learns who and why, and your note — never
+    what they sent, which the relay cannot read."""
+
+    REASONS = [("spam", "Spam"), ("abuse", "Abuse"),
+               ("unwanted", "Unwanted"), ("other", "Other")]
+
+    def __init__(self, app: "FextApp", peer: str) -> None:
+        name = (app.store.get_contact(peer) or {}).get("username") or \
+            short_addr(peer, 12)
+        super().__init__(f"Report {name}",
+                         subtitle="The relay's operator is told who you "
+                                  "report and why. What they sent stays "
+                                  "sealed: nobody but you can read it.")
+        self.app, self.peer, self._block = app, peer, True
+        self.reason = self.add(Segmented(self.REASONS, "spam"))
+        self.note = self.add(Field(hint="Anything the operator should know "
+                                        "(optional)"))
+        self.add(rows_card([ListRow(
+            "block", f"Also block {name}",
+            "What they send is held, unopened, until you unblock them",
+            control=ToggleSwitch(True, lambda on: setattr(self, "_block",
+                                                          on)))], inset=0))
+        if not (app.api and app.api.features().get("reports")):
+            self.add(hint("This relay takes no reports yet: only the block "
+                          "is done here."))
+        self.add(Btn("Report", kind="solid_danger",
+                     on_release=lambda _w: self._send()))
+
+    def _send(self) -> None:
+        self.app.report_contact(self.peer, self.reason.value,
+                                self.note.text.strip(), self._block)
+        self.dismiss()
+
+
+class MobileDataSheet(Sheet):
+    """v14 (B14): asked before a tap downloads on mobile data."""
+
+    def __init__(self, app: "FextApp", msg: dict) -> None:
+        media = message_ext(msg).get("media") or {}
+        what = "voice message" if msg.get("kind") == "voice" else "photo"
+        super().__init__("Download on mobile data?",
+                         subtitle=f"You are not on Wi-Fi. This {what} is "
+                                  f"{size_text(int(media.get('size') or 0))}.")
+        self.app, self.msg, self._quiet = app, msg, False
+        self.add(rows_card([ListRow(
+            "check", "Don't ask again",
+            "Settings › Downloads can turn the question back on",
+            control=ToggleSwitch(False, lambda on: setattr(self, "_quiet",
+                                                           on)))], inset=0))
+        buttons = self.add(BoxLayout(size_hint_y=None, height=TOUCH,
+                                     spacing=dp(10)))
+        buttons.add_widget(Btn("Not now", kind="quiet",
+                               on_release=lambda _w: self.dismiss()))
+        buttons.add_widget(Btn("Download",
+                               on_release=lambda _w: self._download()))
+
+    def _download(self) -> None:
+        if self._quiet:
+            save_pref("ask_metered", False)
+        self.app.fetch_media(self.msg["id"])
+        self.dismiss()
+
+
+class BlockedSheet(Sheet):
+    """v14 (B16): everyone blocked, each with the way to unblock them."""
+
+    def __init__(self, app: "FextApp") -> None:
+        super().__init__("Blocked",
+                         subtitle="What they send is held, unopened, until "
+                                  "you unblock them; it then arrives in "
+                                  "order.")
+        self.app = app
+        self._fill()
+
+    def _fill(self) -> None:
+        self.body.clear_widgets()
+        people = self.app.store.blocked_contacts() if self.app.store else []
+        if not people:
+            self.add(hint("No one is blocked."))
+            return
+        rows = []
+        for person in people:
+            unblock = Btn("Unblock", kind="text", size_hint_x=None,
+                          pos_hint={"center_y": .5},
+                          on_release=lambda _w, a=person["address"]:
+                          self._unblock(a))
+            unblock.width = unblock.natural_width() + dp(8)
+            rows.append(ListRow(
+                "block", person.get("username") or
+                short_addr(person["address"], 12),
+                short_addr(person["address"], 12), control=unblock))
+        self.add(rows_card(rows, inset=0))
+
+    def _unblock(self, address: str) -> None:
+        self.app.set_blocked([address], False)
+        self._fill()
 
 
 class RegisterModal(Sheet):
@@ -14401,9 +15281,11 @@ class ConversationRow(ButtonBehavior, BoxLayout):
 
 class ArchiveRow(ButtonBehavior, BoxLayout):
     """The way into archived chats, at the top of the list: how many, and
-    how many of their messages are unread."""
+    how many of their messages are unread. With another icon and title
+    (v14), the way into message requests."""
 
-    def __init__(self, count: int, unread: int, on_open: Callable, **kw):
+    def __init__(self, count: int, unread: int, on_open: Callable,
+                 icon: str = "archive", title: str = "Archived chats", **kw):
         kw.setdefault("size_hint_y", None)
         kw.setdefault("height", max(dp(60), line_height(17) + dp(26)))
         kw.setdefault("padding", [dp(18), dp(6), dp(18), dp(6)])
@@ -14418,11 +15300,11 @@ class ArchiveRow(ButtonBehavior, BoxLayout):
                 d = dp(44)
                 SmoothEllipse(pos=(w.x + (w.width - d) / 2,
                                    w.y + (w.height - d) / 2), size=(d, d))
-                draw_icon("archive", w.x + w.width / 2, w.y + w.height / 2,
+                draw_icon(icon, w.x + w.width / 2, w.y + w.height / 2,
                           dp(22), C(T.text_2))
         disc.bind(pos=paint, size=paint)
         self.add_widget(disc)
-        self.add_widget(single_line("Archived chats", fs(17), T.text_2))
+        self.add_widget(single_line(title, fs(17), T.text_2))
         tail = BoxLayout(size_hint_x=None, width=dp(64), spacing=dp(6))
         tail.add_widget(single_line(str(count), fs(14), T.text_3,
                                     halign="right"))
@@ -14524,7 +15406,7 @@ class ChatsScreen(SwipeGestures, Screen):
         self.search_head.add_widget(self.search_clear)
         # ---- hold a chat: the head becomes what can be done with it --------
         self.selected: list = []          # peers, in the order picked
-        self.showing_archive = False
+        self.view = "chats"               # or "archive", "requests" (v14)
         self._rows: dict = {}             # peer -> (signature, row)
         self.select_head = BoxLayout(size_hint_y=None, height=head.height,
                                      padding=[dp(4), dp(4), dp(4), dp(4)],
@@ -14559,6 +15441,14 @@ class ChatsScreen(SwipeGestures, Screen):
             on_release=lambda _w: self.show_archive(False)))
         self.archive_head.add_widget(single_line("Archived chats", fs(22),
                                                  T.text, padding=[dp(6), 0]))
+        self.requests_head = BoxLayout(size_hint_y=None, height=head.height,
+                                       padding=[dp(4), dp(4), dp(6), dp(4)],
+                                       spacing=dp(2))
+        self.requests_head.add_widget(IconButton(
+            "back", label="Back to chats", pos_hint={"center_y": .5},
+            on_release=lambda _w: self.show_view("chats")))
+        self.requests_head.add_widget(single_line(
+            "Message requests", fs(22), T.text, padding=[dp(6), 0]))
 
         # ---- the status line: tap it to reconnect at once --------------------
         ribbon = TappableBox(on_tap=lambda: self.app.retry_now(),
@@ -14727,23 +15617,38 @@ class ChatsScreen(SwipeGestures, Screen):
                      None) or {"peer": keys.address, "kind": "self",
                                "preview": None, "unread": 0}
         rest = [c for c in conversations if c.get("kind") != "self"]
+        # v14: someone new waits under Message requests (blocked: nowhere).
+        requests = [c for c in rest if c.get("request") and
+                    not c.get("blocked")]
+        rest = [c for c in rest if not c.get("request")]
         archived = [c for c in rest if c.get("archived")]
         live = [c for c in rest if not c.get("archived")]
-        if self.showing_archive:
+        if self.view == "archive":
             shown = sorted(archived, key=lambda c: -(c.get("pinned") or 0)) \
                 if archived else []
             if not archived:
-                self.show_archive(False)
+                self.show_view("chats")
+                return
+        elif self.view == "requests":
+            shown = requests
+            if not requests:
+                self.show_view("chats")
                 return
         else:
             pinned = sorted((c for c in live if c.get("pinned")),
                             key=lambda c: -c["pinned"])
             shown = [notes] + pinned + [c for c in live if not c.get("pinned")]
+            if requests:
+                self.list.add_widget(ArchiveRow(
+                    len(requests), sum(int(c.get("unread") or 0)
+                                       for c in requests),
+                    lambda: self.show_view("requests"), icon="person_add",
+                    title="Message requests"))
             if archived:
                 self.list.add_widget(ArchiveRow(
                     len(archived), sum(int(c.get("unread") or 0)
                                        for c in archived),
-                    lambda: self.show_archive(True)))
+                    lambda: self.show_view("archive")))
         author = self.app.conversation_screen.author_name
         rows = {}
         for conv in shown:
@@ -14760,15 +15665,22 @@ class ChatsScreen(SwipeGestures, Screen):
         self._rows = rows
         self.selected = [p for p in self.selected if p in self._convs]
         self._sync_select_head()
-        if not self.showing_archive and not live:
+        if self.view == "chats" and not live:
             self.list.add_widget(self._empty_state())
 
-    # ---- the archive ------------------------------------------------------------
+    # ---- the archive, and message requests (v14) ----------------------------------
+    @property
+    def showing_archive(self) -> bool:
+        return self.view == "archive"
+
     def show_archive(self, on: bool) -> None:
-        if on == self.showing_archive:
+        self.show_view("archive" if on else "chats")
+
+    def show_view(self, view: str) -> None:
+        if view == self.view:
             return
         self.clear_selection()
-        self.showing_archive = on
+        self.view = view
         self._set_head()
         self.scroll.scroll_y = 1
         self.app.refresh_sidebar()
@@ -14776,7 +15688,8 @@ class ChatsScreen(SwipeGestures, Screen):
     def _set_head(self) -> None:
         head = (self.select_head if self.selected else
                 self.search_head if self.searching else
-                self.archive_head if self.showing_archive else self.head)
+                self.archive_head if self.view == "archive" else
+                self.requests_head if self.view == "requests" else self.head)
         if head.parent is not self.head_box:
             self.head_box.clear_widgets()
             self.head_box.add_widget(head)
@@ -14795,7 +15708,8 @@ class ChatsScreen(SwipeGestures, Screen):
 
     def start_selection(self, peer: str) -> None:
         if self.searching or peer not in self._convs or \
-                self._convs[peer].get("kind") == "self":
+                self._convs[peer].get("kind") == "self" or \
+                self.view == "requests":
             return
         if peer not in self.selected:
             self.selected.append(peer)
@@ -15485,8 +16399,18 @@ class ImageContent(ButtonBehavior, FloatLayout):
             if self.picture.texture is not thumb:
                 self.picture.texture = thumb
         outgoing = msg["direction"] == "out"
+        if outgoing and state in ("waiting", "failed", "uploading") and \
+                waits_for_tap(msg):
+            state = "failed"          # v14: a day on, it waits for a tap
+        if state == "pending" and not outgoing and \
+                self.screen.app.store is not None and \
+                not downloads_by_itself(self.screen.app.store, msg):
+            state = "tap"                     # v14: it waits for a tap
         self.chip.text = {
             "uploading": "Sending…",
+            "waiting": "Waiting to send",
+            "tap": "Tap to download · " + size_text(
+                int(self.media.get("size") or 0)),
             "pending": "Downloading…",
             "downloading": "Downloading…",
             "expired": "Expired · tap to ask again",
@@ -16232,14 +17156,18 @@ class MessageBubble(BoxLayout):
             draw_icon("star_filled", (self.star.x + self.star.width / 2), (self.star.y + self.star.height / 2),
                       dp(11), C(T.accent))
 
-    @staticmethod
-    def _stamp_text(msg: dict) -> str:
+    def _stamp_text(self, msg: dict) -> str:
         """The time, plus a nudge on incoming messages still unread (only
-        ever left so when auto-read is off)."""
+        ever left so when auto-read is off), or (v14) on one of yours the
+        outbox gave up on after a day."""
         stamp = pretty_time(msg["created_at"])
         if msg["direction"] == "in" and not msg["read"]:
             return "[i][color=%s]tap to mark read[/color][/i]   %s" % (
                 T.accent.lstrip("#"), stamp)
+        if self.screen.kind != "self" and waits_for_tap(msg) and \
+                not message_ext(msg).get("media"):
+            return "[color=%s]Not sent · tap to try again[/color]   %s" % (
+                T.alert.lstrip("#"), stamp)
         return stamp
 
     @staticmethod
@@ -17472,6 +18400,25 @@ class ConversationScreen(SwipeGestures, Screen):
                           [self.peer], False))
         unblock.width = unblock.natural_width() + dp(8)
         self.blocked_note.add_widget(unblock)
+        # v14 (B16): instead of the composer, in a message request.
+        self.request_note = BoxLayout(orientation="vertical",
+                                      padding=[dp(18), dp(8), dp(18), dp(8)],
+                                      spacing=dp(8))
+        self.request_text = InfoLabel("", color=T.text_2, italic=True,
+                                      font_size=fs(15))
+        self.request_text.bind(height=lambda *_a: self._fit_note())
+        self.request_note.add_widget(self.request_text)
+        answers = BoxLayout(size_hint_y=None, height=TOUCH, spacing=dp(10))
+        for title, kind, act in (
+                ("Accept", "primary",
+                 lambda: self.app.accept_request(self.peer)),
+                ("Decline", "quiet",
+                 lambda: self.app.decline_request(self.peer)),
+                ("Report", "danger",
+                 lambda: ReportSheet(self.app, self.peer).open())):
+            answers.add_widget(Btn(title, kind=kind,
+                                   on_release=lambda _w, a=act: a()))
+        self.request_note.add_widget(answers)
         # What the composer becomes while recording: discard, the time and
         # the microphone's level, send.
         self.rec_cancel = IconButton(
@@ -17539,13 +18486,15 @@ class ConversationScreen(SwipeGestures, Screen):
         disc.bind(on_release=lambda _w: self.app.open_chat_info())
         self.peer_avatar_holder.add_widget(disc)
         # Calls are between two people: the button is there for a direct
-        # chat only (a hidden one would still take touches).
+        # chat only (a hidden one would still take touches) — and (v14) not
+        # in a message request, which is answered first.
         has_call = self.call_button.parent is not None
-        if kind == "dm" and not has_call:
+        callable_ = kind == "dm" and contact.get("accepted", 1)
+        if callable_ and not has_call:
             self.normal_bar.add_widget(self.call_button,
                                        index=self.normal_bar.children.index(
                                            self.more_button) + 1)
-        elif kind != "dm" and has_call:
+        elif not callable_ and has_call:
             self.normal_bar.remove_widget(self.call_button)
         self.peer_name.text = name
         bits = []
@@ -17592,12 +18541,19 @@ class ConversationScreen(SwipeGestures, Screen):
                                "yet."}.get(state, "")
         blocked = self.kind == "dm" and self.peer is not None and \
             self.app.store is not None and self.app.store.is_blocked(self.peer)
-        part = self.blocked_note if blocked else self.closed_note
-        other = self.closed_note if blocked else self.blocked_note
-        closed = bool(note) or blocked
-        if other.parent is not None:
-            self.composer.remove_widget(other)
+        # v14: someone new, not yet accepted — answered here, not written to.
+        request = not blocked and self.kind == "dm" and \
+            self.peer is not None and self.app.store is not None and \
+            self.app.store.is_request(self.peer)
+        part = self.blocked_note if blocked else \
+            self.request_note if request else self.closed_note
+        for other in (self.blocked_note, self.request_note, self.closed_note):
+            if other is not part and other.parent is not None:
+                self.composer.remove_widget(other)
+        closed = bool(note) or blocked or request
         showing = part.parent is not None
+        if request:
+            self.request_text.text = self._request_text()
         if blocked:
             held = self.app.store.held_count(self.peer)
             self.blocked_text.text = (
@@ -17609,10 +18565,10 @@ class ConversationScreen(SwipeGestures, Screen):
             self.close_emoji()
             self.cancel_recording()
             self.composer.clear_widgets()
-            if not blocked:
+            if part is self.closed_note:
                 self.closed_note.text = note
             self.composer.add_widget(part)
-        elif closed and not blocked:
+        elif closed and part is self.closed_note:
             self.closed_note.text = note
         elif not closed and (showing or not self.composer.children):
             self.composer.clear_widgets()
@@ -17627,8 +18583,25 @@ class ConversationScreen(SwipeGestures, Screen):
             else self.closed_note if self.closed_note.parent is not None \
             else None
         pad = self.composer.padding[1] + self.composer.padding[3] + dp(8)
+        if self.request_note.parent is not None:
+            note = self.request_note
+            self.composer.height = self.request_text.height + TOUCH + \
+                note.spacing + note.padding[1] + note.padding[3] + pad
+            return
         self.composer.height = max(self._composer_h, label.height + pad) \
             if label is not None else self._composer_h
+
+    def _request_text(self) -> str:
+        """Who wrote first, what you share with them, and what they see."""
+        store = self.app.store
+        name = (store.get_contact(self.peer) or {}).get("username") or \
+            short_addr(self.peer, 12)
+        groups = store.shared_groups(self.peer)
+        both = "" if not groups else \
+            f" You are both in {groups[0]}." if len(groups) == 1 else \
+            f" You are both in {groups[0]} and {len(groups) - 1} more."
+        return (f"{name} wants to message you.{both} Until you accept, they "
+                f"see one tick and no read receipts.")
 
     # ---- bubbles -------------------------------------------------------------
     def render(self, messages: list, ticks_enabled: bool,
@@ -17759,10 +18732,11 @@ class ConversationScreen(SwipeGestures, Screen):
 
     @staticmethod
     def _signature(msg: dict) -> tuple:
-        """Everything that, if it changes, means a bubble must repaint."""
+        """Everything that, if it changes, means a bubble must repaint —
+        (v14) a day passing on a message the relay never took, too."""
         return (msg["status"], msg["read"], msg["body"], msg.get("starred"),
                 msg.get("media_state"), msg.get("media_path"), msg.get("ext"),
-                tuple(msg.get("reactions") or ()))
+                tuple(msg.get("reactions") or ()), waits_for_tap(msg))
 
     def _widgets_for(self, msg: dict, ticks_enabled: bool,
                      prev_day: Optional[str]) -> tuple:
@@ -18416,6 +19390,11 @@ class ConversationScreen(SwipeGestures, Screen):
         msg = bubble.msg
         if msg["direction"] == "in" and not msg["read"]:
             self.app._mark_single_read(msg["id"], msg.get("server_id"))
+        if self.kind != "self" and waits_for_tap(msg) and \
+                not message_ext(msg).get("media"):
+            self.app.retry_message(msg["id"])           # v14 (B15)
+            self.app._set_status("Trying again…", COL_TEXT_DIM)
+            return
         row = self._rows.get(msg_id)
         if touch is not None and row is not None:
             # The row's handler passed its own view of the touch on.
@@ -18478,11 +19457,11 @@ class ConversationScreen(SwipeGestures, Screen):
         outgoing = msg["direction"] == "out"
         if state == "expired":
             self.app.request_resend(msg["id"])
-        elif state == "failed":
+        elif state == "failed" or (outgoing and state == "waiting"):
             (self.app.retry_media if outgoing else self.app.fetch_media)(
                 msg["id"])
         elif state == "pending" and not outgoing:
-            self.app.fetch_media(msg["id"])
+            self.app.download_on_tap(msg)
         elif path and Path(path).is_file():
             if msg.get("kind") == "image":
                 ImageViewer(path).open()
@@ -19339,6 +20318,18 @@ class ChatInfoScreen(PageScreen):
                          lambda: app.close_chat_info(), **kw)
         self.peer: Optional[str] = None
 
+    def _pq_row(self, peer: str) -> "ListRow":
+        """v15: which way this chat is sealed post-quantum. Our messages are
+        once we hold their key; theirs once they have shown they hold ours.
+        Each side's key reaches the other in its next message."""
+        ours = self.app.store.pq_key(peer) is not None
+        theirs = self.app.store.pq_mine(peer) == self.app.keys.pq_kid
+        hint = ("On, both ways" if ours and theirs else
+                "On for yours · theirs after your next message" if ours else
+                "On for theirs · yours after their next message" if theirs
+                else "Off · on once you have both written from Ferritext 15")
+        return ListRow("key", "Post-quantum encryption", hint)
+
     def show(self, peer: str) -> None:
         self.peer = peer
         store = self.app.store
@@ -19381,6 +20372,7 @@ class ChatInfoScreen(PageScreen):
                         "verified") else
                      "Not verified · compare a code in person, or on a call"),
                     chevron=True, on_tap=lambda: self.app.open_verify(peer)),
+            self._pq_row(peer),
             ListRow("check", "Delivery and read ticks",
                     "Off on either side caps both at one tick",
                     control=ToggleSwitch(contact.get("ticks_enabled", 1),
@@ -19791,7 +20783,32 @@ class SettingsScreen(PageScreen):
             "with the message. Off: nothing is fetched, and previews others "
             "send are not shown.",
             control=ToggleSwitch(link_previews_enabled(),
-                                 self._on_previews))]))
+                                 self._on_previews)),
+            ListRow("block", "Blocked",
+                    self._blocked_hint(), chevron=True,
+                    on_tap=lambda: self._open_blocked())]))
+        self.body.add_widget(SectionHead("Downloads"))
+
+        def pref(key):
+            return ToggleSwitch(download_pref(key),
+                                lambda on, k=key: save_pref(k, bool(on)))
+        rows = [ListRow(
+            "group", "Photos in large groups on tap",
+            f"In groups of more than {LARGE_GROUP}, a photo downloads when "
+            f"you tap it; its small preview shows at once",
+            control=pref("dl_large_groups_tap"))]
+        if IS_ANDROID or os.environ.get("FEXT_SHOW_ANDROID_SETTINGS"):
+            rows = [ListRow(
+                "image", "Photos on mobile data",
+                "Off: while not on Wi-Fi, photos wait for a tap",
+                control=pref("dl_photos_metered")), ListRow(
+                "mic", "Voice messages on mobile data",
+                "Off: while not on Wi-Fi, they wait for a tap",
+                control=pref("dl_voice_metered"))] + rows + [ListRow(
+                "download", "Ask before using mobile data",
+                "When you tap to download while not on Wi-Fi",
+                control=pref("ask_metered"))]
+        self.body.add_widget(rows_card(rows))
         self.body.add_widget(SectionHead("Backup"))
         self.body.add_widget(rows_card([
             ListRow("archive", "Back up to a file",
@@ -19834,6 +20851,16 @@ class SettingsScreen(PageScreen):
                                             dp(18)))
         row.icon, row.glyph, col.row = icon, glyph, row
         return col
+
+    def _blocked_hint(self) -> str:
+        n = len(self.app.store.blocked_contacts()) if self.app.store else 0
+        return f"{n} {'person' if n == 1 else 'people'} — and how to " \
+               f"unblock them" if n else "No one is blocked"
+
+    def _open_blocked(self) -> None:
+        sheet = BlockedSheet(self.app)
+        sheet.bind(on_dismiss=lambda *_a: self.show())
+        sheet.open()
 
     def _on_delivery(self, on: bool) -> None:
         save_pref("background_delivery", bool(on))
@@ -19948,7 +20975,7 @@ class ProfileScreen(PageScreen):
             on_tap=self._toggle_private)
         self.body.add_widget(rows_card([
             self.reveal_row,
-            ListRow("copy", "Copy WIF", "Imports into FEXT Core",
+            ListRow("copy", "Copy WIF", "Imports into Ferrite Core",
                     on_tap=self._copy_wif)]))
         self.body.add_widget(self.private_label)
 
@@ -20071,9 +21098,35 @@ class MessagingMixin:
         Every failure here has to end at the UI: a message must never sit at
         0/3 with no reason given anywhere.
         """
-        me = MessageFlowLog.who(self.keys.address, self.keys.username)
+        sealed = self._seal_copy(peer, peer_pub, body, client_msg_id, x)
+        if sealed is None:
+            return False
+        envelope, fragment = sealed
+        try:
+            result = self.api.send_message(peer, envelope, client_msg_id)
+        except (requests.RequestException, ApiClient.ApiError,
+                ValueError) as exc:
+            self._not_sent(peer, local_id, str(exc), fragment)
+            return False
+        except Exception as exc:                     # never lose the thread
+            log.exception("unexpected error sending to %s", peer)
+            self._not_sent(peer, local_id, f"unexpected: {exc}", fragment)
+            return False
+        if local_id is None:                         # a control: no row
+            return True
+        return self._record_copy(local_id, peer, group,
+                                 result.get("server_id"), fragment)
+
+    def _flow_names(self, peer: str) -> tuple:
+        """(us, them) as the message-flow log names them."""
         contact = self.store.get_contact(peer) or {}
-        them = MessageFlowLog.who(peer, contact.get("username"))
+        return (MessageFlowLog.who(self.keys.address, self.keys.username),
+                MessageFlowLog.who(peer, contact.get("username")))
+
+    def _seal_copy(self, peer: str, peer_pub: str, body: str,
+                   client_msg_id: str, x: Optional[dict]):
+        """SIGN → ENCRYPT one copy for `peer`: (envelope, log fragment), or
+        None once the user has been told why not."""
         if x is not None:
             # v9.1.2: what this app can do, and which version of our picture
             # is current — older releases verify these and ignore them.
@@ -20081,33 +21134,40 @@ class MessagingMixin:
             pv = self.store.picture_version(self.keys.address)
             if pv:
                 x["pv"] = pv
+            # v15: our post-quantum key's id, and the key itself until they
+            # have shown they hold it (signed with the rest of the block).
+            x["pq"] = self.keys.pq_kid
+            if self.store.pq_mine(peer) != x["pq"]:
+                x["pqe"] = b64e(self.keys.pq_public)
         try:
             envelope, _sent_at = self.crypto.build_envelope(
-                body, peer_pub, x=x, recipient=peer, cid=client_msg_id)
+                body, peer_pub, x=x, recipient=peer, cid=client_msg_id,
+                pq=self.store.pq_key(peer))
         except Exception as exc:
             log.exception("could not build envelope for %s", peer)
-            MessageFlowLog.failed(me, them, f"encryption failed: {exc}")
+            MessageFlowLog.failed(*self._flow_names(peer),
+                                  f"encryption failed: {exc}")
             self.ui_queue.put(("status", f"Could not encrypt: {exc}",
                                COL_DANGER))
-            return False
+            return None
+        return envelope, MessageFlowLog.fragment(envelope)
 
-        fragment = MessageFlowLog.fragment(envelope)
-        try:
-            result = self.api.send_message(peer, envelope, client_msg_id)
-        except (requests.RequestException, ApiClient.ApiError,
-                ValueError) as exc:
-            MessageFlowLog.failed(me, them, str(exc), fragment)
-            self.ui_queue.put(("status", f"Send failed: {exc}", COL_DANGER))
-            return False
-        except Exception as exc:                     # never lose the thread
-            log.exception("unexpected error sending to %s", peer)
-            MessageFlowLog.failed(me, them, f"unexpected: {exc}", fragment)
-            self.ui_queue.put(("status", f"Send failed: {exc}", COL_DANGER))
-            return False
+    def _not_sent(self, peer: str, local_id: Optional[int], why: str,
+                  fragment: str = "") -> None:
+        """A copy the relay did not take. A message waits, with its clock,
+        for the outbox to send it when the relay answers (v14, B15); a
+        control is lost, so that is said plainly."""
+        MessageFlowLog.failed(*self._flow_names(peer), why, fragment)
+        if local_id is None:
+            self.ui_queue.put(("status", f"Send failed: {why}", COL_DANGER))
+        else:
+            self.ui_queue.put(("status", "Not sent yet · it goes by itself "
+                               "when the relay answers", COL_TICK_GOLD))
 
-        if local_id is None:                         # a control: no row
-            return True
-        server_id = result.get("server_id")
+    def _record_copy(self, local_id: int, peer: str, group: Optional[str],
+                     server_id, fragment: str) -> bool:
+        """The relay took one copy of message `local_id` (1/3): note it."""
+        me, them = self._flow_names(peer)
         recorded = (self.store.group_send_sent(local_id, peer, server_id)
                     if group else self.store.mark_sent(local_id, server_id))
         if not recorded:
@@ -20125,10 +21185,53 @@ class MessagingMixin:
                            group_peer(group) if group else peer))
         return True
 
+    def _send_group_many(self, local_id: Optional[int], gid: str,
+                         members: list, body: str, cid: str,
+                         x: dict) -> bool:
+        """v14 (B1): one group message, or control, to `members` [(address,
+        public key)] in as few requests as the relay allows, instead of one
+        each. True only if every copy reached the relay; the others wait in
+        the outbox like any message that could not go."""
+        sealed = []
+        for address, pub in members:
+            copy = self._seal_copy(address, pub, body, cid, x)
+            if copy is not None:
+                sealed.append((address,) + copy)
+        ok = len(sealed) == len(members)
+        for start in range(0, len(sealed), SEND_MANY_MAX):
+            chunk = sealed[start:start + SEND_MANY_MAX]
+            try:
+                results = self.api.send_many(
+                    [{"recipient": address, "envelope": envelope,
+                      "client_msg_id": cid}
+                     for address, envelope, _f in chunk])
+            except (requests.RequestException, ApiClient.ApiError,
+                    ValueError) as exc:
+                for address, _e, fragment in chunk:
+                    self._not_sent(address, local_id, str(exc), fragment)
+                ok = False
+                continue
+            for (address, _e, fragment), result in zip(chunk, results):
+                if not isinstance(result, dict):
+                    result = {"error": {"message": "no answer"}}
+                error = result.get("error")
+                if error or not result.get("server_id"):
+                    self._not_sent(address, local_id,
+                                   (error or {}).get("message",
+                                                     "not stored"), fragment)
+                    ok = False
+                elif local_id is not None:
+                    ok = self._record_copy(local_id, address, gid,
+                                           result["server_id"],
+                                           fragment) and ok
+        return ok
+
     def _send_copies(self, local_id: Optional[int], peer: str, body: str,
-                     cid: str, x: dict) -> bool:
+                     cid: str, x: dict, only: Optional[set] = None) -> bool:
         """Deliver one message (or control) to every recipient of a
-        conversation. True only if every copy reached the relay."""
+        conversation — in a group, `only` those members, when given (the
+        outbox: the members still without their copy). True only if every
+        copy reached the relay."""
         kind = self.conversation_kind(peer)
         if kind == "self":
             return True
@@ -20152,14 +21255,19 @@ class MessagingMixin:
             gpv = self.store.picture_version(peer) if admin else 0
             if gpv:
                 x["grp"]["pv"] = gpv      # the group picture, from its admin
-        ok = True
-        for address, pub in self.group_recipients(gid):
-            if local_id is not None:
+        members = [(a, k) for a, k in self.group_recipients(gid)
+                   if only is None or a in only]
+        if local_id is not None:
+            for address, _pub in members:
                 contact = self.store.get_contact(address)
                 if contact is not None:
                     self._send_picture_if_due(contact)
                     if admin:
                         self._send_group_picture_if_due(gid, contact)
+        if len(members) > 1 and self.api.features().get("send_many"):
+            return self._send_group_many(local_id, gid, members, body, cid, x)
+        ok = True
+        for address, pub in members:
             ok = self._send_worker(local_id, address, pub, body, cid, x,
                                    group=gid if local_id else None) and ok
         return ok
@@ -20206,6 +21314,8 @@ class MessagingMixin:
             if contact is None:
                 self._set_status("Unknown contact", COL_DANGER)
                 return None
+            if not contact.get("accepted", 1):
+                self.store.set_accepted(peer)   # writing to them accepts
             label = contact.get("username")
         elif conv == "group":
             recipients = [a for a, _k in self.group_recipients(gid_of(peer))]
@@ -20237,10 +21347,155 @@ class MessagingMixin:
         self._after_local_row(peer)
         if media_state != "uploading" and conv != "self":
             threading.Thread(
-                target=self._send_copies,
+                target=self._send_row,
                 args=(local_id, peer, body, client_msg_id, x),
                 daemon=True).start()
         return local_id
+
+    # ---- v14: the outbox (B15) -------------------------------------------------
+    # A message the relay has not taken stays on this phone at 0/3, drawn
+    # with a clock, and goes by itself the next time the relay answers: the
+    # sync worker calls flush_outbox when it connects, and every OUTBOX_EVERY
+    # seconds while it stays connected. After OUTBOX_DAY it waits for a tap
+    # ("Not sent · tap to try again", retry_message). Sending twice is safe
+    # either way: a receiving app keeps one copy per client id.
+    def _sends(self) -> tuple:
+        """(lock, set of local ids being sent right now)."""
+        if getattr(self, "_in_flight", None) is None:
+            self._in_flight_lock = threading.Lock()
+            self._in_flight = set()
+        return self._in_flight_lock, self._in_flight
+
+    def _send_row(self, local_id: int, peer: str, body: str, cid: str,
+                  x: dict, only: Optional[set] = None) -> bool:
+        """_send_copies for one stored message, unless it is already on its
+        way (the first try and the outbox can meet)."""
+        lock, busy = self._sends()
+        with lock:
+            if local_id in busy:
+                return False
+            busy.add(local_id)
+        try:
+            return self._send_copies(local_id, peer, body, cid, x, only=only)
+        finally:
+            with lock:
+                busy.discard(local_id)
+
+    def flush_outbox(self, include_old: bool = False,
+                     only_id: Optional[int] = None) -> int:
+        """Send what is still on this phone, oldest first: messages the
+        relay never took, and in a group the members still without a copy;
+        a photo or voice note is uploaded first if it never was. Returns how
+        many messages went. `include_old`: those past OUTBOX_DAY too."""
+        if self.store is None or self.api is None:
+            return 0
+        cutoff = 0.0 if include_old else time.time() - OUTBOX_DAY
+        sent = 0
+        for row in self.store.outbox(cutoff):
+            if only_id is not None and row["id"] != only_id:
+                continue
+            if self.conversation_kind(row["peer"]) == "self":
+                continue
+            ext = json.loads(row.get("ext") or "{}")
+            media = ext.get("media")
+            if row["kind"] in MEDIA_MIME and isinstance(media, dict) and \
+                    not media.get("blob"):
+                if self._upload_media(row["id"], row["peer"], row["body"],
+                                      row["client_msg_id"]):
+                    sent += 1
+                continue
+            x = dict(ext, k="media" if row["kind"] in MEDIA_MIME else "text")
+            if row.get("ttl"):
+                x["ttl"] = row["ttl"]
+            only = None
+            if row["members"] is not None:
+                # Owed copies, to those still in the group.
+                only = set(row["members"]) & {
+                    a for a, _k in self.group_recipients(gid_of(row["peer"]))}
+                if not only:
+                    continue
+            if self._send_row(row["id"], row["peer"], row["body"],
+                              row["client_msg_id"], x, only=only):
+                sent += 1
+        if sent:
+            flow_log.info("📤   the outbox sent %d message(s)", sent)
+        return sent
+
+    def retry_message(self, local_id: int) -> None:
+        """A tap on "Not sent · tap to try again": send it now, whatever
+        its age."""
+        threading.Thread(target=self.flush_outbox,
+                         kwargs={"include_old": True, "only_id": local_id},
+                         daemon=True).start()
+
+    def _upload_media(self, local_id: int, peer: str, body: str, cid: str,
+                      data: Optional[bytes] = None) -> bool:
+        """Seal, upload and send the photo or voice note of message
+        `local_id`, from the copy kept on this phone. True once it is sent.
+
+        v14: the upload says how many people will fetch it (B2). A relay
+        that is full (B10) or out of reach leaves it 'waiting', with its
+        clock, for the outbox; only a file no relay can take is 'failed'.
+        It carries the chat's timer, as a text does."""
+        lock, busy = self._sends()
+        with lock:
+            if local_id in busy:
+                return False
+            busy.add(local_id)
+        try:
+            row = self.store.message(local_id)
+            if row is None:
+                return False
+            if row.get("media_state") != "uploading":
+                self.store.set_media(local_id, state="uploading")
+                self.ui_queue.put(("message_stored", peer))
+            ext = json.loads(row.get("ext") or "{}")
+            try:
+                if data is None:
+                    data = Path(row.get("media_path") or "").read_bytes()
+            except OSError:
+                self.store.set_media(local_id, state="failed")
+                self.ui_queue.put(("message_stored", peer))
+                self.ui_queue.put(("status", "The original file is gone",
+                                   COL_DANGER))
+                return False
+            gid = gid_of(peer)
+            expect = len(self.group_recipients(gid)) if gid else 1
+            try:
+                blob, key, sha = seal_media(data)
+                blob_id = self.api.upload_blob(blob, expect=expect).get(
+                    "blob", "")
+                if not _TOKEN_RE.match(blob_id or ""):
+                    raise ValueError("relay returned no media id")
+            except (requests.RequestException, ApiClient.ApiError,
+                    ValueError) as exc:
+                log.warning("media upload not done: %s", exc)
+                status = getattr(exc, "status", 0)
+                self.store.set_media(local_id, state="failed"
+                                     if status == 413 else "waiting")
+                self.ui_queue.put(("message_stored", peer))
+                self.ui_queue.put(("status", {
+                    413: "That's too large for this relay",
+                    429: "The relay's room for your media is full · it "
+                         "goes by itself when there is space",
+                    507: "The relay's room for media is full · it goes by "
+                         "itself when there is space",
+                }.get(status, "Not sent yet · it goes by itself when the "
+                              "relay answers"),
+                    COL_DANGER if status == 413 else COL_TICK_GOLD))
+                return False
+            ext["media"] = dict(ext.get("media") or {}, blob=blob_id,
+                                key=key, sha=sha)
+            self.store.set_media(local_id, state="ready", ext=ext)
+        finally:
+            with lock:
+                busy.discard(local_id)
+        x = dict(ext, k="media")
+        if row.get("ttl"):
+            x["ttl"] = row["ttl"]
+        ok = self._send_row(local_id, peer, body, cid, x)
+        self.ui_queue.put(("message_stored", peer))
+        return ok
 
     def _after_local_row(self, peer: str) -> None:
         """A message was just recorded here; the app repaints (FextApp)."""
@@ -20565,6 +21820,84 @@ class MessagingMixin:
                     self._send_group_picture_if_due(gid, contact)
         return ok
 
+    # ---- v15: messages sealed to an earlier post-quantum key -------------------
+    def _reseals(self) -> tuple:
+        """(lock, {peer: message ids to ask them for again}, the (peer,
+        message id) pairs already sent again)."""
+        if getattr(self, "_reseal_wanted", None) is None:
+            self._reseal_lock = threading.Lock()
+            self._reseal_wanted, self._resealed = {}, set()
+        return self._reseal_lock, self._reseal_wanted, self._resealed
+
+    def ask_reseal(self, peer: str, cid: str) -> None:
+        """Ask `peer` to send message `cid` again: it was sealed to our key
+        from an earlier install. What arrives within two seconds goes in one
+        request, which carries our key with it (as every message does until
+        they hold it)."""
+        lock, wanted, _done = self._reseals()
+        with lock:
+            first = peer not in wanted
+            wanted.setdefault(peer, set()).add(cid)
+        if first:
+            timer = threading.Timer(2.0, self._send_reseal, args=(peer,))
+            timer.daemon = True
+            timer.start()
+
+    def _send_reseal(self, peer: str) -> None:
+        lock, wanted, _done = self._reseals()
+        with lock:
+            cids = sorted(wanted.pop(peer, ()))[:RESEAL_MAX]
+        contact = self.store.get_contact(peer) if self.store else None
+        pub = contact["public_key"] if contact else None
+        if pub is None:
+            # A new install may not know them yet: the relay's directory
+            # says, and the address (a hash of the key) proves it.
+            try:
+                pub = self.api.lookup(address=peer).get("public_key")
+                if address_from_pub_bytes(bytes.fromhex(pub)) != peer:
+                    raise ValueError("directory key does not match")
+            except (requests.RequestException, ApiClient.ApiError,
+                    ValueError, TypeError, AttributeError) as exc:
+                log.warning("cannot ask %s to reseal: %s", peer[:12], exc)
+                return
+        self._send_control_to(peer, {"op": "reseal", "cids": cids},
+                              "Please send your last messages again", pub=pub)
+
+    def reseal(self, peer: str, cids: list) -> None:
+        """`peer` could not open these messages: send each again, the same
+        message under the same id, sealed to the key their request brought.
+        Only messages that were sent to them, only recent ones, and each
+        once: a request cannot make this phone send a message twice."""
+        lock, _wanted, done = self._reseals()
+        with lock:
+            cids = [c for c in cids if (peer, c) not in done]
+            done.update((peer, c) for c in cids)
+
+        def work():
+            for cid in cids:
+                row = self.store.outgoing_by_cid(cid)
+                try:
+                    written = datetime.fromisoformat(
+                        row["created_at"]).timestamp()
+                except (TypeError, ValueError):
+                    continue          # also when there is no such message
+                if time.time() - written > RESEAL_WINDOW:
+                    continue
+                gid = gid_of(row["peer"])
+                if gid is None and row["peer"] != peer:
+                    continue
+                if gid is not None and peer not in {
+                        r["member"] for r in self.store.group_sends(row["id"])}:
+                    continue
+                ext = json.loads(row.get("ext") or "{}")
+                x = dict(ext, k="media" if row["kind"] in MEDIA_MIME
+                         else "text")
+                if row.get("ttl"):
+                    x["ttl"] = row["ttl"]
+                self._send_row(row["id"], row["peer"], row["body"], cid, x,
+                               only={peer} if gid else None)
+        threading.Thread(target=work, daemon=True).start()
+
     def _on_resend_request(self, peer: str, cid: str,
                            gid: Optional[str] = None) -> None:
         """They asked for a file the relay no longer has: upload our copy
@@ -20582,7 +21915,8 @@ class MessagingMixin:
             try:
                 data = Path(row["media_path"]).read_bytes()
                 blob, key, sha = seal_media(data)
-                blob_id = self.api.upload_blob(blob).get("blob", "")
+                # For the one person who asked (v14, B2).
+                blob_id = self.api.upload_blob(blob, expect=1).get("blob", "")
                 if not _TOKEN_RE.match(blob_id or ""):
                     raise ValueError("relay returned no media id")
             except (OSError, ValueError, requests.RequestException,
@@ -21028,8 +22362,8 @@ class FextApp(MessagingMixin, App):
             if getattr(chats, "selecting", False):
                 chats.clear_selection()
                 return True
-            if getattr(chats, "showing_archive", False):
-                chats.show_archive(False)
+            if getattr(chats, "view", "chats") != "chats":
+                chats.show_view("chats")      # the archive, or requests
                 return True
         # The outermost page: Android goes to the home screen with the app
         # kept as it is; a computer's Esc does nothing (it used to close
@@ -21356,9 +22690,12 @@ class FextApp(MessagingMixin, App):
             Clock.schedule_once(lambda _dt: self._extend_history(
                 peer, CHAT_PAGE_SIZE - len(messages)), LAYER_IN + 0.04)
         # Photos/voice notes that arrived while the background service was
-        # syncing were never downloaded; fetch them now someone is looking.
+        # syncing were never downloaded; fetch them now someone is looking —
+        # those the download rules (v14) let come by themselves.
         for msg in messages:
-            if msg["direction"] == "in" and msg.get("media_state") == "pending":
+            if msg["direction"] == "in" and \
+                    msg.get("media_state") == "pending" and \
+                    downloads_by_itself(self.store, msg):
                 self.fetch_media(msg["id"])
 
     def load_older_messages(self) -> None:
@@ -21845,50 +23182,17 @@ class FextApp(MessagingMixin, App):
         local_id, cid = rows.get("id"), rows.get("cid")
         if local_id is None or to_self:
             return
-        try:
-            blob, key, sha = seal_media(data)
-            blob_id = self.api.upload_blob(blob).get("blob", "")
-            if not _TOKEN_RE.match(blob_id or ""):
-                raise ValueError("relay returned no media id")
-        except (requests.RequestException, ApiClient.ApiError,
-                ValueError) as exc:
-            log.warning("media upload failed: %s", exc)
-            self.store.set_media(local_id, state="failed")
-            self.ui_queue.put(("message_stored", peer))
-            self.ui_queue.put(("status", f"Upload failed: {exc}",
-                               COL_DANGER))
-            return
-        media = dict(media, blob=blob_id, key=key, sha=sha)
-        ext["media"] = media
-        self.store.set_media(local_id, state="ready", ext=ext)
-        self._send_copies(local_id, peer, body, cid, dict(ext, k="media"))
-        self.ui_queue.put(("message_stored", peer))
+        self._upload_media(local_id, peer, body, cid, data)
 
     def retry_media(self, local_id: int) -> None:
-        """Re-run a failed upload from the copy kept on this device."""
+        """Re-run a failed upload from the copy kept on this device: the
+        same message, in its place (v14; it used to be replaced)."""
         row = self.store.message(local_id)
         if not row or not row.get("media_path"):
             return
-        ext = json.loads(row.get("ext") or "{}")
-        media = ext.get("media") or {}
-        peer = row["peer"]
-        self.store.delete_messages([local_id])       # replaced, not duplicated
-
-        def work():
-            try:
-                data = Path(row["media_path"]).read_bytes()
-            except OSError:
-                self.ui_queue.put(("status", "The original file is gone",
-                                   COL_DANGER))
-                return
-            extra = {k: v for k, v in media.items()
-                     if k in ("w", "h", "thumb", "dur", "wave", "cap")}
-            self._send_media(peer, row["kind"], data,
-                             media.get("mime", "application/octet-stream"),
-                             extra, row["body"], ext.get("reply"),
-                             Path(row["media_path"]).suffix.lstrip(".")
-                             or "bin")
-        threading.Thread(target=work, daemon=True).start()
+        threading.Thread(target=self._upload_media,
+                         args=(local_id, row["peer"], row["body"],
+                               row["client_msg_id"]), daemon=True).start()
 
     def fetch_media(self, local_id: int) -> None:
         """Download + verify + decrypt one media message, in the background.
@@ -21935,6 +23239,14 @@ class FextApp(MessagingMixin, App):
                 self.store.set_media(local_id, state="failed")
             self.ui_queue.put(("message_stored", peer))
         threading.Thread(target=work, daemon=True).start()
+
+    def download_on_tap(self, msg: dict) -> None:
+        """v14 (B14): a tap downloads a photo or voice note that waited; on
+        mobile data it asks first, unless told not to ask again."""
+        if on_metered_network() and download_pref("ask_metered"):
+            MobileDataSheet(self, msg).open()
+        else:
+            self.fetch_media(msg["id"])
 
     def request_resend(self, local_id: int) -> None:
         """Ask the sender to upload an expired photo/voice note again."""
@@ -22586,7 +23898,8 @@ class FextApp(MessagingMixin, App):
                     self._dirty_list = True
                 elif kind == "media_pending" and self.store is not None:
                     row = self.store.message_by_cid(event[1], event[2], "in")
-                    if row is not None:
+                    if row is not None and downloads_by_itself(self.store,
+                                                               row):
                         self.fetch_media(row["id"])
                 elif kind == "resend_request" and self.store is not None:
                     self._on_resend_request(*event[1:4])
@@ -23292,7 +24605,43 @@ class FextApp(MessagingMixin, App):
                     threading.Thread(target=worker.release_held, args=(peer,),
                                      daemon=True).start()
 
-    def delete_chats(self, peers: list) -> None:
+    # ---- v14: message requests (B16) ---------------------------------------------
+    def accept_request(self, peer: str) -> None:
+        """Their chat joins the list, and from now on ticks and read
+        receipts go both ways (the relay is told, as for the ticks switch).
+        What they sent so far is marked read."""
+        self.store.set_accepted(peer)
+        self.set_ticks(peer, True)
+        self.mark_peer_read(peer)
+        self._after_list_change([peer], "Accepted")
+
+    def decline_request(self, peer: str) -> None:
+        """No: their messages go and the request leaves the list. They are
+        not blocked: if they write again, it is a request again."""
+        self.delete_chats([peer], "Declined")
+
+    def report_contact(self, peer: str, reason: str, note: str,
+                       block: bool) -> None:
+        """Report `peer` to the relay's operator (if the relay takes
+        reports), and block them if asked."""
+        if block:
+            self.set_blocked([peer], True)
+        if not (self.api and self.api.features().get("reports")):
+            return
+
+        def work():
+            try:
+                self.api.report(peer, reason, note)
+            except (requests.RequestException, ApiClient.ApiError) as exc:
+                self.ui_queue.put(("status", f"The report did not go: {exc}",
+                                   COL_DANGER))
+                return
+            self.ui_queue.put(("status", "Reported" + (" and blocked"
+                                                       if block else ""),
+                               COL_OK))
+        threading.Thread(target=work, daemon=True).start()
+
+    def delete_chats(self, peers: list, verb: str = "Deleted") -> None:
         """Remove chats from this device (a group is left first) and from
         the list, until something new arrives in them."""
         for peer in peers:
@@ -23308,7 +24657,7 @@ class FextApp(MessagingMixin, App):
                 android_clear_notification(peer)
         if self.current_peer in peers:
             self.go_back_to_chats()
-        self._after_list_change(peers, "Deleted")
+        self._after_list_change(peers, verb)
 
     def _after_list_change(self, peers: list, verb: str) -> None:
         n = len(peers)
@@ -23386,6 +24735,8 @@ def notification_text(store: "LocalStore", peer: str, body: str, kind: str,
             short_addr(author or "", 10)
         return (group.get("name") or "Group", f"{who}: {preview}", muted)
     contact = store.get_contact(peer) or {}
+    if not contact.get("accepted", 1):
+        preview = "Message request"     # v14: what they wrote waits unseen
     return (contact.get("username") or short_addr(peer, 12), preview, muted)
 
 

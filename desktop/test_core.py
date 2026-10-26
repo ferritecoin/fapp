@@ -287,6 +287,17 @@ import queue                                                   # noqa: E402
 import uuid                                                    # noqa: E402
 
 
+class StubRelay:
+    """v14: a message request turns the stranger's ticks off first."""
+
+    def __init__(self):
+        self.ticks = {}
+
+    def set_ticks(self, peer, enabled):
+        self.ticks[peer] = enabled
+        return {}
+
+
 class StubApp:
     """What SyncWorker._ingest_message reaches for, and nothing more."""
 
@@ -295,6 +306,7 @@ class StubApp:
         self.store = M.LocalStore(db)
         self.ui_queue = queue.Queue()
         self.notified = []
+        self.api = StubRelay()
 
     # v11: the worker announces from its own thread
     def notify_incoming(self, peer, body, kind, author=None):
@@ -337,6 +349,9 @@ def media_ref(**over):
     return ref
 
 
+# An established chat: the receiver knows the sender (v14: a stranger's
+# first message would be a message request; test_flows covers those).
+app.store.upsert_contact(sender.address, "sender", sender.pub)
 app.events()
 acked, first = deliver("first message")
 row = app.store.message_by_cid(sender.address, first)
@@ -435,6 +450,8 @@ if OLD is not None:
             self.keys, self.crypto = party.keys, party.crypto
             self.store = OLD.LocalStore(db)
             self.ui_queue = queue.Queue()
+            self.notified = []
+            self.api = StubRelay()        # a 14.0 client's requests use it
 
     old_receiver = Party(OLD, "old-receiver")
     old_app = OldStubApp(old_receiver, DB_DIR / "old_sync.db")
@@ -540,6 +557,28 @@ st.save_group({"id": "cd" * 16, "name": "Empty", "v": 1, "admin": ME,
                            {"a": A, "k": "02" + "ab" * 32}]})
 check("a group with no messages yet is still listed",
       M.group_peer("cd" * 16) in {c["peer"] for c in st.conversations(ME)})
+
+
+def counted_by_hand():
+    """Each chat's unread count and newest message, from every message."""
+    return {row[0]: (row[1], row[2]) for row in st._db.execute(
+        "SELECT peer, SUM(direction = 'in' AND read = 0), MAX(id) "
+        "FROM messages GROUP BY peer")}
+
+
+def listed():
+    return {c["peer"]: (c["unread"], c["last_id"])
+            for c in st.conversations(ME) if c["last_id"]}
+
+
+for i in range(3):
+    st.add_in(A, f"unread {i}", M.now_iso(), 610 + i, f"unr{i}" * 8)
+check("v14: the chat list's unread counts and newest messages agree with "
+      "counting every message", listed() == counted_by_hand() and
+      listed()[A][0] >= 3, str(listed()))
+st.mark_read_local([m["id"] for m in st.messages_for(A)])
+check("...and still agree once a chat is read",
+      listed() == counted_by_hand() and listed()[A][0] == 0)
 check("reactions: set, replace and take back",
       st.set_reaction(GPEER, "ann1" * 8, B, "\U0001F44D") and
       st.set_reaction(GPEER, "ann1" * 8, B, "\u2764\ufe0f") and
@@ -775,6 +814,151 @@ acked, after = gdeliver("still?", carol, x={"k": "text",
 check("...and nothing more arrives in it",
       acked and gapp.store.message_by_cid(M.group_peer(GID3), after) is None)
 gapp.store.close()
+
+
+# =============================================================================
+section("v15: private keys in Ferrite Core's own format")
+KEY_1 = (1).to_bytes(32, "big") + b"\x01"          # key 1, compressed
+check("Copy WIF gives Ferrite Core's format (version 163), which its "
+      "importprivkey takes", M.b58check_decode(M.priv_to_wif(1)) ==
+      (163, KEY_1))
+check("both import: Ferrite Core's, and the Bitcoin-style ones (version 128) "
+      "earlier releases exported",
+      M.parse_private_key(M.priv_to_wif(1)) == 1 and
+      M.parse_private_key(M.b58check_encode(128, KEY_1)) == 1)
+ok, why = expect_reject(
+    lambda: M.parse_private_key(M.b58check_encode(239, KEY_1)),
+    "it is a testnet key")
+check("a testnet key is refused", ok, why)
+
+# =============================================================================
+section("v15: post-quantum encryption (ML-KEM-768, FIPS 203)")
+import hashlib                                                 # noqa: E402
+
+
+def sha3(raw):
+    return hashlib.sha3_256(raw).hexdigest()
+
+
+vectors = json.load(open(os.path.join(os.path.dirname(
+    os.path.abspath(__file__)), "mlkem768_vectors.json")))
+check("NIST's key generation vectors",
+      all((sha3(ek), sha3(dk)) == (t["ek_sha3_256"], t["dk_sha3_256"])
+          for t in vectors["keyGen"]
+          for ek, dk in [M.mlkem_keygen(bytes.fromhex(t["d"] + t["z"]))]))
+check("NIST's encapsulation vector",
+      all((k.hex(), sha3(c)) == (t["k"], t["c_sha3_256"])
+          for t in vectors["encapsulation"]
+          for k, c in [M.mlkem_encaps(bytes.fromhex(t["ek"]),
+                                      bytes.fromhex(t["m"]))]))
+check("NIST's decapsulation vectors, a tampered ciphertext among them",
+      all(M.mlkem_decaps(bytes.fromhex(t["dk"]), bytes.fromhex(t["c"])).hex()
+          == t["k"] for t in vectors["decapsulation"]) and
+      {t["reason"] for t in vectors["decapsulation"]} ==
+      {"valid decapsulation", "modified ciphertext"})
+try:
+    from cryptography.hazmat.primitives.asymmetric import mlkem
+    mlkem.MLKEM768PrivateKey.generate()
+except Exception:                     # noqa: BLE001 — older, or built without
+    mlkem = None
+if mlkem is not None:
+    agree = True
+    for _ in range(3):
+        seed = os.urandom(64)
+        ek, dk = M.mlkem_keygen(seed)
+        theirs = mlkem.MLKEM768PrivateKey.from_seed_bytes(seed)
+        secret, ct = theirs.public_key().encapsulate()
+        mine, ct2 = M.mlkem_encaps(ek)
+        agree &= (theirs.public_key().public_bytes_raw() == ek and
+                  M.mlkem_decaps(dk, ct) == secret and
+                  theirs.decapsulate(ct2) == mine)
+    check("the same keys as the cryptography library's ML-KEM, and "
+          "messages open both ways", agree)
+ek = alice.keys.pq_public
+bad = bytes([0xFF, 0x0F]) + ek[2:]        # a first coefficient of 4095 ≥ q
+ok, why = expect_reject(lambda: M.mlkem_encaps(bad), "a coefficient ≥ q")
+check("a key that is not a valid ML-KEM-768 key is refused",
+      ok and not M.mlkem_ek_ok(bad) and not M.mlkem_ek_ok(ek[:-1]) and
+      M.mlkem_ek_ok(ek), why)
+
+pq_env, _ = alice.crypto.build_envelope(
+    "after the harvest", bob.pub, x={"k": "text"}, recipient=bob.address,
+    cid="q" * 32, pq=(bob.keys.pq_public, bob.keys.pq_kid))
+raw = M.b64d(pq_env["ciphertext"])
+got = bob.crypto.open_envelope(pq_env, alice.address, cid="q" * 32)
+check("a hybrid envelope opens, and says which key it was sealed to",
+      got["body"] == "after the harvest" and got.get("_pq") ==
+      bob.keys.pq_kid and raw[:4] == M.PQ_MAGIC)
+check("...still one envelope of three fields, the size relays accept",
+      set(pq_env) == {"ephemeral_public_key", "nonce", "ciphertext"} and
+      len(raw) < 96 * 1024)
+classic, _ = alice.crypto.build_envelope("as before", bob.pub)
+check("a classic one says nothing of the kind",
+      "_pq" not in bob.crypto.open_envelope(classic, alice.address))
+
+
+def altered(at, envelope=pq_env):
+    flipped = bytearray(M.b64d(envelope["ciphertext"]))
+    flipped[at] ^= 1
+    return dict(envelope, ciphertext=M.b64e(bytes(flipped)))
+
+
+for name, at in (("its ML-KEM ciphertext", 12 + 500),
+                 ("its sealed message", len(raw) - 1)):
+    ok, why = expect_reject(
+        lambda: bob.crypto.open_envelope(altered(at), alice.address,
+                                         cid="q" * 32),
+        f"{name} was altered")
+    check(f"a hybrid envelope with {name} altered is refused", ok, why)
+ok, why = expect_reject(
+    lambda: bob.crypto.open_envelope(altered(5), alice.address, cid="q" * 32),
+    "its key id was altered")
+check("...and one naming a key this device does not hold says so",
+      ok and "post-quantum key" in why, why)
+ok, why = expect_reject(
+    lambda: carol.crypto.open_envelope(pq_env, alice.address, cid="q" * 32),
+    "it was sealed to Bob")
+check("nobody else opens it", ok, why)
+forged = dict(bob.crypto.open_envelope(classic, alice.address),
+              _pq=bob.keys.pq_kid)
+check("a sender cannot claim the post-quantum mark",
+      "_pq" not in bob.crypto.open_envelope(reseal(forged, bob.pub),
+                                            alice.address))
+
+seed = alice.keys.find(alice.address).get("pq_seed_hex", "")
+saved = M.DATA_DIR, M.IDENTITIES_PATH
+M.DATA_DIR = Path(tempfile.mkdtemp(prefix="fext-device-"))
+M.IDENTITIES_PATH = M.DATA_DIR / "identities.json"
+fresh = M.IdentityManager()
+fresh.activate(fresh.add_identity(
+    int(alice.keys.active["private_key_hex"], 16), "again"))
+check("the post-quantum key is random, not made from the identity key: "
+      "the same identity set up again has another",
+      len(seed) == 128 and fresh.pq_kid != alice.keys.pq_kid)
+M.DATA_DIR = Path(tempfile.mkdtemp(prefix="fext-device-"))
+M.IDENTITIES_PATH = M.DATA_DIR / "identities.json"
+restored = M.IdentityManager()
+restored.activate(restored.restore_identity(dict(alice.keys.active)))
+check("...while a backup brings the key back with it",
+      restored.pq_kid == alice.keys.pq_kid and
+      M.IdentityManager().pq_public == alice.keys.pq_public)
+M.DATA_DIR, M.IDENTITIES_PATH = saved
+
+if OLD is not None:
+    old_dan = Party(OLD, "old-dan")
+    sent, _ = alice.crypto.build_envelope(
+        "keys in the block", old_dan.pub, x={
+            "k": "text", "pq": alice.keys.pq_kid,
+            "pqe": M.b64e(alice.keys.pq_public)},
+        recipient=old_dan.address, cid="r" * 32)
+    try:
+        got = old_dan.crypto.open_envelope(sent, alice.address,
+                                           cid="r" * 32)
+        check("the previous release reads a message carrying our key",
+              got["body"] == "keys in the block")
+    except Exception as exc:                      # noqa: BLE001
+        check("the previous release reads a message carrying our key",
+              False, f"{type(exc).__name__}: {exc}")
 
 
 # =============================================================================

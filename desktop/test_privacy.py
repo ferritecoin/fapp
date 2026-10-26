@@ -967,6 +967,9 @@ check("...its photos, found where this device keeps them",
 check("...and its own picture", M.own_picture_path(A).is_file())
 check("...the key the same key", fresh.find(A)["private_key_hex"] ==
       alice.keys.active["private_key_hex"])
+check("...and its post-quantum key (15.0), so what contacts seal to it opens",
+      len(fresh.find(A).get("pq_seed_hex", "")) == 128 and
+      fresh.find(A)["pq_seed_hex"] == alice.keys.active["pq_seed_hex"])
 store.close()
 again = M.restore_backup(fresh, target, "correct horse battery")
 check("restored again: an identity already here keeps its own chats",

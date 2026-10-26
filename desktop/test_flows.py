@@ -11,12 +11,12 @@ What is checked is therefore what actually goes over the wire, including
 the full media loop: upload, download, expiry, ask-to-resend, re-upload.
 """
 import importlib.util
-import json
 import os
 import sys
 import tempfile
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 
 os.environ.setdefault("KIVY_NO_ARGS", "1")
 os.environ["KIVY_NO_CONSOLELOG"] = "1"
@@ -44,6 +44,8 @@ class Relay:
 
     def __init__(self):
         self.mail, self.blobs, self.expired = [], {}, set()
+        self.expects = {}         # v14: how many each upload said would fetch
+        self.directory = {}       # address -> public key, as lookup gives it
         self._next = 1
 
     def post(self, sender, recipient, envelope, cid):
@@ -58,18 +60,52 @@ class StubApi:
     def __init__(self, relay, keys):
         self.relay, self.keys = relay, keys
         self._features = {"blobs": True}
+        # v14: what was asked of the relay, and how it can misbehave.
+        self.requests = []
+        self.ticks = {}
+        self.down = False         # out of reach
+        self.media_full = False   # no room for media (507)
+        self.refuse = set()       # members send_many does not store
 
     def features(self):
         return self._features
 
+    def _reach(self, what):
+        self.requests.append(what)
+        if self.down:
+            raise M.requests.ConnectionError("the relay is out of reach")
+
     def send_message(self, recipient, envelope, client_msg_id):
+        self._reach(("send", recipient))
         return {"server_id": self.relay.post(self.keys.address, recipient,
                                              envelope, client_msg_id)}
 
-    def upload_blob(self, blob):
+    def send_many(self, items):
+        self._reach("send_many")
+        return [{"error": {"code": "mailbox_full", "message": "full"}}
+                if item["recipient"] in self.refuse else
+                {"server_id": self.relay.post(
+                    self.keys.address, item["recipient"], item["envelope"],
+                    item["client_msg_id"])} for item in items]
+
+    def upload_blob(self, blob, expect=0):
+        self._reach("upload")
+        if self.media_full:
+            raise M.ApiClient.ApiError(507, "relay_full", "no room for media")
         blob_id = uuid.uuid4().hex
         self.relay.blobs[blob_id] = blob
+        self.relay.expects[blob_id] = expect
         return {"blob": blob_id}
+
+    def lookup(self, username=None, address=None):
+        if address not in self.relay.directory:
+            raise M.ApiClient.ApiError(404, "not_found", "no such user")
+        return {"address": address,
+                "public_key": self.relay.directory[address]}
+
+    def report(self, address, reason, note=""):
+        self.requests.append(("report", address, reason, note))
+        return {"report": 1}
 
     def download_blob(self, blob_id):
         if blob_id in self.relay.expired or blob_id not in self.relay.blobs:
@@ -80,6 +116,7 @@ class StubApi:
         return {"updated": len(ids)}
 
     def set_ticks(self, peer, enabled):
+        self.ticks[peer] = enabled
         return {}
 
 
@@ -96,6 +133,7 @@ def make_party(label, relay):
     address = app.keys.add_identity(priv, label)
     app.keys.activate(address)
     app.keys.set_username(label)
+    relay.directory[address] = app.keys.public_key_hex
     app.crypto = M.CryptoEngine(app.keys)
     app.api = StubApi(relay, app.keys)
     app.store = M.LocalStore(app.keys.store_path())
@@ -585,6 +623,376 @@ check("a larger text size scales every font",
 alice.set_appearance(theme="dark", text_size="default")
 check("...and back (dark, on black by default)",
       M.T.name == "black" and M.T.dark and M.APPEARANCE.scale == 1.0)
+
+print("\nv14: the outbox (B15), a full relay (B10), counted uploads (B2)")
+api = alice.api
+relay.mail.clear()
+first_photo = M.message_ext(alice.store.message(out["id"]))["media"]
+check("an upload says how many will fetch it: one, in a direct chat",
+      relay.expects.get(first_photo["blob"]) == 1)
+
+
+def attempts(who):
+    return api.requests.count(("send", who))
+
+
+def settled(local_id):
+    return local_id not in alice._sends()[1]
+
+
+api.down = True
+tried = attempts(B)
+waiting = alice.send_text(B, "are you there?")
+wait_for(lambda: attempts(B) > tried and settled(waiting))
+pump(alice)
+check("a message the relay does not take stays here at its clock, not "
+      "'Send failed'",
+      alice.store.message(waiting)["status"] == 0 and not relay.mail and
+      "Not sent yet" in alice.chats_screen.status_label.text,
+      alice.chats_screen.status_label.text)
+api.down = False
+check("...and the outbox sends it once the relay answers",
+      alice.flush_outbox() == 1 and
+      alice.store.message(waiting)["status"] == 1 and
+      [m["recipient"] for m in relay.mail] == [B])
+deliver(relay, parties)
+check("...arriving once",
+      sum(m["body"] == "are you there?"
+          for m in bob.store.messages_for(A)) == 1)
+
+api.down = True
+tried = attempts(B)
+old = alice.send_text(B, "from yesterday")
+wait_for(lambda: attempts(B) > tried and settled(old))
+yesterday = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+alice.store._db.execute("UPDATE messages SET created_at = ? WHERE id = ?",
+                        (yesterday, old))
+alice.store._db.commit()
+api.down = False
+check("after a day it no longer goes by itself",
+      alice.flush_outbox() == 0 and alice.store.message(old)["status"] == 0)
+alice.open_conversation(B)
+wait_for(lambda: old in alice.conversation_screen._bubbles)
+bubble = alice.conversation_screen._bubbles.get(old)
+check("...its bubble says 'Not sent · tap to try again'",
+      bubble is not None and "Not sent · tap to try again" in bubble.meta.text,
+      repr(bubble and bubble.meta.text))
+alice.conversation_screen.on_bubble_tap(old)
+wait_for(lambda: alice.store.message(old)["status"] == 1)
+check("...and a tap sends it", alice.store.message(old)["status"] == 1)
+deliver(relay, parties)
+alice.go_back_to_chats()
+
+alice.set_chat_timer(B, 3600)
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+api.media_full = True
+alice._prepare_image(B, src, "when there is room", None)
+pic = alice.store.messages_for(B)[-1]
+pump(alice)
+check("a photo the relay has no room for waits on the phone (B10)",
+      pic["media_state"] == "waiting" and not relay.mail and
+      "full" in alice.chats_screen.status_label.text)
+api.media_full = False
+alice.flush_outbox()
+pic = alice.store.message(pic["id"])
+check("...and goes once there is room",
+      pic["media_state"] == "ready" and len(relay.mail) == 1)
+deliver(relay, parties)
+got = bob.store.messages_for(A)[-1]
+check("a photo in a disappearing chat carries its timer (a fix: 13.0's "
+      "did not)", got["kind"] == "image" and got["ttl"] == 3600)
+alice.set_chat_timer(B, 0)
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+
+print("\nv14: a group message in one request (B1)")
+for party in (alice, bob, cara):
+    party.api._features = {"blobs": True, "send_many": True}
+relay.mail.clear()
+g14 = alice.create_group("Fourteen", [B, K])
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+for party in (bob, cara):
+    pump(party)
+api.requests.clear()
+one = alice.send_text(g14, "all of you at once")
+wait_for(lambda: len(relay.mail) >= 2)
+check("a group message goes in one request, a copy for each member",
+      api.requests.count("send_many") == 1 and
+      not any(isinstance(r, tuple) and r[0] == "send"
+              for r in api.requests) and
+      sorted(m["recipient"] for m in relay.mail) == sorted([B, K]),
+      str(api.requests))
+check("...each member's copy recorded",
+      all(row["server_id"] for row in alice.store.group_sends(one)))
+deliver(relay, parties)
+api.refuse = {K}
+two = alice.send_text(g14, "and again")
+wait_for(lambda: relay.mail and settled(two))
+check("a member the relay refused keeps the message at its clock",
+      alice.store.message(two)["status"] == 0 and
+      [m["recipient"] for m in relay.mail] == [B])
+deliver(relay, parties)
+api.refuse = set()
+alice.flush_outbox()
+check("...and the outbox sends only that member's copy",
+      [m["recipient"] for m in relay.mail] == [K])
+deliver(relay, parties)
+check("...so each has it once",
+      [m["body"] for m in cara.store.messages_for(g14)].count("and again")
+      == 1 and [m["body"] for m in bob.store.messages_for(g14)].count(
+          "and again") == 1)
+alice._prepare_image(g14, src, "for the group", None)
+gpic = M.message_ext(alice.store.messages_for(g14)[-1])["media"]
+check("an upload for a group counts its other members (B2)",
+      relay.expects.get(gpic["blob"]) == 2)
+deliver(relay, parties)
+
+print("\nv14: download rules (B14)")
+big = uuid.uuid4().hex
+bob.store.save_group({"id": big, "name": "Big", "admin": A, "v": 1,
+                      "members": [{"a": f"Fec{i:030d}", "k": ""}
+                                  for i in range(M.LARGE_GROUP)] +
+                      [{"a": B, "k": ""}]})
+photo_in = {"peer": M.group_peer(big), "kind": "image"}
+check("in a group of more than LARGE_GROUP, a photo waits for a tap",
+      not M.downloads_by_itself(bob.store, photo_in))
+on_data = M.on_metered_network
+M.on_metered_network = lambda: True
+M.save_pref("dl_photos_metered", False)
+check("on mobile data photos wait when told to, voice notes come",
+      not M.downloads_by_itself(bob.store, {"peer": A, "kind": "image"}) and
+      M.downloads_by_itself(bob.store, {"peer": A, "kind": "voice"}))
+M.save_pref("dl_photos_metered", True)
+check("...and come by themselves by default",
+      M.downloads_by_itself(bob.store, {"peer": A, "kind": "image"}))
+M.on_metered_network = on_data
+
+print("\nv14: message requests (B16)")
+dave = make_party("dave", relay)
+D = dave.keys.address
+parties[D] = dave
+dave.store.upsert_contact(A, alice.keys.username, alice.keys.public_key_hex)
+relay.mail.clear()
+dave.send_text(A, "hello, we met at the fair")
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+conv = next(c for c in alice.store.conversations(me=A) if c["peer"] == D)
+check("a first message from someone new waits as a request",
+      conv["request"] and alice.store.is_request(D))
+check("...the relay was told to send them no receipts before it was "
+      "acknowledged", api.ticks.get(D) is False and
+      alice.store.get_contact(D)["ticks_enabled"] == 0)
+check("...its notification says only that it is a request",
+      M.notification_text(alice.store, D, "hello, we met at the fair",
+                          "text")[1] == "Message request")
+check("...and a call from them is refused",
+      alice.worker._as_request(99, D, "dave", {"op": "call"}) == (True, 99))
+alice.refresh_sidebar()
+chats = alice.chats_screen
+check("the list shows a way into requests, not the chat itself",
+      any(isinstance(w, M.ArchiveRow) for w in chats.list.children) and
+      D not in chats._rows)
+chats.show_view("requests")
+check("...which lists it", D in chats._rows)
+chats.show_view("chats")
+alice.open_conversation(D)
+pump(alice)
+screen = alice.conversation_screen
+check("in the chat, Accept, Decline and Report stand where the composer "
+      "was", screen.request_note.parent is not None)
+alice.accept_request(D)
+pump(alice)
+check("accepting turns their receipts back on and gives the composer back",
+      not alice.store.is_request(D) and api.ticks.get(D) is True and
+      screen.request_note.parent is None)
+alice.go_back_to_chats()
+
+erin = make_party("erin", relay)
+E = erin.keys.address
+parties[E] = erin
+erin.store.upsert_contact(A, alice.keys.username, alice.keys.public_key_hex)
+erin.send_text(A, "a great offer")
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+alice.decline_request(E)
+check("declining removes the request without blocking them",
+      not any(c["peer"] == E for c in alice.store.conversations(me=A)) and
+      not alice.store.is_blocked(E) and alice.store.is_request(E))
+erin.send_text(A, "a greater offer")
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+check("...so if they write again, it is a request again",
+      next(c for c in alice.store.conversations(me=A)
+           if c["peer"] == E)["request"])
+api._features["reports"] = True
+alice.report_contact(E, "spam", "twice now", True)
+wait_for(lambda: ("report", E, "spam", "twice now") in api.requests)
+check("reporting tells the relay who and why, and blocks them",
+      ("report", E, "spam", "twice now") in api.requests and
+      alice.store.is_blocked(E))
+check("...after which the request is gone from Requests",
+      not any(c["peer"] == E and c.get("request") and not c.get("blocked")
+              for c in alice.store.conversations(me=A)))
+check("the blocked list has them, to unblock",
+      [p["address"] for p in alice.store.blocked_contacts()] == [E])
+alice.set_blocked([E], False)
+check("...and unblocking takes them off it",
+      alice.store.blocked_contacts() == [])
+
+print("\nv14: a relay restarting (P3)")
+worker = alice.worker
+worker._handle_frame({"type": "restart", "seconds": 40})
+check("the relay asks phones to come back later, and is obeyed",
+      worker._restart_in == 40)
+worker._handle_frame({"type": "restart", "seconds": 86400})
+check("...for five minutes at most",
+      worker._restart_in == M.RESTART_WAIT_MAX)
+worker._restart_in = 0
+
+
+class Paused:
+    status_code = 503
+    headers = {"Retry-After": "60"}
+
+    @staticmethod
+    def json():
+        return {"error": {"code": "paused", "message": "paused"}}
+
+
+try:
+    M.ApiClient(alice.keys)._handle(Paused())
+    asked = None
+except M.ApiClient.ApiError as exc:
+    asked = exc.detail.get("retry_after")
+check("...and a paused relay's Retry-After is kept", asked == 60)
+
+print("\nv15: post-quantum encryption")
+fern, gus, hal = (make_party(n, relay) for n in ("fern", "gus", "hal"))
+F, G, H = fern.keys.address, gus.keys.address, hal.keys.address
+parties.update({F: fern, G: gus, H: hal})
+for me, other in ((fern, gus), (gus, fern), (fern, hal), (hal, fern)):
+    me.store.upsert_contact(other.keys.address, other.keys.username,
+                            other.keys.public_key_hex)
+relay.mail.clear()
+
+
+def seen(msg):
+    """(sealed post-quantum, to which key id, the x-block): a relayed
+    envelope opened as its recipient would, nothing stored."""
+    raw = M.b64d(msg["envelope"]["ciphertext"])
+    payload = parties[msg["recipient"]].crypto.open_envelope(
+        msg["envelope"], msg["sender"], cid=msg["client_msg_id"])
+    pq = raw[:4] == M.PQ_MAGIC
+    return pq, raw[4:12].hex() if pq else None, payload.get("x") or {}
+
+
+def hint(app, peer):
+    return app.chat_info_screen._pq_row(peer).hint.text
+
+
+check("before anyone writes, chat info says it is off",
+      hint(fern, G).startswith("Off"))
+fern.send_text(G, "first, as before")
+wait_for(lambda: relay.mail)
+pq, _kid, x = seen(relay.mail[0])
+check("a first message is sealed as before, with the sender's "
+      "post-quantum key in its signed block",
+      not pq and x.get("pq") == fern.keys.pq_kid and
+      M.b64d(x.get("pqe", "")) == fern.keys.pq_public)
+deliver(relay, parties)
+check("...which the recipient keeps",
+      gus.store.pq_key(F) == (fern.keys.pq_public, fern.keys.pq_kid))
+check("...so their chat info says theirs are sealed now",
+      hint(gus, F) == "On for yours · theirs after your next message")
+gus.send_text(F, "the reply")
+wait_for(lambda: relay.mail)
+pq, kid, x = seen(relay.mail[0])
+check("the reply is post-quantum, sealed to that key, and brings the "
+      "replier's", pq and kid == fern.keys.pq_kid and "pqe" in x)
+deliver(relay, parties)
+check("...and is shown as such: both ways are on",
+      hint(fern, G) == "On, both ways" and
+      fern.store.pq_mine(G) == fern.keys.pq_kid)
+fern.send_text(G, "third")
+wait_for(lambda: relay.mail)
+pq, kid, x = seen(relay.mail[0])
+check("after that, keys are not sent again",
+      pq and kid == gus.keys.pq_kid and "pq" in x and "pqe" not in x)
+deliver(relay, parties)
+check("...and the receiving side agrees", hint(gus, F) == "On, both ways")
+
+garden = fern.create_group("Allotment", [G, H])
+wait_for(lambda: len(relay.mail) >= 2)
+copies = {m["recipient"]: seen(m) for m in relay.mail}
+check("in a group, each member's copy is sealed as their own chat is: "
+      "post-quantum to one whose key is held, as before to a new one",
+      copies[G][0] and not copies[H][0] and "pqe" in copies[H][2])
+deliver(relay, parties)
+pump(gus)
+pump(hal)
+hal.send_text(garden, "where are the spades?")
+wait_for(lambda: len(relay.mail) >= 2)
+copies = {m["recipient"]: seen(m) for m in relay.mail}
+check("a member's first group message is post-quantum to the admin, whose "
+      "key came with the invitation",
+      copies[F][0] and not copies[G][0])
+deliver(relay, parties)
+check("...and members who met only in the group now hold each other's key",
+      gus.store.pq_key(H) is not None)
+
+# A new install of gus, from his WIF alone: no chats, and a new
+# post-quantum key. Fern still holds the old one.
+old_kid = gus.keys.pq_kid
+gus.keys.find(G).pop("pq_seed_hex")
+gus.keys._pq.clear()
+gus.store = M.LocalStore(M.Path(tempfile.mkdtemp(prefix="fext-new-")) /
+                         "store.db")
+relay.mail.clear()
+fern.send_text(G, "sealed to the old key")
+wait_for(lambda: relay.mail)
+first_copy = dict(relay.mail[0])
+lost_cid = first_copy["client_msg_id"]
+check("(fern's message is sealed to gus's old key)",
+      M.b64d(first_copy["envelope"]["ciphertext"])[4:12].hex() == old_kid and
+      gus.keys.pq_kid != old_kid)
+relay.mail.clear()
+acked = gus.worker._ingest_message(first_copy)
+wait_for(lambda: relay.mail)
+asked = relay.mail[0] if relay.mail else {}
+_pq, _kid, x = seen(asked) if asked else (None, None, {})
+check("the new install asks for it again, sending its new key",
+      acked is None and asked.get("recipient") == F and
+      x.get("ctl") == {"op": "reseal", "cids": [lost_cid]} and
+      M.b64d(x.get("pqe", "")) == gus.keys.pq_public)
+deliver(relay, parties)
+wait_for(lambda: relay.mail)
+again = relay.mail[0] if relay.mail else {}
+check("...and the sender sends the same message again, sealed to it",
+      again.get("client_msg_id") == lost_cid and
+      seen(again)[:2] == (True, gus.keys.pq_kid))
+deliver(relay, parties)
+held = gus.store.message_by_cid(F, lost_cid)
+check("...which the new install opens",
+      held is not None and held["body"] == "sealed to the old key")
+check("when the old copy comes round again it is let go, with no warning "
+      "beside the message", gus.worker._ingest_message(first_copy) ==
+      first_copy["id"] and [m["body"] for m in gus.store.messages_for(F)]
+      == ["sealed to the old key"])
+fern.reseal(G, [lost_cid])
+fern.reseal(H, [lost_cid])
+old = next(m for m in fern.store.messages_for(G)
+           if m["body"] == "first, as before")["client_msg_id"]
+with fern.store._lock:
+    fern.store._db.execute(
+        "UPDATE messages SET created_at = ? WHERE client_msg_id = ?",
+        ((datetime.now(timezone.utc) - timedelta(days=8)).isoformat(), old))
+    fern.store._db.commit()
+fern.reseal(G, [old])
+time.sleep(0.5)
+check("a message is sent again once only, only to the person it was for, "
+      "and only within a week", not relay.mail)
 
 print("\nIdentity rename")
 old_user = alice.keys.username
