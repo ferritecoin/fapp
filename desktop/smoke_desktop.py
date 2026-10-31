@@ -15,6 +15,7 @@ os.environ.setdefault("KIVY_NO_ARGS", "1")
 os.environ["KIVY_NO_CONSOLELOG"] = "1"
 HOME = tempfile.mkdtemp(prefix="fext-desktop-")
 os.environ["HOME"] = HOME                         # a FRESH install
+os.environ["FEXT_LANG"] = "en"          # the English the checks read
 
 CLIENT = sys.argv[1]
 RESULTS = []

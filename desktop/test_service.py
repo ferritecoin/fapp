@@ -20,6 +20,7 @@ from pathlib import Path
 os.environ["PYTHON_NAME"] = "Fextsync"        # as python-for-android sets it
 os.environ.pop("DISPLAY", None)
 os.environ["HOME"] = tempfile.mkdtemp(prefix="fext-svc-")
+os.environ["FEXT_LANG"] = "en"          # the English the checks read
 ROOT = Path(__file__).resolve().parent.parent
 MAIN = Path(sys.argv[1] if len(sys.argv) > 1 else "main.py").resolve()
 
@@ -252,6 +253,8 @@ check("...with the classes that draw and answer them, and a call's "
       (ROOT / "android" / "Notifier.java").is_file() and
       (ROOT / "android" / "NotifyReceiver.java").is_file() and
       "USE_FULL_SCREEN_INTENT" in perms)
+check("(15.1) the keep-running guide may ask Android to leave the battery "
+      "alone", "REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" in perms)
 manifest.write_text("<manifest><application></application></manifest>")
 os.chdir(work)
 try:

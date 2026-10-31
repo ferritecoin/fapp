@@ -24,20 +24,23 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 MARK = "# FERRITEXT-ASSETS "
-#: What a computer needs from data/: the type with its licences, the mark
-#: for the loading screen, and the window icons.
+#: What a computer needs from data/: the type with its licences, each
+#: language's phrases (v15.1), the mark for the loading screen, and the
+#: window icons.
 FILES = sorted(["fonts/" + p.name for p in (DATA / "fonts").iterdir()
-                if p.suffix in (".ttf", ".txt")]) + [
+                if p.suffix in (".ttf", ".txt")]) + sorted(
+    ["lang/" + p.name for p in (DATA / "lang").glob("*.json")]) + [
     "ferritext_logo.png", "ferritext_logo_dark.png", "icon_desktop.png",
     "icon_desktop.ico"]
 
 HEADER = """
 # =============================================================================
-#  The fonts and icons of this desktop release (unpacked on first start into
-#  ~/.fext/assets, see _unpack_bundled_assets): Ferritext Serif — EB Garamond
-#  with Noto Emoji, coloured with Twemoji's graphics (CC-BY 4.0) — and
-#  Titillium Web, under the SIL Open Font License (the licence texts are
-#  included), and the Ferritext mark. Built from data/ by
+#  The fonts, phrases and icons of this desktop release (unpacked on first
+#  start into ~/.fext/assets, see _unpack_bundled_assets): Ferritext Serif —
+#  EB Garamond with Noto Emoji, coloured with Twemoji's graphics (CC-BY 4.0)
+#  — and the other faces, under the SIL Open Font License (the licence texts
+#  are included), each language's phrases, and the Ferritext mark. Built
+#  from data/ by
 #  tools/bundle_desktop.py; check this file against the source with
 #      python3 tools/bundle_desktop.py --verify <this file>
 # =============================================================================

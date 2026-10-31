@@ -54,3 +54,8 @@ None of these is needed; each adds what it says.
 | [Noto Emoji](https://github.com/googlefonts/noto-emoji), by Google | the emoji's outlines | SIL Open Font License 1.1 |
 | [Twemoji](https://github.com/jdecked/twemoji), by Twitter, Inc and other contributors, from [twemoji-colr-font](https://github.com/mrdrogdrog/twemoji-color-font) | the emoji in colour | CC-BY 4.0 (the graphics), SIL Open Font License 1.1 (the font) |
 | [Titillium Web](https://www.fontsquirrel.com/fonts/titillium-web), by Accademia di Belle Arti di Urbino | the capitals | SIL Open Font License 1.1 |
+| [IBM Plex Mono](https://github.com/IBM/plex), by IBM Corp. | Overclock's text | SIL Open Font License 1.1 |
+| [Silkscreen](https://github.com/googlefonts/silkscreen), by The Silkscreen Project Authors | Overclock's capitals | SIL Open Font License 1.1 |
+| [Open Sans](https://github.com/googlefonts/opensans), by The Open Sans Project Authors | Ferrite's text | SIL Open Font License 1.1 |
+| [Noto Sans SC and KR](https://github.com/notofonts/noto-cjk), by Adobe and Google | Chinese, Japanese and Korean, in every theme | SIL Open Font License 1.1 |
+| [Noto Sans](https://github.com/notofonts/notofonts.github.io), and its faces for Arabic, Hebrew, Thaana, Devanagari, Bengali, Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada, Malayalam, Sinhala, Thai, Lao, Tibetan (Noto Serif), Myanmar, Khmer, Georgian, Armenian and Ethiopic, by The Noto Project Authors | every other script, in every theme | SIL Open Font License 1.1 |

@@ -28,6 +28,7 @@ os.environ.setdefault("KIVY_NO_ARGS", "1")
 os.environ["KIVY_NO_CONSOLELOG"] = "1"
 os.environ.setdefault("SDL_VIDEODRIVER", "x11")
 os.environ["HOME"] = tempfile.mkdtemp(prefix="fext-nav-")
+os.environ["FEXT_LANG"] = "en"          # the English the checks read
 os.environ["FEXT_SERVER_HOST"] = "127.0.0.1:1"
 
 _spec = importlib.util.spec_from_file_location(

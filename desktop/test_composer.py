@@ -29,6 +29,7 @@ os.environ.setdefault("KIVY_NO_ARGS", "1")
 os.environ["KIVY_NO_CONSOLELOG"] = "1"
 os.environ.setdefault("SDL_VIDEODRIVER", "x11")
 os.environ["HOME"] = tempfile.mkdtemp(prefix="fext-composer-")
+os.environ["FEXT_LANG"] = "en"          # the English the checks read
 os.environ["FEXT_SERVER_HOST"] = "127.0.0.1:1"
 os.environ.pop("FEXT_THEME", None)
 
@@ -198,6 +199,27 @@ def click_pill_edge():
 
 
 step(click_pill_edge, 0.6)
+
+
+def centred(ti):
+    return abs(ti.padding[1] - (ti.height - ti.line_height) / 2) < 0.01
+
+
+def type_other_scripts():
+    ti = screen().entry.input
+    ti.text = "أراك غدا الساعة 10:30"
+    Clock.schedule_once(lambda _dt: check(
+        "a line in another script's face is centred in the field (15.1)",
+        ti.font_name == "FerritextWorld" and centred(ti),
+        f"{ti.font_name} {ti.padding} {ti.line_height}"), 0.3)
+    Clock.schedule_once(lambda _dt: setattr(ti, "text", ""), 0.4)
+    Clock.schedule_once(lambda _dt: check(
+        "...and the hint, back in the theme's, when it is cleared",
+        ti.font_name == "Roboto" and centred(ti),
+        f"{ti.font_name} {ti.padding} {ti.line_height}"), 0.7)
+
+
+step(type_other_scripts, 1.0)
 
 
 def no_eaters():

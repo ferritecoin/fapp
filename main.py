@@ -99,8 +99,10 @@ if ANDROID_SERVICE == SERVICE_NAME:
                        "KIVY_NO_CONSOLELOG": "1"})
 
 import base64
+import functools
 import io
 import json
+import locale
 import logging
 import math
 import platform
@@ -185,6 +187,7 @@ from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.clipboard import Clipboard
 from kivy.core.text import Label as CoreLabel, LabelBase
+from kivy.core.text.markup import MarkupLabel
 from kivy.core.window import Window
 from kivy.graphics import Canvas, ClearBuffers, ClearColor, Color, Ellipse, \
     Fbo, InstructionGroup, Line, Mesh, PopMatrix, PushMatrix, Rectangle, \
@@ -920,7 +923,7 @@ REQUIRE_TLS = _os.environ.get("FEXT_REQUIRE_TLS", "") not in ("", "0", "false")
 
 APP_NAME = "Ferritext"
 #: Must equal `version` in buildozer.spec — CI refuses to build if not.
-APP_VERSION = "15.0.0"
+APP_VERSION = "15.1.0"
 
 # The identity/QR payload keeps carrying the ORIGINAL tag. It is wire data
 # that older clients already produce and consume, so renaming the app must
@@ -1104,14 +1107,140 @@ FEATURE_TIMER = 4                   # v11: honours disappearing messages
 FEATURES = FEATURE_PICTURES | FEATURE_CALLS | FEATURE_TIMER
 
 # =============================================================================
-#  Design system (v9.1): two themes, type, text size, motion
+#  Languages (v15.1)
+# =============================================================================
+# Every phrase the app shows passes through tr(): English is the code's own
+# text, and a language's pack, data/lang/<code>.json, maps each English
+# phrase to its translation. A phrase a pack lacks is shown in English.
+# A phrase kept in a table is marked with N_() and translated where it is
+# shown. tools/phrases.py lists the phrases and what each pack lacks.
+LANG_DIR = ASSET_DIR / "lang"
+#: code: the language's own name, as Settings › Language lists it.
+LANGUAGES = {"en": "English",
+             "zh-CN": "简体中文"}                   # Simplified Chinese
+#: The languages whose "one" differs from "other" (trn): English's 1.
+ONE_IS_SINGULAR = {"en"}
+
+
+def N_(text: str) -> str:
+    """Marks a phrase kept in a table, to be translated where it is shown
+    (tr(text)); returns it as it is."""
+    return text
+
+
+class _Language:
+    code = "en"
+    phrases: dict = {}
+
+    def resolve(self) -> str:
+        """The language chosen in Settings, or the system's."""
+        chosen = load_prefs().get("language", "system")
+        return chosen if chosen in LANGUAGES else system_language()
+
+    def load(self, code: str) -> None:
+        self.code = code if code in LANGUAGES else "en"
+        self.phrases = {}
+        if self.code != "en":
+            try:
+                self.phrases = json.loads(
+                    (LANG_DIR / f"{self.code}.json").read_text("utf-8"))
+            except (OSError, ValueError):
+                log.warning("no phrases for %s: shown in English", self.code)
+
+
+LANG = _Language()
+
+
+def tr(text: str, **fields) -> str:
+    """`text` in the chosen language, with its {fields} filled in."""
+    text = LANG.phrases.get(text, text)
+    return text.format(**fields) if fields else text
+
+
+def trn(one: str, other: str, n: int, **fields) -> str:
+    """`one` or `other`, as `n` needs in the chosen language, with {n} and
+    its {fields} filled in."""
+    form = one if n == 1 and LANG.code in ONE_IS_SINGULAR else other
+    return tr(form, n=n, **fields)
+
+
+#: A date's names and its patterns, translated where a date is written
+#: (date_text): Chinese writes "10月26日 周一" where English writes
+#: "Mon 26 Oct".
+MONTHS = (N_("January"), N_("February"), N_("March"), N_("April"),
+          N_("May"), N_("June"), N_("July"), N_("August"), N_("September"),
+          N_("October"), N_("November"), N_("December"))
+MONTHS_SHORT = (N_("Jan"), N_("Feb"), N_("Mar"), N_("Apr"), N_("May"),
+                N_("Jun"), N_("Jul"), N_("Aug"), N_("Sep"), N_("Oct"),
+                N_("Nov"), N_("Dec"))
+WEEKDAYS = (N_("Monday"), N_("Tuesday"), N_("Wednesday"), N_("Thursday"),
+            N_("Friday"), N_("Saturday"), N_("Sunday"))
+WEEKDAYS_SHORT = (N_("Mon"), N_("Tue"), N_("Wed"), N_("Thu"), N_("Fri"),
+                  N_("Sat"), N_("Sun"))
+DATE_FORMS = {"day_month": N_("{day} {month}"),
+              "day_month_year": N_("{day} {month} {year}"),
+              "day_mon": N_("{day} {mon}"),
+              "wkd_day_mon_time": N_("{wkd} {day} {mon} {time}")}
+
+
+def date_text(when: datetime, form: str) -> str:
+    """`when` written in the chosen language, in one of DATE_FORMS."""
+    return tr(DATE_FORMS[form], day=when.day, year=when.year,
+              month=tr(MONTHS[when.month - 1]),
+              mon=tr(MONTHS_SHORT[when.month - 1]),
+              weekday=tr(WEEKDAYS[when.weekday()]),
+              wkd=tr(WEEKDAYS_SHORT[when.weekday()]),
+              time=when.strftime("%H:%M"))
+
+
+def pick_language(tags: list) -> str:
+    """The first of the language tags (en-GB, zh_Hans_CN, …) that LANGUAGES
+    has, by the tag or by its language; English when none is. Chinese in
+    Traditional characters (Taiwan, Hong Kong, Macau) is not taken for
+    Simplified."""
+    for tag in tags:
+        parts = str(tag or "").replace("_", "-").split(".")[0].split("-")
+        base = parts[0].lower()
+        if base == "zh":
+            rest = {p.lower() for p in parts[1:]}
+            if not rest & {"tw", "hk", "mo", "hant"}:
+                return "zh-CN"
+            continue
+        for code in LANGUAGES:
+            if code.split("-")[0].lower() == base:
+                return code
+    return "en"
+
+
+def system_language() -> str:
+    """The phone's or computer's language, as LANGUAGES has it.
+    FEXT_LANG=<tag> overrides (tests, screenshots)."""
+    tags = [os.environ.get("FEXT_LANG", "")]
+    try:
+        if IS_ANDROID:
+            autoclass, _ = _jni()
+            tags.append(autoclass("java.util.Locale").getDefault()
+                        .toLanguageTag())
+        else:
+            tags += [os.environ.get(k, "") for k in ("LANGUAGE", "LC_ALL",
+                                                     "LC_MESSAGES", "LANG")]
+            tags.append(locale.getlocale()[0] or "")
+    except Exception:
+        pass
+    return pick_language([t for tag in tags if tag for t in tag.split(":")])
+
+
+# =============================================================================
+#  Design system (v9.1): themes, type, text size, motion
 # =============================================================================
 # A serif with true italics for everything people write, spaced capitals for
 # section heads, buttons and dates, thin rules instead of boxes, and colour
 # only where it carries meaning: gold for the delivery ticks, red for what is
-# unread or cannot be undone.
+# unread or cannot be undone. That is Axiom; since 15.1, Overclock and
+# Ferrite bring their own colours, faces and corners (THEME_SETS), each with
+# a light and a dark side.
 #
-# Every text/ground pair either theme uses is at least WCAG AA (4.5:1; 3:1
+# Every text/ground pair any theme uses is at least WCAG AA (4.5:1; 3:1
 # for non-text marks) — see desktop/test_design.py, which measures them.
 THEMES = {
     "dark": {
@@ -1146,6 +1275,85 @@ THEMES["black"] = dict(
     bg="#000000", surface="#0F0E0C", surface_hi="#1A1916", own="#1E1B17",
     peer="#0F0E0C", rule="#1F1D1A", rule_strong="#33302A", press="#171614",
     quote_own="#2A2620", quote_peer="#1A1916")
+# v15.1: the palettes of Overclock and Ferrite, Ferrite Exchange's looks of
+# the same names in this app's tokens. Overclock is obsidian with phosphor
+# marks, and stays a dark page by day (violet, neon); Ferrite is graphite
+# with cyan, and slate with teal by day.
+THEMES["overclock_night"] = {
+    "bg": "#050506", "surface": "#09090B", "surface_hi": "#0E0F12",
+    "own": "#0C1A1E", "peer": "#0E0F12", "rule": "#1C1F24",
+    "rule_strong": "#2A2E35",
+    "text": "#E4ECF1", "text_2": "#B3BEC6", "text_3": "#7D8892",
+    "accent": "#35E8FF", "accent_press": "#22B8CC", "on_accent": "#050506",
+    "alert": "#FF3B5C", "on_alert": "#050506", "ok": "#39FF8C",
+    "tick": "#39FF8C", "tick_grey": "#6A747E", "press": "#15171B",
+    "quote_own": "#13262B", "quote_peer": "#15171B",
+    "select": (0.208, 0.910, 1.0, 0.13), "scrim": (0, 0, 0, 0.8),
+    "plate": "#E4ECF1",
+}
+THEMES["overclock_day"] = {
+    "bg": "#0F0722", "surface": "#170C33", "surface_hi": "#1F1142",
+    "own": "#29175A", "peer": "#170C33", "rule": "#3A2170",
+    "rule_strong": "#5B35A8",
+    "text": "#F6EFFF", "text_2": "#D6C9F2", "text_3": "#B4A3DC",
+    "accent": "#00F0FF", "accent_press": "#00BCD0", "on_accent": "#0F0722",
+    "alert": "#FF3D7F", "on_alert": "#0F0722", "ok": "#4DFF9E",
+    "tick": "#FF2FD0", "tick_grey": "#9584C4", "press": "#1F1142",
+    "quote_own": "#34206B", "quote_peer": "#1F1142",
+    "select": (0.0, 0.941, 1.0, 0.14), "scrim": (0.03, 0.01, 0.08, 0.82),
+    "plate": "#F6EFFF",
+}
+THEMES["ferrite_dark"] = {
+    "bg": "#151515", "surface": "#1C1C1C", "surface_hi": "#242424",
+    "own": "#10343A", "peer": "#1F1F1F", "rule": "#262626",
+    "rule_strong": "#333333",
+    "text": "#FFFFFF", "text_2": "#C7C7C7", "text_3": "#9A9A9A",
+    "accent": "#00BCD4", "accent_press": "#0097A7", "on_accent": "#101010",
+    "alert": "#FF4F4F", "on_alert": "#101010", "ok": "#3DBE5C",
+    "tick": "#00BCD4", "tick_grey": "#808080", "press": "#242424",
+    "quote_own": "#174A52", "quote_peer": "#2A2A2A",
+    "select": (0.0, 0.737, 0.831, 0.14), "scrim": (0, 0, 0, 0.62),
+    "plate": "#FFFFFF",
+}
+THEMES["ferrite_light"] = {
+    "bg": "#EEF2F6", "surface": "#FBFCFD", "surface_hi": "#E6EBF1",
+    "own": "#DDEFF1", "peer": "#FFFFFF", "rule": "#D9DEE5",
+    "rule_strong": "#B9C1CC",
+    "text": "#0F172A", "text_2": "#334155", "text_3": "#5A6476",
+    "accent": "#00737D", "accent_press": "#005B63", "on_accent": "#FFFFFF",
+    "alert": "#C62828", "on_alert": "#FFFFFF", "ok": "#1E7E34",
+    "tick": "#00838F", "tick_grey": "#6E7889", "press": "#E6EBF1",
+    "quote_own": "#C9E4E7", "quote_peer": "#E6EBF1",
+    "select": (0.0, 0.451, 0.490, 0.10), "scrim": (0.06, 0.09, 0.16, 0.42),
+    "plate": "#FFFFFF",
+}
+#: v15.1: a theme (Settings › Appearance) is a look: its palettes for a
+#: light and a dark phone (Axiom's dark may be on black), its text face and
+#: capitals, a type scale that brings the face's x-height near the serif's
+#: (and one for its capitals: Overclock's pixel capitals run wide), and how
+#: far its corners round (Overclock's are cut nearly square).
+#: Axiom is the app as it was.
+THEME_SETS = {
+    "axiom": {"label": "Axiom", "light": "light", "dark": "dark",
+              "black": "black", "face": "FerritextSerif",
+              "caps": "FerritextCaps", "type_scale": 1.0, "caps_scale": 1.0,
+              "corner": 0},
+    "overclock": {"label": "Overclock", "light": "overclock_day",
+                  "dark": "overclock_night", "face": "FerritextMono",
+                  "caps": "FerritextPixel", "type_scale": 0.82,
+                  "caps_scale": 0.82, "corner": 2},
+    "ferrite": {"label": "Ferrite", "light": "ferrite_light",
+                "dark": "ferrite_dark", "face": "FerritextSans",
+                "caps": "FerritextCaps", "type_scale": 0.88, "caps_scale": 1.0,
+                "corner": 0},
+}
+#: The theme set each palette belongs to.
+PALETTE_SET = {palette: key for key, look in THEME_SETS.items()
+               for palette in (look["light"], look["dark"], look.get("black"))
+               if palette}
+#: Palettes drawn as a dark page (Overclock's day side is one).
+DARK_PALETTES = {"dark", "black", "overclock_night", "overclock_day",
+                 "ferrite_dark"}
 #: Avatar colours, picked by address hash. Each carries a light initial at
 #: >= 3:1 (initials are large text).
 AVATAR_PALETTE = ["#3E5A8C", "#B4472E", "#3F7F73", "#A87A2A",
@@ -1157,15 +1365,23 @@ class _Tokens:
     Changing theme rebuilds the widget tree (FextApp.apply_appearance), so
     nothing has to repaint itself in place."""
     name = "dark"
+    theme_set = "axiom"
+    type_scale = caps_scale = 1.0
+    corner_cap = 0
 
     def load(self, name: str) -> None:
         self.name = name if name in THEMES else "dark"
         for key, value in THEMES[self.name].items():
             setattr(self, key, value)
+        self.theme_set = PALETTE_SET[self.name]
+        look = THEME_SETS[self.theme_set]
+        self.type_scale = look["type_scale"]
+        self.caps_scale = look["caps_scale"]
+        self.corner_cap = look["corner"]
 
     @property
     def dark(self) -> bool:
-        return self.name in ("dark", "black")
+        return self.name in DARK_PALETTES
 
 
 T = _Tokens()
@@ -1219,6 +1435,12 @@ COL_SELECT_RGBA = T.select
 def C(hex_color: str) -> list:
     """Hex string -> kivy rgba. UI-side only; workers keep hex strings."""
     return get_color_from_hex(hex_color)
+
+
+def corner(radius: float) -> float:
+    """A corner's radius in the current theme set: Overclock cuts its
+    corners nearly square (v15.1)."""
+    return min(radius, dp(T.corner_cap)) if T.corner_cap else radius
 
 
 def mix(a: str, b: str, t: float) -> str:
@@ -1284,13 +1506,15 @@ def system_reduces_motion() -> bool:
 
 #: Multiplies every font size, on top of the system font scale that sp()
 #: already applies.
-TEXT_SCALES = (("small", "S", 0.9), ("default", "M", 1.0),
-               ("large", "L", 1.15), ("largest", "XL", 1.3))
-THEME_CHOICES = (("system", "System"), ("light", "Light"), ("dark", "Dark"))
+TEXT_SCALES = (("small", N_("S"), 0.9), ("default", N_("M"), 1.0),
+               ("large", N_("L"), 1.15), ("largest", N_("XL"), 1.3))
+THEME_CHOICES = (("system", N_("System")), ("light", N_("Light")),
+                 ("dark", N_("Dark")))
 
 
 class _Appearance:
     mode = "system"                 # the user's choice: system/light/dark
+    theme_set = "axiom"             # v15.1: the look (THEME_SETS)
     scale = 1.0
     reduce_motion = False
 
@@ -1300,6 +1524,9 @@ class _Appearance:
         self.mode = prefs.get("theme", "system")
         if self.mode not in ("system", "light", "dark"):
             self.mode = "system"
+        self.theme_set = prefs.get("theme_set", "axiom")
+        if self.theme_set not in THEME_SETS:
+            self.theme_set = "axiom"
         self.scale = dict((k, s) for k, _l, s in TEXT_SCALES).get(
             prefs.get("text_size", "default"), 1.0)
         # Motion is on unless it is turned off in Settings: the fades are
@@ -1314,19 +1541,22 @@ class _Appearance:
     black = True
 
     def themed(self, dark: bool) -> str:
-        """The theme for a dark or light choice: dark on a black page
-        when Black background is on (v12)."""
+        """The theme set's palette for a dark or light choice: Axiom's dark
+        on a black page when Black background is on (v12)."""
+        look = THEME_SETS[self.theme_set]
         if not dark:
-            return "light"
-        return "black" if self.black else "dark"
+            return look["light"]
+        return look.get("black") if self.black and look.get("black") \
+            else look["dark"]
 
 
 APPEARANCE = _Appearance()
 
 
 def fs(size: float) -> float:
-    """A font size in sp, scaled by the user's text-size choice."""
-    return sp(size) * APPEARANCE.scale
+    """A font size in sp, scaled by the user's text-size choice and the
+    theme set's face (v15.1)."""
+    return sp(size) * APPEARANCE.scale * T.type_scale
 
 
 def motion(duration: float) -> float:
@@ -1341,36 +1571,688 @@ SHEET_RISE, SHEET_FADE = 0.18, 0.12        # a sheet rising, its card fading in
 
 
 # ---- type -------------------------------------------------------------------
-# Kivy draws a label with ONE font file and has no fallback, so the bundled
-# serif carries the emoji too (tools/build_fonts.py merges them). It is
-# registered under Kivy's default family name, so every Label and TextInput
-# in the app — and in Kivy's own widgets — is set in it.
+# Kivy draws a label with ONE font file and has no fallback, so each theme
+# set's face carries the emoji too (tools/build_fonts.py merges them). The
+# set's face is registered under Kivy's default family name, so every Label
+# and TextInput in the app — and in Kivy's own widgets — is set in it.
 FONT_DIR = ASSET_DIR / "fonts"
-SERIF_FILES = {"fn_regular": "FerritextSerif-Regular.ttf",
-               "fn_italic": "FerritextSerif-Italic.ttf",
-               "fn_bold": "FerritextSerif-Bold.ttf",
-               "fn_bolditalic": "FerritextSerif-BoldItalic.ttf"}
-CAPS_FONT = FONT_DIR / "ui.ttf"          # Titillium Web Light, as supplied
+#: Each face's files by style. Kivy neither slants nor emboldens a face, so
+#: a style a face lacks is drawn in its nearest: italic upright, bold
+#: italic bold.
+FACES = {
+    "FerritextSerif": {"fn_regular": "FerritextSerif-Regular.ttf",
+                       "fn_italic": "FerritextSerif-Italic.ttf",
+                       "fn_bold": "FerritextSerif-Bold.ttf",
+                       "fn_bolditalic": "FerritextSerif-BoldItalic.ttf"},
+    "FerritextMono": {"fn_regular": "FerritextMono-Regular.ttf",
+                      "fn_bold": "FerritextMono-Bold.ttf",
+                      "fn_bolditalic": "FerritextMono-Bold.ttf"},
+    "FerritextSans": {"fn_regular": "FerritextSans-Regular.ttf",
+                      "fn_bold": "FerritextSans-Bold.ttf",
+                      "fn_bolditalic": "FerritextSans-Bold.ttf"},
+}
+SERIF_FILES = FACES["FerritextSerif"]
+#: The capitals faces, shipped as they come: Titillium Web Light (as
+#: supplied) and Silkscreen, Overclock's pixel capitals.
+CAPS_FACES = {"FerritextCaps": "ui.ttf",
+              "FerritextPixel": "Silkscreen-Regular.ttf"}
+CAPS_FONT = FONT_DIR / "ui.ttf"
 CAPS_FONT_NAME = "Roboto"
+# v15.1: no theme's face has every script. Chinese, Japanese and Korean
+# are in one face for every theme (Ferritext CJK), and every other script
+# in everyday use in another (Ferritext World: Arabic, Hebrew, the scripts
+# of India and South-East Asia, Georgian, Armenian, Ethiopic, with Latin,
+# Greek and Cyrillic; tools/build_fonts.py). Kivy draws a label in one
+# face, so a label whose face lacks a character of its text is drawn
+# wholly in the first of these that has them all (_resolve_font_name). A
+# text field decides for all its lines at once (InkTextInput), so that it
+# is measured in the face it is drawn in.
+#: Chinese, Japanese and Korean: their characters, punctuation and
+#: full-width forms.
+CJK_TEXT = re.compile("[\u3000-\u30ff\u3130-\u318f\u3400-\u4dbf"
+                      "\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff"
+                      "\uff00-\uffef]")
+#: The faces for what a theme's face lacks, in the order they are tried.
+SCRIPT_FACES = (("FerritextCJK", "FerritextCJK-Regular.ttf"),
+                ("FerritextWorld", "FerritextWorld-Regular.ttf"))
+#: name -> file of each script face present (register_fonts).
+SCRIPT_FILES: dict = {}
 
 
-def register_fonts() -> bool:
+def register_fonts(theme_set: str = "axiom") -> bool:
+    """Make the theme set's face Kivy's default family and its capitals
+    face CAPS_FONT_NAME; every face stays registered by its own name. A set
+    whose files are missing is drawn in Axiom's."""
     global CAPS_FONT_NAME
-    files = {k: FONT_DIR / v for k, v in SERIF_FILES.items()}
-    ok = all(p.is_file() for p in files.values())
-    if ok:
-        paths = {k: str(p) for k, p in files.items()}
-        LabelBase.register("Roboto", **paths)
-        LabelBase.register("FerritextSerif", **paths)
+    faces = {}
+    for name, files in FACES.items():
+        paths = {k: FONT_DIR / v for k, v in files.items()}
+        if all(p.is_file() for p in paths.values()):
+            faces[name] = {k: str(p) for k, p in paths.items()}
+            LabelBase.register(name, **faces[name])
+    look = THEME_SETS[theme_set]
+    face = faces.get(look["face"]) or faces.get("FerritextSerif")
+    if face:
+        LabelBase.register("Roboto", **face)
     else:
         log.warning("bundled fonts missing from %s — using Kivy's", FONT_DIR)
-    if CAPS_FONT.is_file():
-        LabelBase.register("FerritextCaps", str(CAPS_FONT))
-        CAPS_FONT_NAME = "FerritextCaps"
-    return ok
+    caps = {name: FONT_DIR / file for name, file in CAPS_FACES.items()
+            if (FONT_DIR / file).is_file()}
+    for name, path in caps.items():
+        LabelBase.register(name, str(path))
+    CAPS_FONT_NAME = look["caps"] if look["caps"] in caps else (
+        "FerritextCaps" if caps.get("FerritextCaps") else "Roboto")
+    for name, file in SCRIPT_FACES:
+        if (FONT_DIR / file).is_file():
+            SCRIPT_FILES[name] = str(FONT_DIR / file)
+            LabelBase.register(name, SCRIPT_FILES[name])
+    return face is not None
 
 
 register_fonts()
+
+
+_FONT_CHARACTERS: dict = {}
+
+
+def font_characters(path: str) -> frozenset:
+    """The characters a font file has glyphs for, by its cmap: the format
+    12 table where there is one (ours have one, for their emoji), else
+    the format 4 table. Read once a file."""
+    found = _FONT_CHARACTERS.get(path)
+    if found is not None:
+        return found
+    chars, cmap, tables = set(), b"", {}
+    try:
+        with open(path, "rb") as f:
+            count = struct.unpack(">H", f.read(12)[4:6])[0]
+            records = f.read(16 * count)
+            for i in range(0, 16 * count, 16):
+                tag, _sum, at, size = struct.unpack(">4sIII",
+                                                    records[i:i + 16])
+                if tag == b"cmap":
+                    f.seek(at)
+                    cmap = f.read(size)
+        for i in range(struct.unpack(">H", cmap[2:4])[0]):
+            at = struct.unpack(">I", cmap[8 + 8 * i:12 + 8 * i])[0]
+            tables.setdefault(struct.unpack(">H", cmap[at:at + 2])[0], at)
+        if 12 in tables:                    # groups: first, last, glyph
+            at = tables[12]
+            groups = struct.unpack(">I", cmap[at + 12:at + 16])[0]
+            for g in range(at + 16, at + 16 + 12 * groups, 12):
+                first, last = struct.unpack(">II", cmap[g:g + 8])
+                chars.update(range(first, last + 1))
+        elif 4 in tables:                   # segments of the BMP
+            at = tables[4]
+            n = struct.unpack(">H", cmap[at + 6:at + 8])[0] // 2
+            ends, starts, deltas, offsets = (
+                struct.unpack(f">{n}{kind}", cmap[a:a + 2 * n])
+                for kind, a in (("H", at + 14), ("H", at + 16 + 2 * n),
+                                ("h", at + 16 + 4 * n),
+                                ("H", at + 16 + 6 * n)))
+            for k in range(n):
+                for c in range(starts[k], min(ends[k], 0xFFFE) + 1):
+                    glyph = c
+                    if offsets[k]:          # through the glyph id array
+                        g = at + 16 + 6 * n + 2 * k + offsets[k] + \
+                            2 * (c - starts[k])
+                        glyph = struct.unpack(">H", cmap[g:g + 2])[0]
+                    if glyph and (glyph + deltas[k]) & 0xFFFF:
+                        chars.add(c)
+    except (OSError, struct.error):
+        log.warning("could not read the characters of %s", path)
+    found = _FONT_CHARACTERS[path] = frozenset(chars)
+    return found
+
+
+def _drawn(ch: str) -> bool:
+    """Whether a character needs a glyph: not a control, a format mark
+    (joiners, direction marks) or a variation selector."""
+    return unicodedata.category(ch)[0] != "C" and \
+        not 0xFE00 <= ord(ch) <= 0xFE0F and not 0xE0100 <= ord(ch) <= 0xE01EF
+
+
+def script_face(text: str, own: Optional[str] = None) -> Optional[str]:
+    """The face to draw `text` in when its own face (by default the
+    theme's) lacks some of its characters: the first of SCRIPT_FACES that
+    has them all, else the one that has most; None to keep its own."""
+    if not text or text.isascii():
+        return None
+    return _script_face(text, own or LabelBase._fonts.get("Roboto", ("",))[0])
+
+
+@functools.lru_cache(maxsize=512)       # a label asks again as it redraws
+def _script_face(text: str, own: str) -> Optional[str]:
+    lacking = {cp for cp in set(map(ord, text)) - font_characters(own)
+               if _drawn(chr(cp))}
+    best, most = None, 0
+    for name, _file in SCRIPT_FACES:
+        if lacking and name in SCRIPT_FILES:
+            has = len(lacking & font_characters(SCRIPT_FILES[name]))
+            if has == len(lacking):
+                return name
+            if has > most:
+                best, most = name, has
+    return best
+
+
+_kivy_resolve_font_name = LabelBase.resolve_font_name
+
+
+def _resolve_font_name(label) -> None:
+    """Kivy's choice of font file, then ours: a face that has every
+    character, and the script HarfBuzz is to shape it as."""
+    _kivy_resolve_font_name(label)
+    options = label.options
+    face = script_face(label.text, options["font_name_r"])
+    if face:
+        options["font_name_r"] = SCRIPT_FILES[face]
+    options["font_script_name"] = shaping_script(label.text)
+
+
+LabelBase.resolve_font_name = _resolve_font_name
+
+# What HarfBuzz must be told to join Arabic's letters, form the scripts of
+# India's clusters and stack South-East Asia's marks: SDL_ttf shapes a
+# label as the script it is set to, and Kivy sets Latin.
+#: ISO 15924 code: the blocks of a script that needs shaping.
+SHAPED_SCRIPTS = (
+    ("Hebr", "\u0590-\u05ff\ufb1d-\ufb4f"),
+    ("Arab", "\u0600-\u06ff\u0750-\u077f\u0870-\u08ff\ufb50-\ufdff"
+             "\ufe70-\ufeff"),
+    ("Thaa", "\u0780-\u07bf"),
+    ("Deva", "\u0900-\u097f\ua8e0-\ua8ff"),
+    ("Beng", "\u0980-\u09ff"),
+    ("Guru", "\u0a00-\u0a7f"),
+    ("Gujr", "\u0a80-\u0aff"),
+    ("Orya", "\u0b00-\u0b7f"),
+    ("Taml", "\u0b80-\u0bff"),
+    ("Telu", "\u0c00-\u0c7f"),
+    ("Knda", "\u0c80-\u0cff"),
+    ("Mlym", "\u0d00-\u0d7f"),
+    ("Sinh", "\u0d80-\u0dff"),
+    ("Thai", "\u0e00-\u0e7f"),
+    ("Laoo", "\u0e80-\u0eff"),
+    ("Tibt", "\u0f00-\u0fff"),
+    ("Mymr", "\u1000-\u109f\ua9e0-\ua9ff\uaa60-\uaa7f"),
+    ("Khmr", "\u1780-\u17ff\u19e0-\u19ff"),
+)
+_SHAPED = re.compile("[" + "".join(b for _c, b in SHAPED_SCRIPTS) + "]")
+_SCRIPT_OF = [(code, re.compile(f"[{blocks}]"))
+              for code, blocks in SHAPED_SCRIPTS]
+
+
+def shaping_script(text: str) -> str:
+    """The script a text is shaped as: the first in it that needs it, or
+    Latin (Kivy's)."""
+    found = None if text.isascii() else _SHAPED.search(text)
+    if not found:
+        return "Latn"
+    return next(code for code, blocks in _SCRIPT_OF
+                if blocks.match(found.group()))
+
+# Kivy breaks a line only at a space. A run with none, as a Chinese
+# sentence is (and a Thai, Lao, Khmer or Burmese one: their words are not
+# spaced either), it cuts wherever the room runs out, so a full stop could
+# start a line, an opening bracket end one, or a vowel be parted from its
+# letter. A wrapped label whose text has those scripts is broken into
+# lines here first, by the rules Chinese and Japanese type keeps, and the
+# others between syllables (between words would take a dictionary); Kivy
+# lays out the lines it is given.
+#: Scripts written without spaces between words.
+UNSPACED_TEXT = re.compile(CJK_TEXT.pattern[:-1] +
+                           "\u0e00-\u0eff\u1000-\u109f\u1780-\u17ff]")
+#: What may not start a line, and what may not end one: CJK's closing and
+#: opening punctuation, and the vowels of Thai and Lao written after their
+#: letter, and before it.
+NO_LINE_START = frozenset("，。、；：？！）］｝〕〉》」』】〗〙”’…‥—・·ー々"
+                          "ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮヵヶ"
+                          "!%),.:;?]}" "ะาำๅๆฯະາຳໆ")
+NO_LINE_END = frozenset("（［｛〔〈《「『【〖〘“‘([{" "เแโใไເແໂໃໄ")
+#: Khmer's and Burmese's signs that set the next letter under this one.
+_STACKS = frozenset("\u17d2\u1039")
+#: The vowel signs and marks of the unspaced scripts, which stay with
+#: the letter before them.
+_MARKS = frozenset(chr(cp) for start, end in ((0x0E00, 0x0EFF),
+                                              (0x1000, 0x109F),
+                                              (0x1780, 0x17FF),
+                                              (0x3000, 0x30FF))
+                   for cp in range(start, end + 1)
+                   if unicodedata.category(chr(cp))[0] == "M")
+_PIECE = re.compile(" +|\n|" + UNSPACED_TEXT.pattern + "|[^ \n" +
+                    UNSPACED_TEXT.pattern[1:-1] + "]+")
+_MARKUP_TAG = re.compile(r"(\[.*?\])")
+
+
+def line_pieces(text: str) -> list:
+    """What a line may break between: each CJK character and each
+    syllable of the other unspaced scripts, each other word, each run of
+    spaces and each line break; with a mark held to its letter, a letter
+    stacked under another held to it, and the punctuation that may not
+    start (or end) a line held to the piece before (or after) it."""
+    pieces, hold = [], False
+    for piece in _PIECE.findall(text):
+        word = not piece.isspace()
+        if pieces and word and (hold or piece[0] in NO_LINE_START or
+                                piece[0] in _MARKS):
+            pieces[-1] += piece
+        else:
+            pieces.append(piece)
+        hold = word and (piece[-1] in NO_LINE_END or piece[-1] in _STACKS)
+    return pieces
+
+
+def line_breaks(text: str, width: float, extent) -> list:
+    """Where `text` must break to fit `width`, as `extent` (a text's
+    (width, height)) measures: each break's (start, end), which takes in
+    the spaces ending its line. A piece wider than a whole line is left
+    on its own, for Kivy to cut."""
+    breaks, line, at = [], "", 0
+    for piece in line_pieces(text):
+        if piece == "\n":
+            line = ""
+        elif line.strip() and not piece.isspace() and \
+                extent(line + piece)[0] > width:
+            breaks.append((at - len(line) + len(line.rstrip(" ")), at))
+            line = piece
+        else:
+            line += piece
+        at += len(piece)
+    return breaks
+
+
+def break_lines(text: str, width: float, extent,
+                markup: bool = False) -> str:
+    """`text` with a line break wherever line_breaks puts one. In markup
+    the lines are measured without the tags, and a break goes in after
+    any tag at its place."""
+    parts = _MARKUP_TAG.split(text) if markup else [text]
+    shown, place, at = "", [], 0         # place: each shown character's
+    for i, part in enumerate(parts):     # index in `text`
+        if i % 2 == 0:
+            shown += part
+            place += range(at, at + len(part))
+        at += len(part)
+    place.append(at)
+    out, done = "", 0
+    for start, end in line_breaks(shown, width, extent):
+        start, end = place[start], place[end]
+        if text[start:end].strip(" "):      # a tag among the spaces
+            start = end
+        out += text[done:start] + "\n"
+        done = end
+    return out + text[done:]
+
+
+# ---- right to left (15.1) ---------------------------------------------------
+# Kivy lays a line out left to right, in the order its characters are
+# stored. Arabic and Hebrew run right to left, and a number or a Latin word
+# in them left to right, so each line is first put in the order it is
+# shown, by the Unicode bidirectional algorithm (UAX #9; explicit
+# embeddings and isolates are taken as neutral). HarfBuzz still joins
+# Arabic's letters as they are read: told that text in a right-to-left
+# script runs left to right, it takes it as already in display order.
+#: Hebrew, Arabic, Syriac, Thaana, N'Ko and the rest of their blocks,
+#: their presentation forms, and the right-to-left mark.
+RTL_TEXT = re.compile("[\u0590-\u08ff\u200f\ufb1d-\ufdff\ufe70-\ufefe"
+                      "\U00010800-\U00010fff\U0001e800-\U0001efff]")
+_STRONG = ("L", "R", "AL")
+_NEUTRAL = frozenset(("B", "S", "WS", "ON"))
+_EXPLICIT = frozenset(("LRE", "RLE", "LRO", "RLO", "PDF", "LRI", "RLI",
+                       "FSI", "PDI"))
+#: Bracket pairs (BidiBrackets.txt, those in everyday use); U+2329 and
+#: U+232A are the same brackets as U+3008 and U+3009.
+BRACKETS = {"(": ")", "[": "]", "{": "}", "\u2045": "\u2046",
+            "\u3008": "\u3009", "\u300a": "\u300b", "\u300c": "\u300d",
+            "\u300e": "\u300f", "\u3010": "\u3011", "\u3014": "\u3015",
+            "\uff08": "\uff09", "\uff3b": "\uff3d", "\uff5b": "\uff5d"}
+_SAME_BRACKET = {"\u2329": "\u3008", "\u232a": "\u3009"}
+#: What a character becomes where text runs right to left (the everyday
+#: pairs of BidiMirroring.txt).
+MIRRORED = {**BRACKETS, **{v: k for k, v in BRACKETS.items()},
+            "<": ">", ">": "<", "\u00ab": "\u00bb", "\u00bb": "\u00ab",
+            "\u2039": "\u203a", "\u203a": "\u2039", "\u2264": "\u2265",
+            "\u2265": "\u2264", "\u2329": "\u232a", "\u232a": "\u2329"}
+
+
+def _as_strong(kind: str) -> str:
+    return "R" if kind in ("R", "AL", "EN", "AN") else kind
+
+
+def bidi_levels(text: str, base: Optional[int] = None) -> tuple:
+    """(the paragraph's level, each character's) for one paragraph: 0 for
+    left to right, 1 for right to left, 2 for left to right inside right
+    to left. `base` sets the paragraph's; by default its first strong
+    character does (P2, P3). Rule names are UAX #9's."""
+    classes = [unicodedata.bidirectional(ch) or "L" for ch in text]
+    if base is None:
+        base = next((int(c != "L") for c in classes if c in _STRONG), 0)
+    sos = "R" if base else "L"
+    n, types, prev = len(text), [], sos
+    for c in classes:                    # W1: marks are what they follow
+        if c in ("NSM", "BN") or c in _EXPLICIT:
+            c = "ON" if c == "NSM" and prev in _EXPLICIT else prev
+        types.append(c)
+        prev = c
+    last = sos
+    for i, t in enumerate(types):        # W2: digits after Arabic letters
+        if t in _STRONG:
+            last = t
+        elif t == "EN" and last == "AL":
+            types[i] = "AN"
+    types = ["R" if t == "AL" else t for t in types]                # W3
+    for i in range(1, n - 1):            # W4: separators inside numbers
+        a, t, b = types[i - 1], types[i], types[i + 1]
+        if t == "ES" and a == b == "EN" or \
+                t == "CS" and a == b and a in ("EN", "AN"):
+            types[i] = a
+    i = 0
+    while i < n:                         # W5: terminators by a number
+        j = i
+        while j < n and types[j] == "ET":
+            j += 1
+        if j > i and (i and types[i - 1] == "EN" or
+                      j < n and types[j] == "EN"):
+            types[i:j] = ["EN"] * (j - i)
+        i = max(j, i + 1)
+    types = ["ON" if t in ("ES", "ET", "CS") else t for t in types]  # W6
+    last = sos
+    for i, t in enumerate(types):        # W7: digits after Latin
+        if t in ("L", "R"):
+            last = t
+        elif t == "EN" and last == "L":
+            types[i] = "L"
+    _pair_brackets(text, classes, types, sos)                      # N0
+    i = 0
+    while i < n:                         # N1, N2: runs of neutrals
+        j = i
+        while j < n and types[j] in _NEUTRAL:
+            j += 1
+        if j > i:
+            before = _as_strong(types[i - 1]) if i else sos
+            after = _as_strong(types[j]) if j < n else sos
+            types[i:j] = [before if before == after else sos] * (j - i)
+        i = max(j, i + 1)
+    if base:                                                    # I1, I2
+        return base, [2 if t in ("L", "EN", "AN") else 1 for t in types]
+    return base, [1 if t == "R" else 2 if t in ("EN", "AN") else 0
+                  for t in types]
+
+
+def _pair_brackets(text: str, classes: list, types: list, sos: str) -> None:
+    """N0: a pair of brackets takes the direction of what it holds when
+    that is the paragraph's, or when the text before them has it too."""
+    closing = {v: k for k, v in BRACKETS.items()}
+    stack, pairs = [], []
+    for i, ch in enumerate(text):
+        ch = _SAME_BRACKET.get(ch, ch)
+        if types[i] != "ON":
+            continue
+        if ch in BRACKETS:
+            if len(stack) == 63:
+                break
+            stack.append((BRACKETS[ch], i))
+        elif ch in closing:
+            for k in range(len(stack) - 1, -1, -1):
+                if stack[k][0] == ch:
+                    pairs.append((stack[k][1], i))
+                    del stack[k:]
+                    break
+    for start, end in sorted(pairs):
+        inside = {_as_strong(t) for t in types[start + 1:end]} & {"L", "R"}
+        if not inside:
+            continue
+        side = sos
+        if sos not in inside:
+            side = next((_as_strong(t) for t in reversed(types[:start])
+                         if _as_strong(t) in ("L", "R")), sos)
+        for k in (start, end):           # with any marks that follow
+            types[k] = side
+            k += 1
+            while k < len(text) and classes[k] == "NSM":
+                types[k] = side
+                k += 1
+
+
+def _continues(text: str, i: int) -> bool:
+    """Whether text[i] belongs with the character before it, as HarfBuzz
+    groups them: a mark, a joiner and the emoji it joins, a skin tone, a
+    flag's second letter, a tag."""
+    cp = ord(text[i])
+    if unicodedata.category(text[i])[0] == "M" or cp == 0x200D or \
+            0x1F3FB <= cp <= 0x1F3FF or 0xE0020 <= cp <= 0xE007F:
+        return True
+    if text[i - 1] == "\u200d":
+        return unicodedata.category(text[i]) == "So"
+    return 0x1F1E6 <= cp <= 0x1F1FF and 0x1F1E6 <= ord(text[i - 1]) <= \
+        0x1F1FF and not _continues(text, i - 1)
+
+
+def display_order(text: str, levels: list, base: int) -> list:
+    """The indices of one line's characters in the order they are shown
+    (L1 to L3): whitespace ending the line at the paragraph's level, runs
+    reversed from the highest level down, and each cluster (_continues)
+    kept in its own order."""
+    levels = list(levels)
+    trailing = True
+    for i in range(len(text) - 1, -1, -1):                        # L1
+        kind = unicodedata.bidirectional(text[i])
+        if kind in ("S", "B"):
+            levels[i], trailing = base, True
+        elif trailing and (kind in ("WS", "BN") or kind in _EXPLICIT):
+            levels[i] = base
+        else:
+            trailing = False
+    groups = []
+    for i in range(len(text)):                                    # L3
+        if groups and _continues(text, i):
+            groups[-1].append(i)
+        else:
+            groups.append([i])
+    top = max(levels, default=0)
+    lowest = min((v for v in levels if v % 2), default=top + 1)
+    for level in range(top, lowest - 1, -1):                      # L2
+        i = 0
+        while i < len(groups):
+            j = i
+            while j < len(groups) and levels[groups[j][0]] >= level:
+                j += 1
+            groups[i:j] = groups[i:j][::-1]
+            i = max(j, i + 1)
+    return [i for group in groups for i in group]
+
+
+def starts_rtl(text: str) -> bool:
+    """Whether the first character of `text` with a direction runs right
+    to left (P2)."""
+    if not RTL_TEXT.search(text):
+        return False
+    return next((unicodedata.bidirectional(ch) for ch in text
+                 if unicodedata.bidirectional(ch) in _STRONG), "L") != "L"
+
+
+def shown_line(text: str) -> str:
+    """One line as it is shown: in display order, and mirrored where it
+    runs right to left (L4)."""
+    base, levels = bidi_levels(text)
+    return "".join(MIRRORED.get(text[i], text[i]) if levels[i] % 2
+                   else text[i] for i in display_order(text, levels, base))
+
+
+def _markup_runs(text: str) -> list:
+    """Kivy markup as runs of (the tags open on it, their closing tags,
+    its plain text)."""
+    runs, open_tags = [], []
+    for i, part in enumerate(_MARKUP_TAG.split(text)):
+        if i % 2:
+            name = part[1:-1].split("=", 1)[0]
+            names = [n for n, _tag in open_tags]
+            if not name.startswith("/"):
+                open_tags.append((name, part))
+            elif name[1:] in names:
+                del open_tags[len(names) - 1 - names[::-1].index(name[1:])]
+        elif part:
+            runs.append(("".join(tag for _n, tag in open_tags),
+                         "".join(f"[/{n}]" for n, _t in reversed(open_tags)),
+                         part.replace("&bl;", "[").replace("&br;", "]")
+                         .replace("&amp;", "&")))
+    return runs or [("", "", "")]
+
+
+def _fitting(text: str, width: float, extent) -> int:
+    """How many of `text`'s characters fit `width` with an ellipsis after
+    them, never parting a cluster."""
+    low, high = 0, len(text)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if extent(text[:mid].rstrip() + "\u2026")[0] <= width:
+            low = mid
+        else:
+            high = mid - 1
+    while 0 < low < len(text) and _continues(text, low):
+        low -= 1
+    return low
+
+
+def display_text(text: str, width: Optional[float], extent,
+                 markup: bool = False, one_line: bool = False) -> tuple:
+    """(`text` as it is shown, whether it begins right to left): broken
+    into lines that fit `width` in reading order (line_breaks), then each
+    line in display order; on one line, shortened at the end it is read
+    to, with an ellipsis. In markup, each piece of text keeps its tags."""
+    runs = _markup_runs(text) if markup else [("", "", text)]
+    shown = "".join(run[2] for run in runs)
+    owner = [k for k, run in enumerate(runs) for _ch in run[2]]
+    breaks = []
+    if one_line:
+        shown = shown.replace("\n", " ")
+        if width and extent(shown)[0] > width:
+            shown = shown[:_fitting(shown, width, extent)].rstrip()
+            owner = owner[:len(shown)] + [owner[max(len(shown) - 1, 0)]]
+            shown += "\u2026"
+    elif width:
+        breaks = line_breaks(shown, width, extent)
+
+    def line(start: int, end: int, at: int, base: int, levels: list):
+        """One line in display order, each piece of it in its tags."""
+        pieces = []                     # [run, text] in the order shown
+        for i in display_order(shown[start:end], levels[start - at:end - at],
+                               base):
+            ch = shown[start + i]
+            if levels[start - at + i] % 2:
+                ch = MIRRORED.get(ch, ch)
+            if pieces and pieces[-1][0] == owner[start + i]:
+                pieces[-1][1] += ch
+            else:
+                pieces.append([owner[start + i], ch])
+        if not markup:
+            return "".join(piece for _run, piece in pieces)
+        return "".join(runs[run][0] + escape_markup(piece) + runs[run][1]
+                       for run, piece in pieces)
+
+    lines, at, rtl = [], 0, None
+    for paragraph in shown.split("\n"):
+        end = at + len(paragraph)
+        base, levels = bidi_levels(paragraph)
+        rtl = base if rtl is None else rtl
+        start = at
+        while breaks and breaks[0][0] <= end:
+            cut, resume = breaks.pop(0)
+            lines.append(line(start, cut, at, base, levels))
+            start = resume
+        lines.append(line(start, end, at, base, levels))
+        at = end + 1
+    return "\n".join(lines), bool(rtl)
+
+
+try:
+    from kivy.core.text._text_sdl2 import _SurfaceContainer
+except ImportError:                     # another text library: left as is
+    _SurfaceContainer = None
+
+
+def _shape_as(label, script: str, direction: str = "ltr") -> None:
+    """Set the script and direction the label's font is shaped in. SDL_ttf
+    keeps one of each for each open font, set when it draws and used too
+    when it measures: drawing a space sets them. The label's own options
+    are left as they were."""
+    if _SurfaceContainer is None:
+        return
+    options = label.options
+    own = options["font_script_name"], options["font_direction"]
+    options["font_script_name"], options["font_direction"] = script, direction
+    try:
+        _SurfaceContainer(1, 1).render(label, " ", 0, 0)
+    except Exception:
+        log.debug("could not set the font's script", exc_info=True)
+    finally:
+        options["font_script_name"], options["font_direction"] = own
+
+
+def _laid_out(label, text: str, script: str) -> str:
+    """The text Kivy is to lay out: right to left put in display order
+    (display_text), an unspaced script broken into lines (break_lines),
+    else as it is. A right-to-left paragraph that wraps lines up on the
+    right."""
+    options, width = label.options, label.text_size[0]
+    markup = isinstance(label, MarkupLabel)
+    one_line = options["shorten"] or options.get("max_lines") == 1
+    left, _top, right, _bottom = options["padding"]
+    room = width - left - right if width else None
+    if RTL_TEXT.search(text):
+        _shape_as(label, script, "rtl")      # measured in reading order
+        try:
+            shown, rtl = display_text(text, room, label.get_cached_extents(),
+                                      markup, one_line)
+        finally:
+            _shape_as(label, script)          # Kivy measures what is shown
+        if rtl and room and not one_line and options["halign"] == "left":
+            options["halign"], label._fext_rtl = "right", True
+        return shown
+    if room and not one_line and UNSPACED_TEXT.search(text) and not (
+            markup and re.search(r"&|\[/?(size|font)", text)):
+        return break_lines(text, room, label.get_cached_extents(), markup)
+    return text
+
+
+def _breaking_lines(render):
+    """Kivy's `render`, whose first pass lays the text out and second
+    draws it, for the text _laid_out gives. Around both, the label's font
+    is set to shape in the label's script, and back to Latin after, as
+    every other label expects to find it."""
+    def breaking(label, real: bool = False):
+        text, options = label.text, label.options
+        if not real and getattr(label, "_fext_rtl", False):
+            options["halign"], label._fext_rtl = "left", False  # its own
+        if text.isascii():
+            return render(label, real)
+        script = options["font_script_name"]
+        if script != "Latn":
+            _shape_as(label, script)
+        try:
+            shown = text if real else _laid_out(label, text, script)
+            if shown == text:
+                return render(label, real)
+            label.text = shown
+            try:
+                return render(label, real)
+            finally:
+                label.text = text
+        finally:
+            if script != "Latn":
+                _shape_as(label, "Latn")
+    return breaking
+
+
+LabelBase.render = _breaking_lines(LabelBase.render)
+MarkupLabel.render = _breaking_lines(MarkupLabel.render)
+
+
+def use_theme(name: str) -> None:
+    """Apply a palette, and the face and capitals of its theme set."""
+    apply_theme(name)
+    register_fonts(T.theme_set)
+
 
 # =============================================================================
 #  Small shared utilities (DRY helpers)
@@ -1583,21 +2465,21 @@ def link_warning(url: str) -> str:
         parts = urlsplit(url)
         host = parts.hostname or ""
     except ValueError:
-        return "This link is malformed."
+        return tr("This link is malformed.")
     notes = []
     if "xn--" in link_host(url):
-        notes.append("Its name is spelled with letters from other alphabets "
-                     "— it may be dressed up as another site.")
+        notes.append(tr("Its name is spelled with letters from other "
+                        "alphabets — it may be dressed up as another site."))
     try:
         ipaddress.ip_address(host)
-        notes.append("It names no site, only a number.")
+        notes.append(tr("It names no site, only a number."))
     except ValueError:
         pass
     if parts.username is not None:
-        notes.append("Text before an @ in a link is not where it leads.")
+        notes.append(tr("Text before an @ in a link is not where it leads."))
     if parts.scheme == "http":
-        notes.append("Not encrypted: the network on the way can read and "
-                     "change the page.")
+        notes.append(tr("Not encrypted: the network on the way can read "
+                        "and change the page."))
     return " ".join(notes)
 
 
@@ -2005,9 +2887,10 @@ def sanitize_group_state(raw) -> Optional[dict]:
 # and each app deletes its copy that long after sending it, or after reading
 # it. Old releases ignore both, so the setting says when someone's app does
 # not take part (contacts.caps & CAP_TIMER).
-TIMER_CHOICES = ((0, "Off"), (300, "5 minutes"), (3600, "1 hour"),
-                 (8 * 3600, "8 hours"), (86400, "1 day"),
-                 (7 * 86400, "1 week"), (28 * 86400, "4 weeks"))
+TIMER_CHOICES = ((0, N_("Off")), (300, N_("5 minutes")),
+                 (3600, N_("1 hour")), (8 * 3600, N_("8 hours")),
+                 (86400, N_("1 day")), (7 * 86400, N_("1 week")),
+                 (28 * 86400, N_("4 weeks")))
 _TIMER_SECONDS = {seconds for seconds, _label in TIMER_CHOICES}
 
 
@@ -2019,16 +2902,17 @@ def sanitize_timer(value) -> Optional[int]:
 
 
 def timer_label(seconds: int) -> str:
-    return next((label for s, label in TIMER_CHOICES if s == seconds),
-                f"{int(seconds)} seconds")
+    """How long a timer is, as the app says it: "1 hour", "Off"."""
+    label = next((label for s, label in TIMER_CHOICES if s == seconds), None)
+    return tr(label) if label else tr("{n} seconds", n=int(seconds))
 
 
 def timer_event(name: str, seconds: int) -> str:
     """The line in the chat that says who changed the timer, and to what."""
     if not seconds:
-        return f"{name} turned off disappearing messages"
-    return f"{name} set messages to disappear {timer_label(seconds).lower()}" \
-        f" after they are read"
+        return tr("{name} turned off disappearing messages", name=name)
+    return tr("{name} set messages to disappear {duration} after they are "
+              "read", name=name, duration=timer_label(seconds))
 
 
 # ---- v11: verifying a contact ---------------------------------------------------
@@ -2136,23 +3020,23 @@ class BackupError(Exception):
     the person using the app."""
 
 
-_DAMAGED = "This file is damaged."
+_DAMAGED = N_("This file is damaged.")
 
 
 def _backup_key(passphrase: str, kdf) -> bytes:
     if not isinstance(kdf, dict) or kdf.get("name") != "scrypt":
-        raise BackupError("This backup was made by a newer Ferritext — "
-                          "update this one first.")
+        raise BackupError(tr("This backup was made by a newer Ferritext — "
+                             "update this one first."))
     try:
         n, r, p = int(kdf["n"]), int(kdf["r"]), int(kdf["p"])
         salt = b64d(kdf["salt"])
     except (KeyError, TypeError, ValueError):
-        raise BackupError(_DAMAGED)
+        raise BackupError(tr(_DAMAGED))
     # Bounded, so a file made to look like a backup cannot ask for hours of
     # work or gigabytes of memory.
     if not (2 ** 10 <= n <= 2 ** 20 and n & (n - 1) == 0 and 1 <= r <= 32
             and n * r <= 2 ** 21 and 1 <= p <= 4 and len(salt) >= 16):
-        raise BackupError(_DAMAGED)
+        raise BackupError(tr(_DAMAGED))
     from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
     secret = unicodedata.normalize("NFKC", passphrase).encode("utf-8")
     return Scrypt(salt=salt, length=32, n=n, r=r, p=p,
@@ -2216,32 +3100,32 @@ class _SealedReader:
         from cryptography.exceptions import InvalidTag
         head = self._src.read(4)
         if len(head) < 4:
-            raise BackupError("This backup is incomplete — it was cut short "
-                              "when it was made or copied.")
+            raise BackupError(tr("This backup is incomplete — it was cut "
+                                 "short when it was made or copied."))
         word = int.from_bytes(head, "big")
         final, length = bool(word & _BACKUP_FINAL), word & ~_BACKUP_FINAL
         if not 16 <= length <= BACKUP_CHUNK + 16:
-            raise BackupError(_DAMAGED)
+            raise BackupError(tr(_DAMAGED))
         nonce, sealed = self._src.read(12), self._src.read(length)
         if len(nonce) < 12 or len(sealed) < length:
-            raise BackupError("This backup is incomplete — it was cut short "
-                              "when it was made or copied.")
+            raise BackupError(tr("This backup is incomplete — it was cut "
+                                 "short when it was made or copied."))
         try:
             plain = self._aead.decrypt(
                 nonce, sealed, _chunk_ad(self._bound, self._index, final))
         except InvalidTag:
-            raise BackupError("Wrong passphrase." if self._index == 0
-                              else _DAMAGED)
+            raise BackupError(tr("Wrong passphrase.") if self._index == 0
+                              else tr(_DAMAGED))
         if self._index == 0:
             if plain != _BACKUP_CHECK or final:
-                raise BackupError(_DAMAGED)
+                raise BackupError(tr(_DAMAGED))
         else:
             self._buf += plain
         self._index += 1
         if final:
             self._done = True
             if self._src.read(1):
-                raise BackupError(_DAMAGED)
+                raise BackupError(tr(_DAMAGED))
 
     def finish(self) -> None:
         """Read to the end, so all of it is known to be intact."""
@@ -2282,7 +3166,7 @@ def size_text(n: int) -> str:
     for unit, step in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
         if n >= step:
             return f"{n / step:.1f} {unit}"
-    return f"{n} bytes"
+    return tr("{n} bytes", n=n)
 
 
 def backup_media_size(keys: "IdentityManager") -> tuple:
@@ -2317,10 +3201,11 @@ def make_backup(keys: "IdentityManager", passphrase: str, out_path,
     out_path = Path(out_path)
     idents = [dict(i) for i in keys.identities]
     if not idents:
-        raise BackupError("There is nothing on this device to back up yet.")
+        raise BackupError(tr("There is nothing on this device to back up "
+                             "yet."))
     if len(passphrase) < BACKUP_MIN_PASSPHRASE:
-        raise BackupError(f"Use a passphrase of at least "
-                          f"{BACKUP_MIN_PASSPHRASE} characters.")
+        raise BackupError(tr("Use a passphrase of at least {n} characters.",
+                             n=BACKUP_MIN_PASSPHRASE))
     header = {"v": 1, "made": now_iso(), "by": f"{APP_NAME} {APP_VERSION}",
               "kdf": {"name": "scrypt", "n": 2 ** 15, "r": 8, "p": 1,
                       "salt": b64e(os.urandom(16))}}
@@ -2410,8 +3295,8 @@ def make_backup(keys: "IdentityManager", passphrase: str, out_path,
         if progress is not None:
             progress(1.0)
     except OSError as exc:
-        raise BackupError(f"The backup could not be written: "
-                          f"{exc.strerror or exc}.")
+        raise BackupError(tr("The backup could not be written: {reason}.",
+                             reason=exc.strerror or exc))
     finally:
         shutil.rmtree(staging, ignore_errors=True)
         if part.exists():
@@ -2431,21 +3316,21 @@ def read_backup_header(path) -> dict:
 
 def _read_header(raw) -> tuple:
     if raw.read(len(BACKUP_MAGIC)) != BACKUP_MAGIC:
-        raise BackupError("This is not a Ferritext backup.")
+        raise BackupError(tr("This is not a Ferritext backup."))
     word = raw.read(4)
     length = int.from_bytes(word, "big") if len(word) == 4 else 0
     if not 2 <= length <= 4096:
-        raise BackupError(_DAMAGED)
+        raise BackupError(tr(_DAMAGED))
     head = raw.read(length)
     try:
         header = json.loads(head.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
-        raise BackupError(_DAMAGED)
+        raise BackupError(tr(_DAMAGED))
     if not isinstance(header, dict):
-        raise BackupError(_DAMAGED)
+        raise BackupError(tr(_DAMAGED))
     if header.get("v") != 1:
-        raise BackupError("This backup was made by a newer Ferritext — "
-                          "update this one first.")
+        raise BackupError(tr("This backup was made by a newer Ferritext — "
+                             "update this one first."))
     return header, BACKUP_MAGIC + word + head
 
 
@@ -2471,7 +3356,7 @@ def _place_store(snapshot: Path, target: Path) -> None:
     db = sqlite3.connect(str(snapshot))
     try:
         if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-            raise BackupError(_DAMAGED)
+            raise BackupError(tr(_DAMAGED))
         for row_id, stored in db.execute(
                 "SELECT id, media_path FROM messages WHERE media_path IS NOT "
                 "NULL AND media_path != ''").fetchall():
@@ -2488,7 +3373,7 @@ def _place_store(snapshot: Path, target: Path) -> None:
                         else None, peer))
         db.commit()
     except sqlite3.Error:
-        raise BackupError(_DAMAGED)
+        raise BackupError(tr(_DAMAGED))
     finally:
         db.close()
     shutil.move(str(snapshot), str(target))
@@ -2527,16 +3412,16 @@ def restore_backup(keys: "IdentityManager", path, passphrase: str,
                         if progress is not None:
                             progress(min(0.95, raw.tell() / total))
             except tarfile.TarError:
-                raise BackupError(_DAMAGED)
+                raise BackupError(tr(_DAMAGED))
             reader.finish()
         if "identities.json" not in got:
-            raise BackupError(_DAMAGED)
+            raise BackupError(tr(_DAMAGED))
         try:
             records = json.loads(got["identities.json"].read_text("utf-8"))[
                 "identities"]
             assert isinstance(records, list)
         except (ValueError, KeyError, TypeError, AssertionError):
-            raise BackupError(_DAMAGED)
+            raise BackupError(tr(_DAMAGED))
         PICTURES_DIR.mkdir(parents=True, exist_ok=True)
         MEDIA_DIR.mkdir(parents=True, exist_ok=True)
         for name, staged in got.items():
@@ -2577,8 +3462,8 @@ def restore_backup(keys: "IdentityManager", path, passphrase: str,
             progress(1.0)
         return summary
     except OSError as exc:
-        raise BackupError(f"The backup could not be read: "
-                          f"{exc.strerror or exc}.")
+        raise BackupError(tr("The backup could not be read: {reason}.",
+                             reason=exc.strerror or exc))
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
@@ -2622,8 +3507,24 @@ def compress_image(path: str) -> tuple:
 
 
 def voice_label(duration_ms: int) -> str:
+    """A voice message's body: what an app that cannot play it shows. It
+    goes to the other phone in English; shown_body translates it there."""
     seconds = max(0, int(round((duration_ms or 0) / 1000.0)))
     return f"Voice message ({seconds // 60}:{seconds % 60:02d})"
+
+
+_VOICE_BODY = re.compile(r"Voice message \((\d+:\d\d)\)")
+
+
+def shown_body(kind: str, body: str) -> str:
+    """A message's body as this phone shows it: the English the sender's
+    app wrote for a photo or a voice message, in this phone's language."""
+    if kind == "image" and body == "Photo":
+        return tr("Photo")
+    voice = _VOICE_BODY.fullmatch(body or "") if kind == "voice" else None
+    if voice:
+        return tr("Voice message ({time})", time=voice.group(1))
+    return body
 
 
 def seal_media(data: bytes) -> tuple:
@@ -3056,7 +3957,7 @@ def android_share_text(text: str) -> None:
     intent.setType("text/plain")
     intent.putExtra(Intent.EXTRA_TEXT, _charseq(text))
     android_context().startActivity(
-        Intent.createChooser(intent, _charseq("Share")))
+        Intent.createChooser(intent, _charseq(tr("Share"))))
 
 
 def android_share_image(path: str) -> None:
@@ -3071,7 +3972,7 @@ def android_share_image(path: str) -> None:
     ctx = android_context()
     media = autoclass("android.provider.MediaStore$Images$Media")
     uri_text = media.insertImage(ctx.getContentResolver(), path,
-                                 "Ferritext photo", None)
+                                 tr("Ferritext photo"), None)
     if not uri_text:
         raise RuntimeError("the gallery refused the photo")
     Intent = autoclass("android.content.Intent")
@@ -3080,7 +3981,8 @@ def android_share_image(path: str) -> None:
     intent.putExtra(Intent.EXTRA_STREAM, cast(
         "android.os.Parcelable", autoclass("android.net.Uri").parse(uri_text)))
     intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-    ctx.startActivity(Intent.createChooser(intent, _charseq("Share photo")))
+    ctx.startActivity(Intent.createChooser(intent,
+                                           _charseq(tr("Share photo"))))
 
 
 def _notification_id(peer: str) -> int:
@@ -3101,8 +4003,9 @@ def android_notify(peer: str, title: str, text: str) -> None:
         Channel = autoclass("android.app.NotificationChannel")
         importance = autoclass("android.app.NotificationManager"
                                ).IMPORTANCE_HIGH
-        channel = Channel(NOTIFY_CHANNEL, _charseq("Messages"), importance)
-        channel.setDescription("New messages")
+        channel = Channel(NOTIFY_CHANNEL, _charseq(tr("Messages")),
+                          importance)
+        channel.setDescription(tr("New messages"))
         manager.createNotificationChannel(channel)
         builder = Builder(ctx, NOTIFY_CHANNEL)
     else:
@@ -3161,9 +4064,11 @@ def notification_lines(store: "LocalStore", peer: str) -> list:
         kind = msg.get("kind") or "text"
         text = message_text(msg)
         if kind == "image":
-            text = f"Photo · {text}" if text else "Photo"
+            text = tr("Photo · {caption}", caption=text) if text else \
+                tr("Photo")
         elif kind == "voice":
-            text = msg.get("body") or "Voice message"
+            text = shown_body(kind, msg.get("body") or "") or \
+                tr("Voice message")
         try:
             at = datetime.fromisoformat(str(msg["created_at"]).replace(
                 "Z", "+00:00")).timestamp()
@@ -3197,7 +4102,26 @@ def android_message_notification(app, peer: str, title: str,
         senders, [t for _a, t, _w in lines], [w for _a, _t, w in lines],
         not app.store.is_blocked(peer) and app.conversation_kind(peer) !=
         "self", app.keys.address,
-        f"{count} new message{'s' if count != 1 else ''}")
+        trn("{n} new message", "{n} new messages", count))
+
+
+def android_notification_words() -> None:
+    """Give Notifier.java its words in the app's language: the channels'
+    names, Reply, Answer… It keeps them for when the app is not running."""
+    notifier = _notifier() if IS_ANDROID else None
+    if notifier is None:
+        return
+    words = {"messages": tr("Messages"), "messages_about": tr("New messages"),
+             "calls": tr("Calls"), "calls_about": tr("Incoming voice calls"),
+             "you": tr("You"), "reply": tr("Reply"),
+             "read": tr("Mark as read"), "incoming": tr("Incoming voice call"),
+             "decline": tr("Decline"), "answer": tr("Answer"),
+             "ready": tr("Ready for new messages")}
+    try:
+        notifier.setWords(android_context(), list(words),
+                          list(words.values()))
+    except Exception:
+        log.exception("could not give the notifications their words")
 
 
 def android_call_notification(app, peer: str, call_id: str,
@@ -3237,6 +4161,144 @@ def android_open_full_screen_settings() -> None:
         ctx.startActivity(intent)
     except Exception:
         log.exception("could not open the full-screen setting")
+
+
+# ---- v15.1: kept running on phones that stop it -----------------------------
+# Some makers' phones stop an app in the background to save battery, its
+# foreground service too, and the app then misses messages until it is
+# opened (dontkillmyapp.com keeps the list). Each has a page where an app
+# may start by itself; Android asks before an app's battery use goes
+# unrestricted. No app may make these settings itself: KeepRunningSheet
+# opens by itself once, and its Set up goes to each page in turn.
+#: maker (Build.MANUFACTURER, in lower case): its pages where an app may
+#: start by itself (package, activity), tried in turn.
+KEEP_RUNNING = {
+    "xiaomi": (("com.miui.securitycenter",
+                "com.miui.permcenter.autostart.AutoStartManagementActivity"),),
+    "huawei": (("com.huawei.systemmanager", "com.huawei.systemmanager."
+                "startupmgr.ui.StartupNormalAppListActivity"),
+               ("com.huawei.systemmanager", "com.huawei.systemmanager."
+                "optimize.process.ProtectActivity")),
+    "honor": (("com.hihonor.systemmanager", "com.hihonor.systemmanager."
+               "startupmgr.ui.StartupNormalAppListActivity"),),
+    "oppo": (("com.coloros.safecenter", "com.coloros.safecenter.permission."
+              "startup.StartupAppListActivity"),
+             ("com.coloros.safecenter",
+              "com.coloros.safecenter.startupapp.StartupAppListActivity"),
+             ("com.oppo.safe",
+              "com.oppo.safe.permission.startup.StartupAppListActivity")),
+    "vivo": (("com.vivo.permissionmanager",
+              "com.vivo.permissionmanager.activity.BgStartUpManagerActivity"),
+             ("com.iqoo.secure",
+              "com.iqoo.secure.ui.phoneoptimize.AddWhiteListActivity")),
+    "meizu": (("com.meizu.safe",
+               "com.meizu.safe.permission.SmartBGActivity"),),
+    "asus": (("com.asus.mobilemanager",
+              "com.asus.mobilemanager.powersaver.PowerSaverSettings"),),
+    "samsung": (),                      # its battery setting is enough
+}
+#: Makers whose phones run another's software.
+MAKER_OF = {"redmi": "xiaomi", "poco": "xiaomi", "realme": "oppo",
+            "oneplus": "oppo", "iqoo": "vivo"}
+MAKER_NAMES = {"xiaomi": "Xiaomi", "huawei": "Huawei", "honor": "Honor",
+               "oppo": "OPPO", "vivo": "vivo", "meizu": "Meizu",
+               "asus": "ASUS", "samsung": "Samsung"}
+
+
+def phone_maker() -> str:
+    """The phone's maker as KEEP_RUNNING names it ("xiaomi"), or ""."""
+    if not IS_ANDROID:
+        return ""
+    try:
+        autoclass, _ = _jni()
+        maker = str(autoclass("android.os.Build").MANUFACTURER or "").lower()
+    except Exception:
+        return ""
+    return MAKER_OF.get(maker, maker)
+
+
+def battery_unrestricted() -> bool:
+    """Whether Android leaves this app's battery use alone."""
+    if not IS_ANDROID:
+        return False
+    try:
+        autoclass, cast = _jni()
+        ctx = android_context()
+        power = cast("android.os.PowerManager",
+                     ctx.getSystemService("power"))
+        return bool(power.isIgnoringBatteryOptimizations(
+            ctx.getPackageName()))
+    except Exception:
+        return True
+
+
+def _android_start(intents) -> bool:
+    """Open the first of `intents` (Intent factories) that opens."""
+    try:
+        autoclass, _ = _jni()
+        Intent = autoclass("android.content.Intent")
+        ctx = android_context()
+    except Exception:
+        return False
+    for make in intents:
+        try:
+            intent = make(autoclass, ctx)
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            ctx.startActivity(intent)
+            return True
+        except Exception:
+            continue
+    log.warning("no settings page would open")
+    return False
+
+
+def _settings_intent(action: str, package: bool):
+    def make(autoclass, ctx):
+        Intent = autoclass("android.content.Intent")
+        if not package:
+            return Intent(action)
+        Uri = autoclass("android.net.Uri")
+        return Intent(action, Uri.parse("package:" + ctx.getPackageName()))
+    return make
+
+
+def _component_intent(package: str, activity: str):
+    def make(autoclass, _ctx):
+        intent = autoclass("android.content.Intent")()
+        intent.setComponent(autoclass("android.content.ComponentName")(
+            package, activity))
+        return intent
+    return make
+
+
+def android_open_autostart_settings(maker: str) -> bool:
+    """The maker's page where an app may start by itself, or this app's own
+    page in Settings if none opens."""
+    return _android_start(
+        [_component_intent(*page) for page in KEEP_RUNNING.get(maker, ())] +
+        [_settings_intent("android.settings.APPLICATION_DETAILS_SETTINGS",
+                          True)])
+
+
+def android_open_battery_settings() -> bool:
+    """Android's question whether this app's battery use may go
+    unrestricted, or its list of apps if it will not ask."""
+    return _android_start([
+        _settings_intent(
+            "android.settings.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS", True),
+        _settings_intent(
+            "android.settings.IGNORE_BATTERY_OPTIMIZATION_SETTINGS", False)])
+
+
+def keep_running_left(maker: str) -> list:
+    """The settings still to make on a `maker` phone, of "autostart" (the
+    maker's page has been opened once) and "battery"."""
+    left = []
+    if KEEP_RUNNING.get(maker) and not load_prefs().get("autostart_opened"):
+        left.append("autostart")
+    if not battery_unrestricted():
+        left.append("battery")
+    return left
 
 
 def android_cancel_call_notification() -> None:
@@ -3414,7 +4476,7 @@ def android_pick_image(callback: Callable[[str], None]) -> None:
     intent.setType("image/*")
     intent.addCategory(Intent.CATEGORY_OPENABLE)
     android_context().startActivityForResult(
-        Intent.createChooser(intent, _charseq("Choose a photo")),
+        Intent.createChooser(intent, _charseq(tr("Choose a photo"))),
         REQ_PICK_IMAGE)
 
 
@@ -3731,7 +4793,7 @@ def android_service(start: bool) -> None:
                         f"{SERVICE_NAME.capitalize()}")
     if start:
         service.start(ctx, "ic_stat_ferritext", APP_NAME,
-                      "Ready for new messages", "")
+                      tr("Ready for new messages"), "")
     else:
         service.stop(ctx)
 
@@ -3750,7 +4812,7 @@ def android_call_service(start: bool) -> None:
     if start:
         flag.write_text(str(time.time()))
         service.start(ctx, "ic_stat_ferritext", APP_NAME,
-                      "Call in progress", str(flag))
+                      tr("Call in progress"), str(flag))
     else:
         try:
             flag.unlink()
@@ -6414,27 +7476,29 @@ def call_clock(seconds: int) -> str:
 def call_summary(call: "Call", why: str, local: bool) -> str:
     """The line a finished call leaves in the chat."""
     if call.connected_at is not None:
-        return (f"{'Outgoing' if call.outgoing else 'Incoming'} call · "
-                f"{call_clock(call.duration())}")
+        return tr("Outgoing call · {time}" if call.outgoing else
+                  "Incoming call · {time}", time=call_clock(call.duration()))
     if call.outgoing:
         if local:
-            return {"timeout": "No answer", "failed": "Call failed"}.get(
-                why, "Cancelled call")
-        return {"declined": "Call declined", "busy": "Busy — they are in "
-                "another call", "unavailable": "They can't take calls "
-                "right now", "failed": "Call failed"}.get(why, "Call ended")
+            return tr({"timeout": N_("No answer"),
+                       "failed": N_("Call failed")}.get(
+                why, N_("Cancelled call")))
+        return tr({"declined": N_("Call declined"),
+                   "busy": N_("Busy — they are in another call"),
+                   "unavailable": N_("They can't take calls right now"),
+                   "failed": N_("Call failed")}.get(why, N_("Call ended")))
     if local and why == "declined":
-        return "Declined call"
+        return tr("Declined call")
     if why == "failed":
-        return "Call failed"
-    return "Missed call"
+        return tr("Call failed")
+    return tr("Missed call")
 
 
 def call_path_label(path: Optional[str], rtt) -> str:
-    where = {"direct": "Direct", "relay": "Through the relay",
-             "ws": "Over the message link"}.get(path or "", "")
+    where = tr({"direct": N_("Direct"), "relay": N_("Through the relay"),
+                "ws": N_("Over the message link")}.get(path or "", ""))
     if where and rtt is not None:
-        return f"{where} · {int(rtt)} ms"
+        return tr("{where} · {ms} ms", where=where, ms=int(rtt))
     return where
 
 
@@ -6598,7 +7662,7 @@ def pretty_day(iso: str) -> str:
         today = datetime.now().astimezone().date()
         if stamp.date() == today:
             return stamp.strftime("%H:%M")
-        return stamp.strftime("%d %b")
+        return date_text(stamp, "day_mon")
     except ValueError:
         return ""
 
@@ -9470,21 +10534,23 @@ def describe_network_error(exc: Exception) -> str:
     """
     text = str(exc).lower()
     if isinstance(exc, requests.exceptions.SSLError):
-        return ("Secure connection failed — the relay's certificate was "
-                "rejected")
+        return tr("Secure connection failed — the relay's certificate was "
+                  "rejected")
     if isinstance(exc, (requests.exceptions.ConnectTimeout,
                         requests.exceptions.ReadTimeout)):
-        return "The relay didn't respond in time — the network may be slow"
+        return tr("The relay didn't respond in time — the network may be "
+                  "slow")
     if isinstance(exc, requests.exceptions.ConnectionError):
         if "name or service not known" in text or "nodename nor servname" \
                 in text or "getaddrinfo" in text:
-            return "Couldn't look up the relay's address — check your network"
+            return tr("Couldn't look up the relay's address — check your "
+                      "network")
         if "connection refused" in text:
-            return "The relay refused the connection — it may be offline"
+            return tr("The relay refused the connection — it may be offline")
         if "network is unreachable" in text:
-            return "No route to the relay — are you online?"
-        return "Couldn't reach the relay — check your connection"
-    return f"Network problem: {type(exc).__name__}"
+            return tr("No route to the relay — are you online?")
+        return tr("Couldn't reach the relay — check your connection")
+    return tr("Network problem: {error}", error=type(exc).__name__)
 
 
 class Endpoint:
@@ -10121,7 +11187,7 @@ class SyncWorker(threading.Thread):
         store = self.app.store
         group = store.group(gid)
         if group is None:
-            store.save_group({"id": gid, "name": "New group", "v": 0,
+            store.save_group({"id": gid, "name": tr("New group"), "v": 0,
                               "admin": sender,
                               "members": [self._member_entry(sender, inner),
                                           self._member_entry(
@@ -10161,7 +11227,7 @@ class SyncWorker(threading.Thread):
 
     def _who(self, address: str, start: bool = True) -> str:
         if address == self.app.keys.address:
-            return "You" if start else "you"
+            return tr("You") if start else tr("you")
         contact = self.app.store.get_contact(address) or {}
         return contact.get("username") or short_addr(address, 10)
 
@@ -10189,8 +11255,9 @@ class SyncWorker(threading.Thread):
                     store.upsert_contact(member["a"], member.get("u"),
                                          member["k"], listed=False,
                                          accepted=False)
-            store.add_event(peer, f"{self._who(sender)} added you to "
-                                  f"\u201c{state['name']}\u201d")
+            store.add_event(peer, tr("{who} added you to “{group}”",
+                                     who=self._who(sender),
+                                     group=state["name"]))
             self.app.ui_queue.put(("message_stored", peer))
             return
         if sender != local["admin"] or state["v"] <= local["version"]:
@@ -10206,22 +11273,24 @@ class SyncWorker(threading.Thread):
                                      accepted=False)
         who = self._who(sender)
         if state["name"] != local["name"]:
-            store.add_event(peer, f"{who} renamed the group "
-                                  f"\u201c{state['name']}\u201d")
+            store.add_event(peer, tr("{who} renamed the group “{group}”",
+                                     who=who, group=state["name"]))
         added = [m for m in state["members"] if m["a"] not in before]
         removed = [a for a in before if a not in members]
         if added:
-            store.add_event(peer, f"{who} added " + ", ".join(
+            store.add_event(peer, tr("{who} added {members}", who=who,
+                                     members=", ".join(
                 self._who(m["a"], start=False) if m["a"] == me
-                else m.get("u") or self._who(m["a"]) for m in added))
+                else m.get("u") or self._who(m["a"]) for m in added)))
         for address in removed:
             if address == me:
-                store.add_event(peer, f"{who} removed you")
+                store.add_event(peer, tr("{who} removed you", who=who))
             elif address != sender:
-                store.add_event(peer, f"{who} removed {self._who(address)}")
+                store.add_event(peer, tr("{who} removed {member}", who=who,
+                                         member=self._who(address)))
         if state["admin"] != local["admin"]:
-            store.add_event(peer, f"{self._who(state['admin'])} now "
-                                  f"administers the group")
+            store.add_event(peer, tr("{who} now administers the group",
+                                     who=self._who(state["admin"])))
         self.app.ui_queue.put(("message_stored", peer))
 
     def _apply_leave(self, sender: str, gid: Optional[str]) -> None:
@@ -10240,7 +11309,7 @@ class SyncWorker(threading.Thread):
                           "v": local["version"], "admin": admin,
                           "members": members}, local["state"])
         peer = group_peer(gid)
-        store.add_event(peer, f"{self._who(sender)} left")
+        store.add_event(peer, tr("{who} left", who=self._who(sender)))
         self.app.ui_queue.put(("message_stored", peer))
         if admin == me and local["state"] == "active" and len(members) > 1:
             self.app.ui_queue.put(("group_publish", gid))
@@ -10511,12 +11580,12 @@ class SyncWorker(threading.Thread):
         log.error("giving up on relay message %s from %s after %d attempts: "
                   "%s — recording it as unreadable", server_id, sender,
                   attempts, exc)
-        placeholder = ("⚠ A message arrived sealed to this identity's "
-                       "post-quantum key from an earlier install. It has "
-                       "been asked for again." if earlier_key else
-                       "⚠ A message arrived that this device could not "
-                       "decrypt. It was most likely encrypted to an older "
-                       "identity key. Ask the sender to try again.")
+        placeholder = tr("⚠ A message arrived sealed to this identity's "
+                         "post-quantum key from an earlier install. It has "
+                         "been asked for again." if earlier_key else
+                         "⚠ A message arrived that this device could not "
+                         "decrypt. It was most likely encrypted to an older "
+                         "identity key. Ask the sender to try again.")
         # Stored as ALREADY READ so no read receipt is ever emitted for it:
         # the sender is entitled to know it arrived (2/3), and entitled NOT
         # to be told it was read, because it never was.
@@ -10610,9 +11679,10 @@ class SyncWorker(threading.Thread):
                                                hello.get("message", "")))
                     else:
                         self.app.ui_queue.put(
-                            ("status", f"Realtime auth failed: "
-                             f"{hello.get('message', 'unknown error')}",
-                             COL_DANGER))
+                            ("status", tr(
+                                "Realtime auth failed: {error}",
+                                error=hello.get("message") or
+                                tr("unknown error")), COL_DANGER))
                 return False
             with self._ws_lock:
                 self._ws = ws
@@ -10628,12 +11698,12 @@ class SyncWorker(threading.Thread):
             # they have rather than seeing one reassuring string regardless.
             if ENDPOINT.secure:
                 self.app.ui_queue.put(
-                    ("status", "Connected · encrypted end-to-end and in "
-                     "transit", COL_OK))
+                    ("status", tr("Connected · encrypted end-to-end and in "
+                                  "transit"), COL_OK))
             else:
                 self.app.ui_queue.put(
-                    ("status", "Connected · end-to-end encrypted "
-                     "(transport not secured)", COL_TICK_GOLD))
+                    ("status", tr("Connected · end-to-end encrypted "
+                                  "(transport not secured)"), COL_TICK_GOLD))
             # Short recv tick -> the loop wakes every few seconds to honour
             # stop_event and the keepalive schedule even while idle. The
             # keepalive is wall-clock based (not recv-timeout based) so a
@@ -10759,10 +11829,10 @@ class SyncWorker(threading.Thread):
                 if wait:
                     wait += random.uniform(0, min(10.0, wait / 2))
                     self.app.ui_queue.put((
-                        "status", f"The relay is restarting · back in about "
-                        f"{round(wait)} s", COL_TEXT_DIM))
+                        "status", tr("The relay is restarting · back in about "
+                                     "{n} s", n=round(wait)), COL_TEXT_DIM))
                 else:
-                    self.app.ui_queue.put(("status", "Reconnecting…",
+                    self.app.ui_queue.put(("status", tr("Reconnecting…"),
                                            COL_TEXT_DIM))
                 self._sleep(wait or WS_RECONNECT_MIN)
                 continue
@@ -10776,14 +11846,15 @@ class SyncWorker(threading.Thread):
                     online = True
                     if _websocket_mod is None:
                         self.app.ui_queue.put(
-                            ("status", "Connected (polling — install "
-                             "'websocket-client' for instant push)",
-                             COL_TICK_GOLD))
+                            ("status", tr("Connected (polling — install "
+                                          "'websocket-client' for instant "
+                                          "push)"), COL_TICK_GOLD))
                     else:
                         self.app.ui_queue.put(
-                            ("status", "Connected (polling) · end-to-end "
-                             "encrypted" + ("" if ENDPOINT.secure
-                                            else " (transport not secured)"),
+                            ("status", tr("Connected (polling) · end-to-end "
+                                          "encrypted") if ENDPOINT.secure
+                             else tr("Connected (polling) · end-to-end "
+                                     "encrypted (transport not secured)"),
                              COL_OK if ENDPOINT.secure else COL_TICK_GOLD))
             except ApiClient.ApiError as exc:
                 if exc.code == "unknown_address":
@@ -10795,14 +11866,16 @@ class SyncWorker(threading.Thread):
                                  exc.detail.get("retry_after") or 0)
                 if online is not False:
                     online = False
-                    self.app.ui_queue.put(("status", f"Sync error: "
-                                           f"{exc.message}", COL_DANGER))
+                    self.app.ui_queue.put(("status", tr(
+                        "Sync error: {error}", error=exc.message),
+                        COL_DANGER))
             except requests.RequestException as exc:
                 if online is not False:
                     online = False
                     self.app.ui_queue.put(
-                        ("status", f"{describe_network_error(exc)} — "
-                         f"retrying…", COL_DANGER))
+                        ("status", tr("{problem} — retrying…",
+                                      problem=describe_network_error(exc)),
+                         COL_DANGER))
             if reachable:
                 backoff = WS_RECONNECT_MIN
                 self._sleep(POLL_INTERVAL_SECONDS)
@@ -10835,8 +11908,8 @@ def paint_round(widget, hex_color: str, radius=None, corners=None):
     Curves are drawn anti-aliased. Kivy's smooth shapes need an opaque
     colour (a translucent one shows a darker rim), which every ground is.
     """
-    radii = list(corners) if corners is not None else [
-        radius if radius is not None else dp(6)]
+    radii = [corner(r) for r in (list(corners) if corners is not None else [
+        radius if radius is not None else dp(6)])]
     curved = any(r > 0 for r in radii)
     with widget.canvas.before:
         col = Color(*C(hex_color))
@@ -10855,7 +11928,7 @@ def paint_round(widget, hex_color: str, radius=None, corners=None):
 
 
 def paint_border(widget, hex_color: str, radius=None, width=1.0):
-    radius = dp(6) if radius is None else radius
+    radius = corner(dp(6) if radius is None else radius)
     with widget.canvas.after:
         col = Color(*C(hex_color))
         line = SmoothLine(width=max(1.0, dp(width) / 2.0), rounded_rectangle=(
@@ -10934,7 +12007,8 @@ class CapsLabel(Widget):
     def __init__(self, text: str = "", size: float = 11.5,
                  color: Optional[str] = None, tracking: float = 0.12,
                  halign: str = "left", **kw):
-        self._px = fs(size)
+        # The capitals have their own scale, not their set's text face's.
+        self._px = fs(size) / T.type_scale * T.caps_scale
         kw.setdefault("size_hint_y", None)
         kw.setdefault("height", round(self._px * 1.6))
         super().__init__(**kw)
@@ -10948,7 +12022,7 @@ class CapsLabel(Widget):
 
     @classmethod
     def glyph(cls, ch: str, px: float):
-        key = (ch, round(px, 1))
+        key = (CAPS_FONT_NAME, ch, round(px, 1))
         tex = cls._glyphs.get(key)
         if tex is None:
             core = CoreLabel(text=ch, font_size=px, font_name=CAPS_FONT_NAME,
@@ -11063,7 +12137,7 @@ class Btn(ButtonBehavior, Widget):
         self._fill_hex = fill
         with self.canvas.before:
             self._bg = Color(*(C(fill) if fill else (0, 0, 0, 0)))
-            self._shape = RoundedRectangle(radius=[dp(4)])
+            self._shape = RoundedRectangle(radius=[corner(dp(4))])
             self._edge = Color(*(C(edge) if edge else (0, 0, 0, 0)))
             self._line = Line(width=dp(1) / 2.0)
         self.label = CapsLabel(text, size=12.5, color=ink, tracking=0.14,
@@ -11585,6 +12659,12 @@ def icon_geometry(name: str, cx: float, cy: float, size: float, rgba,
                       3.4, 14.6), close=True, width=w, joint="round")
         Line(points=arc(12, 12, 3.9, -48, 48), **line)
         Line(points=arc(12, 12, 7.6, -52, 52), **line)
+    elif name == "language":     # a globe: its rim, a meridian, parallels
+        Line(circle=(cx, cy, 9 * s), width=w)
+        Line(ellipse=(cx - 4 * s, cy - 9 * s, 8 * s, 18 * s), width=w)
+        Line(points=G(3, 12, 21, 12), **line)
+        for y in (7.5, 16.5):
+            Line(points=G(4.3, y, 19.7, y), **line)
     elif name == "clock":
         Line(circle=(cx, cy, size * 8.6 / 24.0), width=w)
         Line(points=G(12, 7.4, 12, 12, 15.4, 14), **line)
@@ -11646,6 +12726,11 @@ def icon_geometry(name: str, cx: float, cy: float, size: float, rgba,
                  mode="triangle_strip")
             Color(*rgba)
         Line(points=outer + back, close=True, width=w, joint="round")
+    elif name == "battery":                    # its body and tip, charged
+        Line(rounded_rectangle=(*G(2.5, 17.5), 16.5 * s, 11 * s, 2 * s),
+             width=w)
+        Line(points=G(21, 10, 21, 14), **line)
+        fill(G(5, 9.2, 12.5, 9.2, 12.5, 14.8, 5, 14.8))
     elif name == "motion":                     # a ball, and its wake
         # state 1 (motion reduced): the ball at rest in the middle, no wake.
         f = state or 0.0
@@ -11673,6 +12758,17 @@ def icon_geometry(name: str, cx: float, cy: float, size: float, rgba,
         Line(points=big(5, 14, 11.8, 14), **line)
         Line(points=G(14.4, 19.5, 17.7, 11.4, 21, 19.5), **line)
         Line(points=G(15.6, 16.6, 19.8, 16.6), **line)
+    elif name == "theme_set":                  # three faces, one filled
+        # state 0, .5, 1: the first, second or third set is the one chosen.
+        f = 0.0 if state is None else state
+        for i, x in enumerate((4.5, 12, 19.5)):
+            on = max(0.0, 1 - abs(f * 2 - i) * 2)
+            pts = G(x - 2.5, 8.5, x + 2.5, 8.5, x + 2.5, 15.5, x - 2.5, 15.5)
+            Line(points=pts, close=True, width=w, joint="round")
+            if on > 0.01:
+                Color(rgba[0], rgba[1], rgba[2], rgba[3] * on)
+                fill(pts)
+                Color(*rgba)
 
 
 _HANDSET: list = []
@@ -12055,17 +13151,22 @@ class ToggleSwitch(ButtonBehavior, Widget):
             if self.active:
                 Color(*C(T.accent))
                 SmoothRoundedRectangle(pos=self.pos, size=self.size,
-                                       radius=[h / 2])
+                                       radius=[corner(h / 2)])
             else:
                 Color(*C(T.rule_strong))
                 SmoothLine(rounded_rectangle=(self.x + .5, self.y + .5,
                                               self.width - 1, h - 1,
-                                              h / 2 - .5),
+                                              corner(h / 2) - .5),
                            width=max(1.0, dp(1.1)))
             knob = h - dp(8)
             x = self.right - knob - dp(4) if self.active else self.x + dp(4)
             Color(*C(T.on_accent if self.active else T.text_3))
-            SmoothEllipse(pos=(x, self.y + dp(4)), size=(knob, knob))
+            if T.corner_cap:                    # a square knob (Overclock)
+                SmoothRoundedRectangle(pos=(x, self.y + dp(4)),
+                                       size=(knob, knob),
+                                       radius=[corner(knob / 2)])
+            else:
+                SmoothEllipse(pos=(x, self.y + dp(4)), size=(knob, knob))
 
 
 Toggle = ToggleSwitch
@@ -12100,6 +13201,70 @@ class Segmented(BoxLayout):
     def _paint(self) -> None:
         for key, seg in self.segments.items():
             seg.set_selected(key == self.value)
+
+
+class ThemeSwatches(BoxLayout):
+    """The theme sets as small faces (v15.1), after Ferrite Exchange's: each
+    tile shows its set's day and night grounds side by side, a card and a
+    stroke of its accent on each, and its name beneath; the chosen one is
+    outlined in the current accent. Each tile is a full touch target."""
+
+    def __init__(self, value: str, on_change: Callable[[str], None], **kw):
+        kw.setdefault("size_hint_y", None)
+        kw.setdefault("height", dp(86))
+        kw.setdefault("spacing", dp(12))
+        super().__init__(**kw)
+        self.value, self._on_change = value, on_change
+        for key in THEME_SETS:
+            self.add_widget(_Swatch(key, self))
+
+    def choose(self, key: str) -> None:
+        if key != self.value:
+            self.value = key
+            self._on_change(key)
+
+
+class _Swatch(ButtonBehavior, BoxLayout):
+    def __init__(self, key: str, row: ThemeSwatches, **kw):
+        super().__init__(orientation="vertical", spacing=dp(6), **kw)
+        self.key, self.row = key, row
+        self.face = Widget(size_hint_y=None, height=dp(52))
+        self.add_widget(self.face)
+        chosen = key == row.value
+        self.add_widget(CapsLabel(THEME_SETS[key]["label"], size=10.5,
+                                  color=T.text if chosen else T.text_3,
+                                  halign="center"))
+        self.face.bind(pos=self._paint, size=self._paint)
+
+    def _paint(self, *_a) -> None:
+        look = THEME_SETS[self.key]
+        x, y, w, h = self.face.x, self.face.y, self.face.width, self.face.height
+        r = dp(2) if look["corner"] else dp(10)
+        self.face.canvas.clear()
+        with self.face.canvas:
+            for i, side in enumerate((look["light"], look["dark"])):
+                pal = THEMES[side]
+                half = w / 2
+                Color(*C(pal["bg"]))
+                RoundedRectangle(pos=(x + i * half, y), size=(half, h),
+                                 radius=[r, 0, 0, r] if i == 0 else
+                                 [0, r, r, 0])
+                cx = x + i * half + dp(8)
+                Color(*C(pal["surface_hi"]))
+                RoundedRectangle(pos=(cx, y + dp(16)),
+                                 size=(half - dp(16), dp(20)),
+                                 radius=[min(r, dp(3))])
+                Color(*C(pal["accent"]))
+                RoundedRectangle(pos=(cx + dp(5), y + dp(24)),
+                                 size=(half - dp(30), dp(4)),
+                                 radius=[dp(1)])
+            chosen = self.key == self.row.value
+            Color(*C(T.accent if chosen else T.rule_strong))
+            Line(rounded_rectangle=(x, y, w, h, r),
+                 width=dp(1.4) if chosen else dp(0.6))
+
+    def on_release(self) -> None:
+        self.row.choose(self.key)
 
 
 class _Segment(ButtonBehavior, Widget):
@@ -12299,7 +13464,8 @@ class UnreadBadge(Label):
                          height=max(dp(22), round(fs(13) * 1.6)), **kw)
         with self.canvas.before:
             Color(*C(T.text_3 if muted else T.alert))
-            self._pill = SmoothRoundedRectangle(radius=[self.height / 2])
+            self._pill = SmoothRoundedRectangle(
+                radius=[corner(self.height / 2)])
         self.bind(pos=self._sync, size=self._sync,
                   texture_size=lambda w, v: setattr(
                       w, "width", max(self.height, v[0] + dp(12))))
@@ -12307,7 +13473,7 @@ class UnreadBadge(Label):
 
     def _sync(self, *_a):
         self._pill.pos, self._pill.size = self.pos, self.size
-        self._pill.radius = [self.height / 2]
+        self._pill.radius = [corner(self.height / 2)]
 
 
 class Concealable:
@@ -12476,21 +13642,22 @@ CozyModal = Sheet                       # pre-9.1 name
 def mute_label(until: float, short: bool = False) -> str:
     """'Muted until Tue 09:15', 'Muted until you unmute' (and short forms)."""
     if not until:
-        return "Muted" if short else "Muted until you turn it back on"
+        return tr("Muted") if short else tr("Muted until you turn it back on")
     when = datetime.fromtimestamp(until)
     now = datetime.now()
     if when.date() == now.date():
         text = when.strftime("%H:%M")
     elif when.date() == (now + timedelta(days=1)).date():
-        text = "tomorrow " + when.strftime("%H:%M")
+        text = tr("tomorrow {time}", time=when.strftime("%H:%M"))
     else:
-        text = when.strftime("%a %d %b %H:%M")
-    return f"Muted until {text}"
+        text = date_text(when, "wkd_day_mon_time")
+    return tr("Muted until {when}", when=text)
 
 
 #: How long the mute choices last (seconds); None: until turned back on.
-MUTE_CHOICES = (("For 12 hours", 12 * 3600), ("For 3 days", 3 * 86400),
-                ("Until I turn it back on", None))
+MUTE_CHOICES = ((N_("For 12 hours"), 12 * 3600),
+                (N_("For 3 days"), 3 * 86400),
+                (N_("Until I turn it back on"), None))
 
 
 class MenuSheet(Sheet):
@@ -12523,16 +13690,17 @@ class TimerSheet(MenuSheet):
 
     def __init__(self, app: "FextApp", peer: str, **kw):
         current = app.store.chat_timer(peer)[0]
-        items = [("check" if seconds == current else "clock", label,
+        items = [("check" if seconds == current else "clock", tr(label),
                   lambda s=seconds: app.set_chat_timer(peer, s))
                  for seconds, label in TIMER_CHOICES]
         behind = app.timer_laggards(peer)
-        note = ("New messages go that long after they are read. Exporting "
-                "the chat still works.")
+        note = tr("New messages go that long after they are read. Exporting "
+                  "the chat still works.")
         if behind:
-            note += (" " + behind + "'s app does not delete them yet (an "
-                     "older Ferritext): their copies stay.")
-        super().__init__(items, title="Disappearing messages",
+            note += " " + tr("{name}'s app does not delete them yet (an "
+                             "older Ferritext): their copies stay.",
+                             name=behind)
+        super().__init__(items, title=tr("Disappearing messages"),
                          subtitle=note, **kw)
 
 
@@ -12544,10 +13712,10 @@ class VerifySheet(Sheet):
     def __init__(self, app: "FextApp", peer: str) -> None:
         contact = app.store.get_contact(peer) or {}
         name = contact.get("username") or short_addr(peer, 12)
-        super().__init__(f"Verify {name}",
-                         subtitle="On both phones this code is the same — "
-                                  "only if each of you has the other's "
-                                  "real key.")
+        super().__init__(tr("Verify {name}", name=name),
+                         subtitle=tr("On both phones this code is the same — "
+                                     "only if each of you has the other's "
+                                     "real key."))
         self.app, self.peer = app, peer
         code = safety_code(app.keys.public_key_hex, contact["public_key"])
         groups = code.split()
@@ -12559,9 +13727,9 @@ class VerifySheet(Sheet):
                                   color=C(T.text), size_hint_y=None,
                                   height=line_height(24) + dp(4)))
         self.add(grid)
-        self.add(hint("Read the groups to each other, in person or on a "
-                      "call. Or scan the code on their phone, and let them "
-                      "scan yours:"))
+        self.add(hint(tr("Read the groups to each other, in person or on a "
+                         "call. Or scan the code on their phone, and let them "
+                         "scan yours:")))
         side = dp(168)
         holder = AnchorLayout(size_hint_y=None, height=side + dp(20))
         plate = AnchorLayout(size_hint=(None, None),
@@ -12577,20 +13745,22 @@ class VerifySheet(Sheet):
         self.status = self.status_label()
         rows = []
         if can_read_qr():
-            rows.append(ListRow("camera", "Scan their code",
-                                "With the camera, from their phone's screen",
+            rows.append(ListRow("camera", tr("Scan their code"),
+                                tr("With the camera, from their phone's "
+                                   "screen"),
                                 chevron=True, on_tap=self._scan))
             if not IS_ANDROID:
-                rows.append(ListRow("image", "Read it from a picture",
-                                    "A screenshot of their code",
+                rows.append(ListRow("image", tr("Read it from a picture"),
+                                    tr("A screenshot of their code"),
                                     chevron=True, on_tap=self._pick))
         verified = bool(contact.get("verified"))
         rows.append(ListRow(
-            "check", "The codes match — mark as verified" if not verified
-            else "Verified · tap to clear", on_tap=self._toggle))
+            "check", tr("The codes match — mark as verified") if not verified
+            else tr("Verified · tap to clear"), on_tap=self._toggle))
         self.add(rows_card(rows))
         if verified:
-            self.set_status(self.status, f"{name} is verified.", COL_OK)
+            self.set_status(self.status, tr("{name} is verified.", name=name),
+                            COL_OK)
 
     def _toggle(self) -> None:
         verified = bool((self.app.store.get_contact(self.peer) or {}).get(
@@ -12604,32 +13774,34 @@ class VerifySheet(Sheet):
                 android_take_photo(self._read)
             except Exception:
                 log.exception("camera failed")
-                self.set_status(self.status, "Couldn't open the camera",
+                self.set_status(self.status, tr("Couldn't open the camera"),
                                 COL_DANGER)
         else:
             open_desktop_camera(self._read, on_choose=self._pick)
 
     def _pick(self) -> None:
-        ImageChooserModal(self._read, title="Their code").open()
+        ImageChooserModal(self._read, title=tr("Their code")).open()
 
     def _read(self, path: str) -> None:
         text = read_qr_image(path)
         if text is None:
-            self.set_status(self.status, "No code found in that picture — "
-                            "try again, closer and steadier", COL_DANGER)
+            self.set_status(self.status, tr("No code found in that picture "
+                                            "— try again, closer and "
+                                            "steadier"), COL_DANGER)
             return
         found = address_in_qr(text)
         if found == self.peer:
             self.app.set_verified(self.peer, True)
-            self.set_status(self.status, "It matches: verified.", COL_OK)
+            self.set_status(self.status, tr("It matches: verified."), COL_OK)
             Clock.schedule_once(lambda _dt: self.dismiss(), 1.2)
         elif found is None:
-            self.set_status(self.status, "That is not a Ferritext code",
+            self.set_status(self.status, tr("That is not a Ferritext code"),
                             COL_DANGER)
         else:
-            self.set_status(self.status, "That code is someone else's — not "
-                            "the one this chat is with. Do not mark them "
-                            "verified.", COL_DANGER)
+            self.set_status(self.status, tr("That code is someone else's — "
+                                            "not the one this chat is "
+                                            "with. Do not mark them "
+                                            "verified."), COL_DANGER)
 
 
 class LinkSheet(Sheet):
@@ -12639,7 +13811,8 @@ class LinkSheet(Sheet):
 
     def __init__(self, app: "FextApp", url: str) -> None:
         super().__init__(escape_markup(link_host(url)),
-                         subtitle="Opens in your browser, outside Ferritext.")
+                         subtitle=tr("Opens in your browser, outside "
+                                     "Ferritext."))
         self.app, self.url = app, url
         self.add(InfoLabel(escape_markup(url), color=T.text_2,
                            font_size=fs(14.5)))
@@ -12648,8 +13821,8 @@ class LinkSheet(Sheet):
             self.add(InfoLabel(escape_markup(warning), color=T.alert,
                                italic=True, font_size=fs(14.5)))
         self.add(rows_card([
-            ListRow("external", "Open the link", on_tap=self._open),
-            ListRow("copy", "Copy the link", on_tap=self._copy)]))
+            ListRow("external", tr("Open the link"), on_tap=self._open),
+            ListRow("copy", tr("Copy the link"), on_tap=self._copy)]))
 
     def _open(self) -> None:
         self.dismiss()
@@ -12657,7 +13830,7 @@ class LinkSheet(Sheet):
             open_url(self.url)
         except Exception:
             log.exception("could not open a link")
-            self.app._set_status("No app here opens links", COL_DANGER)
+            self.app._set_status(tr("No app here opens links"), COL_DANGER)
 
     def _copy(self) -> None:
         self.dismiss()
@@ -12670,45 +13843,46 @@ class BackupSheet(Sheet):
     groups, the pictures and, if wanted, the photos and voice notes."""
 
     def __init__(self, app: "FextApp") -> None:
-        super().__init__("Back up to a file",
-                         subtitle="Every identity here, with its chats, "
-                                  "contacts and groups, sealed with a "
-                                  "passphrase. Without it nobody can open "
-                                  "the backup — not even you.")
+        super().__init__(tr("Back up to a file"),
+                         subtitle=tr("Every identity here, with its chats, "
+                                     "contacts and groups, sealed with a "
+                                     "passphrase. Without it nobody can open "
+                                     "the backup — not even you."))
         self.app = app
         self._media = True
-        self.pass1 = self.add(Field(hint=f"at least {BACKUP_MIN_PASSPHRASE} "
-                                         f"characters; a few words is best",
-                                    label="Passphrase", password=True))
-        self.pass2 = self.add(Field(hint="the same again",
-                                    label="The passphrase again",
+        self.pass1 = self.add(Field(hint=tr("at least {n} characters; a few "
+                                            "words is best",
+                                            n=BACKUP_MIN_PASSPHRASE),
+                                    label=tr("Passphrase"), password=True))
+        self.pass2 = self.add(Field(hint=tr("the same again"),
+                                    label=tr("The passphrase again"),
                                     password=True, on_enter=self._start))
         count, size = backup_media_size(app.keys)
         self.add(rows_card([ListRow(
-            "image", "Photos and voice notes",
-            f"{count} · {size_text(size)}" if count else "None here yet",
+            "image", tr("Photos and voice notes"),
+            f"{count} · {size_text(size)}" if count else tr("None here yet"),
             control=ToggleSwitch(True, lambda on: setattr(self, "_media",
                                                           on)))], inset=0))
         self.path_field = None
         if not IS_ANDROID:
-            self.path_field = self.add(Field(label="Save it as"))
+            self.path_field = self.add(Field(label=tr("Save it as")))
             self.path_field.text = str(default_backup_dir() /
                                        default_backup_name())
-        self.add(hint("It holds your private keys: keep it somewhere safe, "
-                      "away from this device. Ferritext never sends it "
-                      "anywhere."))
+        self.add(hint(tr("It holds your private keys: keep it somewhere safe, "
+                         "away from this device. Ferritext never sends it "
+                         "anywhere.")))
         self.status = self.status_label()
-        self.button = self.add(Btn("Make the backup",
+        self.button = self.add(Btn(tr("Make the backup"),
                                    on_release=lambda _w: self._start()))
 
     def _start(self) -> None:
         one, two = self.pass1.text, self.pass2.text
         if len(one) < BACKUP_MIN_PASSPHRASE:
-            self.set_status(self.status, f"Use at least "
-                            f"{BACKUP_MIN_PASSPHRASE} characters.", T.alert)
+            self.set_status(self.status, tr("Use at least {n} characters.",
+                                            n=BACKUP_MIN_PASSPHRASE), T.alert)
             return
         if one != two:
-            self.set_status(self.status, "The two passphrases differ.",
+            self.set_status(self.status, tr("The two passphrases differ."),
                             T.alert)
             return
         if IS_ANDROID:
@@ -12722,18 +13896,19 @@ class BackupSheet(Sheet):
             elif not target.name.endswith(BACKUP_SUFFIX):
                 target = target.with_name(target.name + BACKUP_SUFFIX)
             if not target.parent.is_dir():
-                self.set_status(self.status, f"There is no folder "
-                                f"{target.parent}.", T.alert)
+                self.set_status(self.status, tr("There is no folder "
+                                                "{folder}.",
+                                                folder=target.parent), T.alert)
                 return
         self.button.disabled = True
-        self.set_status(self.status, "Sealing…")
+        self.set_status(self.status, tr("Sealing…"))
         threading.Thread(target=self._work, args=(one, target, self._media),
                          daemon=True).start()
 
     def _work(self, passphrase: str, target: Path, media: bool) -> None:
         def progress(done: float) -> None:
             run_on_ui(self.set_status, self.status,
-                      f"Sealing… {int(done * 100)}%")
+                      tr("Sealing… {percent}%", percent=int(done * 100)))
         try:
             result = make_backup(self.app.keys, passphrase, target, media,
                                  progress)
@@ -12742,7 +13917,8 @@ class BackupSheet(Sheet):
             return
         except Exception as exc:
             log.exception("backup failed")
-            run_on_ui(self._failed, f"The backup failed: {exc}")
+            run_on_ui(self._failed, tr("The backup failed: {error}",
+                                       error=exc))
             return
         run_on_ui(self._made, result)
 
@@ -12752,25 +13928,25 @@ class BackupSheet(Sheet):
 
     def _made(self, result: dict) -> None:
         idents = len(result["identities"])
-        what = (f"{idents} identit{'y' if idents == 1 else 'ies'}, "
-                f"{size_text(result['size'])}")
+        what = trn("{n} identity, {size}", "{n} identities, {size}", idents,
+                   size=size_text(result["size"]))
         if not IS_ANDROID:
             self.button.disabled = False
             opened = open_folder_in_explorer(Path(result["path"]).parent)
-            self.set_status(self.status, f"Saved: {what}, to "
-                            f"{result['path']}" +
-                            (" (the folder is open)" if opened else ""),
-                            COL_OK)
+            self.set_status(self.status, tr("Saved: {what}, to {path}",
+                                            what=what, path=result["path"]) +
+                            (" " + tr("(the folder is open)") if opened
+                             else ""), COL_OK)
             return
-        self.set_status(self.status, f"Sealed ({what}). Now choose where "
-                        f"to keep it…")
+        self.set_status(self.status, tr("Sealed ({what}). Now choose where "
+                                        "to keep it…", what=what))
         path = result["path"]
 
         def saved(ok: bool) -> None:
             discard_cache_file(path)
             self.button.disabled = False
-            self.set_status(self.status, f"Saved: {what}." if ok else
-                            "Not saved: no place was chosen.",
+            self.set_status(self.status, tr("Saved: {what}.", what=what)
+                            if ok else tr("Not saved: no place was chosen."),
                             COL_OK if ok else T.alert)
         try:
             android_save_document(path, Path(path).name, saved)
@@ -12786,16 +13962,16 @@ class RestoreSheet(Sheet):
 
     def __init__(self, app: "FextApp",
                  on_done: Optional[Callable[[dict], None]] = None) -> None:
-        super().__init__("Restore from a backup",
-                         subtitle="Adds the identities in a backup to this "
-                                  "device, with their chats.")
+        super().__init__(tr("Restore from a backup"),
+                         subtitle=tr("Adds the identities in a backup to this "
+                                     "device, with their chats."))
         self.app, self.on_done = app, on_done
         self.path: Optional[str] = None
         self.chooser = None
         if IS_ANDROID:
             self.add(rows_card([ListRow(
-                "download", "Choose the backup file",
-                "From this phone, a memory card or a cloud drive",
+                "download", tr("Choose the backup file"),
+                tr("From this phone, a memory card or a cloud drive"),
                 chevron=True, on_tap=self._choose)], inset=0))
         else:
             self.chooser = self.add(_file_chooser(
@@ -12805,14 +13981,14 @@ class RestoreSheet(Sheet):
                 sel[0]) if sel else None)
         self.made = self.add(InfoLabel("", color=T.text_3, italic=True,
                                        font_size=fs(14.5)))
-        self.passphrase = self.add(Field(label="The backup's passphrase",
+        self.passphrase = self.add(Field(label=tr("The backup's passphrase"),
                                          password=True,
                                          on_enter=self._start))
-        self.add(hint("Use each identity on one device at a time: while one "
-                      "is in use on two, messages go to whichever is "
-                      "connected, and neither has them all."))
+        self.add(hint(tr("Use each identity on one device at a time: while "
+                         "one is in use on two, messages go to whichever is "
+                         "connected, and neither has them all.")))
         self.status = self.status_label()
-        self.button = self.add(Btn("Restore",
+        self.button = self.add(Btn(tr("Restore"),
                                    on_release=lambda _w: self._start()))
 
     def _choose(self) -> None:
@@ -12820,7 +13996,7 @@ class RestoreSheet(Sheet):
             android_open_document(self._picked)
         except Exception:
             log.exception("could not open the file picker")
-            self.set_status(self.status, "Couldn't open the file picker",
+            self.set_status(self.status, tr("Couldn't open the file picker"),
                             T.alert)
 
     def _picked(self, path: str) -> None:
@@ -12830,27 +14006,29 @@ class RestoreSheet(Sheet):
         except (BackupError, OSError) as exc:
             self.made.text = ""
             self.set_status(self.status, str(exc) if isinstance(
-                exc, BackupError) else "That file cannot be read.", T.alert)
+                exc, BackupError) else tr("That file cannot be "
+                                          "read."), T.alert)
             return
         when = str(header.get("made") or "")[:10]
         self.made.text = escape_markup(
-            f"Made {when} by {header.get('by') or 'Ferritext'}.")
+            tr("Made {when} by {by}.", when=when,
+               by=header.get("by") or APP_NAME))
         self.set_status(self.status, "")
 
     def _start(self) -> None:
         if not self.path:
-            self.set_status(self.status, "Choose the backup file first.",
+            self.set_status(self.status, tr("Choose the backup file first."),
                             T.alert)
             return
         if not self.passphrase.text:
-            self.set_status(self.status, "Enter the backup's passphrase.",
+            self.set_status(self.status, tr("Enter the backup's passphrase."),
                             T.alert)
             return
         if self.app.call is not None and not self.app.call.ended:
-            self.set_status(self.status, "Not during a call.", T.alert)
+            self.set_status(self.status, tr("Not during a call."), T.alert)
             return
         self.button.disabled = True
-        self.set_status(self.status, "Opening…")
+        self.set_status(self.status, tr("Opening…"))
         previous = self.app.pause_identity()
         threading.Thread(target=self._work, args=(
             self.path, self.passphrase.text, previous), daemon=True).start()
@@ -12859,7 +14037,7 @@ class RestoreSheet(Sheet):
               previous: Optional[str]) -> None:
         def progress(done: float) -> None:
             run_on_ui(self.set_status, self.status,
-                      f"Opening… {int(done * 100)}%")
+                      tr("Opening… {percent}%", percent=int(done * 100)))
         try:
             summary = restore_backup(self.app.keys, path, passphrase,
                                      progress)
@@ -12868,7 +14046,8 @@ class RestoreSheet(Sheet):
             return
         except Exception as exc:
             log.exception("restore failed")
-            run_on_ui(self._failed, f"The restore failed: {exc}", previous)
+            run_on_ui(self._failed, tr("The restore failed: {error}",
+                                       error=exc), previous)
             return
         run_on_ui(self._restored, summary, previous)
 
@@ -12884,13 +14063,15 @@ class RestoreSheet(Sheet):
         done = summary["added"] + summary["replaced"]
         bits = []
         if done:
-            bits.append(f"Restored {', '.join(done)}, with "
-                        f"{summary['messages']:,} messages.")
+            bits.append(trn("Restored {names}, with {count} message.",
+                            "Restored {names}, with {count} messages.",
+                            summary["messages"], names=", ".join(done),
+                            count=f"{summary['messages']:,}"))
         if summary["kept"]:
-            bits.append(f"Already here, kept as they are: "
-                        f"{', '.join(summary['kept'])}.")
+            bits.append(tr("Already here, kept as they are: {names}.",
+                           names=", ".join(summary["kept"])))
         if not bits:
-            bits.append("There was nothing in it to restore.")
+            bits.append(tr("There was nothing in it to restore."))
         self.set_status(self.status, escape_markup(" ".join(bits)),
                         COL_OK if done else None)
         self.button.disabled = False
@@ -12905,20 +14086,20 @@ class MuteSheet(MenuSheet):
 
     def __init__(self, app: "FextApp", peers: list, **kw):
         self.app, self.peers = app, list(peers)
-        items = [("bell_off", label,
+        items = [("bell_off", tr(label),
                   lambda s=seconds: app.set_mute(
                       self.peers, LocalStore.MUTE_FOREVER if s is None
                       else time.time() + s))
                  for label, seconds in MUTE_CHOICES]
         if any(app.store.mute_state(p)[0] for p in self.peers):
-            items.append(("bell", "Unmute" + (" all" if len(self.peers) > 1
-                                              else ""),
+            items.append(("bell", tr("Unmute all") if len(self.peers) > 1
+                          else tr("Unmute"),
                           lambda: app.set_mute(self.peers, None)))
         many = len(self.peers) > 1
-        super().__init__(items, title=f"Mute {len(self.peers)} chats"
-                         if many else "Mute notifications",
-                         subtitle="Messages still arrive and show here; "
-                                  "only the notifications stop.", **kw)
+        super().__init__(items, title=tr("Mute {n} chats", n=len(self.peers))
+                         if many else tr("Mute notifications"),
+                         subtitle=tr("Messages still arrive and show here; "
+                                     "only the notifications stop."), **kw)
 
 
 # =============================================================================
@@ -12934,29 +14115,30 @@ class ReportSheet(Sheet):
     block them too. The operator learns who and why, and your note — never
     what they sent, which the relay cannot read."""
 
-    REASONS = [("spam", "Spam"), ("abuse", "Abuse"),
-               ("unwanted", "Unwanted"), ("other", "Other")]
+    REASONS = [("spam", N_("Spam")), ("abuse", N_("Abuse")),
+               ("unwanted", N_("Unwanted")), ("other", N_("Other"))]
 
     def __init__(self, app: "FextApp", peer: str) -> None:
         name = (app.store.get_contact(peer) or {}).get("username") or \
             short_addr(peer, 12)
-        super().__init__(f"Report {name}",
-                         subtitle="The relay's operator is told who you "
-                                  "report and why. What they sent stays "
-                                  "sealed: nobody but you can read it.")
+        super().__init__(tr("Report {name}", name=name),
+                         subtitle=tr("The relay's operator is told who you "
+                                     "report and why. What they sent stays "
+                                     "sealed: nobody but you can read it."))
         self.app, self.peer, self._block = app, peer, True
-        self.reason = self.add(Segmented(self.REASONS, "spam"))
-        self.note = self.add(Field(hint="Anything the operator should know "
-                                        "(optional)"))
+        self.reason = self.add(Segmented(
+            [(key, tr(label)) for key, label in self.REASONS], "spam"))
+        self.note = self.add(Field(hint=tr("Anything the operator should know "
+                                           "(optional)")))
         self.add(rows_card([ListRow(
-            "block", f"Also block {name}",
-            "What they send is held, unopened, until you unblock them",
+            "block", tr("Also block {name}", name=name),
+            tr("What they send is held, unopened, until you unblock them"),
             control=ToggleSwitch(True, lambda on: setattr(self, "_block",
                                                           on)))], inset=0))
         if not (app.api and app.api.features().get("reports")):
-            self.add(hint("This relay takes no reports yet: only the block "
-                          "is done here."))
-        self.add(Btn("Report", kind="solid_danger",
+            self.add(hint(tr("This relay takes no reports yet: only the block "
+                             "is done here.")))
+        self.add(Btn(tr("Report"), kind="solid_danger",
                      on_release=lambda _w: self._send()))
 
     def _send(self) -> None:
@@ -12970,21 +14152,22 @@ class MobileDataSheet(Sheet):
 
     def __init__(self, app: "FextApp", msg: dict) -> None:
         media = message_ext(msg).get("media") or {}
-        what = "voice message" if msg.get("kind") == "voice" else "photo"
-        super().__init__("Download on mobile data?",
-                         subtitle=f"You are not on Wi-Fi. This {what} is "
-                                  f"{size_text(int(media.get('size') or 0))}.")
+        size = size_text(int(media.get("size") or 0))
+        super().__init__(tr("Download on mobile data?"), subtitle=tr(
+            "You are not on Wi-Fi. This voice message is {size}."
+            if msg.get("kind") == "voice" else
+            "You are not on Wi-Fi. This photo is {size}.", size=size))
         self.app, self.msg, self._quiet = app, msg, False
         self.add(rows_card([ListRow(
-            "check", "Don't ask again",
-            "Settings › Downloads can turn the question back on",
+            "check", tr("Don't ask again"),
+            tr("Settings › Downloads can turn the question back on"),
             control=ToggleSwitch(False, lambda on: setattr(self, "_quiet",
                                                            on)))], inset=0))
         buttons = self.add(BoxLayout(size_hint_y=None, height=TOUCH,
                                      spacing=dp(10)))
-        buttons.add_widget(Btn("Not now", kind="quiet",
+        buttons.add_widget(Btn(tr("Not now"), kind="quiet",
                                on_release=lambda _w: self.dismiss()))
-        buttons.add_widget(Btn("Download",
+        buttons.add_widget(Btn(tr("Download"),
                                on_release=lambda _w: self._download()))
 
     def _download(self) -> None:
@@ -12994,14 +14177,113 @@ class MobileDataSheet(Sheet):
         self.dismiss()
 
 
+class KeepRunningSheet(Sheet):
+    """v15.1: on a phone whose maker stops background apps (KEEP_RUNNING),
+    the settings that keep the app running: starting by itself, where the
+    maker has such a page, and battery use Android does not restrict.
+    Set up opens each still to make in turn, the next as the app comes
+    back from the last; a tick shows each made."""
+
+    def __init__(self, app: "FextApp", maker: str) -> None:
+        super().__init__(tr("Keep Ferritext running"), subtitle=tr(
+            "{maker} phones stop apps in the background to save battery, "
+            "and Ferritext then misses messages until you open it. These "
+            "settings keep it running.",
+            maker=MAKER_NAMES.get(maker, maker.title())))
+        self.app, self.maker = app, maker
+        self._to_open = []              # what Set up has still to open
+        self._fill()
+        self.bind(on_pre_open=lambda *_a: self._listen(True),
+                  on_dismiss=lambda *_a: self._listen(False))
+
+    def _listen(self, on: bool) -> None:
+        """While open: back from a settings page, the app resumes; from
+        Android's battery question, a dialog over it, it regains focus."""
+        (self.app.bind if on else self.app.unbind)(on_resume=self._back)
+        (Window.bind if on else Window.unbind)(focus=self._focused)
+
+    def _focused(self, _window, focused: bool) -> None:
+        if focused:
+            self._back()
+
+    def _fill(self) -> None:
+        self.body.clear_widgets()
+        left = keep_running_left(self.maker)
+        rows = []
+        if KEEP_RUNNING.get(self.maker):
+            rows.append(self._row(
+                "retry", tr("Let it start by itself"),
+                tr("Turn Ferritext on in the list of apps that may start "
+                   "by themselves") if "autostart" in left else
+                tr("Opened: Ferritext should be turned on there"),
+                "autostart" not in left, self._open_autostart))
+        rows.append(self._row(
+            "battery", tr("Don't restrict its battery use"),
+            tr("Android asks you: choose Allow") if "battery" in left else
+            tr("Done: Android leaves it alone"),
+            "battery" not in left, android_open_battery_settings))
+        self.body.add_widget(rows_card(rows))
+        self.body.add_widget(hint(tr(
+            "Some phones also let you lock an app in the list of recent "
+            "apps: open the list, then pull Ferritext's card down or tap "
+            "its lock.")))
+        if left:
+            buttons = BoxLayout(size_hint_y=None, height=TOUCH,
+                                spacing=dp(10))
+            buttons.add_widget(Btn(tr("Not now"), kind="quiet",
+                                   on_release=lambda _w: self.dismiss()))
+            buttons.add_widget(Btn(tr("Set up"),
+                                   on_release=lambda _w: self._set_up()))
+            self.body.add_widget(buttons)
+        else:
+            self.body.add_widget(Btn(tr("Done"), kind="text",
+                                     on_release=lambda _w: self.dismiss()))
+
+    @staticmethod
+    def _row(icon: str, title: str, hint_text: str, made: bool,
+             on_tap: Callable) -> "ListRow":
+        tick = None
+        if made:
+            tick = Widget(size_hint=(None, None), size=(dp(24), dp(24)))
+            tick.bind(pos=lambda w, *_a: ListRow._glyph(w, "check",
+                                                        T.accent),
+                      size=lambda w, *_a: ListRow._glyph(w, "check",
+                                                         T.accent))
+        return ListRow(icon, title, hint_text, control=tick,
+                       chevron=not made, on_tap=on_tap)
+
+    def _open_autostart(self) -> bool:
+        if not android_open_autostart_settings(self.maker):
+            return False
+        save_pref("autostart_opened", True)
+        return True
+
+    def _set_up(self) -> None:
+        self._to_open = keep_running_left(self.maker)
+        self._open_next()
+
+    def _open_next(self) -> None:
+        while self._to_open:
+            step = self._to_open.pop(0)
+            if self._open_autostart() if step == "autostart" else \
+                    android_open_battery_settings():
+                return
+
+    def _back(self, *_a) -> None:
+        """Back from one of Android's pages: what they now are, and the
+        next page Set up has to open."""
+        self._fill()
+        self._open_next()
+
+
 class BlockedSheet(Sheet):
     """v14 (B16): everyone blocked, each with the way to unblock them."""
 
     def __init__(self, app: "FextApp") -> None:
-        super().__init__("Blocked",
-                         subtitle="What they send is held, unopened, until "
-                                  "you unblock them; it then arrives in "
-                                  "order.")
+        super().__init__(tr("Blocked"),
+                         subtitle=tr("What they send is held, unopened, until "
+                                     "you unblock them; it then arrives in "
+                                     "order."))
         self.app = app
         self._fill()
 
@@ -13009,11 +14291,11 @@ class BlockedSheet(Sheet):
         self.body.clear_widgets()
         people = self.app.store.blocked_contacts() if self.app.store else []
         if not people:
-            self.add(hint("No one is blocked."))
+            self.add(hint(tr("No one is blocked.")))
             return
         rows = []
         for person in people:
-            unblock = Btn("Unblock", kind="text", size_hint_x=None,
+            unblock = Btn(tr("Unblock"), kind="text", size_hint_x=None,
                           pos_hint={"center_y": .5},
                           on_release=lambda _w, a=person["address"]:
                           self._unblock(a))
@@ -13041,19 +14323,19 @@ class RegisterModal(Sheet):
     """
 
     def __init__(self, app: "FextApp", reason: str = "") -> None:
-        super().__init__("Choose your name", dismissable=False,
-                         subtitle=f"for the identity "
-                                  f"{short_addr(app.keys.address, 16)}")
+        super().__init__(tr("Choose your name"), dismissable=False,
+                         subtitle=tr("for the identity {address}",
+                                     address=short_addr(app.keys.address, 16)))
         self.app = app
         self._suggested: Optional[str] = None
         if reason:
             self.add(InfoLabel(reason, color=T.accent, font_size=fs(15)))
-        self.entry = self.add(Field(hint="username", label="Username",
+        self.entry = self.add(Field(hint="username", label=tr("Username"),
                                     on_enter=self._submit))
-        self.add(hint("3–32 letters, digits or underscores. Others find "
-                      "you by it."))
+        self.add(hint(tr("3–32 letters, digits or underscores. Others find "
+                         "you by it.")))
         self.status = self.status_label()
-        self.button = self.add(Btn("Register", on_release=lambda
+        self.button = self.add(Btn(tr("Register"), on_release=lambda
                                    _w: self._submit()))
         # Shown only when the relay says this key already has a name.
         self.adopt_button = Btn("", kind="quiet",
@@ -13062,11 +14344,11 @@ class RegisterModal(Sheet):
     def _submit(self) -> None:
         username = self.entry.text.strip()
         if not valid_username(username):
-            self.set_status(self.status, "That name doesn't fit yet — 3–32 "
-                            "letters, digits or _", T.alert)
+            self.set_status(self.status, tr("That name doesn't fit yet — 3–32 "
+                                            "letters, digits or _"), T.alert)
             return
         self.button.disabled = True
-        self.set_status(self.status, "Registering…")
+        self.set_status(self.status, tr("Registering…"))
         threading.Thread(target=self._worker, args=(username,),
                          daemon=True).start()
 
@@ -13075,8 +14357,8 @@ class RegisterModal(Sheet):
             self.app.api.register(username)
         except ApiClient.ApiError as exc:
             if exc.code == "username_taken":
-                run_on_ui(self._fail,
-                          f"‘{username}’ is already taken — try another.")
+                run_on_ui(self._fail, tr("‘{name}’ is already taken — try "
+                                         "another.", name=username))
             elif exc.code == "address_registered":
                 run_on_ui(self._offer_adopt,
                           exc.detail.get("username") or "")
@@ -13090,13 +14372,15 @@ class RegisterModal(Sheet):
     def _offer_adopt(self, existing: str) -> None:
         self.button.disabled = False
         if not existing:
-            self.set_status(self.status, "This identity is already "
-                            "registered on the relay.", T.alert)
+            self.set_status(self.status, tr("This identity is already "
+                                            "registered on the "
+                                            "relay."), T.alert)
             return
         self._suggested = existing
-        self.set_status(self.status, f"This identity is already registered "
-                        f"as ‘{existing}’.", T.accent)
-        self.adopt_button.text = f"Continue as {existing}"
+        self.set_status(self.status, tr("This identity is already "
+                                        "registered as ‘{name}’.",
+                                        name=existing), T.accent)
+        self.adopt_button.text = tr("Continue as {name}", name=existing)
         if self.adopt_button.parent is None:
             self.add(self.adopt_button)
 
@@ -13118,12 +14402,12 @@ class AddContactModal(Sheet):
     """Find someone by username OR by their Fec… address."""
 
     def __init__(self, app: "FextApp") -> None:
-        super().__init__("Add a contact")
+        super().__init__(tr("Add a contact"))
         self.app = app
-        self.entry = self.add(Field(hint="username or Fec… address",
-                                    label="Who", on_enter=self._submit))
+        self.entry = self.add(Field(hint=tr("username or Fec… address"),
+                                    label=tr("Who"), on_enter=self._submit))
         self.status = self.status_label()
-        self.button = self.add(Btn("Look up",
+        self.button = self.add(Btn(tr("Look up"),
                                    on_release=lambda _w: self._submit()))
 
     def _submit(self) -> None:
@@ -13131,7 +14415,7 @@ class AddContactModal(Sheet):
         if not query:
             return
         self.button.disabled = True
-        self.set_status(self.status, "Searching…")
+        self.set_status(self.status, tr("Searching…"))
         threading.Thread(target=self._worker, args=(query,),
                          daemon=True).start()
 
@@ -13142,18 +14426,18 @@ class AddContactModal(Sheet):
             elif valid_username(query):
                 user = self.app.api.lookup(username=query)
             else:
-                run_on_ui(self._fail, "That is neither a username nor a "
-                          "Fec… address.")
+                run_on_ui(self._fail, tr("That is neither a username nor a "
+                                         "Fec… address."))
                 return
             if user["address"] == self.app.keys.address:
-                run_on_ui(self._fail, "That's you — your saved messages are "
-                          "at the top of the list.")
+                run_on_ui(self._fail, tr("That's you — your saved messages "
+                                         "are at the top of the list."))
                 return
             self.app.store.upsert_contact(user["address"], user["username"],
                                           user["public_key"])
         except ApiClient.ApiError as exc:
             run_on_ui(self._fail,
-                      "No one by that name." if exc.status == 404
+                      tr("No one by that name.") if exc.status == 404
                       else str(exc))
         except requests.RequestException as exc:
             run_on_ui(self._fail, describe_network_error(exc))
@@ -13176,35 +14460,37 @@ class NewIdentityModal(Sheet):
     relay would refuse them anyway."""
 
     def __init__(self, app: "FextApp", first_run: bool = False) -> None:
-        super().__init__(f"Welcome to {APP_NAME}" if first_run else
-                         "A new identity", dismissable=not first_run)
+        super().__init__(tr("Welcome to {app}", app=APP_NAME) if first_run else
+                         tr("A new identity"), dismissable=not first_run)
         self.app = app
         self.first_run = first_run
         self._mining = False
         self._cancel_mining = False
         self.add(hint(
-            "An identity is a secp256k1 key, the kind Bitcoin uses. The "
-            "network only admits addresses that begin “Fec”, so a new key "
-            "is mined until one does — a few seconds."))
-        self.label_entry = self.add(Field(hint="e.g. Personal",
-                                          label="Label, on this device only"))
+            tr("An identity is a secp256k1 key, the kind Bitcoin uses. The "
+               "network only admits addresses that begin “Fec”, so a new key "
+               "is mined until one does — a few seconds.")))
+        self.label_entry = self.add(Field(hint=tr("e.g. Personal"),
+                                          label=tr("Label, on this device "
+                                                   "only")))
         self.mine_button = self.add(Btn(
-            "Mine a new identity", on_release=lambda _w: self._start_mining()))
+            tr("Mine a new identity"),
+            on_release=lambda _w: self._start_mining()))
         self.progress = self.add(InfoLabel("", color=T.accent,
                                            font_size=fs(15), halign="center"))
-        self.add(CapsLabel("or import a key", size=11, halign="center"))
+        self.add(CapsLabel(tr("or import a key"), size=11, halign="center"))
         self.key_entry = self.add(Field(
-            hint="64 hex characters, or WIF (K… L… 5…)", password=True,
-            label="Private key"))
+            hint=tr("64 hex characters, or WIF (K… L… 5…)"), password=True,
+            label=tr("Private key")))
         self.import_button = self.add(Btn(
-            "Import key", kind="quiet",
+            tr("Import key"), kind="quiet",
             on_release=lambda _w: self._import_key()))
         self.status = self.status_label()
-        self.add(Btn("Restore from a backup", kind="text",
+        self.add(Btn(tr("Restore from a backup"), kind="text",
                      on_release=lambda _w: RestoreSheet(
                          app, on_done=self._restored).open()))
         if not first_run:
-            self.add(Btn("Cancel", kind="text",
+            self.add(Btn(tr("Cancel"), kind="text",
                          on_release=lambda _w: self._close()))
         self.bind(on_dismiss=lambda *_a: setattr(self, "_cancel_mining",
                                                  True))
@@ -13221,7 +14507,7 @@ class NewIdentityModal(Sheet):
         self.mine_button.disabled = True
         self.import_button.disabled = True
         self.set_status(self.status, "")
-        self.progress.text = "Mining… 0 attempts"
+        self.progress.text = tr("Mining… {n} attempts", n=0)
         threading.Thread(target=self._mine_worker, daemon=True).start()
 
     def _mine_worker(self) -> None:
@@ -13235,7 +14521,8 @@ class NewIdentityModal(Sheet):
             last_ui[0] = now
             rate = attempts / max(now - started, 0.001)
             run_on_ui(setattr, self.progress, "text",
-                      f"Mining… {attempts:,} attempts ({rate:,.0f} a second)")
+                      tr("Mining… {n} attempts ({rate} a second)",
+                         n=f"{attempts:,}", rate=f"{rate:,.0f}"))
 
         result = mine_identity(should_stop=lambda: self._cancel_mining,
                                progress=progress)
@@ -13245,7 +14532,8 @@ class NewIdentityModal(Sheet):
         run_on_ui(self._finish, priv, address, attempts)
 
     def _finish(self, priv: int, address: str, attempts: int) -> None:
-        self.progress.text = f"Found {address}\nafter {attempts:,} attempts"
+        self.progress.text = tr("Found {address}\nafter {n} attempts",
+                                address=address, n=f"{attempts:,}")
         self._save(priv)
 
     def _import_key(self) -> None:
@@ -13255,14 +14543,14 @@ class NewIdentityModal(Sheet):
         try:
             priv = parse_private_key(text)
         except ValueError as exc:
-            self.set_status(self.status, f"Cannot read that key: {exc}",
-                            T.alert)
+            self.set_status(self.status, tr("Cannot read that key: {error}",
+                                            error=exc), T.alert)
             return
         self._save(priv)
 
     def _save(self, priv: int) -> None:
         label = self.label_entry.text.strip() or \
-            f"Identity {len(self.app.keys.identities) + 1}"
+            tr("Identity {n}", n=len(self.app.keys.identities) + 1)
         try:
             address = self.app.keys.add_identity(priv, label)
         except ValueError as exc:
@@ -13305,14 +14593,15 @@ class ImportChooserModal(Sheet):
     """Pick a .json chat export to import."""
 
     def __init__(self, on_pick: Callable[[str], None]) -> None:
-        super().__init__("Import a chat", subtitle="A .json export")
+        super().__init__(tr("Import a chat"), subtitle=tr("A .json export"))
         self._on_pick = on_pick
         start = EXPORT_DIR if EXPORT_DIR.exists() else DATA_DIR
         self.chooser = self.add(_file_chooser(
             str(start), ["*.json"], min(dp(340), Window.height * .5)))
-        self.add(button_row(Btn("Cancel", kind="quiet",
+        self.add(button_row(Btn(tr("Cancel"), kind="quiet",
                                 on_release=lambda _w: self.dismiss()),
-                            Btn("Import", on_release=lambda _w: self._pick())))
+                            Btn(tr("Import"),
+                                on_release=lambda _w: self._pick())))
 
     def _pick(self) -> None:
         if self.chooser.selection:
@@ -13390,10 +14679,10 @@ def conversation_title(app, peer: str) -> tuple:
     notes to self."""
     kind = app.conversation_kind(peer)
     if kind == "self":
-        return "Saved messages", kind
+        return tr("Saved messages"), kind
     if kind == "group":
         group = app.store.group(gid_of(peer)) if app.store else None
-        return (group or {}).get("name") or "Group", kind
+        return (group or {}).get("name") or tr("Group"), kind
     contact = app.store.get_contact(peer) if app.store else None
     return (contact or {}).get("username") or short_addr(peer, 14), kind
 
@@ -13405,7 +14694,7 @@ class ForwardModal(Sheet):
     def __init__(self, app: "FextApp", local_ids: list,
                  on_done: Optional[Callable] = None) -> None:
         n = len(local_ids)
-        super().__init__(f"Forward {n} message{'s' if n != 1 else ''}")
+        super().__init__(trn("Forward {n} message", "Forward {n} messages", n))
         self.app, self.local_ids, self.on_done = app, local_ids, on_done
         self.card.padding = [0, dp(8), 0, dp(18)]
         self.title_label.padding = [dp(22), 0]
@@ -13418,14 +14707,16 @@ class ForwardModal(Sheet):
         for target in targets:
             peer = target["address"]
             name, kind = conversation_title(app, peer)
-            sub = {"self": "Kept on this device",
-                   "group": f"{len((app.store.group(gid_of(peer)) or {}).get('members', []))} members"
+            members = len((app.store.group(gid_of(peer)) or {}).get(
+                "members", []))
+            sub = {"self": tr("Kept on this device"),
+                   "group": trn("{n} member", "{n} members", members)
                    }.get(kind)
             self.rows.append(ContactPickRow(
                 {"address": peer}, kind=kind, name=name, sub=sub,
                 on_change=lambda _r: self._sync_button()))
         self.add(rows_card(self.rows, inset=dp(74)))
-        self.button = Btn("Forward", on_release=lambda _w: self._go(),
+        self.button = Btn(tr("Forward"), on_release=lambda _w: self._go(),
                           size_hint_x=None)
         holder = BoxLayout(size_hint_y=None, height=TOUCH,
                            padding=[dp(22), 0])
@@ -13437,7 +14728,8 @@ class ForwardModal(Sheet):
     def _sync_button(self) -> None:
         n = sum(1 for r in self.rows if r.picked)
         self.button.disabled = n == 0
-        self.button.text = "Forward" if n <= 1 else f"Forward to {n} chats"
+        self.button.text = tr("Forward") if n <= 1 else tr(
+            "Forward to {n} chats", n=n)
 
     def _go(self) -> None:
         targets = [r.address for r in self.rows if r.picked]
@@ -13448,9 +14740,11 @@ class ForwardModal(Sheet):
         if self.on_done:
             self.on_done()
         who = (len(targets) == 1 and conversation_title(
-            self.app, targets[0])[0]) or f"{len(targets)} chats"
-        self.app._set_status(f"Forwarded {sent} message"
-                             f"{'s' if sent != 1 else ''} to {who}", T.ok)
+            self.app, targets[0])[0]) or trn("{n} chat", "{n} chats",
+                                             len(targets))
+        self.app._set_status(trn("Forwarded {n} message to {who}",
+                                 "Forwarded {n} messages to {who}", sent,
+                                 who=who), T.ok)
 
 
 class DeleteModal(Sheet):
@@ -13460,7 +14754,8 @@ class DeleteModal(Sheet):
     def __init__(self, app: "FextApp", msgs: list,
                  on_done: Optional[Callable] = None) -> None:
         n = len(msgs)
-        super().__init__(f"Delete {n} message{'s' if n != 1 else ''}?")
+        super().__init__(trn("Delete {n} message?", "Delete {n} messages?",
+                             n))
         # NOT self.ids: every Kivy widget already has an `ids` property.
         self.app, self.msg_ids, self.on_done = app, [m["id"] for m in msgs], \
             on_done
@@ -13470,24 +14765,25 @@ class DeleteModal(Sheet):
         kind = app.conversation_kind(peer) if peer else "dm"
         if own and kind != "self":
             if kind == "group":
-                label, note = "Delete for everyone", ""
+                label, note = tr("Delete for everyone"), ""
             else:
                 contact = (app.store.get_contact(peer) or {}) if peer else {}
-                name = contact.get("username") or "them"
-                label = f"Delete for me and {name}"
+                name = contact.get("username") or tr("them")
+                label = tr("Delete for me and {name}", name=name)
                 note = ("" if contact.get("caps", 0) & LocalStore.CAP_V9 else
-                        f"If {name} is still on an older version, their "
-                        f"copy stays and they see a note instead.")
+                        tr("If {name} is still on an older version, their "
+                           "copy stays and they see a note instead.",
+                           name=name))
             self.add(Btn(label, kind="solid_danger",
                          on_release=lambda _w: self._go(True)))
             if note:
                 self.add(hint(note))
-        self.add(Btn("Delete for me", kind="danger",
+        self.add(Btn(tr("Delete for me"), kind="danger",
                      on_release=lambda _w: self._go(False)))
         if not own and kind != "self":
-            self.add(hint("Only your own messages can be deleted for "
-                          "everyone."))
-        self.add(Btn("Cancel", kind="text",
+            self.add(hint(tr("Only your own messages can be deleted for "
+                             "everyone.")))
+        self.add(Btn(tr("Cancel"), kind="text",
                      on_release=lambda _w: self.dismiss()))
 
     def _go(self, for_everyone: bool) -> None:
@@ -13504,24 +14800,24 @@ class DeleteChatsSheet(Sheet):
     def __init__(self, app: "FextApp", convs: list,
                  on_done: Optional[Callable] = None) -> None:
         n = len(convs)
-        super().__init__("Delete this chat?" if n == 1 else
-                         f"Delete {n} chats?")
+        super().__init__(tr("Delete this chat?") if n == 1 else
+                         tr("Delete {n} chats?", n=n))
         self.app, self.convs, self.on_done = app, convs, on_done
         groups = [c for c in convs if c.get("kind") == "group" and
                   (c.get("group_state") or "active") == "active"]
-        text = ("Its messages are removed from this device; the people you "
-                "wrote to keep their copies." if n == 1 else
-                "Their messages are removed from this device; the people "
-                "you wrote to keep their copies.")
+        text = (tr("Its messages are removed from this device; the people "
+                   "you wrote to keep their copies.") if n == 1 else
+                tr("Their messages are removed from this device; the people "
+                   "you wrote to keep their copies."))
         if groups:
-            text += (" You also leave the group, and its members are told."
-                     if len(groups) == 1 else
-                     f" You also leave {len(groups)} groups, and their "
-                     "members are told.")
+            text += trn(" You also leave the group, and its members are "
+                        "told.", " You also leave {n} groups, and their "
+                        "members are told.", len(groups))
         self.add(InfoLabel(text, color=T.text_2, font_size=fs(16)))
         self.add(button_row(
-            Btn("Cancel", kind="quiet", on_release=lambda _w: self.dismiss()),
-            Btn("Delete", kind="solid_danger",
+            Btn(tr("Cancel"), kind="quiet",
+                on_release=lambda _w: self.dismiss()),
+            Btn(tr("Delete"), kind="solid_danger",
                 on_release=lambda _w: self._go())))
 
     def _go(self) -> None:
@@ -13535,7 +14831,7 @@ class StarredModal(Sheet):
     """Starred messages of one chat — private bookmarks, never sent."""
 
     def __init__(self, app: "FextApp", peer: Optional[str]) -> None:
-        super().__init__("Starred")
+        super().__init__(tr("Starred"))
         self.app = app
         rows = app.store.starred(peer) if app.store else []
         screen = app.conversation_screen
@@ -13555,9 +14851,9 @@ class StarredModal(Sheet):
             self.add(item)
             self.add(Rule())
         if not rows:
-            self.add(hint("Nothing starred yet. Hold a message and choose "
-                          "the star to keep it here."))
-        self.add(Btn("Done", kind="quiet",
+            self.add(hint(tr("Nothing starred yet. Hold a message and choose "
+                             "the star to keep it here.")))
+        self.add(Btn(tr("Done"), kind="quiet",
                      on_release=lambda _w: self.dismiss()))
 
     def _open(self, msg: dict) -> None:
@@ -13587,16 +14883,17 @@ class ImageChooserModal(Sheet):
     """Desktop photo picker."""
 
     def __init__(self, on_pick: Callable[[str], None],
-                 title: str = "Send a photo") -> None:
-        super().__init__(title)
+                 title: str = "") -> None:
+        super().__init__(title or tr("Send a photo"))
         self._on_pick = on_pick
         self.chooser = self.add(_file_chooser(
             str(Path.home()), ["*.jpg", "*.jpeg", "*.png", "*.webp", "*.JPG",
                                "*.JPEG", "*.PNG", "*.bmp", "*.gif"],
             min(dp(360), Window.height * 0.5)))
-        self.add(button_row(Btn("Cancel", kind="quiet",
+        self.add(button_row(Btn(tr("Cancel"), kind="quiet",
                                 on_release=lambda _w: self.dismiss()),
-                            Btn("Choose", on_release=lambda _w: self._pick())))
+                            Btn(tr("Choose"),
+                                on_release=lambda _w: self._pick())))
 
     def _pick(self) -> None:
         if self.chooser.selection:
@@ -13612,7 +14909,7 @@ class AttachPreviewModal(Sheet):
 
     def __init__(self, app: "FextApp", path: str,
                  temporary: bool = False) -> None:
-        super().__init__("Send photo")
+        super().__init__(tr("Send photo"))
         self.app, self.path, self.temporary = app, path, temporary
         self._sent = False
         if temporary:
@@ -13621,13 +14918,14 @@ class AttachPreviewModal(Sheet):
         self.add(KivyImage(source=path, allow_stretch=True, keep_ratio=True,
                            size_hint_y=None,
                            height=min(dp(300), Window.height * 0.4)))
-        self.caption = self.add(Field(hint="Add a caption…",
+        self.caption = self.add(Field(hint=tr("Add a caption…"),
                                       on_enter=self._send))
-        self.add(hint("Sent compressed, with its location and camera "
-                      "details removed."))
-        self.add(button_row(Btn("Cancel", kind="quiet",
+        self.add(hint(tr("Sent compressed, with its location and camera "
+                         "details removed.")))
+        self.add(button_row(Btn(tr("Cancel"), kind="quiet",
                                 on_release=lambda _w: self.dismiss()),
-                            Btn("Send", on_release=lambda _w: self._send())))
+                            Btn(tr("Send"),
+                                on_release=lambda _w: self._send())))
 
     def _send(self) -> None:
         self._sent = True
@@ -13683,9 +14981,9 @@ class PictureCropSheet(Sheet):
     ZOOM = 4.0                       # at most this far past "just covers"
 
     def __init__(self, path: str, on_done: Callable[[bytes], None],
-                 title: str = "Profile photo",
+                 title: str = "",
                  temporary: bool = False) -> None:
-        super().__init__(title)
+        super().__init__(title or tr("Profile photo"))
         self.on_done, self.path, self.temporary = on_done, path, temporary
         self.image = open_picture_source(path)          # raises if unusable
         if temporary:
@@ -13723,12 +15021,13 @@ class PictureCropSheet(Sheet):
         self.scatter.scale = self._cover
         self.scatter.center = (side / 2, side / 2)
         self.scatter.bind(on_transform_with_touch=lambda *_a: self._clamp())
-        self.add(hint("Drag the photo to place it; " +
-                      ("pinch" if IS_MOBILE else "scroll") +
-                      " to make it larger or smaller."))
-        self.add(button_row(Btn("Cancel", kind="quiet",
+        self.add(hint(tr("Drag the photo to place it; pinch to make it "
+                         "larger or smaller.") if IS_MOBILE else
+                      tr("Drag the photo to place it; scroll to make it "
+                         "larger or smaller.")))
+        self.add(button_row(Btn(tr("Cancel"), kind="quiet",
                                 on_release=lambda _w: self.dismiss()),
-                            Btn("Use photo",
+                            Btn(tr("Use photo"),
                                 on_release=lambda _w: self._use())))
         self._fit()
 
@@ -13780,7 +15079,7 @@ class CameraSheet(Sheet):
     """A photo from the computer's camera: what it sees, and a shutter."""
 
     def __init__(self, on_photo: Callable[[str], None]) -> None:
-        super().__init__("Take a photo")
+        super().__init__(tr("Take a photo"))
         from kivy.uix.camera import Camera as CameraView
         self.on_photo = on_photo
         self.view = CameraView(play=True, resolution=(1280, 720),
@@ -13788,9 +15087,9 @@ class CameraSheet(Sheet):
                                size_hint_y=None,
                                height=min(dp(320), Window.height * 0.45))
         self.add(self.view)
-        self.add(button_row(Btn("Cancel", kind="quiet",
+        self.add(button_row(Btn(tr("Cancel"), kind="quiet",
                                 on_release=lambda _w: self.dismiss()),
-                            Btn("Take photo",
+                            Btn(tr("Take photo"),
                                 on_release=lambda _w: self._shoot())))
         self.bind(on_dismiss=lambda *_a: setattr(self.view, "play", False))
 
@@ -13818,18 +15117,19 @@ class NoCameraSheet(Sheet):
     """Said when the computer has no camera this app can open."""
 
     def __init__(self, on_choose: Optional[Callable[[], None]]) -> None:
-        super().__init__("No camera found")
-        how = ("Ferritext opens a computer's camera through OpenCV. To use "
-               "one, install it and restart:  pip install opencv-python")
+        super().__init__(tr("No camera found"))
+        how = tr("Ferritext opens a computer's camera through OpenCV. To "
+                 "use one, install it and restart:  pip install "
+                 "opencv-python")
         self.add(InfoLabel(how, color=T.text_2, font_size=fs(16)))
 
         def choose(_w):
             self.dismiss()
             if on_choose is not None:
                 on_choose()
-        self.add(button_row(Btn("Close", kind="quiet",
+        self.add(button_row(Btn(tr("Close"), kind="quiet",
                                 on_release=lambda _w: self.dismiss()),
-                            Btn("Choose a photo", on_release=choose)))
+                            Btn(tr("Choose a photo"), on_release=choose)))
 
 
 _desktop_camera: Optional[bool] = None
@@ -13870,9 +15170,10 @@ class TextPromptSheet(Sheet):
         self.entry.text = value
         if note:
             self.add(hint(note))
-        self.add(button_row(Btn("Cancel", kind="quiet",
+        self.add(button_row(Btn(tr("Cancel"), kind="quiet",
                                 on_release=lambda _w: self.dismiss()),
-                            Btn("Save", on_release=lambda _w: self._save())))
+                            Btn(tr("Save"),
+                                on_release=lambda _w: self._save())))
 
     def _save(self) -> None:
         value = sanitize_text(self.entry.text)[:self._limit].strip()
@@ -13887,10 +15188,11 @@ class RenameIdentityModal(TextPromptSheet):
         ident = app.keys.find(address) or {}
         self.app, self.address = app, address
         super().__init__(
-            "Rename identity", "Label", ident.get("label", ""),
-            "Only this device shows the label, to tell your identities "
-            "apart. Your name on the relay stays "
-            f"@{ident.get('username') or '(unregistered)'}.", self._apply)
+            tr("Rename identity"), tr("Label"), ident.get("label", ""),
+            tr("Only this device shows the label, to tell your identities "
+               "apart. Your name on the relay stays {name}.",
+               name="@" + ident["username"] if ident.get("username") else
+               tr("(unregistered)")), self._apply)
 
     def _apply(self, label: str) -> bool:
         self.app.keys.rename_identity(self.address, label)
@@ -13904,22 +15206,22 @@ class ChatHistorySheet(Sheet):
 
     def __init__(self, app: "FextApp", peer: str) -> None:
         name, _kind = conversation_title(app, peer)
-        super().__init__("Chat history", subtitle=f"{name} — plaintext copies "
-                                                  f"that stay on this device")
+        super().__init__(tr("Chat history"), subtitle=tr(
+            "{name} — plaintext copies that stay on this device", name=name))
         self.app, self.peer, self.name = app, peer, name
-        self.add(button_row(Btn("Export .json", kind="quiet",
+        self.add(button_row(Btn(tr("Export .json"), kind="quiet",
                                 on_release=lambda _w: self._export("json")),
-                            Btn("Export .txt", kind="quiet",
+                            Btn(tr("Export .txt"), kind="quiet",
                                 on_release=lambda _w: self._export("txt"))))
-        self.add(Btn("Import .json", kind="quiet",
+        self.add(Btn(tr("Import .json"), kind="quiet",
                      on_release=lambda _w: self._import()))
         self.io_status = self.status_label()
-        self.add(Btn("Done", kind="text",
+        self.add(Btn(tr("Done"), kind="text",
                      on_release=lambda _w: self.dismiss()))
 
     def _author(self, m: dict) -> str:
         if m["direction"] == "out":
-            return self.app.keys.username or "Me"
+            return self.app.keys.username or tr("Me")
         if m.get("kind") == "event":
             return "·"
         return self.app.conversation_screen.author_name(
@@ -13953,18 +15255,21 @@ class ChatHistorySheet(Sheet):
                 }, indent=2, ensure_ascii=False), "utf-8")
             else:
                 lines = [f"{APP_NAME} — {self.name} ({self.peer})",
-                         f"Exported {now_iso()}", ""]
+                         tr("Exported {when}", when=now_iso()), ""]
                 for m in messages:
                     lines.append(f"[{m['created_at']}] {self._author(m)}: "
                                  f"{m['body']}")
                 path.write_text("\n".join(lines) + "\n", "utf-8")
             opened = open_folder_in_explorer(EXPORT_DIR)
-            note = f"Exported {len(messages)} messages to {path}"
+            note = trn("Exported {n} message to {path}",
+                       "Exported {n} messages to {path}", len(messages),
+                       path=path)
             if opened:
-                note += " (the folder is open)"
+                note = tr("{note} (the folder is open)", note=note)
             self.set_status(self.io_status, note)
         except OSError as exc:
-            self.set_status(self.io_status, f"Export failed: {exc}", T.alert)
+            self.set_status(self.io_status, tr("Export failed: {error}",
+                                               error=exc), T.alert)
 
     def _import(self) -> None:
         ImportChooserModal(self._import_file).open()
@@ -13974,7 +15279,8 @@ class ChatHistorySheet(Sheet):
             data = json.loads(Path(path).read_text("utf-8"))
             if data.get("fext_chat_export") != 2 or \
                     not isinstance(data.get("messages"), list):
-                raise ValueError(f"not a {APP_NAME} chat export")
+                raise ValueError(tr("not a {app} chat export",
+                                    app=APP_NAME))
             added = 0
             for m in data["messages"]:
                 if not isinstance(m, dict):
@@ -13988,14 +15294,16 @@ class ChatHistorySheet(Sheet):
                     str(m.get("status", 1)).lstrip("-").isdigit() else 1,
                     read=1)
                 added += 1 if ok else 0
-            self.set_status(self.io_status, (
-                f"Imported {added} new messages "
-                f"({len(data['messages']) - added} already here)"))
+            self.set_status(self.io_status, trn(
+                "Imported {n} new message ({old} already here)",
+                "Imported {n} new messages ({old} already here)", added,
+                old=len(data["messages"]) - added))
             self.app.conversation_screen._rendered_peer = None
             self.app.refresh_chat(self.peer)
             self.app.refresh_sidebar()
         except (OSError, ValueError, json.JSONDecodeError) as exc:
-            self.set_status(self.io_status, f"Import failed: {exc}", T.alert)
+            self.set_status(self.io_status, tr("Import failed: {error}",
+                                               error=exc), T.alert)
 
 
 ContactSettingsModal = ChatHistorySheet     # pre-9.1 name
@@ -14013,31 +15321,32 @@ class RemoveIdentityModal(Sheet):
     def __init__(self, app: "FextApp", address: str) -> None:
         ident = app.keys.find(address) or {}
         label = ident.get("label") or short_addr(address, 12)
-        super().__init__(f"Remove “{label}”?")
+        super().__init__(tr("Remove “{label}”?", label=label))
         self.app = app
         self.address = address
         self.username = ident.get("username")
         self._release = bool(self.username)
         self.add(hint(
-            "This deletes its private key and its chats from this device. "
-            "The key cannot be recovered afterwards — if you might want "
-            "this identity back, copy the key first."))
+            tr("This deletes its private key and its chats from this device. "
+               "The key cannot be recovered afterwards — if you might want "
+               "this identity back, copy the key first.")))
         self.add(InfoLabel(address, color=T.accent, font_size=fs(14)))
-        self.add(Btn("Copy the private key first", kind="danger",
+        self.add(Btn(tr("Copy the private key first"), kind="danger",
                      on_release=lambda _w: self._copy_key()))
         if self.username:
             self.release_switch = ToggleSwitch(
                 True, lambda on: setattr(self, "_release", on))
-            self.add(ListRow(None, f"Release “{self.username}” on the relay",
-                             "Frees the name and removes you from the "
-                             "directory. Leave it if another device still "
-                             "uses this key.", control=self.release_switch,
+            self.add(ListRow(None, tr("Release “{name}” on the relay",
+                                      name=self.username),
+                             tr("Frees the name and removes you from the "
+                                "directory. Leave it if another device still "
+                                "uses this key."), control=self.release_switch,
                              on_tap=self.release_switch.flip,
                              padding=[0, dp(8), 0, dp(8)]))
         self.status = self.status_label()
-        self.confirm = Btn("Remove identity", kind="solid_danger",
+        self.confirm = Btn(tr("Remove identity"), kind="solid_danger",
                            on_release=lambda _w: self._confirm())
-        self.add(button_row(Btn("Cancel", kind="quiet",
+        self.add(button_row(Btn(tr("Cancel"), kind="quiet",
                                 on_release=lambda _w: self.dismiss()),
                             self.confirm))
 
@@ -14049,12 +15358,13 @@ class RemoveIdentityModal(Sheet):
             self.app.keys.activate(self.address)
             data = json.loads(self.app.keys.private_export())
             Clipboard.copy(data["private_key_wif"])
-            self.set_status(self.status, "The private key is on the "
-                            "clipboard — paste it somewhere safe now.",
+            self.set_status(self.status, tr("The private key is on the "
+                                            "clipboard — paste it somewhere "
+                                            "safe now."),
                             T.accent)
         except Exception as exc:
-            self.set_status(self.status, f"Could not export the key: {exc}",
-                            T.alert)
+            self.set_status(self.status, tr("Could not export the key: "
+                                            "{error}", error=exc), T.alert)
         finally:
             try:
                 self.app.keys.activate(active)
@@ -14063,7 +15373,7 @@ class RemoveIdentityModal(Sheet):
 
     def _confirm(self) -> None:
         self.confirm.disabled = True
-        self.set_status(self.status, "Removing…")
+        self.set_status(self.status, tr("Removing…"))
         threading.Thread(target=self._worker, daemon=True).start()
 
     def _worker(self) -> None:
@@ -14074,8 +15384,8 @@ class RemoveIdentityModal(Sheet):
                 self.app.keys.activate(self.address)
                 ApiClient(self.app.keys).deregister()
             except (requests.RequestException, ApiClient.ApiError):
-                note = (" (the relay could not be reached, so the name is "
-                        "still registered)")
+                note = tr("the relay could not be reached, so the name is "
+                          "still registered")
             finally:
                 try:
                     self.app.keys.activate(previous)
@@ -14093,7 +15403,7 @@ class IdentitySheet(Sheet):
     this device (switch, rename, remove), a new one, and settings."""
 
     def __init__(self, app: "FextApp") -> None:
-        super().__init__("Identities")
+        super().__init__(tr("Identities"))
         self.app = app
         keys = app.keys
         self.card.padding = [0, dp(8), 0, dp(16)]
@@ -14104,9 +15414,11 @@ class IdentitySheet(Sheet):
         self.add(rows_card(rows, inset=dp(76)))
         self.add(Rule())
         self.add(rows_card([
-            ListRow("plus", "New identity", "Mine a fresh key or import one",
+            ListRow("plus", tr("New identity"), tr("Mine a fresh key or "
+                                                   "import one"),
                     on_tap=self._new),
-            ListRow("sliders", "Settings", "Appearance, notifications, keys",
+            ListRow("sliders", tr("Settings"), tr("Appearance, notifications, "
+                                                  "keys"),
                     on_tap=self._settings)]))
 
     def _row(self, ident: dict, active: bool) -> BoxLayout:
@@ -14129,18 +15441,18 @@ class IdentitySheet(Sheet):
             f"{short_addr(address, 10)}", fs(14), T.text_3))
         row.add_widget(texts)
         if active:
-            mark = CapsLabel("Active", size=10.5, color=T.accent,
+            mark = CapsLabel(tr("Active"), size=10.5, color=T.accent,
                              size_hint=(None, None), halign="right",
                              pos_hint={"center_y": .5})
             mark.width = mark.natural_width
             row.add_widget(mark)
         line.add_widget(row)
-        line.add_widget(IconButton("edit", label="Rename identity",
+        line.add_widget(IconButton("edit", label=tr("Rename identity"),
                                    pos_hint={"center_y": .5},
                                    on_release=lambda _w: self._rename(
                                        address)))
         line.add_widget(IconButton("delete", tint=T.alert,
-                                   label="Remove identity",
+                                   label=tr("Remove identity"),
                                    pos_hint={"center_y": .5},
                                    on_release=lambda _w: self._remove(
                                        address)))
@@ -14406,23 +15718,23 @@ class NavDrawer(FloatLayout):
             for ident in sorted(keys.identities,
                                 key=lambda i: i["address"] != keys.address):
                 col.add_widget(self._identity_row(ident))
-        col.add_widget(DrawerRow("person_add", "New identity",
+        col.add_widget(DrawerRow("person_add", tr("New identity"),
                                  lambda: self.close(lambda: NewIdentityModal(
                                      app).open())))
         col.add_widget(Rule())
         if keys.has_identity:
-            col.add_widget(DrawerRow("person", "My profile",
+            col.add_widget(DrawerRow("person", tr("My profile"),
                                      lambda: self.close(app.open_profile)))
-            col.add_widget(DrawerRow("group", "New group",
+            col.add_widget(DrawerRow("group", tr("New group"),
                                      lambda: self.close(app.open_new_group)))
             col.add_widget(DrawerRow(
-                "bookmark", "Saved messages",
+                "bookmark", tr("Saved messages"),
                 lambda: self.close(lambda: app.open_conversation(
                     keys.address))))
             col.add_widget(Rule())
-        col.add_widget(DrawerRow("sliders", "Settings",
+        col.add_widget(DrawerRow("sliders", tr("Settings"),
                                  lambda: self.close(app.open_settings)))
-        col.add_widget(DrawerRow("info", "About",
+        col.add_widget(DrawerRow("info", tr("About"),
                                  lambda: self.close(lambda: AboutSheet(
                                      app).open())))
 
@@ -14457,8 +15769,8 @@ class NavDrawer(FloatLayout):
         line.add_widget(texts)
         line.add_widget(IconButton(
             "chevron_up" if self._show_identities else "chevron_down",
-            label="Hide identities" if self._show_identities
-            else "Show identities", pos_hint={"center_y": .5},
+            label=tr("Hide identities") if self._show_identities
+            else tr("Show identities"), pos_hint={"center_y": .5},
             on_release=lambda _w: self._toggle_identities()))
         head.add_widget(line)
         return head
@@ -14505,52 +15817,65 @@ SOURCE_URL = "https://github.com/ferritecoin/fapp"
 #: What Ferritext is made with: (group, [(name, what it does here, licence)]).
 #: CREDITS.md says the same, for those reading the source.
 OPEN_SOURCE = (
-    ("In the app", (
-        ("Python", "the language it is written in", "PSF License 2.0"),
-        ("Kivy", "its windows, touch and drawing", "MIT"),
-        ("cryptography", "the sealing: AES-GCM, HKDF, scrypt",
+    (N_("In the app"), (
+        ("Python", N_("the language it is written in"), "PSF License 2.0"),
+        ("Kivy", N_("its windows, touch and drawing"), "MIT"),
+        ("cryptography", N_("the sealing: AES-GCM, HKDF, scrypt"),
          "Apache 2.0 or BSD"),
-        ("Pillow", "photos and pictures, made small", "HPND"),
+        ("Pillow", N_("photos and pictures, made small"), "HPND"),
         ("requests, urllib3, idna, charset-normalizer",
-         "talking to the relay", "Apache 2.0, MIT, BSD, MIT"),
-        ("certifi", "the certificates HTTPS trusts", "MPL 2.0"),
-        ("websocket-client", "the relay's live connection", "Apache 2.0"),
-        ("qrcode", "drawing QR codes", "BSD"),
-        ("SQLite", "the database every chat is kept in", "public domain"),
+         N_("talking to the relay"), "Apache 2.0, MIT, BSD, MIT"),
+        ("certifi", N_("the certificates HTTPS trusts"), "MPL 2.0"),
+        ("websocket-client", N_("the relay's live connection"),
+         "Apache 2.0"),
+        ("qrcode", N_("drawing QR codes"), "BSD"),
+        ("SQLite", N_("the database every chat is kept in"),
+         N_("public domain")),
     )),
-    ("On Android", (
-        ("python-for-android", "the Android build", "MIT"),
-        ("pyjnius", "Python speaking to Android", "MIT"),
+    (N_("On Android"), (
+        ("python-for-android", N_("the Android build"), "MIT"),
+        ("pyjnius", N_("Python speaking to Android"), "MIT"),
         ("SDL 2, SDL_image, SDL_mixer, SDL_ttf",
-         "the screen, touch, sound and type", "zlib"),
-        ("FreeType", "drawing the type", "FreeType License"),
-        ("libpng, libjpeg-turbo", "PNG and JPEG pictures",
+         N_("the screen, touch, sound and type"), "zlib"),
+        ("FreeType", N_("drawing the type"), "FreeType License"),
+        ("libpng, libjpeg-turbo", N_("PNG and JPEG pictures"),
          "libpng, IJG and BSD"),
-        ("OpenSSL", "the cryptography beneath", "OpenSSL and SSLeay"),
-        ("libffi, cffi, pycparser", "Python calling native code",
+        ("OpenSSL", N_("the cryptography beneath"), "OpenSSL and SSLeay"),
+        ("libffi, cffi, pycparser", N_("Python calling native code"),
          "MIT, MIT, BSD"),
-        ("Opus", "calls, clear on weak networks", "BSD"),
-        ("ZXing", "reading QR codes from photos", "Apache 2.0"),
-        ("AndroidX Core", "photos from the camera app", "Apache 2.0"),
+        ("Opus", N_("calls, clear on weak networks"), "BSD"),
+        ("ZXing", N_("reading QR codes from photos"), "Apache 2.0"),
+        ("AndroidX Core", N_("photos from the camera app"), "Apache 2.0"),
     )),
-    ("On computers, when installed", (
-        ("Opus", "calls, clear on weak networks", "BSD"),
-        ("sounddevice, PortAudio", "choosing the microphone and speaker",
-         "MIT"),
-        ("NumPy", "voice notes at 1.5× and 2×", "BSD"),
-        ("PyAV, FFmpeg", "playing voice notes recorded on a phone",
+    (N_("On computers, when installed"), (
+        ("Opus", N_("calls, clear on weak networks"), "BSD"),
+        ("sounddevice, PortAudio",
+         N_("choosing the microphone and speaker"), "MIT"),
+        ("NumPy", N_("voice notes at 1.5× and 2×"), "BSD"),
+        ("PyAV, FFmpeg", N_("playing voice notes recorded on a phone"),
          "BSD, LGPL 2.1+"),
-        ("OpenCV, pyzbar, ZBar", "reading QR codes from a picture",
+        ("OpenCV, pyzbar, ZBar", N_("reading QR codes from a picture"),
          "Apache 2.0, MIT, LGPL 2.1"),
     )),
-    ("Type", (
-        ("EB Garamond", "the text: The EB Garamond Project Authors",
+    (N_("Type"), (
+        ("EB Garamond", N_("the text: The EB Garamond Project Authors"),
          "SIL Open Font License 1.1"),
-        ("Noto Emoji", "the emoji's outlines: Google",
+        ("Noto Emoji", N_("the emoji's outlines: Google"),
          "SIL Open Font License 1.1"),
-        ("Twemoji", "the emoji in colour: Twitter, Inc and other "
-         "contributors", "CC-BY 4.0"),
-        ("Titillium Web", "the capitals: Accademia di Belle Arti di Urbino",
+        ("Twemoji", N_("the emoji in colour: Twitter, Inc and other "
+                       "contributors"), "CC-BY 4.0"),
+        ("Titillium Web",
+         N_("the capitals: Accademia di Belle Arti di Urbino"),
+         "SIL Open Font License 1.1"),
+        ("IBM Plex Mono", N_("Overclock's text: IBM Corp."),
+         "SIL Open Font License 1.1"),
+        ("Silkscreen", N_("Overclock's capitals: The Silkscreen Project "
+                          "Authors"), "SIL Open Font License 1.1"),
+        ("Open Sans", N_("Ferrite's text: The Open Sans Project Authors"),
+         "SIL Open Font License 1.1"),
+        ("Noto Sans SC and KR", N_("Chinese, Japanese and Korean: Adobe "
+                                   "and Google"), "SIL Open Font License 1.1"),
+        ("Noto Sans", N_("every other script: The Noto Project Authors"),
          "SIL Open Font License 1.1"),
     )),
 )
@@ -14560,18 +15885,19 @@ class CreditsSheet(Sheet):
     """The open-source work Ferritext is made with, and its licences."""
 
     def __init__(self) -> None:
-        super().__init__("Open source",
-                         subtitle="Ferritext is made with the work of many "
-                                  "people, freely shared. Thank you.")
+        super().__init__(tr("Open source"),
+                         subtitle=tr("Ferritext is made with the work of many "
+                                     "people, freely shared. Thank you."))
         for group, items in OPEN_SOURCE:
-            self.add(CapsLabel(group, size=10.5, color=T.accent))
+            self.add(CapsLabel(tr(group), size=10.5, color=T.accent))
             for name, what, licence in items:
                 self.add(InfoLabel(
                     f"{escape_markup(name)}[color={T.text_3.lstrip('#')}] — "
-                    f"{escape_markup(what)} · [i]{escape_markup(licence)}"
-                    f"[/i][/color]", font_size=fs(15)))
-        self.add(hint("Each project's full licence comes with it; the "
-                      "fonts' licences come with the app."))
+                    f"{escape_markup(tr(what))} · "
+                    f"[i]{escape_markup(tr(licence))}[/i][/color]",
+                    font_size=fs(15)))
+        self.add(hint(tr("Each project's full licence comes with it; the "
+                         "fonts' licences come with the app.")))
 
 
 class AboutSheet(Sheet):
@@ -14579,26 +15905,28 @@ class AboutSheet(Sheet):
     source it is made with."""
 
     def __init__(self, app: "FextApp") -> None:
-        super().__init__(APP_NAME, subtitle="Ferrite Text Messenger")
+        super().__init__(APP_NAME, subtitle=tr("Ferrite Text Messenger"))
         self.app = app
         self.add(InfoLabel(
-            "Messages, photos and voice notes, sealed on this device and "
-            "opened only on the devices they are for. The relay passes on "
-            "what it cannot read.", font_size=fs(16)))
-        transport = ("TLS" if ENDPOINT.secure else "cleartext") \
-            if ENDPOINT.resolved else "not connected yet"
+            tr("Messages, photos and voice notes, sealed on this device and "
+               "opened only on the devices they are for. The relay passes on "
+               "what it cannot read."), font_size=fs(16)))
+        transport = ("TLS" if ENDPOINT.secure else tr("cleartext")) \
+            if ENDPOINT.resolved else tr("not connected yet")
         self.add(rows_card([
-            ListRow("info", f"Version {APP_VERSION}", f"Relay {SERVER_HOST} · "
-                    f"{transport}"),
-            ListRow("link", "Source code", "github.com/ferritecoin/fapp",
+            ListRow("info", tr("Version {version}", version=APP_VERSION),
+                    tr("Relay {host} · {transport}", host=SERVER_HOST,
+                       transport=transport)),
+            ListRow("link", tr("Source code"), "github.com/ferritecoin/fapp",
                     chevron=True,
                     on_tap=lambda: self._go(lambda: app.open_link(
                         SOURCE_URL))),
-            ListRow("group", "Open source", "The work Ferritext is made "
-                    "with, and its licences", chevron=True,
+            ListRow("group", tr("Open source"), tr("The work Ferritext is "
+                                                   "made with, and its "
+                                                   "licences"), chevron=True,
                     on_tap=lambda: self._go(lambda: CreditsSheet().open())),
         ]))
-        self.add(InfoLabel("by koh-gt", color=T.text_3, italic=True,
+        self.add(InfoLabel(tr("by koh-gt"), color=T.text_3, italic=True,
                            font_size=fs(15), halign="center"))
 
     def _go(self, then: Callable) -> None:
@@ -14865,7 +16193,7 @@ class CallOverlay(ModalView):
                          padding=[dp(24), dp(34), dp(24), dp(40)],
                          spacing=dp(6))
         paint_round(root, T.bg, radius=0)
-        root.add_widget(CapsLabel("Voice call · sealed end to end",
+        root.add_widget(CapsLabel(tr("Voice call · sealed end to end"),
                                   size=10.5, color=T.text_3,
                                   halign="center"))
         root.add_widget(Widget(size_hint_y=.22))
@@ -14888,14 +16216,15 @@ class CallOverlay(ModalView):
                                   spacing=dp(10))
         root.add_widget(self.controls)
         self.add_widget(root)
-        self.mute = CallButton("mic", "Mute", lambda: app.toggle_call_mute())
-        self.speaker = CallButton("speaker", "Speaker",
+        self.mute = CallButton("mic", tr("Mute"),
+                               lambda: app.toggle_call_mute())
+        self.speaker = CallButton("speaker", tr("Speaker"),
                                   lambda: app.choose_call_route())
-        self.end = CallButton("phone_end", "End", lambda: app.end_call(),
+        self.end = CallButton("phone_end", tr("End"), lambda: app.end_call(),
                               kind="end")
-        self.decline = CallButton("phone_end", "Decline",
+        self.decline = CallButton("phone_end", tr("Decline"),
                                   lambda: app.decline_call(), kind="end")
-        self.accept = CallButton("phone", "Accept",
+        self.accept = CallButton("phone", tr("Answer"),
                                  lambda: app.answer_call(), kind="accept")
         self.refresh()
 
@@ -14919,29 +16248,29 @@ class CallOverlay(ModalView):
     def refresh(self) -> None:
         call = self.call
         if call.ended:
-            self.status.text = call.summary or "Call ended"
+            self.status.text = call.summary or tr("Call ended")
             self.detail.text = ""
             self._arrange("ended")
             return
         self._arrange("ringing" if call.state == "incoming" else "call")
         self.mute.set_on(call.muted, "mic_off" if call.muted else "mic",
-                         "Unmute" if call.muted else "Mute")
+                         tr("Unmute" if call.muted else "Mute"))
         route = getattr(call, "route", "") or (
             "speaker" if call.speaker else "earpiece")
         if route == "bluetooth":
-            self.speaker.set_on(True, "bluetooth", "Bluetooth")
+            self.speaker.set_on(True, "bluetooth", tr("Bluetooth"))
         elif route == "wired":
-            self.speaker.set_on(False, "speaker", "Headset")
+            self.speaker.set_on(False, "speaker", tr("Headset"))
         else:
-            self.speaker.set_on(call.speaker, "speaker", "Speaker")
+            self.speaker.set_on(call.speaker, "speaker", tr("Speaker"))
         if call.state == "active":
-            self.status.text = "Reconnecting…" if call.quiet else \
+            self.status.text = tr("Reconnecting…") if call.quiet else \
                 call_clock(call.duration())
         else:
-            self.status.text = {
-                "calling": "Calling…", "ringing": "Ringing…",
-                "incoming": "Incoming voice call",
-                "connecting": "Connecting…"}.get(call.state, "")
+            self.status.text = tr({
+                "calling": N_("Calling…"), "ringing": N_("Ringing…"),
+                "incoming": N_("Incoming voice call"),
+                "connecting": N_("Connecting…")}.get(call.state, ""))
         engine = call.engine
         self.detail.text = call_path_label(
             call.path, engine.rtt_ms if engine else None) \
@@ -14978,7 +16307,7 @@ class CallPill(ButtonBehavior, Widget):
             Color(*C(T.accent_press if self.state == "down" else T.accent))
             SmoothRoundedRectangle(pos=(self.x, y),
                                    size=(self.width, self.PILL),
-                                   radius=[self.PILL / 2])
+                                   radius=[corner(self.PILL / 2)])
         self.label.pos, self.label.size = self.pos, self.size
         self.label.text_size = self.size
 
@@ -15046,7 +16375,7 @@ class AppBar(BoxLayout):
         kw.setdefault("spacing", dp(4))
         super().__init__(**kw)
         if on_back is not None:
-            self.add_widget(IconButton("back", label="Back",
+            self.add_widget(IconButton("back", label=tr("Back"),
                                        pos_hint={"center_y": .5},
                                        on_release=lambda _w: on_back()))
         else:
@@ -15121,9 +16450,9 @@ class ConversationRow(ButtonBehavior, BoxLayout):
         self.peer, self.kind, self.conv = peer, kind, conv
         self._screen, self._press, self._held = screen, None, False
         if kind == "self":
-            name = "Saved messages"
+            name = tr("Saved messages")
         elif kind == "group":
-            name = conv.get("group_name") or "Group"
+            name = conv.get("group_name") or tr("Group")
         else:
             name = conv.get("username") or short_addr(peer, 14)
         unread = int(conv.get("unread") or 0)
@@ -15169,8 +16498,9 @@ class ConversationRow(ButtonBehavior, BoxLayout):
         preview, italic = self._preview(conv, kind, author_name)
         draft = " ".join(str(conv.get("draft") or "").split())
         if draft:
-            mark = Label(text="Draft:", font_size=fs(15.5), color=C(T.alert),
-                         size_hint_x=None, halign="left", valign="middle")
+            mark = Label(text=tr("Draft:"), font_size=fs(15.5),
+                         color=C(T.alert), size_hint_x=None, halign="left",
+                         valign="middle")
             mark.texture_update()
             mark.width = mark.texture_size[0] + dp(2)
             bottom.add_widget(mark)
@@ -15205,19 +16535,21 @@ class ConversationRow(ButtonBehavior, BoxLayout):
         body = conv.get("preview")
         if body is None:
             if kind == "self":
-                return ("Jot things down — they stay on this device", True)
+                return tr("Jot things down — they stay on this device"), True
             if kind == "group":
-                return ("A new group. Say something to everyone", True)
-            return ("Say hello — sealed end to end", True)
-        body = " ".join(str(body).split())
+                return tr("A new group. Say something to everyone"), True
+            return tr("Say hello — sealed end to end"), True
+        body = shown_body(conv.get("last_kind") or "text",
+                          " ".join(str(body).split()))
         if conv.get("last_kind") == "event":
             return body, True
         if kind == "group":
             if conv.get("last_direction") == "out":
-                return f"You: {body}", False
+                return tr("You: {body}", body=body), False
             who = author_name(conv.get("last_author")) if author_name and \
                 conv.get("last_author") else ""
-            return (f"{who}: {body}" if who else body), False
+            return (tr("{who}: {body}", who=who, body=body) if who
+                    else body), False
         return body, False
 
     def _sync(self, *_a):
@@ -15285,7 +16617,8 @@ class ArchiveRow(ButtonBehavior, BoxLayout):
     (v14), the way into message requests."""
 
     def __init__(self, count: int, unread: int, on_open: Callable,
-                 icon: str = "archive", title: str = "Archived chats", **kw):
+                 icon: str = "archive", title: str = "", **kw):
+        title = title or tr("Archived chats")
         kw.setdefault("size_hint_y", None)
         kw.setdefault("height", max(dp(60), line_height(17) + dp(26)))
         kw.setdefault("padding", [dp(18), dp(6), dp(18), dp(6)])
@@ -15365,7 +16698,7 @@ class ChatsScreen(SwipeGestures, Screen):
                                                       + line_height(13.5)
                                                       + dp(22)),
                          padding=[dp(4), dp(4), dp(6), dp(4)], spacing=dp(2))
-        head.add_widget(IconButton("menu", label="Menu",
+        head.add_widget(IconButton("menu", label=tr("Menu"),
                                    pos_hint={"center_y": .5},
                                    on_release=lambda _w:
                                    self.app.open_drawer()))
@@ -15377,7 +16710,7 @@ class ChatsScreen(SwipeGestures, Screen):
         self.me_label = single_line("", fs(13.5), T.text_3, italic=True)
         titles.add_widget(self.me_label)
         head.add_widget(titles)
-        head.add_widget(IconButton("search", label="Search",
+        head.add_widget(IconButton("search", label=tr("Search"),
                                    pos_hint={"center_y": .5},
                                    on_release=lambda _w:
                                    self.app.open_search()))
@@ -15393,15 +16726,15 @@ class ChatsScreen(SwipeGestures, Screen):
                                      padding=[dp(4), dp(4), dp(6), dp(4)],
                                      spacing=dp(2))
         self.search_head.add_widget(IconButton(
-            "back", label="Close search", pos_hint={"center_y": .5},
+            "back", label=tr("Close search"), pos_hint={"center_y": .5},
             on_release=lambda _w: self.exit_search()))
-        self.search_field = Field("Search names and messages",
+        self.search_field = Field(tr("Search names and messages"),
                                   pos_hint={"center_y": .5})
         self.search_field.input.font_size = fs(18)
         self.search_field.input.bind(text=lambda _w, v: self._search_soon())
         self.search_head.add_widget(self.search_field)
         self.search_clear = IconButton(
-            "close", label="Clear search", pos_hint={"center_y": .5},
+            "close", label=tr("Clear search"), pos_hint={"center_y": .5},
             on_release=lambda _w: setattr(self.search_field, "text", ""))
         self.search_head.add_widget(self.search_clear)
         # ---- hold a chat: the head becomes what can be done with it --------
@@ -15412,22 +16745,22 @@ class ChatsScreen(SwipeGestures, Screen):
                                      padding=[dp(4), dp(4), dp(4), dp(4)],
                                      spacing=dp(2))
         self.select_head.add_widget(IconButton(
-            "close", label="Cancel selection", pos_hint={"center_y": .5},
+            "close", label=tr("Cancel selection"), pos_hint={"center_y": .5},
             on_release=lambda _w: self.clear_selection()))
         self.select_count = single_line("1", fs(21), T.text,
                                         padding=[dp(6), 0])
         self.select_head.add_widget(self.select_count)
-        self.act_mute = IconButton("bell_off", label="Mute",
+        self.act_mute = IconButton("bell_off", label=tr("Mute"),
                                    pos_hint={"center_y": .5},
                                    on_release=lambda _w: self._act_mute())
-        self.act_archive = IconButton("archive", label="Archive",
+        self.act_archive = IconButton("archive", label=tr("Archive"),
                                       pos_hint={"center_y": .5},
                                       on_release=lambda _w:
                                       self._act_archive())
-        self.act_delete = IconButton("delete", label="Delete",
+        self.act_delete = IconButton("delete", label=tr("Delete"),
                                      pos_hint={"center_y": .5},
                                      on_release=lambda _w: self._act_delete())
-        self.act_more = IconButton("more", label="More",
+        self.act_more = IconButton("more", label=tr("More"),
                                    pos_hint={"center_y": .5},
                                    on_release=lambda _w: self._act_more())
         for button in (self.act_mute, self.act_archive, self.act_delete,
@@ -15437,32 +16770,33 @@ class ChatsScreen(SwipeGestures, Screen):
                                       padding=[dp(4), dp(4), dp(6), dp(4)],
                                       spacing=dp(2))
         self.archive_head.add_widget(IconButton(
-            "back", label="Back to chats", pos_hint={"center_y": .5},
+            "back", label=tr("Back to chats"), pos_hint={"center_y": .5},
             on_release=lambda _w: self.show_archive(False)))
-        self.archive_head.add_widget(single_line("Archived chats", fs(22),
+        self.archive_head.add_widget(single_line(tr("Archived chats"), fs(22),
                                                  T.text, padding=[dp(6), 0]))
         self.requests_head = BoxLayout(size_hint_y=None, height=head.height,
                                        padding=[dp(4), dp(4), dp(6), dp(4)],
                                        spacing=dp(2))
         self.requests_head.add_widget(IconButton(
-            "back", label="Back to chats", pos_hint={"center_y": .5},
+            "back", label=tr("Back to chats"), pos_hint={"center_y": .5},
             on_release=lambda _w: self.show_view("chats")))
         self.requests_head.add_widget(single_line(
-            "Message requests", fs(22), T.text, padding=[dp(6), 0]))
+            tr("Message requests"), fs(22), T.text, padding=[dp(6), 0]))
 
         # ---- the status line: tap it to reconnect at once --------------------
         ribbon = TappableBox(on_tap=lambda: self.app.retry_now(),
                              orientation="horizontal", size_hint_y=None,
                              height=max(dp(40), line_height(14) + dp(12)),
                              padding=[dp(20), 0, dp(20), 0])
-        self.status_label = Label(text="Starting…", font_size=fs(14),
+        self.status_label = Label(text=tr("Starting…"), font_size=fs(14),
                                   italic=True, color=C(T.text_3),
                                   halign="left", valign="middle",
                                   shorten=True, shorten_from="right")
         self.status_label.bind(size=lambda w, v: setattr(w, "text_size", v))
         ribbon.add_widget(self.status_label)
-        self.retry_hint = CapsLabel("Tap to retry", size=10, color=T.accent,
-                                    size_hint=(None, 1), halign="right")
+        self.retry_hint = CapsLabel(tr("Tap to retry"), size=10,
+                                    color=T.accent, size_hint=(None, 1),
+                                    halign="right")
         self.retry_hint.width = self.retry_hint.natural_width + dp(4)
         self.retry_hint.opacity = 0
         ribbon.add_widget(self.retry_hint)
@@ -15477,7 +16811,7 @@ class ChatsScreen(SwipeGestures, Screen):
         column.add_widget(self.scroll)
 
         # ---- the compose button ----------------------------------------------
-        self.fab = FabButton("edit", label="New conversation",
+        self.fab = FabButton("edit", label=tr("New conversation"),
                              size=(dp(60), dp(60)),
                              on_release=lambda _w: self.app.open_compose())
         holder = AnchorLayout(anchor_x="right", anchor_y="bottom",
@@ -15534,8 +16868,8 @@ class ChatsScreen(SwipeGestures, Screen):
         q = (query or "").strip()
         if not q:
             self.list.add_widget(InfoLabel(
-                "Names, usernames, addresses and the words of your "
-                "messages, on this device only.", color=T.text_3,
+                tr("Names, usernames, addresses and the words of your "
+                   "messages, on this device only."), color=T.text_3,
                 italic=True, font_size=fs(15.5), halign="center",
                 padding=[dp(32), dp(28)]))
             return
@@ -15549,30 +16883,32 @@ class ChatsScreen(SwipeGestures, Screen):
                 chats.append((conv["peer"], name, kind))
         hits = app.store.search_messages(q, limit=80)
         if chats:
-            self.list.add_widget(SectionHead("Chats"))
+            self.list.add_widget(SectionHead(tr("Chats")))
             for peer, name, kind in chats[:12]:
                 self.list.add_widget(PersonRow(
                     peer, name, short_addr(peer, 14) if kind == "dm" else
-                    ("Group" if kind == "group" else "Saved messages"),
+                    tr("Group" if kind == "group" else "Saved messages"),
                     kind=kind, on_tap=lambda p=peer: self._open(p)))
         if hits:
-            self.list.add_widget(SectionHead(
-                f"Messages · {len(hits)}{'+' if len(hits) >= 80 else ''}"))
+            self.list.add_widget(SectionHead(tr(
+                "Messages · {n}", n=f"{len(hits)}+" if len(hits) >= 80
+                else len(hits))))
             author = app.conversation_screen.author_name
             for hit in hits:
                 title, kind = conversation_title(app, hit["peer"])
                 body = hit["body"] or ""
                 if kind == "group" and hit.get("author"):
-                    body = f"{author(hit['author'])}: {body}"
+                    body = tr("{who}: {body}", who=author(hit["author"]),
+                              body=body)
                 elif hit["direction"] == "out" and kind != "self":
-                    body = f"You: {body}"
+                    body = tr("You: {body}", body=body)
                 self.list.add_widget(SearchHit(
                     title, hit["peer"], kind, pretty_time(hit["created_at"]),
                     search_snippet(body, q), on_tap=lambda h=hit:
                     self._open(h["peer"], h["id"])))
         if not chats and not hits:
             self.list.add_widget(InfoLabel(
-                f"Nothing here matches “{q}”.", color=T.text_3,
+                tr("Nothing here matches “{q}”.", q=q), color=T.text_3,
                 italic=True, font_size=fs(15.5), halign="center",
                 padding=[dp(32), dp(28)]))
 
@@ -15586,7 +16922,7 @@ class ChatsScreen(SwipeGestures, Screen):
     def refresh_header(self) -> None:
         keys = self.app.keys
         if not keys.has_identity:
-            self.me_label.text = "end-to-end encrypted correspondence"
+            self.me_label.text = tr("end-to-end encrypted correspondence")
             return
         self.me_label.text = (f"@{keys.username}" if keys.username
                               else "unregistered") + \
@@ -15643,7 +16979,7 @@ class ChatsScreen(SwipeGestures, Screen):
                     len(requests), sum(int(c.get("unread") or 0)
                                        for c in requests),
                     lambda: self.show_view("requests"), icon="person_add",
-                    title="Message requests"))
+                    title=tr("Message requests")))
             if archived:
                 self.list.add_widget(ArchiveRow(
                     len(archived), sum(int(c.get("unread") or 0)
@@ -15740,12 +17076,13 @@ class ChatsScreen(SwipeGestures, Screen):
         self.select_count.text = str(len(convs))
         mute = self.mute_choice(convs)
         self.act_mute.set_icon("bell_off" if mute else "bell")
-        self.act_mute.label = ("Mute" if mute else "Unmute") + \
-            (" all" if len(convs) > 1 else "")
+        many = len(convs) > 1
+        self.act_mute.label = tr(("Mute all" if many else "Mute") if mute
+                                 else ("Unmute all" if many else "Unmute"))
         self.act_archive.set_icon("unarchive" if self.showing_archive
                                   else "archive")
-        self.act_archive.label = "Unarchive" if self.showing_archive \
-            else "Archive"
+        self.act_archive.label = tr("Unarchive" if self.showing_archive
+                                    else "Archive")
 
     @staticmethod
     def is_muted(conv: dict) -> bool:
@@ -15788,20 +17125,24 @@ class ChatsScreen(SwipeGestures, Screen):
         pin = not all(c.get("pinned") for c in convs)
         unread = any(int(c.get("unread") or 0) or c.get("marked_unread")
                      for c in convs)
+        many = len(convs) > 1
         items = [("unpin" if not pin else "pin",
-                  ("Pin" if pin else "Unpin") +
-                  (" all" if len(convs) > 1 else ""),
+                  tr(("Pin all" if many else "Pin") if pin
+                     else ("Unpin all" if many else "Unpin")),
                   lambda: app.set_chats_pinned(peers, pin)),
                  ("read" if unread else "unread",
-                  "Mark as read" if unread else "Mark as unread",
+                  tr("Mark as read" if unread else "Mark as unread"),
                   lambda: (app.mark_chats_read if unread
                            else app.mark_chats_unread)(peers))]
         direct = [c for c in convs if c.get("kind") == "dm"]
         if len(direct) == len(convs):
             block = not all(c.get("blocked") for c in convs)
-            items.append(("block", ("Block" if block else "Unblock") +
-                          (f" {len(convs)} contacts" if len(convs) > 1
-                           else ""),
+            if many:
+                label = tr("Block {n} contacts" if block else
+                           "Unblock {n} contacts", n=len(convs))
+            else:
+                label = tr("Block" if block else "Unblock")
+            items.append(("block", label,
                           lambda: app.set_blocked(peers, block)))
 
         def run(action):
@@ -15816,15 +17157,15 @@ class ChatsScreen(SwipeGestures, Screen):
         box.bind(minimum_height=box.setter("height"))
         box.add_widget(InfoLabel(FLEURON, color=T.accent, font_size=fs(34),
                                  halign="center"))
-        box.add_widget(InfoLabel("No correspondence yet", font_size=fs(22),
+        box.add_widget(InfoLabel(tr("No correspondence yet"), font_size=fs(22),
                                  halign="center"))
         box.add_widget(InfoLabel(
-            "Add someone by their username or Fec… address, or gather "
-            "several into a group. Every word is sealed on this device "
-            "before it leaves, and only they can open it.",
+            tr("Add someone by their username or Fec… address, or gather "
+               "several into a group. Every word is sealed on this device "
+               "before it leaves, and only they can open it."),
             color=T.text_3, font_size=fs(15.5), halign="center"))
         holder = AnchorLayout(size_hint_y=None, height=TOUCH + dp(12))
-        button = Btn("Add a contact", size_hint_x=None,
+        button = Btn(tr("Add a contact"), size_hint_x=None,
                      on_release=lambda _w: self.app.open_add_contact())
         button.width = max(dp(200), button.natural_width())
         holder.add_widget(button)
@@ -15897,24 +17238,24 @@ class ComposeSheet(Sheet):
     or one of the people you already know."""
 
     def __init__(self, app: "FextApp") -> None:
-        super().__init__("New conversation")
+        super().__init__(tr("New conversation"))
         self.app = app
         self.card.padding = [0, dp(8), 0, dp(16)]
         self.title_label.padding = [dp(22), 0]
         self.add(rows_card([
-            ListRow("person_add", "Add a contact",
-                    "By username or Fec… address",
+            ListRow("person_add", tr("Add a contact"),
+                    tr("By username or Fec… address"),
                     on_tap=lambda: self._then(app.open_add_contact)),
-            ListRow("group", "New group",
-                    f"You and up to {MAX_GROUP_MEMBERS - 1} others",
+            ListRow("group", tr("New group"),
+                    tr("You and up to {n} others", n=MAX_GROUP_MEMBERS - 1),
                     on_tap=lambda: self._then(app.open_new_group)),
-            ListRow("bookmark", "Saved messages", "Kept on this device only",
-                    on_tap=lambda: self._then(
+            ListRow("bookmark", tr("Saved messages"),
+                    tr("Kept on this device only"), on_tap=lambda: self._then(
                         lambda: app.open_conversation(app.keys.address))),
         ]))
         contacts = app.store.contacts() if app.store else []
         if contacts:
-            self.add(SectionHead("Contacts"))
+            self.add(SectionHead(tr("Contacts")))
             self.add(rows_card([
                 PersonRow(c["address"], c.get("username") or
                           short_addr(c["address"], 14),
@@ -16010,7 +17351,62 @@ class InkTextInput(TextInput):
         self.foreground_color = (1, 1, 1, 1)
         self.hint_text_color = (1, 1, 1, 1)
         self.disabled_foreground_color = (1, 1, 1, .5)
-        self.bind(ink=self._reink, hint_ink=self._reink)
+        self.bind(ink=self._reink, hint_ink=self._reink, text=self._set_face)
+        self._set_face()
+
+    def _set_face(self, *_a) -> None:
+        """A field is set wholly in the face its text needs, so that it is
+        measured as it is drawn, and lines up on the right when its text
+        begins right to left (v15.1)."""
+        face = script_face(self.text) or "Roboto"
+        if self.font_name != face:
+            self.font_name = face
+        direction = "rtl" if starts_rtl(self.text) else None
+        if self.base_direction != direction:
+            self.base_direction = direction
+
+    # Each row is drawn in display order (display_text), so where a row
+    # has right-to-left text the caret is placed, and a tap read, by where
+    # its characters are shown rather than by the order they are stored.
+    def _carets(self, row: str) -> list:
+        """The caret's x before each position in `row` (and after its end),
+        as the row is shown."""
+        base, levels = bidi_levels(row)
+        order = display_order(row, levels, base)
+        label = self._label_cached
+        _shape_as(label, shaping_script(row))
+        try:
+            edges = [label.get_extents("".join(row[i] for i in order[:k]))[0]
+                     for k in range(len(row) + 1)]
+        finally:
+            _shape_as(label, "Latn")
+        shown_at = {i: k for k, i in enumerate(order)}
+        # A character's leading edge: its right one if it runs right to left.
+        carets = [edges[shown_at[i] + levels[i] % 2] for i in range(len(row))]
+        last = len(row) - 1
+        return carets + [edges[shown_at[last] + 1 - levels[last] % 2]]
+
+    def cursor_offset(self):
+        row = self._lines[self.cursor_row] if self.cursor_row < len(
+            self._lines) else ""
+        if not RTL_TEXT.search(row):
+            return super().cursor_offset()
+        return self._carets(row)[min(self.cursor_col, len(row))]
+
+    def get_cursor_from_xy(self, x, y):
+        col, row = super().get_cursor_from_xy(x, y)
+        line = self._lines[row] if row < len(self._lines) else ""
+        if not RTL_TEXT.search(line):
+            return col, row
+        left, _top, right, _bottom = self.padding
+        shift = 0                           # Kivy's for a row on the right
+        if self.halign == "right" or self.halign == "auto" and \
+                self.base_direction == "rtl":
+            shift = max(0, int(self.width - left - right -
+                               self._get_row_width(row)))
+        at = x - self.x + self.scroll_x - left - shift
+        carets = self._carets(line)
+        return min(range(len(carets)), key=lambda i: abs(carets[i] - at)), row
 
     def _reink(self, *_a) -> None:
         self._line_options = None
@@ -16191,6 +17587,19 @@ def texture_from_b64(data: str):
     return tex
 
 
+#: What a quote of a photo or voice message without words says. Sent in
+#: English, as before 15.1, and shown in the reader's language.
+QUOTE_NAMES = {"image": N_("Photo"), "voice": N_("Voice message")}
+
+
+def quote_text(reply: dict) -> str:
+    """The words a quoted message shows: its own, or its kind's name."""
+    kind, snip = reply.get("kind"), reply.get("snip") or ""
+    if not snip or snip == QUOTE_NAMES.get(kind):
+        return tr(QUOTE_NAMES.get(kind, N_("Message")))
+    return snip
+
+
 class QuoteBlock(ButtonBehavior, BoxLayout):
     """The message a reply answers: a gold rule, who said it (capitals),
     and a line of what they said (italic). Tap it to go there."""
@@ -16203,7 +17612,7 @@ class QuoteBlock(ButtonBehavior, BoxLayout):
         super().__init__(**kw)
         with self.canvas.before:
             Color(*C(T.quote_own if outgoing else T.quote_peer))
-            self._bg = SmoothRoundedRectangle(radius=[dp(4)])
+            self._bg = SmoothRoundedRectangle(radius=[corner(dp(4))])
             Color(*C(T.accent))
             self._bar = Rectangle()
         self.bind(pos=self._sync, size=self._sync)
@@ -16269,7 +17678,7 @@ class LinkCard(ButtonBehavior, BoxLayout):
         self.preview = preview
         with self.canvas.before:
             Color(*C(T.quote_own if outgoing else T.quote_peer))
-            self._bg = SmoothRoundedRectangle(radius=[dp(4)])
+            self._bg = SmoothRoundedRectangle(radius=[corner(dp(4))])
             Color(*C(T.accent))
             self._bar = Rectangle()
         self.bind(pos=self._sync, size=self._sync)
@@ -16338,7 +17747,7 @@ class MediaStatus(Label):
                          color=C("#FFFFF8"), size_hint=(None, None), **kw)
         with self.canvas.before:
             self._col = Color(0, 0, 0, .5)
-            self._bg = RoundedRectangle(radius=[dp(11)])
+            self._bg = RoundedRectangle(radius=[corner(dp(11))])
         self.bind(pos=self._sync, size=self._sync,
                   texture_size=lambda w, v: setattr(
                       w, "size", (v[0] + dp(18), max(dp(24), v[1] + dp(6)))))
@@ -16358,7 +17767,7 @@ class ImageContent(ButtonBehavior, FloatLayout):
         self.msg, self.media, self.screen = msg, media, screen
         with self.canvas.before:
             Color(*C(T.surface_hi))
-            self._ground = SmoothRoundedRectangle(radius=[dp(6)])
+            self._ground = SmoothRoundedRectangle(radius=[corner(dp(6))])
         self.bind(pos=self._sync, size=self._sync)
         self.picture = KivyImage(allow_stretch=True, keep_ratio=True,
                                  size_hint=(1, 1),
@@ -16407,17 +17816,17 @@ class ImageContent(ButtonBehavior, FloatLayout):
                 not downloads_by_itself(self.screen.app.store, msg):
             state = "tap"                     # v14: it waits for a tap
         self.chip.text = {
-            "uploading": "Sending…",
-            "waiting": "Waiting to send",
-            "tap": "Tap to download · " + size_text(
-                int(self.media.get("size") or 0)),
-            "pending": "Downloading…",
-            "downloading": "Downloading…",
-            "expired": "Expired · tap to ask again",
-            "requested": "Asked for it again",
-            "failed": ("Not sent · tap to retry" if outgoing
-                       else "Not downloaded · tap to retry"),
-            "unreadable": "This photo cannot be shown",
+            "uploading": tr("Sending…"),
+            "waiting": tr("Waiting to send"),
+            "tap": tr("Tap to download · {size}", size=size_text(
+                int(self.media.get("size") or 0))),
+            "pending": tr("Downloading…"),
+            "downloading": tr("Downloading…"),
+            "expired": tr("Expired · tap to ask again"),
+            "requested": tr("Asked for it again"),
+            "failed": tr("Not sent · tap to retry" if outgoing
+                         else "Not downloaded · tap to retry"),
+            "unreadable": tr("This photo cannot be shown"),
         }.get(state, "")
 
 
@@ -16490,7 +17899,8 @@ class VoiceContent(BoxLayout):
         super().__init__(**kw)
         self.msg, self.media, self.screen = msg, media, screen
         self.button = IconButton("play", tint=T.on_accent, bg=T.accent,
-                                 icon_size=dp(18), label="Play voice message",
+                                 icon_size=dp(18),
+                                 label=tr("Play voice message"),
                                  pos_hint={"center_y": .5},
                                  on_release=lambda _w:
                                  screen.on_media_tap(self.msg))
@@ -16710,7 +18120,7 @@ class ReactionChip(ButtonBehavior, Widget):
             PushMatrix()
             self._scale = Scale(1, 1, 1)
             self._ground_col = Color(*C(self.fill))
-            self._ground = SmoothRoundedRectangle(radius=[dp(15)])
+            self._ground = SmoothRoundedRectangle(radius=[corner(dp(15))])
         with self.canvas.after:
             PopMatrix()
         for face in reversed(self.faces):       # the first on top
@@ -16731,7 +18141,7 @@ class ReactionChip(ButtonBehavior, Widget):
         self._scale.origin = (cx, cy)
         self._scale.x = self._scale.y = self.pop
         self._ground.pos, self._ground.size = self.pos, self.size
-        self._ground.radius = [self.height / 2]
+        self._ground.radius = [corner(self.height / 2)]
         if not self.faces:
             self.label.center = (cx, cy + dp(.5))
             return
@@ -16828,11 +18238,10 @@ class ReactorsSheet(Sheet):
     messages does."""
 
     def __init__(self, screen, msg: dict, only: str = "", **kw):
-        words = message_text(msg) or {"image": "Photo", "voice":
-                                      "Voice message"}.get(msg.get("kind"),
-                                                           "")
+        words = message_text(msg) or tr(QUOTE_NAMES.get(msg.get("kind"),
+                                                        ""))
         quote = f"\u201c{single_line_text(words, 48)}\u201d" if words else ""
-        super().__init__("Reactions", subtitle=quote, **kw)
+        super().__init__(tr("Reactions"), subtitle=quote, **kw)
         self.screen, self.msg, self.only = screen, msg, only
         self.card.padding = [0, dp(8), 0, dp(14)]
         self.title_label.padding = [dp(22), 0]
@@ -16869,7 +18278,7 @@ class ReactorsSheet(Sheet):
         if len(counts) > 1:
             card = T.surface if T.dark else T.bg
             self.kinds_row.add_widget(ReactionChip(
-                "All", len(reactions), not self.only,
+                tr("All"), len(reactions), not self.only,
                 lambda _e: self._choose(""), under=card))
             for emoji, count in counts.items():
                 self.kinds_row.add_widget(ReactionChip(
@@ -16891,7 +18300,8 @@ class ReactorsSheet(Sheet):
             glyph = Label(text=emoji, font_size=fs(24), color=C(T.text),
                           size_hint=(None, None), size=(dp(40), dp(40)))
             row = PersonRow(
-                who, name, "Tap to take it back" if mine else pretty_day(at),
+                who, name, tr("Tap to take it back") if mine else
+                pretty_day(at),
                 on_tap=(lambda e=emoji: self._take_back(e)) if mine else
                 (lambda a=who: self._person(a)), trailing=glyph,
                 initial_from=app.keys.username if mine else name)
@@ -16976,7 +18386,8 @@ class MessageBubble(BoxLayout):
 
         self.fwd = None
         if ext.get("fwd"):
-            self.fwd = Label(text="Forwarded", italic=True, font_size=fs(14),
+            self.fwd = Label(text=tr("Forwarded"), italic=True,
+                             font_size=fs(14),
                              color=C(T.text_3), halign="left",
                              size_hint=(None, None), height=line_height(14))
             self.fwd.bind(size=lambda w, v: setattr(w, "text_size", v))
@@ -16986,10 +18397,7 @@ class MessageBubble(BoxLayout):
         reply = ext.get("reply")
         if isinstance(reply, dict):
             who = screen.author_name(reply.get("from"), outgoing)
-            snippet = reply.get("snip") or {"image": "Photo",
-                                            "voice": "Voice message"}.get(
-                reply.get("kind"), "Message")
-            self.quote = QuoteBlock(who, snippet, outgoing,
+            self.quote = QuoteBlock(who, quote_text(reply), outgoing,
                                     on_tap=lambda c=reply.get("cid"):
                                     screen.jump_to_cid(c))
             self.add_widget(self.quote)
@@ -17074,7 +18482,7 @@ class MessageBubble(BoxLayout):
 
     def _sync_ground(self, *_a) -> None:
         cap = max(0.0, min(self.width, self.height) / 2.0)
-        radii = [min(r, cap) for r in self._radii()]
+        radii = [min(corner(r), cap) for r in self._radii()]
         if self._ground is not None:
             self._ground.pos, self._ground.size = self.pos, self.size
             self._ground.radius = radii
@@ -17162,12 +18570,12 @@ class MessageBubble(BoxLayout):
         outbox gave up on after a day."""
         stamp = pretty_time(msg["created_at"])
         if msg["direction"] == "in" and not msg["read"]:
-            return "[i][color=%s]tap to mark read[/color][/i]   %s" % (
-                T.accent.lstrip("#"), stamp)
+            return "[i][color=%s]%s[/color][/i]   %s" % (
+                T.accent.lstrip("#"), tr("tap to mark read"), stamp)
         if self.screen.kind != "self" and waits_for_tap(msg) and \
                 not message_ext(msg).get("media"):
-            return "[color=%s]Not sent · tap to try again[/color]   %s" % (
-                T.alert.lstrip("#"), stamp)
+            return "[color=%s]%s[/color]   %s" % (
+                T.alert.lstrip("#"), tr("Not sent · tap to try again"), stamp)
         return stamp
 
     @staticmethod
@@ -17266,13 +18674,17 @@ class MessageBubble(BoxLayout):
         if self.card is not None:
             widest = max(widest, self.card.natural_width(max_w))
         if self.fwd is not None:
-            widest = max(widest, measure_text("Forwarded", fs(14), dp(300),
-                                              italic=True)[0])
+            widest = max(widest, measure_text(tr("Forwarded"), fs(14),
+                                              dp(300), italic=True)[0])
         rw, rh = self.reactions.layout_for(max_w)
         self._react_row.height = rh
         widest = max(widest, rw)
         self.meta.texture_update()
-        self.meta.size = (self.meta.texture_size[0], line_height(12.5))
+        # A face with a taller line than the serif's (Chinese in the CJK
+        # face, say) gets the room it needs (15.1).
+        meta_h = max(line_height(12.5), self.meta.texture_size[1])
+        self.meta.size = (self.meta.texture_size[0], meta_h)
+        self.meta_box.height = self.meta_row.height = meta_h
         meta_w = self.meta.width + self.ticks.width + self.star.width
         meta_w += dp(5) * (1 + (1 if self.ticks.width else 0))
         meta_w += self.meta_box.padding[0] + self.meta_box.padding[2]
@@ -17291,7 +18703,7 @@ class MessageBubble(BoxLayout):
         if self._react_row.parent is not None:
             parts.append(rh)
         if meta_shown:
-            parts.append(line_height(12.5))         # the meta row
+            parts.append(meta_h)                    # the meta row
         pad_l, pad_t, pad_r, pad_b = self.padding
         self.width = widest + pad_l + pad_r
         self.height = (sum(parts) + self.spacing * (len(self.children) - 1)
@@ -17553,11 +18965,12 @@ class DayFloat(Widget):
         r = self.height / 2
         with self.canvas.before:
             Color(*C(T.surface_hi))
-            SmoothRoundedRectangle(pos=self.pos, size=self.size, radius=[r])
+            SmoothRoundedRectangle(pos=self.pos, size=self.size,
+                                   radius=[corner(r)])
             Color(*C(T.rule_strong))
             SmoothLine(rounded_rectangle=(self.x + .5, self.y + .5,
                                           self.width - 1, self.height - 1,
-                                          r - .5), width=1.0)
+                                          corner(r) - .5), width=1.0)
         self.caps.size = (self.caps.natural_width + dp(2), self.height)
         self.caps.center = self.center
 
@@ -17600,8 +19013,8 @@ class NewMessagesLine(BoxLayout):
         kw.setdefault("spacing", dp(12))
         super().__init__(**kw)
         self.add_widget(Rule(color=T.accent, pos_hint={"center_y": .5}))
-        text = f"{count} new message{'s' if count != 1 else ''}" \
-            if count else "New messages"
+        text = trn("{n} new message", "{n} new messages", count) \
+            if count else tr("New messages")
         caps = CapsLabel(text, size=10.5, color=T.accent, tracking=0.18,
                          halign="center", size_hint=(None, None),
                          pos_hint={"center_y": .5})
@@ -17668,19 +19081,19 @@ class JumpToBottomButton(Concealable, ButtonBehavior, Widget):
 
 
 EMOJI_SETS = (
-    ("Faces",
+    (N_("Faces"),
      "😀😃😄😁😆😅🤣😂🙂🙃😉😊😇🥰😍🤩😘😗😚😙😋😛😜🤪"
      "😝🤑🤗🤭🤫🤔🤐🤨😐😑😶😏😒🙄😬😌😔😪🤤😴😷🤒🤕🤢"
      "🤮🥵🥶🥴😵🤯🤠🥳😎🤓🧐😕😟🙁😮😯😲😳🥺😦😧😨😰😥"
      "😢😭😱😖😣😞😓😩😫🥱😤😡😠🤬😈👿💀💩🤡👻👽🤖"),
-    ("People",
+    (N_("People"),
      "👋🤚🖐✋🖖👌🤌🤏✌🤞🤟🤘🤙👈👉👆🖕👇☝👍👎✊👊🤛"
      "🤜👏🙌👐🤲🤝🙏✍💅🤳💪🦾🦵🦶👂🦻👃🧠🫀🫁🦷🦴👀👁"
      "👅👄💋🩸👶🧒👦👧🧑👱👨🧔👩🧓👴👵🙍🙎🙅🙆💁🙋🧏🙇"
      "🤦🤷👮🕵💂🥷👷🤴👸👳👲🧕🤵👰🤰🤱👼🎅🤶🦸🦹🧙🧚🧛"
      "🧜🧝🧞🧟💆💇🚶🧍🧎🏃💃🕺👯🧖🧗🤺🏇⛷🏂🏌🏄🚣🏊⛹"
      "🏋🚴🚵🤸🤼🤽🤾🤹🧘"),
-    ("Nature",
+    (N_("Nature"),
      "🐶🐱🐭🐹🐰🦊🐻🐼🐨🐯🦁🐮🐷🐸🐵🙈🙉🙊🐒🐔🐧🐦🐤🦆"
      "🦅🦉🦇🐺🐗🐴🦄🐝🐛🦋🐌🐞🐜🕷🦂🐢🐍🦎🐙🦑🦀🐡🐠🐟"
      "🐬🐳🐋🦈🐊🐅🐆🦓🦍🐘🦏🐪🐫🦒🐃🐂🐄🐎🐖🐏🐑🦙🐐🦌"
@@ -17688,13 +19101,13 @@ EMOJI_SETS = (
      "🌲🌳🌴🌱🌿☘🍀🎍🎋🍃🍂🍁🍄🐚🌾💐🌷🌹🥀🌺🌸🌼🌻🌞"
      "🌝🌛🌜🌚🌕🌖🌗🌘🌑🌒🌓🌔🌙🌎🌍🌏🪐💫⭐🌟✨⚡☄💥"
      "🔥🌪🌈☀🌤⛅🌥☁🌦🌧⛈🌩🌨❄☃⛄🌬💨💧💦☔☂🌊🌫"),
-    ("Food",
+    (N_("Food"),
      "🍏🍎🍐🍊🍋🍌🍉🍇🍓🫐🍈🍒🍑🥭🍍🥥🥝🍅🍆🥑🥦🥬🥒🌶"
      "🫑🌽🥕🧄🧅🥔🍠🥐🥯🍞🥖🥨🧀🥚🍳🧈🥞🧇🥓🥩🍗🍖🌭🍔"
      "🍟🍕🥪🥙🧆🌮🌯🥗🥘🥫🍝🍜🍲🍛🍣🍱🥟🍤🍙🍚🍘🍥🥠🥮"
      "🍢🍡🍧🍨🍦🥧🧁🍰🎂🍮🍭🍬🍫🍿🍩🍪🌰🥜🍯🥛🍼☕🍵🧃"
      "🥤🍶🍺🍻🥂🍷🥃🍸🍹🧉🍾🧊🥄🍴🍽🥣🥡🥢🧂"),
-    ("Things",
+    (N_("Things"),
      "⌚📱💻⌨🖥🖨🖱💽💾💿📀📷📸📹🎥📞☎📺📻🎙⏱⏰⌛⏳"
      "📡🔋🔌💡🔦🕯💸💵💴💶💷💰💳💎⚖🧰🔧🔨⚒🛠⛏🔩⚙🧱"
      "⛓🧲🔫💣🧨🔪🗡⚔🛡🔮📿🧿💈⚗🔭🔬🩺💊💉🧬🦠🧪🌡🧹"
@@ -17702,7 +19115,7 @@ EMOJI_SETS = (
      "📩📨📧💌📥📤📦🏷📪📫📬📭📮📯📜📃📄📑🧾📊📈📉🗒🗓"
      "📆📅📇🗃🗳🗄📋📁📂🗂🗞📰📓📔📒📕📗📘📙📚📖🔖🧷🔗"
      "📎🖇📐📏🧮📌"),
-    ("Signs",
+    (N_("Signs"),
      "❤🧡💛💚💙💜🖤🤍🤎💔❣💕💞💓💗💖💘💝💟☮✝☪🕉☸"
      "✡🔯🕎☯☦🛐⛎♈♉♊♋♌♍♎♏♐♑♒♓🆔⚛☢☣📴"
      "📳🈶🈚🈸🈺🈷✴🆚💮🉐㊙㊗🈴🈵🈹🈲🅰🅱🆎🆑🅾🆘❌⭕"
@@ -17753,8 +19166,8 @@ class EmojiPanel(Concealable, BoxLayout):
         recent = [e for e in load_prefs().get("recent_emoji", [])
                   if isinstance(e, str) and sanitize_emoji(e)]
         self._recent = recent[:RECENT_EMOJI_MAX]
-        options = ([("Recent", "Recent")] if self._recent else []) + \
-            [(name, name) for name, _set in EMOJI_SETS]
+        options = ([("Recent", tr("Recent"))] if self._recent else []) + \
+            [(name, tr(name)) for name, _set in EMOJI_SETS]
         self._sets = dict(EMOJI_SETS)
         tab_scroll = ScrollView(size_hint_y=None, height=TOUCH,
                                 do_scroll_y=False, bar_width=0)
@@ -17824,16 +19237,16 @@ class ReactionStrip(Concealable, BoxLayout):
         super().__init__(**kw)
         self._on_pick = on_pick
         self.keys = {}
-        self.more_key = IconButton("plus", label="More reactions",
+        self.more_key = IconButton("plus", label=tr("More reactions"),
                                    size=(dp(46), dp(48)),
                                    on_release=lambda _w: on_more())
         self.set_choices(QUICK_REACTIONS)
         self.width = dp(46) * (len(QUICK_REACTIONS) + 1) + dp(12)
         with self.canvas.before:
             Color(0, 0, 0, .30 if T.dark else .10)
-            self._shadow = RoundedRectangle(radius=[dp(27)])
+            self._shadow = RoundedRectangle(radius=[corner(dp(27))])
             Color(*C(T.surface_hi))
-            self._bg = SmoothRoundedRectangle(radius=[dp(27)])
+            self._bg = SmoothRoundedRectangle(radius=[corner(dp(27))])
             # One ring per reaction of yours that the strip offers. An
             # unused one is made clear, not shrunk: a smooth ellipse sized
             # to nothing goes on drawing its last shape.
@@ -17933,7 +19346,7 @@ class ComposerInput(BoxLayout):
 
     KEY = dp(44)
 
-    def __init__(self, hint="Message", on_enter=None, on_emoji=None,
+    def __init__(self, hint="", on_enter=None, on_emoji=None,
                  on_attach=None, on_camera=None, **kw):
         kw.setdefault("padding", [dp(2), 0, dp(2), 0])
         super().__init__(**kw)
@@ -17943,19 +19356,21 @@ class ComposerInput(BoxLayout):
             return IconButton(icon, label=label, size=(self.KEY, TOUCH),
                               pos_hint={"center_y": .5},
                               on_release=lambda _w: action and action())
-        self.emoji_button = key("smile", "Emoji", on_emoji)
+        self.emoji_button = key("smile", tr("Emoji"), on_emoji)
         self.input = InkTextInput(
-            hint_text=hint, multiline=False, background_normal="",
+            hint_text=hint or tr("Message"), multiline=False,
+            background_normal="",
             background_active="", background_color=(0, 0, 0, 0),
             foreground_color=C(T.text), hint_text_color=C(T.text_3),
             cursor_color=C(T.accent), selection_color=C(T.accent)[:3] + [.3],
             font_size=fs(17), write_tab=False, text_validate_unfocus=False,
             padding=[dp(4), 0, dp(4), 0])
-        self.input.bind(size=self._centre_text)
+        # Its face, and so its line, changes with what is typed (15.1).
+        self.input.bind(size=self._centre_text, line_height=self._centre_text)
         if on_enter is not None:
             self.input.bind(on_text_validate=lambda _w: on_enter())
-        self.attach_button = key("attach", "Attach a photo", on_attach)
-        self.camera_button = key("camera", "Take a photo", on_camera)
+        self.attach_button = key("attach", tr("Attach a photo"), on_attach)
+        self.camera_button = key("camera", tr("Take a photo"), on_camera)
         for part in (self.emoji_button, self.input, self.attach_button,
                      self.camera_button):
             self.add_widget(part)
@@ -18067,9 +19482,11 @@ class LockPill(Widget):
         x, y, w, h = self.x, self.y, self.width, self.height
         with self.canvas:
             Color(*C(T.surface_hi))
-            SmoothRoundedRectangle(pos=(x, y), size=(w, h), radius=[w / 2])
+            SmoothRoundedRectangle(pos=(x, y), size=(w, h),
+                                   radius=[corner(w / 2)])
             Color(*C(T.rule_strong))
-            SmoothLine(rounded_rectangle=(x, y, w, h, w / 2), width=1.0)
+            SmoothLine(rounded_rectangle=(x, y, w, h, corner(w / 2)),
+                       width=1.0)
             tint = C(T.accent if self._rise > .6 else T.text_2)
             draw_icon("lock", x + w / 2, y + h - dp(22), dp(18), tint)
             draw_icon("chevron_up", x + w / 2, y + dp(20) + self._rise * dp(4),
@@ -18135,7 +19552,7 @@ class ConversationScreen(SwipeGestures, Screen):
         self._stick_to_bottom = True
         self._last_content_h = 0.0
         self.has_older = False
-        self._more_button = Btn("Earlier messages", kind="text",
+        self._more_button = Btn(tr("Earlier messages"), kind="text",
                                 size_hint_y=None,
                                 on_release=lambda _w:
                                 self.app.load_older_messages())
@@ -18171,7 +19588,7 @@ class ConversationScreen(SwipeGestures, Screen):
                                     spacing=dp(4), size_hint=(1, 1),
                                     pos_hint={"x": 0, "y": 0})
         self.normal_bar.add_widget(IconButton(
-            "back", label="Back", pos_hint={"center_y": .5},
+            "back", label=tr("Back"), pos_hint={"center_y": .5},
             on_release=lambda _w: self.app.go_back_to_chats()))
         self.peer_avatar_holder = AnchorLayout(size_hint_x=None, width=dp(42))
         self.normal_bar.add_widget(self.peer_avatar_holder)
@@ -18185,11 +19602,11 @@ class ConversationScreen(SwipeGestures, Screen):
         titles.add_widget(self.peer_sub)
         self.normal_bar.add_widget(titles)
         self.call_button = IconButton(
-            "phone", label="Voice call", pos_hint={"center_y": .5},
+            "phone", label=tr("Voice call"), pos_hint={"center_y": .5},
             on_release=lambda _w: self.app.start_call())
         self.normal_bar.add_widget(self.call_button)
         self.more_button = IconButton(
-            "more", label="More", pos_hint={"center_y": .5},
+            "more", label=tr("More"), pos_hint={"center_y": .5},
             on_release=lambda w: self.open_menu(w))
         self.normal_bar.add_widget(self.more_button)
 
@@ -18197,7 +19614,7 @@ class ConversationScreen(SwipeGestures, Screen):
                                     size_hint=(1, 1),
                                     pos_hint={"x": 0, "y": 0})
         self.select_bar.add_widget(IconButton(
-            "close", label="Cancel selection", pos_hint={"center_y": .5},
+            "close", label=tr("Cancel selection"), pos_hint={"center_y": .5},
             on_release=lambda _w: self.clear_selection()))
         self.select_count = Label(text="1", font_size=fs(20),
                                   color=C(T.text), halign="left",
@@ -18208,13 +19625,13 @@ class ConversationScreen(SwipeGestures, Screen):
         self.select_bar.add_widget(Widget())
         self.actions: dict = {}
         for name, handler, label in (
-                ("reply", self._act_reply, "Reply"),
-                ("copy", self._act_copy, "Copy"),
-                ("star", self._act_star, "Star"),
-                ("forward", self._act_forward, "Forward"),
-                ("share", self._act_share, "Share"),
-                ("delete", self._act_delete, "Delete")):
-            button = IconButton(name, label=label, size=(dp(42), TOUCH),
+                ("reply", self._act_reply, N_("Reply")),
+                ("copy", self._act_copy, N_("Copy")),
+                ("star", self._act_star, N_("Star")),
+                ("forward", self._act_forward, N_("Forward")),
+                ("share", self._act_share, N_("Share")),
+                ("delete", self._act_delete, N_("Delete"))):
+            button = IconButton(name, label=tr(label), size=(dp(42), TOUCH),
                                 pos_hint={"center_y": .5},
                                 on_release=lambda _w, h=handler: h())
             self.actions[name] = button
@@ -18229,9 +19646,9 @@ class ConversationScreen(SwipeGestures, Screen):
                                     spacing=dp(2), size_hint=(1, 1),
                                     pos_hint={"x": 0, "y": 0})
         self.search_bar.add_widget(IconButton(
-            "back", label="Close search", pos_hint={"center_y": .5},
+            "back", label=tr("Close search"), pos_hint={"center_y": .5},
             on_release=lambda _w: self.close_search()))
-        self.search_field = Field("Search this chat",
+        self.search_field = Field(tr("Search this chat"),
                                   pos_hint={"center_y": .5},
                                   on_enter=lambda: self.search_step(1))
         self.search_field.input.font_size = fs(18)
@@ -18244,11 +19661,11 @@ class ConversationScreen(SwipeGestures, Screen):
         self.search_count.bind(size=lambda w, v: setattr(w, "text_size", v))
         self.search_bar.add_widget(self.search_count)
         self.search_up = IconButton(
-            "chevron_up", label="Earlier match", size=(dp(40), TOUCH),
+            "chevron_up", label=tr("Earlier match"), size=(dp(40), TOUCH),
             pos_hint={"center_y": .5},
             on_release=lambda _w: self.search_step(1))
         self.search_down = IconButton(
-            "chevron_down", label="Later match", size=(dp(40), TOUCH),
+            "chevron_down", label=tr("Later match"), size=(dp(40), TOUCH),
             pos_hint={"center_y": .5},
             on_release=lambda _w: self.search_step(-1))
         self.search_bar.add_widget(self.search_up)
@@ -18322,7 +19739,7 @@ class ConversationScreen(SwipeGestures, Screen):
                                        pos_hint={"center_y": .5})
         self.preview_bar.add_widget(self.preview_thumb)
         self.preview_bar.add_widget(IconButton(
-            "close", label="Send without a preview",
+            "close", label=tr("Send without a preview"),
             pos_hint={"center_y": .5},
             on_release=lambda _w: self.dismiss_preview()))
         root.add_widget(self.preview_bar)
@@ -18350,7 +19767,7 @@ class ConversationScreen(SwipeGestures, Screen):
         texts.add_widget(self.reply_snip)
         self.reply_bar.add_widget(texts)
         self.reply_bar.add_widget(IconButton(
-            "close", label="Cancel reply", pos_hint={"center_y": .5},
+            "close", label=tr("Cancel reply"), pos_hint={"center_y": .5},
             on_release=lambda _w: self.cancel_reply()))
         root.add_widget(self.reply_bar)
 
@@ -18373,7 +19790,7 @@ class ConversationScreen(SwipeGestures, Screen):
         self.camera_button = self.entry.camera_button
         self.action_holder = AnchorLayout(size_hint_x=None, width=dp(56))
         self.action_button = SendMicButton(
-            self, "send", bg=T.accent, tint=T.on_accent, label="Send",
+            self, "send", bg=T.accent, tint=T.on_accent, label=tr("Send"),
             icon_size=dp(23), on_release=lambda _w: self._on_action_button())
         self.action_holder.add_widget(self.action_button)
         self.entry.input.bind(text=lambda *_a: self._on_text_changed(),
@@ -18394,7 +19811,7 @@ class ConversationScreen(SwipeGestures, Screen):
         # A note longer than the composer is tall makes room for itself.
         for label in (self.closed_note, self.blocked_text):
             label.bind(height=lambda *_a: self._fit_note())
-        unblock = Btn("Unblock", kind="text", size_hint_x=None,
+        unblock = Btn(tr("Unblock"), kind="text", size_hint_x=None,
                       pos_hint={"center_y": .5},
                       on_release=lambda _w: self.app.set_blocked(
                           [self.peer], False))
@@ -18410,19 +19827,19 @@ class ConversationScreen(SwipeGestures, Screen):
         self.request_note.add_widget(self.request_text)
         answers = BoxLayout(size_hint_y=None, height=TOUCH, spacing=dp(10))
         for title, kind, act in (
-                ("Accept", "primary",
+                (N_("Accept"), "primary",
                  lambda: self.app.accept_request(self.peer)),
-                ("Decline", "quiet",
+                (N_("Decline"), "quiet",
                  lambda: self.app.decline_request(self.peer)),
-                ("Report", "danger",
+                (N_("Report"), "danger",
                  lambda: ReportSheet(self.app, self.peer).open())):
-            answers.add_widget(Btn(title, kind=kind,
+            answers.add_widget(Btn(tr(title), kind=kind,
                                    on_release=lambda _w, a=act: a()))
         self.request_note.add_widget(answers)
         # What the composer becomes while recording: discard, the time and
         # the microphone's level, send.
         self.rec_cancel = IconButton(
-            "delete", tint=T.alert, label="Discard recording",
+            "delete", tint=T.alert, label=tr("Discard recording"),
             pos_hint={"center_y": .5},
             on_release=lambda _w: self.cancel_recording())
         self.rec_dot = Widget(size_hint_x=None, width=dp(18))
@@ -18433,15 +19850,15 @@ class ConversationScreen(SwipeGestures, Screen):
         self.rec_label.bind(size=lambda w, v: setattr(w, "text_size", v))
         self.rec_levels = LiveLevels()
         self.rec_send = IconButton(
-            "send", bg=T.accent, tint=T.on_accent, label="Send recording",
+            "send", bg=T.accent, tint=T.on_accent, label=tr("Send recording"),
             icon_size=dp(23), pos_hint={"center_y": .5},
             on_release=lambda _w: self.finish_recording())
         # Holding: what sliding does, and (over the microphone) the lock.
-        self.rec_hint = Label(text="‹  Slide to cancel", font_size=fs(15),
+        self.rec_hint = Label(text=tr("‹  Slide to cancel"), font_size=fs(15),
                               italic=True, color=C(T.text_3),
                               halign="center", valign="middle")
         self.rec_hint.bind(size=lambda w, v: setattr(w, "text_size", v))
-        self.rec_pause = IconButton("pause", label="Pause recording",
+        self.rec_pause = IconButton("pause", label=tr("Pause recording"),
                                     pos_hint={"center_y": .5},
                                     on_release=lambda _w:
                                     self.toggle_pause())
@@ -18474,9 +19891,9 @@ class ConversationScreen(SwipeGestures, Screen):
         self._refresh_me()
         self.peer, self.kind, self.group = peer, kind, group
         if kind == "self":
-            name = "Saved messages"
+            name = tr("Saved messages")
         elif kind == "group":
-            name = (group or {}).get("name") or "Group"
+            name = (group or {}).get("name") or tr("Group")
         else:
             name = contact.get("username") or short_addr(peer, 14)
         self.peer_name_text = name
@@ -18499,32 +19916,33 @@ class ConversationScreen(SwipeGestures, Screen):
         self.peer_name.text = name
         bits = []
         if kind == "self":
-            bits.append("kept on this device")
+            bits.append(tr("kept on this device"))
         elif kind == "group":
             members = (group or {}).get("members") or []
             me = self.app.keys.address
-            names = ["you"] + [self.author_name(m["a"]) for m in members
-                               if m["a"] != me]
+            names = [tr("you")] + [self.author_name(m["a"])
+                                   for m in members if m["a"] != me]
             bits.append(", ".join(names) if len(names) <= 4
-                        else f"{len(members)} members")
+                        else trn("{n} member", "{n} members", len(members)))
             if self.app.store is not None and \
                     self.app.store.mute_state(peer)[0]:
-                bits.append("muted")
+                bits.append(tr("muted"))
         else:
             bits.append(short_addr(peer, 12))
             if self.app.store is not None and \
                     self.app.store.mute_state(peer)[0]:
-                bits.append("muted")
+                bits.append(tr("muted"))
         if unread_count and kind != "group" and not contact.get("auto_read",
                                                                 1):
-            bits.append(f"{unread_count} unread")
-        if kind == "dm" and contact.get("verified"):
-            bits.insert(0, "verified")
+            bits.append(tr("{n} unread", n=unread_count))
+        verified = kind == "dm" and contact.get("verified")
+        if verified:
+            bits.insert(0, tr("verified"))
         timer = self.app.store.chat_timer(peer)[0] \
             if self.app.store is not None and kind != "self" else 0
         if timer:               # first: it is cut short before the address
-            bits.insert(1 if bits and bits[0] == "verified" else 0,
-                        f"disappearing: {timer_label(timer).lower()}")
+            bits.insert(1 if verified else 0, tr(
+                "disappearing: {timer}", timer=timer_label(timer).lower()))
         self.peer_sub.text = " · ".join(bits)
         self._sync_closed()
 
@@ -18535,10 +19953,11 @@ class ConversationScreen(SwipeGestures, Screen):
         note = ""
         if self.kind == "group":
             state = (self.group or {}).get("state")
-            note = {"left": "You left this group.",
-                    "removed": "You are no longer a member of this group.",
-                    "pending": "This group's invitation has not arrived "
-                               "yet."}.get(state, "")
+            note = tr({"left": N_("You left this group."),
+                       "removed": N_("You are no longer a member of this "
+                                     "group."),
+                       "pending": N_("This group's invitation has not "
+                                     "arrived yet.")}.get(state, ""))
         blocked = self.kind == "dm" and self.peer is not None and \
             self.app.store is not None and self.app.store.is_blocked(self.peer)
         # v14: someone new, not yet accepted — answered here, not written to.
@@ -18556,9 +19975,10 @@ class ConversationScreen(SwipeGestures, Screen):
             self.request_text.text = self._request_text()
         if blocked:
             held = self.app.store.held_count(self.peer)
-            self.blocked_text.text = (
-                f"Blocked. {held} message{'s' if held != 1 else ''} held, "
-                f"unopened, until you unblock them." if held else
+            self.blocked_text.text = trn(
+                "Blocked. {n} message held, unopened, until you unblock "
+                "them.", "Blocked. {n} messages held, unopened, until you "
+                "unblock them.", held) if held else tr(
                 "Blocked. What they send is held, unopened, until you "
                 "unblock them.")
         if closed and not showing:
@@ -18597,11 +20017,16 @@ class ConversationScreen(SwipeGestures, Screen):
         name = (store.get_contact(self.peer) or {}).get("username") or \
             short_addr(self.peer, 12)
         groups = store.shared_groups(self.peer)
-        both = "" if not groups else \
-            f" You are both in {groups[0]}." if len(groups) == 1 else \
-            f" You are both in {groups[0]} and {len(groups) - 1} more."
-        return (f"{name} wants to message you.{both} Until you accept, they "
-                f"see one tick and no read receipts.")
+        if not groups:
+            both = ""
+        elif len(groups) == 1:
+            both = tr(" You are both in {group}.", group=groups[0])
+        else:
+            both = tr(" You are both in {group} and {n} more.",
+                      group=groups[0], n=len(groups) - 1)
+        return tr("{name} wants to message you.{both} Until you accept, "
+                  "they see one tick and no read receipts.", name=name,
+                  both=both)
 
     # ---- bubbles -------------------------------------------------------------
     def render(self, messages: list, ticks_enabled: bool,
@@ -19251,12 +20676,12 @@ class ConversationScreen(SwipeGestures, Screen):
                 # v11: the text, or one of its links (to see where it leads,
                 # open it, or copy it alone).
                 self.clear_selection()
-                items = [("copy", "Copy the text",
+                items = [("copy", tr("Copy the text"),
                           lambda: self.app.copy_text(text))]
                 items += [("link", escape_markup(link_host(url)),
                            lambda u=url: self.app.open_link(u))
                           for url in links[:4]]
-                MenuSheet(items, title="Copy").open()
+                MenuSheet(items, title=tr("Copy")).open()
                 return
         else:
             text = "\n".join(
@@ -19273,7 +20698,7 @@ class ConversationScreen(SwipeGestures, Screen):
         ids = [m["id"] for m in msgs]
         self.clear_selection()
         self.app.star_messages(ids, star)
-        self.app._set_status("Starred" if star else "Removed from starred",
+        self.app._set_status(tr("Starred" if star else "Removed from starred"),
                              T.ok)
 
     def _act_forward(self) -> None:
@@ -19300,9 +20725,9 @@ class ConversationScreen(SwipeGestures, Screen):
         """Who someone is, as this phone knows them: You, the contact's
         name, their name in a group, or their address."""
         if not address:
-            return "Message"
+            return tr("Message")
         if address == self.app.keys.address:
-            return "You"
+            return tr("You")
         if address == self.peer and self.kind == "dm":
             return self.peer_name_text or short_addr(address, 12)
         store = self.app.store
@@ -19316,15 +20741,14 @@ class ConversationScreen(SwipeGestures, Screen):
 
     def set_reply(self, msg: dict) -> None:
         kind = msg.get("kind") or "text"
-        snip = self._text_of(msg) or {"image": "Photo",
-                                      "voice": "Voice message"}.get(kind, "")
+        snip = self._text_of(msg) or QUOTE_NAMES.get(kind, "")
         reply = {"snip": snip[:120], "from": self._author_of(msg),
                  "kind": kind}
         if msg.get("client_msg_id"):
             reply["cid"] = msg["client_msg_id"]
         self.reply_to = reply
         self.reply_author.text = self.author_name(reply["from"])
-        self.reply_snip.text = snip
+        self.reply_snip.text = quote_text(reply)
         self.reply_bar.height, self.reply_bar.opacity = max(
             dp(56), self.reply_author.height + line_height(15) + dp(14)), 1
         self.reply_bar.conceal(False)
@@ -19361,7 +20785,8 @@ class ConversationScreen(SwipeGestures, Screen):
         if row is not None:
             self.app.open_conversation_at(self.peer, row["id"])
         else:
-            self.app._set_status("That message is no longer on this device",
+            self.app._set_status(tr("That message is no longer on this "
+                                    "device"),
                                  T.text_3)
 
     # ---- taps ------------------------------------------------------------------
@@ -19393,7 +20818,7 @@ class ConversationScreen(SwipeGestures, Screen):
         if self.kind != "self" and waits_for_tap(msg) and \
                 not message_ext(msg).get("media"):
             self.app.retry_message(msg["id"])           # v14 (B15)
-            self.app._set_status("Trying again…", COL_TEXT_DIM)
+            self.app._set_status(tr("Trying again…"), COL_TEXT_DIM)
             return
         row = self._rows.get(msg_id)
         if touch is not None and row is not None:
@@ -19470,7 +20895,8 @@ class ConversationScreen(SwipeGestures, Screen):
                     self.app.voice.toggle(path)
                 except Exception:
                     log.exception("could not play voice note")
-                    self.app._set_status("Couldn't play that voice message",
+                    self.app._set_status(tr("Couldn't play that voice "
+                                            "message"),
                                          T.alert)
                 self.refresh_voice_buttons()
 
@@ -19483,7 +20909,8 @@ class ConversationScreen(SwipeGestures, Screen):
             self.app.voice.seek(path, fraction)
         except Exception:
             log.exception("could not play voice note")
-            self.app._set_status("Couldn't play that voice message", T.alert)
+            self.app._set_status(tr("Couldn't play that voice "
+                                    "message"), T.alert)
         self.refresh_voice_buttons()
 
     def refresh_voice_buttons(self) -> None:
@@ -19506,45 +20933,46 @@ class ConversationScreen(SwipeGestures, Screen):
         if self.peer is None or self.app.store is None:
             return
         peer, app = self.peer, self.app
-        items = [("search", "Search in this chat", self.open_search)]
+        items = [("search", tr("Search in this chat"), self.open_search)]
         if self.app.store.unread_for(peer):
-            items.append(("check", "Mark all as read",
+            items.append(("check", tr("Mark all as read"),
                           lambda: app.mark_peer_read(peer)))
         if self.kind == "group":
             gid = gid_of(peer)
-            items.append(("group", "Group info", app.open_chat_info))
-            items.append(("star", "Starred messages",
+            items.append(("group", tr("Group info"), app.open_chat_info))
+            items.append(("star", tr("Starred messages"),
                           lambda: StarredModal(app, peer).open()))
             muted = app.store.mute_state(peer)[0]
             items.append(("bell" if muted else "bell_off",
-                          "Unmute notifications" if muted else
-                          "Mute notifications…",
+                          tr("Unmute notifications" if muted else
+                             "Mute notifications…"),
                           lambda: app.toggle_notify(peer)))
-            items.append(("clock", "Disappearing messages…",
+            items.append(("clock", tr("Disappearing messages…"),
                           lambda: app.choose_timer(peer)))
-            items.append(("share", "Export or import",
+            items.append(("share", tr("Export or import"),
                           lambda: ChatHistorySheet(app, peer).open()))
             if (self.group or {}).get("state") == "active":
-                items.append(("leave", "Leave group",
+                items.append(("leave", tr("Leave group"),
                               lambda: app.confirm_leave_group(gid), True))
         elif self.kind == "self":
-            items.append(("star", "Starred notes",
+            items.append(("star", tr("Starred notes"),
                           lambda: StarredModal(app, peer).open()))
-            items.append(("share", "Export or import",
+            items.append(("share", tr("Export or import"),
                           lambda: ChatHistorySheet(app, peer).open()))
         else:
-            items.append(("info", "Chat info", app.open_chat_info))
-            items.append(("star", "Starred messages",
+            items.append(("info", tr("Chat info"), app.open_chat_info))
+            items.append(("star", tr("Starred messages"),
                           lambda: StarredModal(app, peer).open()))
             muted = app.store.mute_state(peer)[0]
             items.append(("bell" if muted else "bell_off",
-                          "Unmute notifications" if muted else
-                          "Mute notifications…",
+                          tr("Unmute notifications" if muted else
+                             "Mute notifications…"),
                           lambda: app.toggle_notify(peer)))
-            items.append(("clock", "Disappearing messages…",
+            items.append(("clock", tr("Disappearing messages…"),
                           lambda: app.choose_timer(peer)))
-            items.append(("lock", "Verify…", lambda: app.open_verify(peer)))
-            items.append(("share", "Export or import",
+            items.append(("lock", tr("Verify…"),
+                          lambda: app.open_verify(peer)))
+            items.append(("share", tr("Export or import"),
                           lambda: ChatHistorySheet(app, peer).open()))
         MenuSheet(items).open()
 
@@ -19561,14 +20989,14 @@ class ConversationScreen(SwipeGestures, Screen):
         self.entry.input.focus = False
         self.emoji_panel.set_open(True)
         self.emoji_button.set_icon("keyboard")
-        self.emoji_button.label = "Keyboard"
+        self.emoji_button.label = tr("Keyboard")
 
     def close_emoji(self) -> None:
         if self.emoji_panel.is_open:
             self.emoji_panel.set_open(False)
         self._emoji_target = None
         self.emoji_button.set_icon("smile")
-        self.emoji_button.label = "Emoji"
+        self.emoji_button.label = tr("Emoji")
 
     def _emoji_picked(self, emoji: str) -> None:
         if self._emoji_target is not None:
@@ -19626,7 +21054,8 @@ class ConversationScreen(SwipeGestures, Screen):
         if url in (self._preview_url, self._preview_dismissed):
             return
         self._preview_url, self.link_preview = url, None
-        self._show_preview_bar(link_host(url), "Fetching a preview…", None)
+        self._show_preview_bar(link_host(url), tr("Fetching a preview…"),
+                               None)
         threading.Thread(target=self._fetch_preview, args=(url, self.peer),
                          daemon=True).start()
 
@@ -19733,7 +21162,8 @@ class ConversationScreen(SwipeGestures, Screen):
         name = keys.username or keys.label
         me = AvatarButton(keys.address, name, diameter=dp(34),
                           pos_hint={"center_x": .5, "center_y": .5})
-        me.label = f"Writing as {'@' + keys.username if keys.username else name}"
+        me.label = tr("Writing as {name}", name="@" + keys.username
+                      if keys.username else name)
         me.bind(on_release=lambda _w: IdentitySheet(self.app).open())
         self.me_holder.add_widget(me)
 
@@ -19748,8 +21178,8 @@ class ConversationScreen(SwipeGestures, Screen):
             self.action_button.morph(icon)
         else:
             self.action_button.show_icon(icon)
-        self.action_button.label = "Record a voice message" if voice \
-            else "Send"
+        self.action_button.label = tr("Record a voice message" if voice
+                                      else "Send")
 
     def _on_action_button(self) -> None:
         if self.recorder is not None:          # already recording
@@ -19761,33 +21191,34 @@ class ConversationScreen(SwipeGestures, Screen):
 
     def _media_refused(self, what: str) -> bool:
         if self.kind != "self" and not self.app.media_available():
-            self.app._set_status(f"{what} need the v9 relay — this one can't "
-                                 "carry them yet", T.accent)
+            self.app._set_status(tr("{what} need the v9 relay — this one "
+                                    "can't carry them yet", what=what),
+                                 T.accent)
             return True
         return False
 
     def pick_image(self) -> None:
-        if self._media_refused("Photos and voice messages"):
+        if self._media_refused(tr("Photos and voice messages")):
             return
         if IS_ANDROID:
             try:
                 android_pick_image(lambda path: self._picked(path, True))
             except Exception:
                 log.exception("photo picker failed")
-                self.app._set_status("Couldn't open the photo picker",
+                self.app._set_status(tr("Couldn't open the photo picker"),
                                      T.alert)
         else:
             ImageChooserModal(lambda path: self._picked(path, False)).open()
 
     def take_photo(self) -> None:
-        if self._media_refused("Photos"):
+        if self._media_refused(tr("Photos")):
             return
         if IS_ANDROID:
             try:
                 android_take_photo(lambda path: self._picked(path, True))
             except Exception:
                 log.exception("camera failed")
-                self.app._set_status("Couldn't open the camera", T.alert)
+                self.app._set_status(tr("Couldn't open the camera"), T.alert)
         else:
             open_desktop_camera(lambda path: self._picked(path, True),
                                 on_choose=self.pick_image)
@@ -19821,7 +21252,7 @@ class ConversationScreen(SwipeGestures, Screen):
         if -dx >= self.CANCEL_SLIDE:
             self._hold = None
             self.cancel_recording()
-            self.app._set_status("Recording deleted", T.text_3)
+            self.app._set_status(tr("Recording deleted"), T.text_3)
             return
         if dy >= self.LOCK_SLIDE:
             self._hold = None
@@ -19862,8 +21293,8 @@ class ConversationScreen(SwipeGestures, Screen):
     def _sync_pause(self) -> None:
         paused = bool(getattr(self.recorder, "paused", False))
         self.rec_pause.set_icon("mic" if paused else "pause")
-        self.rec_pause.label = "Carry on recording" if paused \
-            else "Pause recording"
+        self.rec_pause.label = tr("Carry on recording" if paused
+                                  else "Pause recording")
         Animation.cancel_all(self.rec_dot, "opacity")
         self.rec_dot.opacity = .35 if paused else 1
         if motion(1) and not paused:
@@ -19897,7 +21328,7 @@ class ConversationScreen(SwipeGestures, Screen):
         self._sync_pause()
 
     def start_recording(self, held: bool = False) -> None:
-        if self._media_refused("Voice messages"):
+        if self._media_refused(tr("Voice messages")):
             return
         if IS_ANDROID and not android_has_permission(
                 "android.permission.RECORD_AUDIO"):
@@ -19911,8 +21342,8 @@ class ConversationScreen(SwipeGestures, Screen):
         except Exception as exc:
             log.warning("could not start recording: %s", exc)
             self.recorder = None
-            self.app._set_status("Couldn't start recording — is a "
-                                 "microphone connected?", T.alert)
+            self.app._set_status(tr("Couldn't start recording — is a "
+                                    "microphone connected?"), T.alert)
             return
         self._rec_locked = not held
         self._show_rec_ui()
@@ -19923,8 +21354,8 @@ class ConversationScreen(SwipeGestures, Screen):
         if granted:
             self.start_recording()
         else:
-            self.app._set_status("Voice messages need the microphone "
-                                 "permission", T.accent)
+            self.app._set_status(tr("Voice messages need the microphone "
+                                    "permission"), T.accent)
 
     def _paint_rec_dot(self, dot, *_a) -> None:
         dot.canvas.clear()
@@ -19941,7 +21372,7 @@ class ConversationScreen(SwipeGestures, Screen):
             return
         if getattr(recorder, "failed", False) and recorder.elapsed_ms == 0:
             self.cancel_recording()
-            self.app._set_status("No sound came from the microphone",
+            self.app._set_status(tr("No sound came from the microphone"),
                                  T.alert)
             return
         sec = recorder.elapsed_ms // 1000
@@ -19972,11 +21403,11 @@ class ConversationScreen(SwipeGestures, Screen):
             path, duration, wave = recorder.stop()
         except Exception:
             log.exception("recording failed")
-            self.app._set_status("Recording failed", T.alert)
+            self.app._set_status(tr("Recording failed"), T.alert)
             return
         if duration < 700:
             discard_media_file(path)
-            self.app._set_status("That was too short to send", T.text_3)
+            self.app._set_status(tr("That was too short to send"), T.text_3)
             return
         self.app.send_voice(path, duration, wave)
 
@@ -20162,25 +21593,26 @@ class ConversationScreen(SwipeGestures, Screen):
             return day
         delta = (datetime.now().date() - date).days
         if delta == 0:
-            return "Today"
+            return tr("Today")
         if delta == 1:
-            return "Yesterday"
+            return tr("Yesterday")
         if 1 < delta < 7:
-            return date.strftime("%A")
+            return tr(WEEKDAYS[date.weekday()])
         if date.year == datetime.now().year:
-            return f"{date.day} {date.strftime('%B')}"
-        return f"{date.day} {date.strftime('%B %Y')}"
+            return date_text(date, "day_month")
+        return date_text(date, "day_month_year")
 
     def _empty_state(self) -> BoxLayout:
         if self.kind == "self":
-            text = ("Saved messages. Whatever you write, forward or "
-                    "photograph here stays on this device and goes nowhere.")
+            text = tr("Saved messages. Whatever you write, forward or "
+                      "photograph here stays on this device and goes "
+                      "nowhere.")
         elif self.kind == "group":
-            text = ("The beginning of the group. Each message is sealed "
-                    "separately for every member before it leaves.")
+            text = tr("The beginning of the group. Each message is sealed "
+                      "separately for every member before it leaves.")
         else:
-            text = ("The beginning of your correspondence. Messages are "
-                    "sealed on this device before they leave it.")
+            text = tr("The beginning of your correspondence. Messages are "
+                      "sealed on this device before they leave it.")
         box = BoxLayout(orientation="vertical", size_hint_y=None,
                         padding=[dp(36), dp(28), dp(36), dp(8)],
                         spacing=dp(10))
@@ -20228,11 +21660,11 @@ class PageScreen(SwipeGestures, Screen):
     def _timer_row(self, peer: str, can_set: bool = True) -> "ListRow":
         """Disappearing messages: off, or how long — tap to change."""
         seconds = self.app.store.chat_timer(peer)[0]
-        value = (timer_label(seconds) + " after reading") if seconds \
-            else "Off"
+        value = tr("{timer} after reading", timer=timer_label(seconds)) \
+            if seconds else tr("Off")
         if not can_set:
-            value += " · set by the group's admin"
-        return ListRow("clock", "Disappearing messages", value,
+            value = tr("{value} · set by the group's admin", value=value)
+        return ListRow("clock", tr("Disappearing messages"), value,
                        chevron=can_set,
                        on_tap=(lambda: self.app.choose_timer(peer))
                        if can_set else None)
@@ -20240,9 +21672,9 @@ class PageScreen(SwipeGestures, Screen):
     def _mute_row(self, peer: str) -> "ListRow":
         """Notifications: on, or muted until when — tap to change."""
         muted, until = self.app.store.mute_state(peer)
-        return ListRow("bell_off" if muted else "bell", "Notifications",
+        return ListRow("bell_off" if muted else "bell", tr("Notifications"),
                        mute_label(until) if muted else
-                       "On · muting keeps messages coming, quietly",
+                       tr("On · muting keeps messages coming, quietly"),
                        chevron=True,
                        on_tap=lambda: self.app.choose_mute([peer]))
 
@@ -20314,7 +21746,7 @@ class ChatInfoScreen(PageScreen):
     and export. A group's page is GroupInfoScreen."""
 
     def __init__(self, app: "FextApp", **kw):
-        super().__init__(app, "info", "About this chat",
+        super().__init__(app, "info", tr("About this chat"),
                          lambda: app.close_chat_info(), **kw)
         self.peer: Optional[str] = None
 
@@ -20324,11 +21756,12 @@ class ChatInfoScreen(PageScreen):
         Each side's key reaches the other in its next message."""
         ours = self.app.store.pq_key(peer) is not None
         theirs = self.app.store.pq_mine(peer) == self.app.keys.pq_kid
-        hint = ("On, both ways" if ours and theirs else
-                "On for yours · theirs after your next message" if ours else
-                "On for theirs · yours after their next message" if theirs
-                else "Off · on once you have both written from Ferritext 15")
-        return ListRow("key", "Post-quantum encryption", hint)
+        hint = tr("On, both ways" if ours and theirs else
+                  "On for yours · theirs after your next message" if ours
+                  else "On for theirs · yours after their next message"
+                  if theirs else
+                  "Off · on once you have both written from Ferritext 15")
+        return ListRow("key", tr("Post-quantum encryption"), hint)
 
     def show(self, peer: str) -> None:
         self.peer = peer
@@ -20336,86 +21769,89 @@ class ChatInfoScreen(PageScreen):
         self.body.clear_widgets()
         kind = self.app.conversation_kind(peer)
         if kind == "self":
-            self.appbar.title.text = "Saved messages"
-            self.hero(peer, "Saved messages", "self",
-                      "Kept on this device only")
+            self.appbar.title.text = tr("Saved messages")
+            self.hero(peer, tr("Saved messages"), "self",
+                      tr("Kept on this device only"))
             starred = len(store.starred(peer))
             self.body.add_widget(rows_card([
-                ListRow("star", "Starred notes",
-                        f"{starred} note{'s' if starred != 1 else ''}",
+                ListRow("star", tr("Starred notes"),
+                        trn("{n} note", "{n} notes", starred),
                         chevron=True,
                         on_tap=lambda: StarredModal(self.app, peer).open()),
-                ListRow("share", "Export or import",
-                        "Plaintext copies, kept on this device",
+                ListRow("share", tr("Export or import"),
+                        tr("Plaintext copies, kept on this device"),
                         chevron=True,
                         on_tap=lambda: ChatHistorySheet(self.app,
                                                         peer).open())]))
-            self.paragraph("Nothing written here is sent anywhere. Photos "
-                           "and voice messages stay on this phone too; "
-                           "forwarding one to a chat sends it then.",
+            self.paragraph(tr("Nothing written here is sent anywhere. Photos "
+                              "and voice messages stay on this phone too; "
+                              "forwarding one to a chat sends it then."),
                            italic=True)
             return
-        self.appbar.title.text = "About this chat"
+        self.appbar.title.text = tr("About this chat")
         contact = store.get_contact(peer) or {}
         name = contact.get("username") or short_addr(peer, 14)
         self.hero(peer, name, "dm", short_addr(peer, 22),
                   on_sub=lambda: self.app.copy_text(peer),
                   on_avatar=lambda: self.app.view_picture(peer))
-        self.body.add_widget(SectionHead("This chat"))
+        self.body.add_widget(SectionHead(tr("This chat")))
         self.body.add_widget(rows_card([
-            ListRow("phone", "Voice call", "Sealed end to end, like the "
-                    "messages", on_tap=lambda: self.app.start_call(peer)),
+            ListRow("phone", tr("Voice call"),
+                    tr("Sealed end to end, like the messages"),
+                    on_tap=lambda: self.app.start_call(peer)),
             self._mute_row(peer),
             self._timer_row(peer),
-            ListRow("lock", "Verify " + name,
-                    ("Verified — you compared codes" if contact.get(
+            ListRow("lock", tr("Verify {name}", name=name),
+                    (tr("Verified — you compared codes") if contact.get(
                         "verified") else
-                     "Not verified · compare a code in person, or on a call"),
+                     tr("Not verified · compare a code in person, or on a "
+                        "call")),
                     chevron=True, on_tap=lambda: self.app.open_verify(peer)),
             self._pq_row(peer),
-            ListRow("check", "Delivery and read ticks",
-                    "Off on either side caps both at one tick",
+            ListRow("check", tr("Delivery and read ticks"),
+                    tr("Off on either side caps both at one tick"),
                     control=ToggleSwitch(contact.get("ticks_enabled", 1),
                                          lambda on: self.app.set_ticks(peer,
                                                                        on))),
-            ListRow("info", "Mark as read automatically",
-                    "When off, tap a message to mark it read",
+            ListRow("info", tr("Mark as read automatically"),
+                    tr("When off, tap a message to mark it read"),
                     control=ToggleSwitch(contact.get("auto_read", 1),
                                          lambda on: self.app.set_auto_read(
                                              peer, on))),
         ]))
         starred = len(store.starred(peer))
-        self.body.add_widget(SectionHead("Kept here"))
+        self.body.add_widget(SectionHead(tr("Kept here")))
         self.body.add_widget(rows_card([
-            ListRow("star", "Starred messages",
-                    f"{starred} message{'s' if starred != 1 else ''}",
+            ListRow("star", tr("Starred messages"),
+                    trn("{n} message", "{n} messages", starred),
                     chevron=True,
                     on_tap=lambda: StarredModal(self.app, peer).open()),
-            ListRow("share", "Export or import",
-                    "Plaintext copies, kept on this device", chevron=True,
+            ListRow("share", tr("Export or import"),
+                    tr("Plaintext copies, kept on this device"), chevron=True,
                     on_tap=lambda: ChatHistorySheet(self.app, peer).open()),
         ]))
         held = store.held_count(peer) if store.is_blocked(peer) else 0
         if held:
-            self.paragraph(f"Blocked. {held} message{'s are' if held != 1 else ' is'} "
-                           f"kept here unopened, to arrive if you unblock "
-                           f"them.", italic=True)
+            self.paragraph(trn("Blocked. {n} message is kept here unopened, "
+                               "to arrive if you unblock them.",
+                               "Blocked. {n} messages are kept here unopened, "
+                               "to arrive if you unblock them.", held),
+                           italic=True)
         caps = contact.get("caps", 0) & LocalStore.CAP_V9
-        self.paragraph(
-            "Sealed end to end. " +
-            ("They run Ferritext 9 or later: replies, photos, voice "
-             "messages, reactions and delete-for-both all reach them."
-             if caps else
-             "Replies, photos, voice messages, reactions and "
-             "delete-for-both reach them fully once they run Ferritext 9."),
-            italic=True)
+        self.paragraph(tr(
+            "Sealed end to end. They run Ferritext 9 or later: replies, "
+            "photos, voice messages, reactions and delete-for-both all "
+            "reach them." if caps else
+            "Sealed end to end. Replies, photos, voice messages, reactions "
+            "and delete-for-both reach them fully once they run "
+            "Ferritext 9."), italic=True)
 
 
 class NewGroupScreen(PageScreen):
     """Name a group and choose who is in it."""
 
     def __init__(self, app: "FextApp", **kw):
-        super().__init__(app, "new_group", "New group",
+        super().__init__(app, "new_group", tr("New group"),
                          lambda: app.go_back_to_chats(), **kw)
         self.rows: list = []
 
@@ -20424,12 +21860,12 @@ class NewGroupScreen(PageScreen):
         box = BoxLayout(orientation="vertical", size_hint_y=None,
                         padding=[dp(20), dp(18), dp(20), dp(6)])
         box.bind(minimum_height=box.setter("height"))
-        self.name_field = Field(hint="What is it called?", label="Group name",
-                                on_enter=lambda: None)
+        self.name_field = Field(hint=tr("What is it called?"),
+                                label=tr("Group name"), on_enter=lambda: None)
         self.name_field.input.bind(text=lambda *_a: self._sync())
         box.add_widget(self.name_field)
         self.body.add_widget(box)
-        self.count = SectionHead("Members")
+        self.count = SectionHead(tr("Members"))
         self.body.add_widget(self.count)
         contacts = self.app.store.contacts() if self.app.store else []
         self.rows = [ContactPickRow(c, on_change=lambda _r: self._sync())
@@ -20437,11 +21873,11 @@ class NewGroupScreen(PageScreen):
         if self.rows:
             self.body.add_widget(rows_card(self.rows, inset=dp(74)))
         else:
-            self.paragraph("Add contacts first — a group is made of people "
-                           "you already know.", italic=True)
+            self.paragraph(tr("Add contacts first — a group is made of people "
+                              "you already know."), italic=True)
         holder = BoxLayout(size_hint_y=None, height=TOUCH + dp(36),
                            padding=[dp(20), dp(18), dp(20), dp(0)])
-        self.create = Btn("Create group", on_release=lambda _w: self._go())
+        self.create = Btn(tr("Create group"), on_release=lambda _w: self._go())
         holder.add_widget(self.create)
         self.body.add_widget(holder)
         self.status = self.paragraph("", italic=True)
@@ -20450,7 +21886,8 @@ class NewGroupScreen(PageScreen):
     def _sync(self) -> None:
         n = sum(1 for r in self.rows if r.picked)
         room = MAX_GROUP_MEMBERS - 1
-        self.count.caps.text = f"Members · {n} of up to {room}"
+        self.count.caps.text = tr("Members · {n} of up to {room}", n=n,
+                                  room=room)
         self.create.disabled = not (self.name_field.text.strip() and
                                     1 <= n <= room)
 
@@ -20458,7 +21895,7 @@ class NewGroupScreen(PageScreen):
         members = [r.address for r in self.rows if r.picked]
         peer = self.app.create_group(self.name_field.text, members)
         if peer is None:
-            self.status.text = "Choose a name and at least one member."
+            self.status.text = tr("Choose a name and at least one member.")
             return
         self.app.open_conversation(peer)
 
@@ -20468,9 +21905,9 @@ def person_items(app: "FextApp", address: str, name: str) -> list:
     someone known only from the group, adding them to your contacts."""
     contact = app.store.get_contact(address)
     if contact and contact.get("listed", 1):
-        return [("send", f"Message {name}",
+        return [("send", tr("Message {name}", name=name),
                  lambda: app.open_conversation(address))]
-    return [("person_add", f"Add {name} to your contacts",
+    return [("person_add", tr("Add {name} to your contacts", name=name),
              lambda: app.list_contact(address))]
 
 
@@ -20480,64 +21917,64 @@ class GroupInfoScreen(PageScreen):
     and leaving."""
 
     def __init__(self, app: "FextApp", **kw):
-        super().__init__(app, "group_info", "Group",
+        super().__init__(app, "group_info", tr("Group"),
                          lambda: app.close_chat_info(), **kw)
         self.gid: Optional[str] = None
 
     def show(self, gid: str) -> None:
         self.gid = gid
         app, store = self.app, self.app.store
-        group = store.group(gid) or {"name": "Group", "members": [],
+        group = store.group(gid) or {"name": tr("Group"), "members": [],
                                      "admin": "", "state": "pending"}
         me = app.keys.address
         admin = group.get("admin") == me and group.get("state") == "active"
         peer = group_peer(gid)
         self.body.clear_widgets()
         members = group.get("members") or []
-        self.hero(peer, group.get("name") or "Group", "group",
-                  f"{len(members)} member{'s' if len(members) != 1 else ''}",
+        self.hero(peer, group.get("name") or tr("Group"), "group",
+                  trn("{n} member", "{n} members", len(members)),
                   on_name=(lambda: self._rename(group)) if admin else None,
                   on_avatar=(lambda: app.picture_menu(gid)) if admin else
                   (lambda: app.view_picture(peer)), editable=admin)
         state = group.get("state")
         if state != "active":
-            self.paragraph({"left": "You left this group. Its history stays "
-                                    "here, read-only.",
-                            "removed": "You were removed from this group. "
-                                       "Its history stays here, read-only.",
-                            "pending": "Messages arrived for this group "
-                                       "before its invitation; they will "
-                                       "join it when that arrives."
-                            }.get(state, ""), italic=True)
-        self.body.add_widget(SectionHead("This group"))
+            self.paragraph(tr({
+                "left": N_("You left this group. Its history stays here, "
+                           "read-only."),
+                "removed": N_("You were removed from this group. Its history "
+                              "stays here, read-only."),
+                "pending": N_("Messages arrived for this group before its "
+                              "invitation; they will join it when that "
+                              "arrives.")}.get(state, "")), italic=True)
+        self.body.add_widget(SectionHead(tr("This group")))
         rows = [self._mute_row(peer), self._timer_row(
             peer, can_set=group.get("admin") == me)]
         if admin:
-            rows.append(ListRow("edit", "Rename the group",
+            rows.append(ListRow("edit", tr("Rename the group"),
                                 group.get("name") or "", chevron=True,
                                 on_tap=lambda: self._rename(group)))
-            rows.append(ListRow("camera", "Group photo",
-                                "Every member sees it", chevron=True,
+            rows.append(ListRow("camera", tr("Group photo"),
+                                tr("Every member sees it"), chevron=True,
                                 on_tap=lambda: app.picture_menu(gid)))
         starred = len(store.starred(peer))
-        rows.append(ListRow("star", "Starred messages",
-                            f"{starred} message{'s' if starred != 1 else ''}",
+        rows.append(ListRow("star", tr("Starred messages"),
+                            trn("{n} message", "{n} messages", starred),
                             chevron=True,
                             on_tap=lambda: StarredModal(app, peer).open()))
         self.body.add_widget(rows_card(rows))
-        head = SectionHead(f"Members · {len(members)}")
+        head = SectionHead(tr("Members · {n}", n=len(members)))
         self.body.add_widget(head)
         member_rows = []
         if admin and len(members) < MAX_GROUP_MEMBERS:
-            member_rows.append(ListRow("person_add", "Add members",
-                                       "From your contacts",
+            member_rows.append(ListRow("person_add", tr("Add members"),
+                                       tr("From your contacts"),
                                        on_tap=lambda: AddMembersSheet(
                                            app, gid).open()))
         for m in sorted(members, key=lambda m: (m["a"] != me,
                                                 m["a"] != group.get("admin"),
                                                 (m.get("u") or "").lower())):
             address = m["a"]
-            name = "You" if address == me else \
+            name = tr("You") if address == me else \
                 app.conversation_screen.author_name(address) \
                 if app.conversation_screen.peer == peer else \
                 (store.get_contact(address) or {}).get("username") or \
@@ -20546,7 +21983,7 @@ class GroupInfoScreen(PageScreen):
                              spacing=dp(8))
             width = 0
             if address == group.get("admin"):
-                tag = caps_tag("Admin")
+                tag = caps_tag(tr("Admin"))
                 tags.add_widget(tag)
                 width += tag.width
             tags.width = width
@@ -20564,18 +22001,21 @@ class GroupInfoScreen(PageScreen):
         if state == "active":
             self.body.add_widget(Rule())
             self.body.add_widget(rows_card([ListRow(
-                "leave", "Leave group", "Your copy of its history stays",
+                "leave", tr("Leave group"), tr("Your copy of its history "
+                                               "stays"),
                 danger=True,
                 on_tap=lambda: app.confirm_leave_group(gid))]))
-        self.paragraph("Each message is sealed separately for every member "
-                       "and signed by its author, so no one — the relay "
-                       "included — can forge or read it. Groups hold up to "
-                       f"{MAX_GROUP_MEMBERS} people.", italic=True)
+        self.paragraph(tr("Each message is sealed separately for every "
+                          "member and signed by its author, so no one — the "
+                          "relay included — can forge or read it. Groups "
+                          "hold up to {n} people.", n=MAX_GROUP_MEMBERS),
+                       italic=True)
 
     def _rename(self, group: dict) -> None:
         gid = group["gid"]
-        TextPromptSheet("Rename group", "Group name", group.get("name", ""),
-                        "Every member sees the new name.",
+        TextPromptSheet(tr("Rename group"), tr("Group name"),
+                        group.get("name", ""),
+                        tr("Every member sees the new name."),
                         lambda name: self._renamed(gid, name),
                         limit=MAX_GROUP_NAME).open()
 
@@ -20587,7 +22027,8 @@ class GroupInfoScreen(PageScreen):
     def _member_menu(self, address: str, name: str, admin: bool = True):
         items = person_items(self.app, address, name)
         if admin:
-            items.append(("delete", f"Remove {name} from the group",
+            items.append(("delete", tr("Remove {name} from the group",
+                                       name=name),
                           lambda: self._remove(address), True))
         MenuSheet(items, title=name).open()
 
@@ -20600,14 +22041,13 @@ class MessageInfoSheet(Sheet):
     """Where a message of yours in a group has got to (v12): who has read
     it, who has it, who it is on its way to."""
 
-    TIERS = ((3, "Read by"), (2, "Delivered to"), (1, "On its way to"),
-             (0, "Not sent yet to"))
+    TIERS = ((3, N_("Read by")), (2, N_("Delivered to")),
+             (1, N_("On its way to")), (0, N_("Not sent yet to")))
 
     def __init__(self, screen, msg: dict) -> None:
-        text = single_line_text(message_text(msg) or {
-            "image": "Photo", "voice": "Voice message"}.get(
-                msg.get("kind"), "Message"), 60)
-        super().__init__("Message info", subtitle=f"\u201c{text}\u201d")
+        text = single_line_text(message_text(msg) or tr(QUOTE_NAMES.get(
+            msg.get("kind"), N_("Message"))), 60)
+        super().__init__(tr("Message info"), subtitle=f"\u201c{text}\u201d")
         store = screen.app.store
         sends = store.group_sends(msg["id"]) if store is not None else []
         self.counts = {}
@@ -20617,14 +22057,14 @@ class MessageInfoSheet(Sheet):
             self.counts[tier] = len(people)
             if not people:
                 continue
-            self.add(CapsLabel(f"{heading} \u00b7 {len(people)}", size=10.5,
-                               color=T.accent))
+            self.add(CapsLabel(f"{tr(heading)} \u00b7 {len(people)}",
+                               size=10.5, color=T.accent))
             self.add(rows_card([PersonRow(m, screen.author_name(m),
                                           short_addr(m, 18))
                                 for m in people], inset=dp(76)))
         if sends and not self.counts.get(3):
-            self.add(InfoLabel("Someone who has turned read receipts off "
-                               "shows here as delivered, at most.",
+            self.add(InfoLabel(tr("Someone who has turned read receipts off "
+                                  "shows here as delivered, at most."),
                                color=T.text_3, italic=True))
 
 
@@ -20632,7 +22072,7 @@ class AddMembersSheet(Sheet):
     """The admin adds contacts to a group."""
 
     def __init__(self, app: "FextApp", gid: str) -> None:
-        super().__init__("Add members")
+        super().__init__(tr("Add members"))
         self.app, self.gid = app, gid
         self.card.padding = [0, dp(8), 0, dp(18)]
         self.title_label.padding = [dp(22), 0]
@@ -20644,12 +22084,13 @@ class AddMembersSheet(Sheet):
         if self.rows:
             self.add(rows_card(self.rows, inset=dp(74)))
         else:
-            self.add(InfoLabel("Everyone in your contacts is already here.",
+            self.add(InfoLabel(tr("Everyone in your contacts is already "
+                                  "here."),
                                color=T.text_3, italic=True, font_size=fs(15),
                                padding=[dp(22), 0]))
         holder = BoxLayout(size_hint_y=None, height=TOUCH,
                            padding=[dp(22), 0])
-        self.button = Btn("Add", on_release=lambda _w: self._go())
+        self.button = Btn(tr("Add"), on_release=lambda _w: self._go())
         holder.add_widget(self.button)
         self.add(holder)
         self._sync()
@@ -20657,7 +22098,8 @@ class AddMembersSheet(Sheet):
     def _sync(self) -> None:
         n = sum(1 for r in self.rows if r.picked)
         self.button.disabled = not 1 <= n <= self.room
-        self.button.text = "Add" if n <= 1 else f"Add {n} people"
+        self.button.text = tr("Add") if n <= 1 else tr("Add {n} people",
+                                                        n=n)
 
     def _go(self) -> None:
         picked = [r.address for r in self.rows if r.picked]
@@ -20671,161 +22113,193 @@ class SettingsScreen(PageScreen):
     this identity's profile and keys."""
 
     def __init__(self, app: "FextApp", **kw):
-        super().__init__(app, "settings", "Settings",
+        super().__init__(app, "settings", tr("Settings"),
                          lambda: app.close_settings(), **kw)
 
     def show(self) -> None:
         self.body.clear_widgets()
         app = self.app
-        self.body.add_widget(SectionHead("Appearance"))
+        self.body.add_widget(SectionHead(tr("Appearance")))
         sys_dark = system_prefers_dark()
         # What each choice shows in its icon (StateIcon).
         theme_at = {"light": 0.0, "system": 0.5, "dark": 1.0}
         size_at = {k: i / (len(TEXT_SCALES) - 1)
                    for i, (k, _l, _s) in enumerate(TEXT_SCALES)}
 
+        set_at = {k: i / (len(THEME_SETS) - 1)
+                  for i, k in enumerate(THEME_SETS)}
+
         def chose(what, glyph_of, value, at):
             app.set_appearance(**{what: value})
             glyph_of().go(at)
-        theme = self._picker("theme", "Theme", Segmented(
-            THEME_CHOICES, APPEARANCE.mode,
+        looks = self._picker("theme_set", tr("Theme"), ThemeSwatches(
+            APPEARANCE.theme_set,
+            lambda v: chose("theme_set", lambda: looks.row.glyph, v,
+                            set_at[v])), set_at[APPEARANCE.theme_set])
+        theme = self._picker("theme", tr("Light or dark"), Segmented(
+            [(key, tr(label)) for key, label in THEME_CHOICES],
+            APPEARANCE.mode,
             lambda v: chose("theme", lambda: theme.row.glyph, v,
                             theme_at[v])), theme_at[APPEARANCE.mode])
         theme.add_widget(InfoLabel(
-            "System follows your phone's setting" +
-            ("" if sys_dark is None else
-             f" (now {'dark' if sys_dark else 'light'})") + ".",
+            tr("System follows your phone's setting.") if sys_dark is None
+            else tr("System follows your phone's setting (now dark)."
+                    if sys_dark else
+                    "System follows your phone's setting (now light)."),
             color=T.text_3, italic=True, font_size=fs(14.5)))
         current = next((k for k, _l, s in TEXT_SCALES
                         if abs(s - APPEARANCE.scale) < .01), "default")
-        size = self._picker("text_size", "Text size", Segmented(
-            [(k, label) for k, label, _s in TEXT_SCALES], current,
+        size = self._picker("text_size", tr("Text size"), Segmented(
+            [(k, tr(label)) for k, label, _s in TEXT_SCALES], current,
             lambda v: chose("text_size", lambda: size.row.glyph, v,
                             size_at[v])), size_at[current])
         size.add_widget(InfoLabel(
-            "“See you at nine?” — this size, 14:05 👍",
+            tr("“See you at nine?” — this size, 14:05 👍"),
             font_size=fs(17), padding=[0, dp(6)]))
-        self.body.add_widget(rows_card([theme.row, size.row]))
+        self.body.add_widget(rows_card([looks.row, theme.row, size.row]))
         self.body.add_widget(Rule(inset=dp(60)))
-        black = ListRow(
-            "moon", "Black background",
-            "The dark theme on a black page: deeper at night, and it saves "
-            "battery on OLED screens. Off: a warm dark grey",
-            control=ToggleSwitch(APPEARANCE.black, lambda on: chose(
-                "black", lambda: black.glyph, on, float(on))),
-            state=float(APPEARANCE.black))
+        rows = []
+        if THEME_SETS[APPEARANCE.theme_set].get("black"):
+            black = ListRow(
+                "moon", tr("Black background"),
+                tr("The dark theme on a black page: deeper at night, and it "
+                   "saves battery on OLED screens. Off: a warm dark grey"),
+                control=ToggleSwitch(APPEARANCE.black, lambda on: chose(
+                    "black", lambda: black.glyph, on, float(on))),
+                state=float(APPEARANCE.black))
+            rows.append(black)
         motion = ListRow(
-            "motion", "Reduce motion",
-            "Pages cross-fade instead of sliding; sheets, reactions and "
-            "scrolling move without animation",
+            "motion", tr("Reduce motion"),
+            tr("Pages cross-fade instead of sliding; sheets, reactions and "
+               "scrolling move without animation"),
             control=ToggleSwitch(APPEARANCE.reduce_motion, lambda on: chose(
                 "reduce_motion", lambda: motion.glyph, on, float(on))),
             state=float(APPEARANCE.reduce_motion))
-        self.body.add_widget(rows_card([black, motion]))
-        self.body.add_widget(SectionHead("Notifications"))
+        self.body.add_widget(rows_card(rows + [motion]))
+        self.body.add_widget(SectionHead(tr("Language")))
+        self.body.add_widget(rows_card([ListRow(
+            "language", self._language_choice(load_prefs().get("language")),
+            tr("Menus, buttons and notes. Messages stay as they were "
+               "written."), chevron=True, on_tap=self._choose_language)]))
+        self.body.add_widget(SectionHead(tr("Notifications")))
         if IS_ANDROID or os.environ.get("FEXT_SHOW_ANDROID_SETTINGS"):
             rows = [ListRow(
-                "bell", "Receive messages while closed",
-                "A small service keeps listening after Android closes the "
-                "app; Android shows it as running. Off saves battery — you "
-                "are then only notified while Ferritext is open.",
+                "bell", tr("Receive messages while closed"),
+                tr("A small service keeps listening after Android closes the "
+                   "app; Android shows it as running. Off saves battery — you "
+                   "are then only notified while Ferritext is open."),
                 control=ToggleSwitch(background_delivery_enabled(),
                                      self._on_delivery))]
+            maker = phone_maker()
+            if maker in KEEP_RUNNING and background_delivery_enabled():
+                left = len(keep_running_left(maker))
+                rows.append(ListRow(
+                    "battery", tr("Keep Ferritext running"),
+                    tr("Done: its settings keep it running") if not left
+                    else tr("{maker} phones stop apps in the background: "
+                            "one setting keeps it running",
+                            maker=MAKER_NAMES[maker]) if left == 1
+                    else tr("{maker} phones stop apps in the background: two "
+                            "settings keep it running",
+                            maker=MAKER_NAMES[maker]),
+                    chevron=True, on_tap=lambda: self._keep_running(maker)))
             if not android_full_screen_allowed():
                 rows.append(ListRow(
-                    "phone", "Let calls ring over the lock screen",
-                    "Android asks you to allow it: until then a call rings "
-                    "as a notification only", chevron=True,
+                    "phone", tr("Let calls ring over the lock screen"),
+                    tr("Android asks you to allow it: until then a call rings "
+                       "as a notification only"), chevron=True,
                     on_tap=android_open_full_screen_settings))
             self.body.add_widget(rows_card(rows))
         else:
             self.body.add_widget(rows_card([ListRow(
-                "bell", "Notifications on this computer",
-                "The system's own, while Ferritext's window is not in "
-                "front; muted chats stay quiet",
+                "bell", tr("Notifications on this computer"),
+                tr("The system's own, while Ferritext's window is not in "
+                   "front; muted chats stay quiet"),
                 control=ToggleSwitch(desktop_notifications_enabled(),
                                      lambda on: save_pref(
                                          "desktop_notifications", bool(on))))]))
         self.body.add_widget(InfoLabel(
-            "A muted chat still receives everything and shows it here; only "
-            "its notifications stop. Mute one for 12 hours, 3 days, or until "
-            "you turn it back on, from its page or by holding it in the list.",
+            tr("A muted chat still receives everything and shows it here; "
+               "only its notifications stop. Mute one for 12 hours, 3 days, "
+               "or until you turn it back on, from its page or by holding it "
+               "in the list."),
             color=T.text_3, italic=True, font_size=fs(14.5),
             padding=[dp(20), dp(4)]))
         if not IS_MOBILE:
-            self.body.add_widget(SectionHead("Calls and voice notes"))
+            self.body.add_widget(SectionHead(tr("Calls and voice notes")))
             rows = []
-            for kind, title in (("input", "Microphone"), ("output",
-                                                          "Speaker")):
+            for kind, title in (("input", N_("Microphone")),
+                                ("output", N_("Speaker"))):
                 rows.append(ListRow(
-                    "mic" if kind == "input" else "speaker", title,
-                    chosen_device(kind) or "The system's own", chevron=True,
+                    "mic" if kind == "input" else "speaker", tr(title),
+                    chosen_device(kind) or tr("The system's own"),
+                    chevron=True,
                     on_tap=lambda k=kind: self._choose_device(k)))
             self.body.add_widget(rows_card(rows))
             echo = use_system_echo_cancel()
             self.body.add_widget(InfoLabel(
-                ("Echo is cancelled by your system (" + echo + ")."
+                (tr("Echo is cancelled by your system ({how}).", how=echo)
                  if echo else
-                 "Echo cancelling comes from your computer or headset: with "
-                 "headphones, a headset, or a speakerphone that cancels echo "
-                 "itself, the other side never hears themselves. On Linux, "
-                 "PulseAudio's or PipeWire's echo-cancel module is used "
-                 "whenever it is on.") +
+                 tr("Echo cancelling comes from your computer or headset: "
+                    "with headphones, a headset, or a speakerphone that "
+                    "cancels echo itself, the other side never hears "
+                    "themselves. On Linux, PulseAudio's or PipeWire's "
+                    "echo-cancel module is used whenever it is on.")) +
                 ("" if _has_sounddevice() else
-                 " Install sounddevice to choose the devices here."),
+                 tr(" Install sounddevice to choose the devices here.")),
                 color=T.text_3, italic=True, font_size=fs(14.5),
                 padding=[dp(20), dp(4)]))
-        self.body.add_widget(SectionHead("Privacy"))
+        self.body.add_widget(SectionHead(tr("Privacy")))
         self.body.add_widget(rows_card([ListRow(
-            "link", "Link previews",
-            "When you write a link, this device fetches its title and "
-            "picture from the site (which sees the request) and sends them "
-            "with the message. Off: nothing is fetched, and previews others "
-            "send are not shown.",
+            "link", tr("Link previews"),
+            tr("When you write a link, this device fetches its title and "
+               "picture from the site (which sees the request) and sends them "
+               "with the message. Off: nothing is fetched, and previews "
+               "others send are not shown."),
             control=ToggleSwitch(link_previews_enabled(),
                                  self._on_previews)),
-            ListRow("block", "Blocked",
+            ListRow("block", tr("Blocked"),
                     self._blocked_hint(), chevron=True,
                     on_tap=lambda: self._open_blocked())]))
-        self.body.add_widget(SectionHead("Downloads"))
+        self.body.add_widget(SectionHead(tr("Downloads")))
 
         def pref(key):
             return ToggleSwitch(download_pref(key),
                                 lambda on, k=key: save_pref(k, bool(on)))
         rows = [ListRow(
-            "group", "Photos in large groups on tap",
-            f"In groups of more than {LARGE_GROUP}, a photo downloads when "
-            f"you tap it; its small preview shows at once",
+            "group", tr("Photos in large groups on tap"),
+            tr("In groups of more than {n}, a photo downloads when you tap "
+               "it; its small preview shows at once", n=LARGE_GROUP),
             control=pref("dl_large_groups_tap"))]
         if IS_ANDROID or os.environ.get("FEXT_SHOW_ANDROID_SETTINGS"):
             rows = [ListRow(
-                "image", "Photos on mobile data",
-                "Off: while not on Wi-Fi, photos wait for a tap",
+                "image", tr("Photos on mobile data"),
+                tr("Off: while not on Wi-Fi, photos wait for a tap"),
                 control=pref("dl_photos_metered")), ListRow(
-                "mic", "Voice messages on mobile data",
-                "Off: while not on Wi-Fi, they wait for a tap",
+                "mic", tr("Voice messages on mobile data"),
+                tr("Off: while not on Wi-Fi, they wait for a tap"),
                 control=pref("dl_voice_metered"))] + rows + [ListRow(
-                "download", "Ask before using mobile data",
-                "When you tap to download while not on Wi-Fi",
+                "download", tr("Ask before using mobile data"),
+                tr("When you tap to download while not on Wi-Fi"),
                 control=pref("ask_metered"))]
         self.body.add_widget(rows_card(rows))
-        self.body.add_widget(SectionHead("Backup"))
+        self.body.add_widget(SectionHead(tr("Backup")))
         self.body.add_widget(rows_card([
-            ListRow("archive", "Back up to a file",
-                    "Your identities and chats, sealed with a passphrase",
+            ListRow("archive", tr("Back up to a file"),
+                    tr("Your identities and chats, sealed with a passphrase"),
                     chevron=True, on_tap=lambda: BackupSheet(app).open()),
-            ListRow("unarchive", "Restore from a backup",
-                    "Adds the identities in a backup to this device",
+            ListRow("unarchive", tr("Restore from a backup"),
+                    tr("Adds the identities in a backup to this device"),
                     chevron=True, on_tap=lambda: RestoreSheet(app).open())]))
         if app.keys.has_identity:
-            self.body.add_widget(SectionHead("Identity"))
+            self.body.add_widget(SectionHead(tr("Identity")))
             self.body.add_widget(rows_card([ListRow(
-                "key", "Profile and keys",
-                "Your name, address, QR codes and private key",
+                "key", tr("Profile and keys"),
+                tr("Your name, address, QR codes and private key"),
                 chevron=True, on_tap=app.open_profile)]))
-        self.body.add_widget(SectionHead("About"))
+        self.body.add_widget(SectionHead(tr("About")))
         self.body.add_widget(rows_card([ListRow(
-            "info", f"{APP_NAME} {APP_VERSION}", "Version, relay and type",
+            "info", f"{APP_NAME} {APP_VERSION}", tr("Version, relay and type"),
             chevron=True, on_tap=lambda: AboutSheet(app).open())]))
 
     @staticmethod
@@ -20852,10 +22326,29 @@ class SettingsScreen(PageScreen):
         row.icon, row.glyph, col.row = icon, glyph, row
         return col
 
+    @staticmethod
+    def _language_choice(code) -> str:
+        """A choice of language as the list shows it: the system's (and
+        which that is), or a language by its own name."""
+        if code in LANGUAGES:
+            return LANGUAGES[code]
+        return tr("System ({language})",
+                  language=LANGUAGES[system_language()])
+
+    def _choose_language(self) -> None:
+        chosen = load_prefs().get("language")
+        chosen = chosen if chosen in LANGUAGES else "system"
+        MenuSheet([("check" if code == chosen else "language",
+                    self._language_choice(code),
+                    lambda c=code: self.app.set_language(c))
+                   for code in ["system", *LANGUAGES]],
+                  title=tr("Language")).open()
+
     def _blocked_hint(self) -> str:
         n = len(self.app.store.blocked_contacts()) if self.app.store else 0
-        return f"{n} {'person' if n == 1 else 'people'} — and how to " \
-               f"unblock them" if n else "No one is blocked"
+        return trn("{n} person — and how to unblock them",
+                   "{n} people — and how to unblock them", n) if n else \
+            tr("No one is blocked")
 
     def _open_blocked(self) -> None:
         sheet = BlockedSheet(self.app)
@@ -20865,6 +22358,14 @@ class SettingsScreen(PageScreen):
     def _on_delivery(self, on: bool) -> None:
         save_pref("background_delivery", bool(on))
         self.app._sync_background_service()
+        maker = phone_maker()
+        if on and keep_running_left(maker) and maker in KEEP_RUNNING:
+            self._keep_running(maker)
+
+    def _keep_running(self, maker: str) -> None:
+        sheet = KeepRunningSheet(self.app, maker)
+        sheet.bind(on_dismiss=lambda *_a: self.show())
+        sheet.open()
 
     def _on_previews(self, on: bool) -> None:
         save_pref("link_previews", bool(on))
@@ -20877,21 +22378,21 @@ class SettingsScreen(PageScreen):
     def _choose_device(self, kind: str) -> None:
         names = sound_devices(kind)
         if not names:
-            self.app._set_status("Choosing devices needs the sounddevice "
-                                 "package", T.accent)
+            self.app._set_status(tr("Choosing devices needs the sounddevice "
+                                    "package"), T.accent)
             return
         now = chosen_device(kind)
 
         def pick(name):
             save_pref(f"sound_{kind}", name or "")
             self.show()
-        items = [("check" if now is None else "speaker", "The system's own",
-                  lambda: pick(None))]
+        items = [("check" if now is None else "speaker",
+                  tr("The system's own"), lambda: pick(None))]
         items += [("check" if name == now else
                    ("mic" if kind == "input" else "speaker"), name,
                    lambda n=name: pick(n)) for name in names[:20]]
-        MenuSheet(items, title="Microphone" if kind == "input"
-                  else "Speaker").open()
+        MenuSheet(items, title=tr("Microphone") if kind == "input"
+                  else tr("Speaker")).open()
 
 class ProfileScreen(PageScreen):
     """Your profile: the identity you are writing as — its disc, name and
@@ -20899,7 +22400,7 @@ class ProfileScreen(PageScreen):
     text or QR), the private key (never to share), and removing it."""
 
     def __init__(self, app: "FextApp", **kw):
-        super().__init__(app, "profile", "My profile",
+        super().__init__(app, "profile", tr("My profile"),
                          lambda: app.close_profile(), **kw)
         self._revealed = False
 
@@ -20910,21 +22411,22 @@ class ProfileScreen(PageScreen):
         if not keys.has_identity:
             return
         self.hero(keys.address, keys.label or keys.username or "?", "dm",
-                  sub=f"@{keys.username or 'not registered'}",
+                  sub="@" + keys.username if keys.username else
+                  tr("not registered"),
                   on_name=lambda: RenameIdentityModal(app,
                                                       keys.address).open(),
                   on_avatar=lambda: app.picture_menu(), editable=True)
-        self.body.add_widget(SectionHead("Photo"))
+        self.body.add_widget(SectionHead(tr("Photo")))
         self.body.add_widget(rows_card([ListRow(
-            "camera", "Change the profile photo" if
-            PICTURES.path(keys.address) else "Set a profile photo",
-            "The people you write to see it", chevron=True,
+            "camera", tr("Change the profile photo") if
+            PICTURES.path(keys.address) else tr("Set a profile photo"),
+            tr("The people you write to see it"), chevron=True,
             on_tap=lambda: app.picture_menu())]))
         self._identity()
-        self.body.add_widget(SectionHead("This device"))
+        self.body.add_widget(SectionHead(tr("This device")))
         self.body.add_widget(rows_card([ListRow(
-            "delete", "Remove this identity",
-            "Its key, chats and settings leave this device", danger=True,
+            "delete", tr("Remove this identity"),
+            tr("Its key, chats and settings leave this device"), danger=True,
             on_tap=lambda: RemoveIdentityModal(app, keys.address).open())]))
 
     def _qr(self, data: str, side=dp(184)) -> AnchorLayout:
@@ -20943,55 +22445,56 @@ class ProfileScreen(PageScreen):
         keys, app = self.app.keys, self.app
         if not keys.has_identity:
             return
-        self.body.add_widget(SectionHead("Address"))
+        self.body.add_widget(SectionHead(tr("Address")))
         self.body.add_widget(rows_card([
-            ListRow("copy", "Copy address", keys.address,
+            ListRow("copy", tr("Copy address"), keys.address,
                     on_tap=lambda: app.copy_text(keys.address)),
-        ] + ([ListRow("share", "Open the key folder", str(DATA_DIR),
+        ] + ([ListRow("share", tr("Open the key folder"), str(DATA_DIR),
                       on_tap=lambda: open_folder_in_explorer(DATA_DIR))]
              if not IS_MOBILE else [])))
         self.body.add_widget(self._qr(keys.address))
         self.body.add_widget(InfoLabel(
-            "Scan for the address alone", color=T.text_3, italic=True,
+            tr("Scan for the address alone"), color=T.text_3, italic=True,
             font_size=fs(14), halign="center"))
         self.paragraph(
-            "The address is the HASH160 of your public key in Base58Check "
-            "(version 0x24), as Bitcoin builds one. Its “Fec” prefix is the "
-            "network's proof of work.", italic=True)
+            tr("The address is the HASH160 of your public key in Base58Check "
+               "(version 0x24), as Bitcoin builds one. Its “Fec” prefix is "
+               "the network's proof of work."), italic=True)
         bundle = json.dumps(keys.public_bundle(), indent=2)
-        self.body.add_widget(SectionHead("Public bundle · safe to share"))
+        self.body.add_widget(SectionHead(tr("Public bundle · safe to share")))
         self.body.add_widget(rows_card([ListRow(
-            "copy", "Copy the public bundle", "Username, address and key",
+            "copy", tr("Copy the public "
+                       "bundle"), tr("Username, address and key"),
             on_tap=lambda: app.copy_text(bundle))]))
         self.body.add_widget(self._qr(json.dumps(keys.public_bundle(),
                                                  separators=(",", ":")),
                                       side=dp(200)))
-        self.body.add_widget(SectionHead("Private key · never share it"))
+        self.body.add_widget(SectionHead(tr("Private key · never share it")))
         self.private_label = InfoLabel(
-            "Hidden", color=T.alert, font_size=fs(14), italic=True,
+            tr("Hidden"), color=T.alert, font_size=fs(14), italic=True,
             padding=[dp(20), dp(4)])
         self.reveal_row = ListRow(
-            "key", "Reveal the private key", "As raw hex and as WIF",
+            "key", tr("Reveal the private key"), tr("As raw hex and as WIF"),
             on_tap=self._toggle_private)
         self.body.add_widget(rows_card([
             self.reveal_row,
-            ListRow("copy", "Copy WIF", "Imports into Ferrite Core",
+            ListRow("copy", tr("Copy WIF"), tr("Imports into Ferrite Core"),
                     on_tap=self._copy_wif)]))
         self.body.add_widget(self.private_label)
 
     def _toggle_private(self) -> None:
         self._revealed = not self._revealed
         self.private_label.text = (self.app.keys.private_export()
-                                   if self._revealed else "Hidden")
+                                   if self._revealed else tr("Hidden"))
         self.private_label.italic = not self._revealed
-        self.reveal_row.title.text = ("Hide the private key" if
-                                      self._revealed else
-                                      "Reveal the private key")
+        self.reveal_row.title.text = tr("Hide the private key" if
+                                        self._revealed else
+                                        "Reveal the private key")
 
     def _copy_wif(self) -> None:
         data = json.loads(self.app.keys.private_export())
         Clipboard.copy(data["private_key_wif"])
-        self.app._set_status("Private key copied — keep it safe", T.accent)
+        self.app._set_status(tr("Private key copied — keep it safe"), T.accent)
 
 
 
@@ -21042,13 +22545,13 @@ class SplashOverlay(FloatLayout):
         # As tall as its two lines: a fixed height a pixel short of them
         # made Kivy drop "Messenger" without a word.
         wordmark = Label(
-            text="Ferrite Text\nMessenger", halign="center", valign="top",
+            text=tr("Ferrite Text\nMessenger"), halign="center", valign="top",
             font_size=sp(26), color=C(T.text if dark else "#1B1915"),
             line_height=1.1, size_hint_y=None)
         wordmark.bind(width=lambda w, v: setattr(w, "text_size", (v, None)),
                       texture_size=lambda w, v: setattr(w, "height", v[1]))
         column.add_widget(wordmark)
-        byline = Label(text="by koh-gt", italic=True, font_size=sp(15),
+        byline = Label(text=tr("by koh-gt"), italic=True, font_size=sp(15),
                        color=C(T.text_3 if dark else "#6F685C"),
                        size_hint_y=None, height=dp(24))
         column.add_widget(byline)
@@ -21147,8 +22650,8 @@ class MessagingMixin:
             log.exception("could not build envelope for %s", peer)
             MessageFlowLog.failed(*self._flow_names(peer),
                                   f"encryption failed: {exc}")
-            self.ui_queue.put(("status", f"Could not encrypt: {exc}",
-                               COL_DANGER))
+            self.ui_queue.put(("status", tr("Could not encrypt: {error}",
+                                            error=exc), COL_DANGER))
             return None
         return envelope, MessageFlowLog.fragment(envelope)
 
@@ -21159,10 +22662,12 @@ class MessagingMixin:
         control is lost, so that is said plainly."""
         MessageFlowLog.failed(*self._flow_names(peer), why, fragment)
         if local_id is None:
-            self.ui_queue.put(("status", f"Send failed: {why}", COL_DANGER))
+            self.ui_queue.put(("status", tr("Send failed: {error}",
+                                            error=why), COL_DANGER))
         else:
-            self.ui_queue.put(("status", "Not sent yet · it goes by itself "
-                               "when the relay answers", COL_TICK_GOLD))
+            self.ui_queue.put(("status", tr("Not sent yet · it goes by "
+                                            "itself when the relay answers"),
+                               COL_TICK_GOLD))
 
     def _record_copy(self, local_id: int, peer: str, group: Optional[str],
                      server_id, fragment: str) -> bool:
@@ -21177,8 +22682,8 @@ class MessagingMixin:
                 me, them, f"relay accepted it as #{server_id} but the local "
                           f"store could not record that", fragment)
             self.ui_queue.put(
-                ("status", "Sent, but this device could not record it — "
-                 "the tick may be wrong", COL_DANGER))
+                ("status", tr("Sent, but this device could not record it — "
+                              "the tick may be wrong"), COL_DANGER))
             return False
         MessageFlowLog.tick(1, server_id, me, them, fragment)
         self.ui_queue.put(("message_stored",
@@ -21312,7 +22817,7 @@ class MessagingMixin:
         if conv == "dm":
             contact = self.store.get_contact(peer)
             if contact is None:
-                self._set_status("Unknown contact", COL_DANGER)
+                self._set_status(tr("Unknown contact"), COL_DANGER)
                 return None
             if not contact.get("accepted", 1):
                 self.store.set_accepted(peer)   # writing to them accepts
@@ -21320,7 +22825,8 @@ class MessagingMixin:
         elif conv == "group":
             recipients = [a for a, _k in self.group_recipients(gid_of(peer))]
             if not recipients:
-                self._set_status("You are no longer a member of this group",
+                self._set_status(tr("You are no longer a member of this "
+                                    "group"),
                                  COL_TICK_GOLD)
                 return None
             label = (self.store.group(gid_of(peer)) or {}).get("name")
@@ -21456,7 +22962,7 @@ class MessagingMixin:
             except OSError:
                 self.store.set_media(local_id, state="failed")
                 self.ui_queue.put(("message_stored", peer))
-                self.ui_queue.put(("status", "The original file is gone",
+                self.ui_queue.put(("status", tr("The original file is gone"),
                                    COL_DANGER))
                 return False
             gid = gid_of(peer)
@@ -21474,14 +22980,14 @@ class MessagingMixin:
                 self.store.set_media(local_id, state="failed"
                                      if status == 413 else "waiting")
                 self.ui_queue.put(("message_stored", peer))
-                self.ui_queue.put(("status", {
-                    413: "That's too large for this relay",
-                    429: "The relay's room for your media is full · it "
-                         "goes by itself when there is space",
-                    507: "The relay's room for media is full · it goes by "
-                         "itself when there is space",
-                }.get(status, "Not sent yet · it goes by itself when the "
-                              "relay answers"),
+                self.ui_queue.put(("status", tr({
+                    413: N_("That's too large for this relay"),
+                    429: N_("The relay's room for your media is full · it "
+                            "goes by itself when there is space"),
+                    507: N_("The relay's room for media is full · it goes "
+                            "by itself when there is space"),
+                }.get(status, N_("Not sent yet · it goes by itself when the "
+                                 "relay answers"))),
                     COL_DANGER if status == 413 else COL_TICK_GOLD))
                 return False
             ext["media"] = dict(ext.get("media") or {}, blob=blob_id,
@@ -21626,7 +23132,7 @@ class MessagingMixin:
         threading.Thread(target=self._send_control_to, args=(
             peer, {"op": "end", "id": call_id, "why": "declined"},
             "Voice call"), daemon=True).start()
-        self.store.add_event(peer, "Declined call")
+        self.store.add_event(peer, tr("Declined call"))
         self.ui_queue.put(("message_stored", peer))
 
     def _send_control(self, peer: str, op: dict, fallback: str) -> bool:
@@ -21944,9 +23450,10 @@ class FextApp(MessagingMixin, App):
     """
 
     def __init__(self, **kw) -> None:
+        LANG.load(LANG.resolve())
         super().__init__(**kw)
-        self.title = f"{APP_NAME} {APP_VERSION} — end-to-end encrypted " \
-                     f"messenger"
+        self.title = tr("{app} {version} — end-to-end encrypted messenger",
+                        app=APP_NAME, version=APP_VERSION)
         self.keys = IdentityManager()
         self.crypto: Optional[CryptoEngine] = None
         self.api: Optional[ApiClient] = None
@@ -21954,7 +23461,7 @@ class FextApp(MessagingMixin, App):
         self.worker: Optional[SyncWorker] = None
         self.ui_queue: "queue.Queue" = queue.Queue()
         self.current_peer: Optional[str] = None
-        self._pending_status = ("Starting…", T.text_3)
+        self._pending_status = (tr("Starting…"), T.text_3)
         self._chat_anchor: Optional[int] = None  # oldest id shown in the chat
         # Newest id shown, when the window stops short of the end (opened
         # at a found or quoted message); None while it follows the chat.
@@ -21973,8 +23480,9 @@ class FextApp(MessagingMixin, App):
 
     # ---- lifecycle -----------------------------------------------------------
     def build(self):
-        apply_theme(APPEARANCE.resolve())
+        use_theme(APPEARANCE.resolve())
         self._theme_name = T.name
+        android_notification_words()
         Window.clearcolor = C(T.bg)
         if IS_MOBILE:
             # Without this the soft keyboard covers the composer you are
@@ -22116,9 +23624,12 @@ class FextApp(MessagingMixin, App):
     def set_appearance(self, theme: Optional[str] = None,
                        text_size: Optional[str] = None,
                        reduce_motion: Optional[bool] = None,
-                       black: Optional[bool] = None) -> None:
+                       black: Optional[bool] = None,
+                       theme_set: Optional[str] = None) -> None:
         if theme is not None:
             save_pref("theme", theme)
+        if theme_set is not None:
+            save_pref("theme_set", theme_set)
         if black is not None:
             save_pref("black", bool(black))
         if text_size is not None:
@@ -22126,6 +23637,14 @@ class FextApp(MessagingMixin, App):
         if reduce_motion is not None:
             save_pref("reduce_motion", bool(reduce_motion))
         self.apply_appearance(force=text_size is not None)
+
+    def set_language(self, code: str) -> None:
+        """Settings › Language: "system", or a code LANGUAGES has. The
+        interface is built again in it, as for a new theme."""
+        save_pref("language", code)
+        LANG.load(LANG.resolve())
+        android_notification_words()
+        self._rebuild_ui(T.name)
 
     def apply_appearance(self, force: bool = False) -> None:
         """Re-read the preferences (and the system's theme); rebuild the
@@ -22173,7 +23692,7 @@ class FextApp(MessagingMixin, App):
         for view in list(Window.children):
             if isinstance(view, ModalView):
                 view.dismiss(animation=False)
-        apply_theme(name)
+        use_theme(name)
         self._theme_name = name
         Window.clearcolor = C(T.bg)
         for old in list(self.manager.screens):
@@ -22214,11 +23733,11 @@ class FextApp(MessagingMixin, App):
             base = ENDPOINT.resolve(force=not ENDPOINT.resolved)
             if base is None:
                 self.ui_queue.put(
-                    ("status", "Can't reach the relay — tap to retry",
+                    ("status", tr("Can't reach the relay — tap to retry"),
                      COL_DANGER))
             elif not ENDPOINT.secure:
                 self.ui_queue.put(
-                    ("status", "Relay reachable (transport not secured)",
+                    ("status", tr("Relay reachable (transport not secured)"),
                      COL_TICK_GOLD))
         threading.Thread(target=worker, daemon=True).start()
 
@@ -22300,10 +23819,11 @@ class FextApp(MessagingMixin, App):
             if isinstance(filename, bytes) else str(filename)
         screen = self.conversation_screen
         if self.manager.current != "conversation" or screen.peer is None:
-            self._set_status("Open a chat, then drop the photo on it", T.accent)
+            self._set_status(tr("Open a chat, then drop the photo on "
+                                "it"), T.accent)
             return
         if not is_image_file(path):
-            self._set_status("Only photos can be dropped here", T.accent)
+            self._set_status(tr("Only photos can be dropped here"), T.accent)
             return
         screen._picked(path, False)
 
@@ -22394,8 +23914,6 @@ class FextApp(MessagingMixin, App):
         self.refresh_sidebar()
         if self.keys.username:
             self._start_worker()
-            self._ask_notification_permission()
-            self._sync_background_service()
             action, call_id = self._launch_call_action()
             if action == "answer" and call_id:
                 self._answer_on_ring = str(call_id)
@@ -22403,8 +23921,10 @@ class FextApp(MessagingMixin, App):
             peer = self._launch_peer()
             if peer and self._known_conversation(peer):
                 self.open_conversation(peer)
+            # Opened for a call or a chat: the guide can wait for next time.
+            self._ready_to_receive(offer=not (peer or call_id))
         else:
-            self._set_status("Pick a username to start chatting",
+            self._set_status(tr("Pick a username to start chatting"),
                              COL_TICK_GOLD)
             RegisterModal(self).open()
 
@@ -22422,7 +23942,7 @@ class FextApp(MessagingMixin, App):
     def _start_worker(self) -> None:
         self.worker = SyncWorker(self)
         self.worker.start()
-        self._set_status("Connecting…", COL_TEXT_DIM)
+        self._set_status(tr("Connecting…"), COL_TEXT_DIM)
         # Learn what the relay can carry (media needs v9) off the UI thread,
         # so the composer knows before anyone reaches for the camera.
         api = self.api
@@ -22442,6 +23962,7 @@ class FextApp(MessagingMixin, App):
     def on_registered(self) -> None:
         self.chats_screen.refresh_header()
         self._start_worker()
+        self._ready_to_receive()
 
     def on_identity_created(self, address: str) -> None:
         self._activate_identity(address)
@@ -22497,7 +24018,9 @@ class FextApp(MessagingMixin, App):
         remaining = self.keys.remove_identity(address)
         if remaining:
             self._activate_identity(remaining)
-            self._set_status(f"Identity removed{note}", COL_TEXT_DIM)
+            self._set_status(tr("Identity removed ({note})", note=note)
+                             if note else tr("Identity removed"),
+                             COL_TEXT_DIM)
         else:
             # Nothing left: return to the first-run experience rather than
             # leaving a half-live UI pointing at an identity that is gone.
@@ -22506,7 +24029,9 @@ class FextApp(MessagingMixin, App):
             self.chats_screen.refresh_header()
             self.chats_screen.refresh_list([])
             self._navigate("chats", None)
-            self._set_status(f"No identities on this device{note}",
+            self._set_status(tr("No identities on this device ({note})",
+                                note=note) if note else
+                             tr("No identities on this device"),
                              COL_TICK_GOLD)
             NewIdentityModal(self, first_run=True).open()
 
@@ -22639,7 +24164,8 @@ class FextApp(MessagingMixin, App):
             return
         unread = sum(int(c.get("unread") or 0) for c in conversations
                      if not c.get("muted") and not c.get("blocked"))
-        base = f"{APP_NAME} {APP_VERSION} — end-to-end encrypted messenger"
+        base = tr("{app} {version} — end-to-end encrypted messenger",
+                  app=APP_NAME, version=APP_VERSION)
         title = f"({unread}) {base}" if unread else base
         if title != getattr(self, "_title_now", None):
             self._title_now = title
@@ -22820,8 +24346,8 @@ class FextApp(MessagingMixin, App):
         own = [r for r in rows if r["direction"] == "out"
                and r.get("client_msg_id")]
         if len(own) != len(rows):
-            self._set_status("You can only delete your own messages for "
-                             "everyone", COL_TICK_GOLD)
+            self._set_status(tr("You can only delete your own messages for "
+                                "everyone"), COL_TICK_GOLD)
             return
 
         if self.conversation_kind(peer) == "self":
@@ -22839,8 +24365,8 @@ class FextApp(MessagingMixin, App):
 
     def _finish_delete_for_everyone(self, rows: list, ok: bool) -> None:
         if not ok:
-            self._set_status("Couldn't delete for everyone — check your "
-                             "connection and try again", COL_DANGER)
+            self._set_status(tr("Couldn't delete for everyone — check your "
+                                "connection and try again"), COL_DANGER)
             return
         for row in self.store.delete_messages([r["id"] for r in rows]):
             discard_media_file(row.get("media_path"))
@@ -22923,8 +24449,9 @@ class FextApp(MessagingMixin, App):
 
         def work():
             if not self._send_control(peer, ctl, fallback):
-                self.ui_queue.put(("status", "Couldn't send that reaction — "
-                                   "it shows here only", COL_TICK_GOLD))
+                self.ui_queue.put(("status", tr("Couldn't send that reaction "
+                                                "— it shows here only"),
+                                   COL_TICK_GOLD))
         threading.Thread(target=work, daemon=True).start()
 
     # =========================================================================
@@ -22952,7 +24479,7 @@ class FextApp(MessagingMixin, App):
                  "admin": self.keys.address, "members": members}
         self.store.save_group(state, "active")
         peer = group_peer(gid)
-        self.store.add_event(peer, f"You created \u201c{name}\u201d")
+        self.store.add_event(peer, tr("You created “{group}”", group=name))
         threading.Thread(target=self._announce_group, args=(
             gid, (), f"{self.keys.username or 'Someone'} added you to the "
                      f"group \u201c{name}\u201d", False), daemon=True).start()
@@ -22962,9 +24489,10 @@ class FextApp(MessagingMixin, App):
     def _announce_group(self, gid: str, also=(), fallback: str = "",
                         bump: bool = True) -> None:
         if not self._publish_group_state(gid, also, fallback, bump):
-            self.ui_queue.put(("status", "Not every member could be reached "
-                               "yet — they'll get the group when they "
-                               "next receive a message", COL_TICK_GOLD))
+            self.ui_queue.put(("status", tr("Not every member could be "
+                                            "reached yet — they'll get the "
+                                            "group when they next receive a "
+                                            "message"), COL_TICK_GOLD))
         self.ui_queue.put(("message_stored", group_peer(gid)))
 
     def rename_group(self, gid: str, name: str) -> bool:
@@ -22976,8 +24504,8 @@ class FextApp(MessagingMixin, App):
         state = self._group_state(gid)
         state["name"] = name
         self.store.save_group(state, group["state"])
-        self.store.add_event(group_peer(gid), f"You renamed the group "
-                                              f"\u201c{name}\u201d")
+        self.store.add_event(group_peer(gid), tr(
+            "You renamed the group “{group}”", group=name))
         threading.Thread(target=self._announce_group, args=(gid,),
                          daemon=True).start()
         self.refresh_chat(self.current_peer)
@@ -23004,7 +24532,8 @@ class FextApp(MessagingMixin, App):
         if not added:
             return 0
         self.store.save_group(state, group["state"])
-        self.store.add_event(group_peer(gid), "You added " + ", ".join(added))
+        self.store.add_event(group_peer(gid), tr("You added {names}",
+                                                 names=", ".join(added)))
         threading.Thread(target=self._announce_group, args=(gid,),
                          daemon=True).start()
         self.refresh_chat(self.current_peer)
@@ -23023,8 +24552,9 @@ class FextApp(MessagingMixin, App):
         if len(state["members"]) < 2:
             return False
         self.store.save_group(state, group["state"])
-        self.store.add_event(group_peer(gid), "You removed " + (
-            gone[0].get("u") or short_addr(address, 10)))
+        self.store.add_event(group_peer(gid), tr(
+            "You removed {name}", name=gone[0].get("u") or
+            short_addr(address, 10)))
         threading.Thread(target=self._announce_group, args=(
             gid, [(address, gone[0]["k"])]), daemon=True).start()
         self.refresh_chat(self.current_peer)
@@ -23037,7 +24567,7 @@ class FextApp(MessagingMixin, App):
             return
         recipients = self.group_recipients(gid)
         self.store.set_group_state(gid, "left")
-        self.store.add_event(group_peer(gid), "You left the group")
+        self.store.add_event(group_peer(gid), tr("You left the group"))
 
         def work():
             for address, pub in recipients:
@@ -23059,7 +24589,7 @@ class FextApp(MessagingMixin, App):
 
     def copy_text(self, text: str) -> None:
         Clipboard.copy(text)
-        self._set_status("Copied", COL_OK)
+        self._set_status(tr("Copied"), COL_OK)
 
     def open_link(self, url: str) -> None:
         """A link tapped in a message: first, where it leads (v11)."""
@@ -23084,7 +24614,7 @@ class FextApp(MessagingMixin, App):
             except Exception:
                 log.exception("share sheet failed; copying instead")
         self.copy_text(text or rows[0]["body"])
-        self._set_status("Copied — paste it into any app", COL_OK)
+        self._set_status(tr("Copied — paste it into any app"), COL_OK)
 
     # =========================================================================
     #  Media (v9): photos and voice notes
@@ -23105,8 +24635,8 @@ class FextApp(MessagingMixin, App):
             data, width, height, thumb = compress_image(path)
         except Exception as exc:
             log.warning("could not read image %s: %s", path, exc)
-            self.ui_queue.put(("status", "That file isn't an image this "
-                               "app can read", COL_DANGER))
+            self.ui_queue.put(("status", tr("That file isn't an image this "
+                                            "app can read"), COL_DANGER))
             return
         finally:
             # The full-size original (with its camera details) is not kept:
@@ -23129,7 +24659,8 @@ class FextApp(MessagingMixin, App):
             try:
                 data = Path(path).read_bytes()
             except OSError as exc:
-                self.ui_queue.put(("status", f"Recording unavailable: {exc}",
+                self.ui_queue.put(("status", tr("Recording unavailable: "
+                                                "{error}", error=exc),
                                    COL_DANGER))
                 return
             finally:
@@ -23155,11 +24686,11 @@ class FextApp(MessagingMixin, App):
         if not to_self and not (self.api is not None and
                                 self.api.features().get("blobs")):
             self.ui_queue.put((
-                "status", "This relay can't carry photos or voice notes "
-                "yet — it needs the v9 relay", COL_TICK_GOLD))
+                "status", tr("This relay can't carry photos or voice notes "
+                             "yet — it needs the v9 relay"), COL_TICK_GOLD))
             return
         if len(data) > MAX_MEDIA_BYTES - 64:
-            self.ui_queue.put(("status", "That's too large to send",
+            self.ui_queue.put(("status", tr("That's too large to send"),
                                COL_DANGER))
             return
         MEDIA_DIR.mkdir(parents=True, exist_ok=True)
@@ -23167,8 +24698,8 @@ class FextApp(MessagingMixin, App):
         try:
             local_path.write_bytes(data)
         except OSError as exc:
-            self.ui_queue.put(("status", f"Could not save media: {exc}",
-                               COL_DANGER))
+            self.ui_queue.put(("status", tr("Could not save media: {error}",
+                                            error=exc), COL_DANGER))
             return
         media = dict(extra, kind=kind, mime=mime, size=len(data))
         ext = {"media": media}
@@ -23286,22 +24817,23 @@ class FextApp(MessagingMixin, App):
     def call_blocker(self, peer: Optional[str]) -> Optional[str]:
         """Why `peer` cannot be called from here, now — or None."""
         if not peer or self.store is None:
-            return "Open a chat to call"
+            return tr("Open a chat to call")
         if self.conversation_kind(peer) != "dm":
-            return "Calls are between two people"
+            return tr("Calls are between two people")
         if self.call is not None and not self.call.ended:
-            return "You are already in a call"
+            return tr("You are already in a call")
         if self.store.is_blocked(peer):
-            return "Unblock them to call"
+            return tr("Unblock them to call")
         features = self.api.features() if self.api is not None else {}
         if not features.get("calls"):
-            return "Calls need the relay to be updated first"
+            return tr("Calls need the relay to be updated first")
         contact = self.store.get_contact(peer) or {}
         if not contact.get("caps", 0) & LocalStore.CAP_CALL:
-            return ("They can take calls once they run Ferritext 9.1.2 or "
-                    "later — and have written to you since")
+            return tr("They can take calls once they run Ferritext 9.1.2 or "
+                      "later — and have written to you since")
         if not calls_possible_here():
-            return "This computer has no microphone or speaker to call with"
+            return tr("This computer has no microphone or speaker to call "
+                      "with")
         return None
 
     def start_call(self, peer: Optional[str] = None) -> None:
@@ -23339,8 +24871,9 @@ class FextApp(MessagingMixin, App):
                 if grants and all(grants):
                     run_on_ui(then)
                 else:
-                    run_on_ui(self._set_status, "Calls need the microphone "
-                              "permission", T.accent)
+                    run_on_ui(self._set_status, tr("Calls need the "
+                                                   "microphone permission"),
+                              T.accent)
             android_request_permissions(["android.permission.RECORD_AUDIO"],
                                         answered)
             return
@@ -23401,7 +24934,7 @@ class FextApp(MessagingMixin, App):
         call.signalled = True
         if not self._send_control_to(call.peer, op, "Voice call"):
             self.ui_queue.put(("call_engine", call.id, "failed",
-                               "The call could not be placed"))
+                               tr("The call could not be placed")))
 
     def _prepare_incoming(self, call: "Call") -> None:
         """Worker thread: the callee's side, while it rings — find the way
@@ -23431,17 +24964,17 @@ class FextApp(MessagingMixin, App):
             return
         age = time.time() - sig["t"] if sig.get("t") else 0
         if age > CALL_OFFER_MAX_AGE:
-            self._log_call(sender, "Missed call", missed=True)
+            self._log_call(sender, tr("Missed call"), missed=True)
             return
         current = self.call
         if current is not None and not current.ended:
             if current.id != sig["id"]:
                 self._send_call_end(sender, sig["id"], "busy")
-                self._log_call(sender, "Missed call", missed=True)
+                self._log_call(sender, tr("Missed call"), missed=True)
             return
         if not calls_possible_here():
             self._send_call_end(sender, sig["id"], "unavailable")
-            self._log_call(sender, "Missed call", missed=True)
+            self._log_call(sender, tr("Missed call"), missed=True)
             return
         if sig["id"] in self._declined_calls:
             return                     # declined from its notification
@@ -23529,11 +25062,12 @@ class FextApp(MessagingMixin, App):
         elif kind == "bye":
             self._finish_call("hangup", local=False)
         elif kind == "lost":
-            self._set_status("The call dropped", T.alert)
+            self._set_status(tr("The call dropped"), T.alert)
             self._finish_call("failed", local=True)
         elif kind in ("audio_failed", "failed"):
             self._set_status(str(value) if kind == "failed" else
-                             f"The call's sound would not start ({value})",
+                             tr("The call's sound would not start ({reason})",
+                                reason=value),
                              T.alert)
             self._finish_call("failed", local=True)
         self._refresh_call()
@@ -23623,11 +25157,12 @@ class FextApp(MessagingMixin, App):
                 short_addr(peer, 12)
             if IS_ANDROID:
                 try:
-                    android_notify(peer, name, "Missed call")
+                    android_notify(peer, name, tr("Missed call"))
                 except Exception:
                     log.exception("could not post a missed call")
             else:
-                self._set_status(f"Missed call from {name}", COL_ACCENT)
+                self._set_status(tr("Missed call from {name}", name=name),
+                                 COL_ACCENT)
 
     def toggle_call_mute(self) -> None:
         call = self.call
@@ -23676,7 +25211,7 @@ class FextApp(MessagingMixin, App):
         MenuSheet([(icons.get(key, "speaker"),
                     label + ("  ✓" if key == now else ""),
                     lambda k=key: self.set_call_route(k))
-                   for key, label in routes], title="Sound").open()
+                   for key, label in routes], title=tr("Sound")).open()
 
     def set_call_route(self, key: str) -> None:
         call = self.call
@@ -23754,10 +25289,12 @@ class FextApp(MessagingMixin, App):
             self._call_overlay.refresh()
         if self._call_pill is not None and call is not None:
             what = call_clock(call.duration()) if call.state == "active" \
-                else {"incoming": "Incoming call", "ringing": "Ringing…",
-                      "calling": "Calling…",
-                      "connecting": "Connecting…"}.get(call.state, "Call")
-            self._call_pill.set_text(f"{what}  ·  tap to return")
+                else tr({"incoming": N_("Incoming call"),
+                         "ringing": N_("Ringing…"), "calling": N_("Calling…"),
+                         "connecting": N_("Connecting…")}.get(call.state,
+                                                              N_("Call")))
+            self._call_pill.set_text(tr("{what}  ·  tap to return",
+                                        what=what))
 
     def _start_call_clock(self) -> None:
         if self._call_clock is None:
@@ -23781,7 +25318,7 @@ class FextApp(MessagingMixin, App):
             self._finish_call("timeout", local=True)
         elif call.state == "connecting" and \
                 now - (call.answered_at or now) > CALL_CONNECT_SECONDS:
-            self._set_status("No way through to them was found", T.alert)
+            self._set_status(tr("No way through to them was found"), T.alert)
             self._finish_call("failed", local=True)
         self._refresh_call()
 
@@ -23892,9 +25429,10 @@ class FextApp(MessagingMixin, App):
                     if peer:
                         name = (self.store.get_contact(peer) or {}).get(
                             "username") or short_addr(peer, 10)
-                        self._set_status(
-                            f"{count} message{'s' if count != 1 else ''} "
-                            f"from {name} arrived", COL_OK)
+                        self._set_status(trn(
+                            "{n} message from {name} arrived",
+                            "{n} messages from {name} arrived", count,
+                            name=name), COL_OK)
                     self._dirty_list = True
                 elif kind == "media_pending" and self.store is not None:
                     row = self.store.message_by_cid(event[1], event[2], "in")
@@ -23962,8 +25500,8 @@ class FextApp(MessagingMixin, App):
                 desktop_notify(name, preview)
             desktop_flash_window()
         else:
-            self.ui_queue.put(("status", f"New message from {name}",
-                               COL_ACCENT))
+            self.ui_queue.put(("status", tr("New message from {name}",
+                                            name=name), COL_ACCENT))
 
     def call_signal_arrived(self, sender: str, sig: dict) -> None:
         """A call's message (sync thread, v11). On screen, or with a call
@@ -24066,6 +25604,25 @@ class FextApp(MessagingMixin, App):
             return
         self._check_pending_offer()
 
+    def _ready_to_receive(self, offer: bool = True) -> None:
+        """With a username: notifications allowed, the background service
+        running and, with `offer`, the settings that keep it running."""
+        self._ask_notification_permission()
+        self._sync_background_service()
+        if offer:
+            self._offer_keep_running()
+
+    def _offer_keep_running(self) -> None:
+        """KeepRunningSheet, once on this phone and by itself, if its maker
+        stops apps in the background and a setting is still to make."""
+        maker = phone_maker()
+        if maker not in KEEP_RUNNING or not background_delivery_enabled() \
+                or load_prefs().get("keep_running_offered") \
+                or self.call is not None or not keep_running_left(maker):
+            return
+        save_pref("keep_running_offered", True)
+        KeepRunningSheet(self, maker).open()
+
     def _sync_background_service(self) -> None:
         """Run the background service if the user wants delivery while the
         app is closed (default), stop it if not. Started from here — the
@@ -24157,11 +25714,11 @@ class FextApp(MessagingMixin, App):
             self.worker = None
         self.keys.clear_username()
         self.chats_screen.refresh_header()
-        self._set_status("This relay doesn't recognise your identity — "
-                         "pick a username to reconnect", COL_TICK_GOLD)
-        reason = ("The relay no longer has a record of this identity "
-                  "(its database may have been reset). Your keys are "
-                  "safe — choose a name to register again.")
+        self._set_status(tr("This relay doesn't recognise your identity — "
+                            "pick a username to reconnect"), COL_TICK_GOLD)
+        reason = tr("The relay no longer has a record of this identity "
+                    "(its database may have been reset). Your keys are "
+                    "safe — choose a name to register again.")
         self._register_modal = RegisterModal(self, reason=reason)
         self._register_modal.bind(
             on_dismiss=lambda *_a: setattr(self, "_register_modal", None))
@@ -24176,7 +25733,7 @@ class FextApp(MessagingMixin, App):
         self._probe_transport()
         if self.worker is not None and self.worker.is_alive():
             self.worker.nudge()
-            self._set_status("Reconnecting…", COL_TEXT_DIM)
+            self._set_status(tr("Reconnecting…"), COL_TEXT_DIM)
         elif self.keys.has_identity and self.keys.username:
             self._start_worker()
 
@@ -24234,7 +25791,7 @@ class FextApp(MessagingMixin, App):
         if self.store is not None and self.keys.username:
             AddContactModal(self).open()
         else:
-            self._set_status("Register this identity first", COL_TICK_GOLD)
+            self._set_status(tr("Register this identity first"), COL_TICK_GOLD)
 
     def open_contact_settings(self) -> None:
         if self.current_peer is not None:
@@ -24299,17 +25856,17 @@ class FextApp(MessagingMixin, App):
         has = bool(PICTURES.path(peer))
         items = []
         if has:
-            items.append(("image", "See the photo",
+            items.append(("image", tr("See the photo"),
                           lambda: self.view_picture(peer)))
-        items.append(("image", "Choose a photo",
+        items.append(("image", tr("Choose a photo"),
                       lambda: self._pick_picture(gid)))
-        items.append(("camera", "Take a photo",
+        items.append(("camera", tr("Take a photo"),
                       lambda: self._shoot_picture(gid)))
         if has:
-            items.append(("delete", "Remove the photo",
+            items.append(("delete", tr("Remove the photo"),
                           lambda: self.set_picture(None, gid), True))
-        MenuSheet(items, title="Group photo" if gid else
-                  "Profile photo").open()
+        MenuSheet(items, title=tr("Group photo") if gid else
+                  tr("Profile photo")).open()
 
     def view_picture(self, peer: str) -> bool:
         path = PICTURES.path(peer)
@@ -24325,11 +25882,11 @@ class FextApp(MessagingMixin, App):
                     lambda path: self._frame_picture(path, gid, True))
             except Exception:
                 log.exception("photo picker failed")
-                self._set_status("Couldn't open the photo picker", T.alert)
+                self._set_status(tr("Couldn't open the photo picker"), T.alert)
         else:
             ImageChooserModal(
                 lambda path: self._frame_picture(path, gid, False),
-                title="Group photo" if gid else "Profile photo").open()
+                title=tr("Group photo") if gid else tr("Profile photo")).open()
 
     def _shoot_picture(self, gid: Optional[str]) -> None:
         if IS_ANDROID:
@@ -24338,7 +25895,7 @@ class FextApp(MessagingMixin, App):
                     lambda path: self._frame_picture(path, gid, True))
             except Exception:
                 log.exception("camera failed")
-                self._set_status("Couldn't open the camera", T.alert)
+                self._set_status(tr("Couldn't open the camera"), T.alert)
         else:
             open_desktop_camera(
                 lambda path: self._frame_picture(path, gid, True),
@@ -24348,13 +25905,14 @@ class FextApp(MessagingMixin, App):
                        temporary: bool) -> None:
         try:
             PictureCropSheet(path, lambda data: self.set_picture(data, gid),
-                             title="Group photo" if gid else "Profile photo",
+                             title=tr("Group photo" if gid
+                                      else "Profile photo"),
                              temporary=temporary).open()
         except Exception:
             log.exception("could not open a photo to frame")
             if temporary:
                 discard_media_file(path)
-            self._set_status("That photo could not be opened", T.alert)
+            self._set_status(tr("That photo could not be opened"), T.alert)
 
     def set_picture(self, data: Optional[bytes],
                     gid: Optional[str] = None) -> bool:
@@ -24367,8 +25925,8 @@ class FextApp(MessagingMixin, App):
             group = self.store.group(gid)
             if group is None or group["admin"] != self.keys.address or \
                     group["state"] != "active":
-                self._set_status("Only the group's admin can change its "
-                                 "photo", T.accent)
+                self._set_status(tr("Only the group's admin can change its "
+                                    "photo"), T.accent)
                 return False
             peer = group_peer(gid)
             target = peer_picture_path(self.keys.address, peer)
@@ -24378,7 +25936,7 @@ class FextApp(MessagingMixin, App):
         path = None
         if data:
             if not write_picture(target, data):
-                self._set_status("The photo could not be saved", T.alert)
+                self._set_status(tr("The photo could not be saved"), T.alert)
                 return False
             path = str(target)
         else:
@@ -24394,9 +25952,12 @@ class FextApp(MessagingMixin, App):
         elif self.manager.current == "group_info" and \
                 self.group_info_screen.gid == gid:
             self.group_info_screen.show(gid)
-        what = "Group photo" if gid else "Profile photo"
-        self._set_status(f"{what} {'updated' if path else 'removed'}",
-                         COL_TEXT_DIM)
+        if gid:
+            done = tr("Group photo updated" if path else "Group photo removed")
+        else:
+            done = tr("Profile photo updated" if path
+                      else "Profile photo removed")
+        self._set_status(done, COL_TEXT_DIM)
         return True
 
     def open_settings(self) -> None:
@@ -24417,11 +25978,11 @@ class FextApp(MessagingMixin, App):
         if self.store is not None and self.keys.username:
             ComposeSheet(self).open()
         else:
-            self._set_status("Register this identity first", T.accent)
+            self._set_status(tr("Register this identity first"), T.accent)
 
     def open_new_group(self) -> None:
         if self.store is None or not self.keys.username:
-            self._set_status("Register this identity first", T.accent)
+            self._set_status(tr("Register this identity first"), T.accent)
             return
         self.new_group_screen.show()
         self._navigate("new_group", "left")
@@ -24430,19 +25991,19 @@ class FextApp(MessagingMixin, App):
         group = self.store.group(gid) if self.store else None
         if not group:
             return
-        sheet = Sheet(f"Leave “{group['name']}”?")
-        sheet.add(hint("The others are told you left. Your copy of the "
-                       "history stays on this device, read-only; only the "
-                       "admin can add you back."))
+        sheet = Sheet(tr("Leave “{group}”?", group=group["name"]))
+        sheet.add(hint(tr("The others are told you left. Your copy of the "
+                          "history stays on this device, read-only; only the "
+                          "admin can add you back.")))
 
         def leave(_w):
             sheet.dismiss()
             self.leave_group(gid)
             if self.manager.current == "group_info":
                 self.group_info_screen.show(gid)
-        sheet.add(button_row(Btn("Stay", kind="quiet",
+        sheet.add(button_row(Btn(tr("Stay"), kind="quiet",
                                  on_release=lambda _w: sheet.dismiss()),
-                             Btn("Leave", kind="solid_danger",
+                             Btn(tr("Leave"), kind="solid_danger",
                                  on_release=leave)))
         sheet.open()
 
@@ -24479,7 +26040,7 @@ class FextApp(MessagingMixin, App):
             if until is not None and IS_ANDROID:
                 android_clear_notification(peer)
         if until is None:
-            verb = "Notifications on" if len(peers) == 1 else "Unmuted"
+            verb = tr("Notifications on" if len(peers) == 1 else "Unmuted")
         else:
             verb = mute_label(until, short=True)
         self._after_list_change(peers, verb)
@@ -24499,7 +26060,7 @@ class FextApp(MessagingMixin, App):
         gid = gid_of(peer)
         if gid and (self.store.group(gid) or {}).get("admin") != \
                 self.keys.address:
-            self._set_status("Only the group's admin sets this", T.accent)
+            self._set_status(tr("Only the group's admin sets this"), T.accent)
             return
         TimerSheet(self, peer).open()
 
@@ -24515,8 +26076,9 @@ class FextApp(MessagingMixin, App):
             contact = self.store.get_contact(address) or {}
             if not contact.get("caps", 0) & LocalStore.CAP_TIMER:
                 names.append(contact.get("username") or short_addr(address, 8))
-        return ", ".join(names[:3]) + (" and others" if len(names) > 3
-                                       else "")
+        if len(names) > 3:
+            return tr("{names} and others", names=", ".join(names[:3]))
+        return ", ".join(names)
 
     def set_chat_timer(self, peer: str, seconds: int) -> None:
         """Set a chat's timer here and tell the other side (in a group,
@@ -24524,16 +26086,20 @@ class FextApp(MessagingMixin, App):
         at = time.time()
         if not self.store.set_chat_timer(peer, seconds, at):
             return
-        self.store.add_event(peer, timer_event("You", seconds))
-        fallback = ("Turned on disappearing messages: " +
-                    timer_label(seconds).lower()) if seconds else \
-            "Turned off disappearing messages"
+        self.store.add_event(peer, timer_event(tr("You"), seconds))
+        # for an app that cannot keep the timer, in English like every
+        # control's fallback
+        english = dict(TIMER_CHOICES).get(seconds) or f"{seconds} seconds"
+        fallback = (f"Turned on disappearing messages: {english.lower()}"
+                    if seconds else "Turned off disappearing messages")
         if self.conversation_kind(peer) in ("dm", "group"):
             threading.Thread(target=self._send_control, args=(
                 peer, {"op": "timer", "s": seconds, "at": at}, fallback),
                 daemon=True).start()
-        self._after_list_change([peer], "Disappearing messages " + (
-            timer_label(seconds).lower() if seconds else "off"))
+        self._after_list_change([peer], tr(
+            "Disappearing messages: {timer}", timer=timer_label(
+                seconds).lower()) if seconds else
+            tr("Disappearing messages off"))
         if self.manager.current == "info":
             self.chat_info_screen.show(peer)
         elif self.manager.current == "group_info" and gid_of(peer):
@@ -24549,10 +26115,12 @@ class FextApp(MessagingMixin, App):
         self.store.set_verified(peer, verified)
         name = (self.store.get_contact(peer) or {}).get("username") or \
             short_addr(peer, 10)
-        self.store.add_event(peer, f"You verified {name}" if verified else
-                             f"You cleared {name}'s verification")
-        self._after_list_change([peer], "Verified" if verified
-                                else "Verification cleared")
+        self.store.add_event(peer, tr("You verified {name}", name=name)
+                             if verified else
+                             tr("You cleared {name}'s verification",
+                                name=name))
+        self._after_list_change([peer], tr("Verified" if verified
+                                           else "Verification cleared"))
         if self.manager.current == "info":
             self.chat_info_screen.show(peer)
 
@@ -24565,8 +26133,8 @@ class FextApp(MessagingMixin, App):
 
     def set_chats_archived(self, peers: list, archived: bool) -> None:
         self.store.set_chat_flag(peers, "archived", 1 if archived else 0)
-        self._after_list_change(peers, "Archived" if archived
-                                else "Back in your chats")
+        self._after_list_change(peers, tr("Archived" if archived
+                                          else "Back in your chats"))
 
     def set_chats_pinned(self, peers: list, pinned: bool) -> None:
         now = time.time()
@@ -24574,17 +26142,18 @@ class FextApp(MessagingMixin, App):
         for i, peer in enumerate(reversed(peers)):
             self.store.set_chat_flag([peer], "pinned",
                                      now + i / 1000 if pinned else None)
-        self._after_list_change(peers, "Pinned" if pinned else "Unpinned")
+        self._after_list_change(peers, tr("Pinned" if pinned
+                                          else "Unpinned"))
 
     def mark_chats_unread(self, peers: list) -> None:
         self.store.set_chat_flag(peers, "marked_unread", 1)
-        self._after_list_change(peers, "Marked as unread")
+        self._after_list_change(peers, tr("Marked as unread"))
 
     def mark_chats_read(self, peers: list) -> None:
         for peer in peers:
             self.mark_peer_read(peer, refresh=False)
         self.store.set_chat_flag(peers, "marked_unread", 0)
-        self._after_list_change(peers, "Marked as read")
+        self._after_list_change(peers, tr("Marked as read"))
 
     def set_blocked(self, peers: list, blocked: bool) -> None:
         """Block: what they send is held, sealed, unseen and unannounced;
@@ -24595,7 +26164,8 @@ class FextApp(MessagingMixin, App):
         if blocked and IS_ANDROID:
             for peer in peers:
                 android_clear_notification(peer)
-        self._after_list_change(peers, "Blocked" if blocked else "Unblocked")
+        self._after_list_change(peers, tr("Blocked" if blocked
+                                          else "Unblocked"))
         if self.current_peer in peers:
             self.refresh_chat(self.current_peer)
         worker = self.worker
@@ -24613,12 +26183,12 @@ class FextApp(MessagingMixin, App):
         self.store.set_accepted(peer)
         self.set_ticks(peer, True)
         self.mark_peer_read(peer)
-        self._after_list_change([peer], "Accepted")
+        self._after_list_change([peer], tr("Accepted"))
 
     def decline_request(self, peer: str) -> None:
         """No: their messages go and the request leaves the list. They are
         not blocked: if they write again, it is a request again."""
-        self.delete_chats([peer], "Declined")
+        self.delete_chats([peer], tr("Declined"))
 
     def report_contact(self, peer: str, reason: str, note: str,
                        block: bool) -> None:
@@ -24633,15 +26203,15 @@ class FextApp(MessagingMixin, App):
             try:
                 self.api.report(peer, reason, note)
             except (requests.RequestException, ApiClient.ApiError) as exc:
-                self.ui_queue.put(("status", f"The report did not go: {exc}",
+                self.ui_queue.put(("status", tr("The report did not go: "
+                                                "{error}", error=exc),
                                    COL_DANGER))
                 return
-            self.ui_queue.put(("status", "Reported" + (" and blocked"
-                                                       if block else ""),
-                               COL_OK))
+            self.ui_queue.put(("status", tr("Reported and blocked" if block
+                                            else "Reported"), COL_OK))
         threading.Thread(target=work, daemon=True).start()
 
-    def delete_chats(self, peers: list, verb: str = "Deleted") -> None:
+    def delete_chats(self, peers: list, verb: str = "") -> None:
         """Remove chats from this device (a group is left first) and from
         the list, until something new arrives in them."""
         for peer in peers:
@@ -24657,13 +26227,13 @@ class FextApp(MessagingMixin, App):
                 android_clear_notification(peer)
         if self.current_peer in peers:
             self.go_back_to_chats()
-        self._after_list_change(peers, verb)
+        self._after_list_change(peers, verb or tr("Deleted"))
 
     def _after_list_change(self, peers: list, verb: str) -> None:
         n = len(peers)
         if n:
-            self._set_status(f"{verb}" + (f" · {n} chats" if n > 1 else ""),
-                             COL_OK)
+            self._set_status(tr("{verb} · {n} chats", verb=verb, n=n)
+                             if n > 1 else verb, COL_OK)
         self.refresh_sidebar()
         if self.current_peer in peers and self.manager.current != "chats":
             self.refresh_chat(self.current_peer)
@@ -24684,9 +26254,10 @@ class FextApp(MessagingMixin, App):
             try:
                 self.api.set_ticks(peer, enabled)
             except (requests.RequestException, ApiClient.ApiError):
-                self.ui_queue.put(("status", "Ticks preference saved here; "
-                                   "the relay hears about it once you're "
-                                   "online", COL_TICK_GOLD))
+                self.ui_queue.put(("status", tr("Ticks preference saved "
+                                                "here; the relay hears about "
+                                                "it once you're online"),
+                                   COL_TICK_GOLD))
         threading.Thread(target=work, daemon=True).start()
 
     def set_auto_read(self, peer: str, auto: bool) -> None:
@@ -24726,17 +26297,18 @@ def notification_text(store: "LocalStore", peer: str, body: str, kind: str,
                       author: Optional[str] = None) -> tuple:
     """(title, text, muted) for a new message. A group's notification is
     titled with the group and names who wrote."""
-    preview = "Photo" if kind == "image" else body
+    preview = tr("Photo") if kind == "image" else shown_body(kind, body)
     muted = store.mute_state(peer)[0] or store.is_blocked(peer)
     gid = gid_of(peer)
     if gid:
         group = store.group(gid) or {}
         who = (store.get_contact(author or "") or {}).get("username") or \
             short_addr(author or "", 10)
-        return (group.get("name") or "Group", f"{who}: {preview}", muted)
+        return (group.get("name") or tr("Group"),
+                tr("{who}: {body}", who=who, body=preview), muted)
     contact = store.get_contact(peer) or {}
     if not contact.get("accepted", 1):
-        preview = "Message request"     # v14: what they wrote waits unseen
+        preview = tr("Message request")   # v14: what they wrote waits unseen
     return (contact.get("username") or short_addr(peer, 12), preview, muted)
 
 
@@ -24751,7 +26323,7 @@ def _service_call_signal(app: HeadlessApp, sender: str, sig: dict) -> None:
         if sig["id"] in app._declined_calls:
             return
         if sig.get("t") and time.time() - sig["t"] > CALL_OFFER_MAX_AGE:
-            app.store.add_event(sender, "Missed call")
+            app.store.add_event(sender, tr("Missed call"))
             app.ui_queue.put(("message_stored", sender))
             return
         if app.store.get_contact(sender) is None:
@@ -24772,11 +26344,11 @@ def _service_call_signal(app: HeadlessApp, sender: str, sig: dict) -> None:
                 log.exception("could not ring for a call")
             if not rang:
                 try:
-                    android_notify(sender, name, "Incoming voice call")
+                    android_notify(sender, name, tr("Incoming voice call"))
                 except Exception:
                     log.exception("could not post a call's notification")
         else:
-            desktop_notify(name, "Incoming voice call")
+            desktop_notify(name, tr("Incoming voice call"))
     elif sig["op"] == "end":
         try:
             pending = json.loads(path.read_text("utf-8"))
@@ -24787,16 +26359,16 @@ def _service_call_signal(app: HeadlessApp, sender: str, sig: dict) -> None:
                 path.unlink()
             except OSError:
                 pass
-            app.store.add_event(sender, "Missed call")
+            app.store.add_event(sender, tr("Missed call"))
             app.ui_queue.put(("message_stored", sender))
             if IS_ANDROID:
                 android_cancel_call_notification()
                 try:
-                    android_notify(sender, name, "Missed call")
+                    android_notify(sender, name, tr("Missed call"))
                 except Exception:
                     log.exception("could not post a missed call")
             else:
-                desktop_notify(name, "Missed call")
+                desktop_notify(name, tr("Missed call"))
 
 
 def _service_handle(app: HeadlessApp, event: tuple) -> None:
@@ -24847,6 +26419,7 @@ def run_background_service(max_cycles: Optional[int] = None,
             app = worker = None
             log.info("background service: standing down")
         if wanted and worker is None:
+            LANG.load(LANG.resolve())        # its notifications' language
             try:
                 app = HeadlessApp(keys)
                 worker = SyncWorker(app)

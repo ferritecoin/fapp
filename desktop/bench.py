@@ -6,7 +6,10 @@
 Prints one JSON object of milliseconds, each the median of five runs:
 
   * text: drawing a message-sized label in the app's fonts (English,
-    Chinese, emoji), and the first label, which opens the font;
+    Chinese, a Chinese paragraph, emoji; Arabic, an Arabic paragraph and
+    Hindi, from 15.1), and the first label, which opens the font;
+  * faces (15.1): the same in each theme set's face (Chinese is drawn in
+    the CJK face in every set);
   * store: on a phone holding 50,000 messages, a chat's newest 60 (what
     opening a chat reads), the chat list, a search through every message,
     and the outbox (14.0);
@@ -39,6 +42,7 @@ import uuid
 os.environ.setdefault("KIVY_NO_ARGS", "1")
 os.environ["KIVY_NO_CONSOLELOG"] = "1"
 os.environ["HOME"] = tempfile.mkdtemp(prefix="fext-bench-")
+os.environ["FEXT_LANG"] = "en"          # the English the checks read
 os.environ["FEXT_SERVER_HOST"] = "127.0.0.1:1"
 
 # Only the numbers: the app's log and Kivy's start-up notes stay quiet
@@ -55,7 +59,16 @@ RUNS = 5
 TEXTS = {"english": "Did you see the trail map I sent? The ridge path "
                     "closes at dusk, so we should start by noon.",
          "chinese": "我们这次走西山那条路线，大概需要四个小时。记得带水和外套。",
-         "emoji": "Happy birthday!! 🎂🎈🥳 Photos from the trip: 🇬🇧 🇫🇷 🍝"}
+         # (15.1) a paragraph: a Chinese text is broken into lines first
+         "chinese_long": "我们这次走西山那条路线，大概需要四个小时。记得带水和外套。"
+                         * 4,
+         "emoji": "Happy birthday!! 🎂🎈🥳 Photos from the trip: 🇬🇧 🇫🇷 🍝",
+         # (15.1) put in display order and shaped; a paragraph is broken
+         # into lines first
+         "arabic": "الاجتماع غدا الساعة 10:30 مع John في المكتب (الطابق 3).",
+         "arabic_long": "الاجتماع غدا الساعة 10:30 مع John في المكتب "
+                        "(الطابق 3). " * 4,
+         "hindi": "नमस्ते! कल सुबह क्षेत्रीय कार्यालय में मिलते हैं।"}
 
 
 def median_ms(job, repeat=1):
@@ -70,8 +83,8 @@ def median_ms(job, repeat=1):
     return round(statistics.median(times), 3)
 
 
-def draw(text):
-    label = CoreLabel(text=text, font_name="FerritextSerif", font_size=34,
+def draw(text, face="FerritextSerif"):
+    label = CoreLabel(text=text, font_name=face, font_size=34,
                       text_size=(560, None))
     label.refresh()
 
@@ -83,6 +96,14 @@ result = {"text": {"first_label": round((time.perf_counter() - start) * 1000,
                                          3)}}
 for name, text in TEXTS.items():
     result["text"][name] = median_ms(lambda: draw(text), repeat=60)
+if hasattr(M, "THEME_SETS"):
+    result["faces"] = {}
+    for key in M.THEME_SETS:
+        M.register_fonts(key)
+        result["faces"][key] = {
+            name: median_ms(lambda: draw(text, "Roboto"), repeat=60)
+            for name, text in TEXTS.items()}
+    M.register_fonts()
 
 # A phone with 50,000 messages: 49 chats of 1,000, one of 1,000 more.
 keys = M.IdentityManager()

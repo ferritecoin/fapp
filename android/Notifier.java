@@ -8,6 +8,7 @@ import android.app.Person;
 import android.app.RemoteInput;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.graphics.drawable.Icon;
 import android.media.AudioAttributes;
 import android.media.AudioManager;
@@ -27,6 +28,10 @@ import android.os.Build;
  *
  * On the lock screen a notification shows only "Ferritext" and a count,
  * unless the phone is set to show private content there.
+ *
+ * Its words (Reply, Answer, the channels' names…) are the app's language:
+ * main.py gives them (setWords) whenever it sets its language, and they
+ * are kept for when the app is not running. English until then.
  */
 public final class Notifier {
     public static final String CHANNEL_MESSAGES = "messages";
@@ -36,8 +41,27 @@ public final class Notifier {
     public static final String ACTION_DECLINE = "org.fext.notify.DECLINE";
     public static final String KEY_REPLY = "fext_reply";
     private static final long[] RING_VIBRATION = {0, 900, 700, 900, 700};
+    private static final String WORDS = "fext_notify_words";
 
     private Notifier() {
+    }
+
+    /** Keep the words, by key (main.android_notification_words), and
+     * rename the channels to match. */
+    public static void setWords(Context ctx, String[] keys, String[] words) {
+        SharedPreferences.Editor edit = ctx.getSharedPreferences(
+                WORDS, Context.MODE_PRIVATE).edit();
+        for (int i = 0; i < Math.min(keys.length, words.length); i++) {
+            edit.putString(keys[i], words[i]);
+        }
+        edit.commit();
+        ensureChannels(ctx);
+    }
+
+    /** The word kept for `key`, or its English. */
+    static String word(Context ctx, String key, String english) {
+        return ctx.getSharedPreferences(WORDS, Context.MODE_PRIVATE)
+                .getString(key, english);
     }
 
     private static NotificationManager manager(Context ctx) {
@@ -67,34 +91,35 @@ public final class Notifier {
         return new Notification.Builder(ctx);
     }
 
-    /** The two channels: messages, and calls (which ring). */
+    /** The two channels: messages, and calls (which ring). Made each
+     * time, which renames them; Android keeps the rest as the person set
+     * it. */
     public static void ensureChannels(Context ctx) {
         if (Build.VERSION.SDK_INT < 26) {
             return;
         }
         NotificationManager nm = manager(ctx);
-        if (nm.getNotificationChannel(CHANNEL_MESSAGES) == null) {
-            NotificationChannel messages = new NotificationChannel(
-                    CHANNEL_MESSAGES, "Messages",
-                    NotificationManager.IMPORTANCE_HIGH);
-            messages.setDescription("New messages");
-            nm.createNotificationChannel(messages);
-        }
-        if (nm.getNotificationChannel(CHANNEL_CALLS) == null) {
-            NotificationChannel calls = new NotificationChannel(
-                    CHANNEL_CALLS, "Calls", NotificationManager.IMPORTANCE_HIGH);
-            calls.setDescription("Incoming voice calls");
-            calls.setSound(RingtoneManager.getDefaultUri(
-                    RingtoneManager.TYPE_RINGTONE),
-                    new AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
-                            .setContentType(
-                                    AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                            .build());
-            calls.enableVibration(true);
-            calls.setVibrationPattern(RING_VIBRATION);
-            nm.createNotificationChannel(calls);
-        }
+        NotificationChannel messages = new NotificationChannel(
+                CHANNEL_MESSAGES, word(ctx, "messages", "Messages"),
+                NotificationManager.IMPORTANCE_HIGH);
+        messages.setDescription(word(ctx, "messages_about",
+                "New messages"));
+        nm.createNotificationChannel(messages);
+        NotificationChannel calls = new NotificationChannel(
+                CHANNEL_CALLS, word(ctx, "calls", "Calls"),
+                NotificationManager.IMPORTANCE_HIGH);
+        calls.setDescription(word(ctx, "calls_about",
+                "Incoming voice calls"));
+        calls.setSound(RingtoneManager.getDefaultUri(
+                RingtoneManager.TYPE_RINGTONE),
+                new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                        .setContentType(
+                                AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build());
+        calls.enableVibration(true);
+        calls.setVibrationPattern(RING_VIBRATION);
+        nm.createNotificationChannel(calls);
     }
 
     /** What a tap on the app's icon sends, so the running app resumes. */
@@ -184,7 +209,8 @@ public final class Notifier {
                 PendingIntent.FLAG_UPDATE_CURRENT | immutable()));
 
         if (Build.VERSION.SDK_INT >= 28) {
-            Person you = new Person.Builder().setName("You").build();
+            Person you = new Person.Builder()
+                    .setName(word(ctx, "you", "You")).build();
             Notification.MessagingStyle style =
                     new Notification.MessagingStyle(you);
             if (group) {
@@ -199,7 +225,8 @@ public final class Notifier {
             b.setStyle(style);
         } else if (Build.VERSION.SDK_INT >= 24) {
             Notification.MessagingStyle style =
-                    new Notification.MessagingStyle("You");
+                    new Notification.MessagingStyle(
+                            word(ctx, "you", "You"));
             if (group) {
                 style.setConversationTitle(title);
             }
@@ -216,9 +243,10 @@ public final class Notifier {
         }
 
         if (canReply && Build.VERSION.SDK_INT >= 24) {
+            String replyWord = word(ctx, "reply", "Reply");
             RemoteInput input = new RemoteInput.Builder(KEY_REPLY)
-                    .setLabel("Reply").build();
-            Notification.Action.Builder reply = action(ctx, "Reply",
+                    .setLabel(replyWord).build();
+            Notification.Action.Builder reply = action(ctx, replyWord,
                     toReceiver(ctx, id * 8 + 1, ACTION_REPLY, peer, id, me,
                             null, true));
             reply.addRemoteInput(input);
@@ -229,7 +257,8 @@ public final class Notifier {
             }
             b.addAction(reply.build());
         }
-        Notification.Action.Builder read = action(ctx, "Mark as read",
+        Notification.Action.Builder read = action(ctx,
+                word(ctx, "read", "Mark as read"),
                 toReceiver(ctx, id * 8 + 2, ACTION_READ, peer, id, me, null,
                         false));
         if (Build.VERSION.SDK_INT >= 28) {
@@ -265,6 +294,7 @@ public final class Notifier {
         PendingIntent declineIntent = toReceiver(ctx, id * 8 + 2,
                 ACTION_DECLINE, peer, id, me, callId, false);
 
+        String incoming = word(ctx, "incoming", "Incoming voice call");
         Notification.Builder b = builder(ctx, CHANNEL_CALLS);
         if (Build.VERSION.SDK_INT < 26) {
             b.setPriority(Notification.PRIORITY_MAX);
@@ -276,7 +306,7 @@ public final class Notifier {
         }
         b.setSmallIcon(smallIcon(ctx))
                 .setContentTitle(name)
-                .setContentText("Incoming voice call")
+                .setContentText(incoming)
                 .setCategory(Notification.CATEGORY_CALL)
                 .setOngoing(true)
                 .setAutoCancel(false)
@@ -284,15 +314,17 @@ public final class Notifier {
                 .setFullScreenIntent(full, true)
                 .setVisibility(Notification.VISIBILITY_PRIVATE)
                 .setPublicVersion(publicVersion(ctx, CHANNEL_CALLS,
-                        "Incoming voice call"));
+                        incoming));
         if (Build.VERSION.SDK_INT >= 31) {
             Person caller = new Person.Builder().setName(name)
                     .setImportant(true).build();
             b.setStyle(Notification.CallStyle.forIncomingCall(caller,
                     declineIntent, answerIntent));
         } else {
-            b.addAction(action(ctx, "Decline", declineIntent).build());
-            b.addAction(action(ctx, "Answer", answerIntent).build());
+            b.addAction(action(ctx, word(ctx, "decline", "Decline"),
+                    declineIntent).build());
+            b.addAction(action(ctx, word(ctx, "answer", "Answer"),
+                    answerIntent).build());
         }
         Notification notification = b.build();
         notification.flags |= Notification.FLAG_INSISTENT;

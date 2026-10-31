@@ -12,7 +12,9 @@
   * main.py run from a checkout uses data/ and unpacks nothing;
   * tools/check_keystore.sh, which the release build runs first, accepts
     the key that FEXT_KEY_SHA256 names, written either way, and refuses
-    any other (needs keytool; skipped without it).
+    any other (needs keytool; skipped without it);
+  * (15.1) tools/download_page.py makes a page that fetches nothing from
+    elsewhere, gives the APK's size and SHA-256, and a true QR code.
 """
 import hashlib
 import json
@@ -175,6 +177,44 @@ else:
     rc, out = check_key(theirs)
     check("...and any other key stops the build, naming the variable",
           rc != 0 and "::error::" in out and "FEXT_KEY_SHA256" in out, out)
+
+print("\nThe download page (15.1)")
+sys.path.insert(0, str(ROOT / "tools"))
+import re                                                     # noqa: E402
+import download_page                                          # noqa: E402
+import qrcode                                                 # noqa: E402
+apk = work / "Ferritext-9.9.9.apk"
+apk.write_bytes(os.urandom(1_500_000))
+site = work / "site"
+page = download_page.build(apk, site, "https://example.org/f/").read_text(
+    "utf-8")
+check("it names the APK beside it, with its version, size (in decimal "
+      "MB, as Android shows it) and SHA-256",
+      (site / apk.name).read_bytes() == apk.read_bytes() and
+      'href="Ferritext-9.9.9.apk"' in page and "9.9.9" in page and
+      "1.5\u00a0MB" in page and
+      hashlib.sha256(apk.read_bytes()).hexdigest() in page)
+links = re.findall(r'(?:src|href)="([^"]*)"', page)
+check("...and fetches nothing from elsewhere: no fonts, scripts or "
+      "pictures, the APK its only link",
+      set(links) == {apk.name} and "url(" not in page and
+      "@import" not in page and "<script" not in page, str(links))
+code = qrcode.QRCode(border=2,
+                     error_correction=qrcode.constants.ERROR_CORRECT_M)
+code.add_data("https://example.org/f/")
+code.make(fit=True)
+squares = {(x, y) for y, row in enumerate(code.get_matrix())
+           for x, dark in enumerate(row) if dark}
+drawn = {(int(x), int(y)) for x, y in
+         re.findall(r"M(\d+) (\d+)h1v1h-1z", page)}
+check("...its QR code is the page's address, square for square",
+      drawn == squares)
+try:
+    download_page.build(work / "no-version.apk", site, "https://e.org/")
+    refused = False
+except SystemExit:
+    refused = True
+check("an APK whose name gives no version needs --version", refused)
 
 shutil.rmtree(work, ignore_errors=True)
 passed = sum(1 for _n, c in RESULTS if c)

@@ -94,7 +94,7 @@ public class NotifyReceiver extends BroadcastReceiver {
             Method start = service.getMethod("start", Context.class,
                     String.class, String.class, String.class, String.class);
             start.invoke(null, ctx, "ic_stat_ferritext", "Ferritext",
-                    "Ready for new messages", "");
+                    Notifier.word(ctx, "ready", "Ready for new messages"), "");
         } catch (Exception e) {
             Log.w(TAG, "could not start the sync service", e);
         }

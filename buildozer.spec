@@ -17,7 +17,7 @@ package.domain = org.fext
 source.dir = .
 
 # (list) Source files to include (let empty to include all the files)
-source.include_exts = py,png,jpg,kv,atlas,ttf,txt
+source.include_exts = py,png,jpg,kv,atlas,ttf,txt,json
 
 # (list) List of inclusions using pattern matching
 #source.include_patterns = assets/*,images/*.png
@@ -30,10 +30,11 @@ source.exclude_dirs = tests, bin, venv, .git, .github, .buildozer, __pycache__, 
 # desktop/ (Nuitka packaging + the headless test suites) and tools/ (the
 # logo generator) are build-time only; android/ reaches the APK through
 # android.add_src and android.add_resources. data/ is NOT excluded: the app
-# loads data/ferritext_logo.png at runtime for the loading screen.
+# loads data/ferritext_logo.png at runtime for the loading screen, and
+# (v15.1) each language's phrases from data/lang/*.json.
 
 # (str) Application versioning (method 1)
-version = 15.0.0
+version = 15.1.0
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy
@@ -87,7 +88,9 @@ fullscreen = 0
 # darkens the screen against the ear; VIBRATE for a ringing call.
 # 11.0: USE_FULL_SCREEN_INTENT lets an incoming call open the app over the
 # lock screen (Android 14 asks the user; earlier versions grant it).
-android.permissions = INTERNET,ACCESS_NETWORK_STATE,POST_NOTIFICATIONS,RECORD_AUDIO,FOREGROUND_SERVICE,FOREGROUND_SERVICE_DATA_SYNC,FOREGROUND_SERVICE_MICROPHONE,MODIFY_AUDIO_SETTINGS,WAKE_LOCK,VIBRATE,USE_FULL_SCREEN_INTENT
+# 15.1: REQUEST_IGNORE_BATTERY_OPTIMIZATIONS lets Settings › Keep Ferritext
+# running ask Android, which asks the user, to leave its battery use alone.
+android.permissions = INTERNET,ACCESS_NETWORK_STATE,POST_NOTIFICATIONS,RECORD_AUDIO,FOREGROUND_SERVICE,FOREGROUND_SERVICE_DATA_SYNC,FOREGROUND_SERVICE_MICROPHONE,MODIFY_AUDIO_SETTINGS,WAKE_LOCK,VIBRATE,USE_FULL_SCREEN_INTENT,REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
 
 # (list) Put these files or directories in the apk res directory.
 # Ships res/xml/network_security_config.xml, which permits cleartext for the

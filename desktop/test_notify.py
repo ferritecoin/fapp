@@ -33,6 +33,7 @@ os.environ.setdefault("KIVY_NO_ARGS", "1")
 os.environ["KIVY_NO_CONSOLELOG"] = "1"
 os.environ.setdefault("SDL_VIDEODRIVER", "x11")
 os.environ["HOME"] = tempfile.mkdtemp(prefix="fext-notify-")
+os.environ["FEXT_LANG"] = "en"          # the English the checks read
 os.environ["FEXT_SERVER_HOST"] = "127.0.0.1:1"
 
 _spec = importlib.util.spec_from_file_location(
@@ -487,6 +488,111 @@ check("...says so to the other side, and ends the call service",
       relay.mail and relay.mail[-1]["recipient"] == B and
       not (M.DATA_DIR / ".call_active").exists())
 relay.mail.clear()
+
+print("\nKept running on phones that stop it (15.1)")
+os.environ["FEXT_SHOW_ANDROID_SETTINGS"] = "1"     # Settings as a phone's
+opened = []
+M.android_open_autostart_settings = lambda maker: opened.append(maker) or 1
+M.android_open_battery_settings = lambda: opened.append("battery") or 1
+M.battery_unrestricted = lambda: False
+alice.call = None
+
+
+def guide_row():
+    alice.open_settings()
+    tick(0.3)
+    return next((w for w in alice.settings_screen.body.walk()
+                 if isinstance(w, M.ListRow) and w.icon == "battery"), None)
+
+
+def guide_rows(sheet):
+    return [w for w in sheet.walk() if isinstance(w, M.ListRow)]
+
+
+def guide_open():
+    return [v for v in Window.children if isinstance(v, M.KeepRunningSheet)]
+
+
+def back_from_android(dialog=False):
+    """Back from a settings page, or from a dialog over the app."""
+    if dialog:                                  # the window regains focus
+        Window._focus = False
+        Window._focus = True
+        return
+    alice.on_resume = lambda: None              # only the guide's handler
+    alice.dispatch("on_resume")
+    del alice.on_resume
+
+
+check("each maker the guide knows has its name, and each brand its maker",
+      set(M.KEEP_RUNNING) == set(M.MAKER_NAMES) and
+      set(M.MAKER_OF.values()) <= set(M.KEEP_RUNNING))
+M.phone_maker = lambda: "xiaomi"
+row = guide_row()
+check("on a phone whose maker stops background apps, Settings offers the "
+      "guide", row is not None and "Xiaomi" in row.hint.text and
+      "two settings" in row.hint.text)
+alice._offer_keep_running()
+tick(0.3)
+sheet = (guide_open() or [None])[0]
+for each in guide_open():
+    each.dismiss(animation=False)
+alice._offer_keep_running()
+check("the guide opens by itself, once on the phone",
+      sheet is not None and not guide_open() and
+      M.load_prefs().get("keep_running_offered") is True)
+sheet = M.KeepRunningSheet(alice, "xiaomi")
+sheet.open(animation=False)
+for each in guide_rows(sheet):
+    each.dispatch("on_release")
+check("...its two settings open the maker's page and Android's battery "
+      "question", [r.icon for r in guide_rows(sheet)] == ["retry", "battery"]
+      and opened == ["xiaomi", "battery"])
+M.save_pref("autostart_opened", False)
+sheet._fill()
+opened.clear()
+sheet._set_up()
+first = list(opened)
+back_from_android()
+check("Set up opens each setting in turn, the next as the app comes back",
+      first == ["xiaomi"] and opened == ["xiaomi", "battery"])
+M.battery_unrestricted = lambda: True           # Allow, in Android's dialog
+back_from_android(dialog=True)
+texts = [r.hint.text for r in guide_rows(sheet)]
+check("...and then shows both made, and nothing more to set up",
+      opened == ["xiaomi", "battery"] and
+      texts == ["Opened: Ferritext should be turned on there",
+                "Done: Android leaves it alone"] and
+      M.keep_running_left("xiaomi") == [] and
+      "Set up" not in [w.text for w in sheet.walk()
+                       if isinstance(w, M.Btn)])
+sheet.dismiss(animation=False)
+check("...as Settings says", "Done" in guide_row().hint.text)
+M.battery_unrestricted = lambda: False
+check("a Samsung has no page for starting by itself: only the battery",
+      [r.icon for r in guide_rows(M.KeepRunningSheet(alice, "samsung"))] ==
+      ["battery"])
+M.phone_maker = lambda: "google"
+pixel = guide_row()
+M.phone_maker = lambda: "xiaomi"
+M.save_pref("background_delivery", False)
+check("no guide on a phone that keeps apps running, nor when messages are "
+      "not received while closed", pixel is None and guide_row() is None)
+alice.settings_screen._on_delivery(True)
+tick(0.3)
+check("turning that back on opens the guide, the battery still to allow",
+      guide_open() and M.background_delivery_enabled())
+for each in guide_open():
+    each.dismiss(animation=False)
+ready = []
+alice._start_worker = lambda: None
+alice._ready_to_receive = lambda **_k: ready.append(1)
+alice.on_registered()
+del alice._start_worker, alice._ready_to_receive
+check("a new username asks for notifications and starts the service at "
+      "once, not at the next start", ready == [1])
+os.environ.pop("FEXT_SHOW_ANDROID_SETTINGS")
+alice.go_back_to_chats()
 
 passed = sum(1 for _n, ok in RESULTS if ok)
 print(f"\n  {passed}/{len(RESULTS)} passed")

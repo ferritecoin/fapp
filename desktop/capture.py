@@ -3,10 +3,12 @@
 
     xvfb-run -a -s "-screen 0 1280x1024x24" \\
         python3 desktop/capture.py main.py shots/after [--theme light]
+            [--set overclock] [--lang zh-CN]
 
-It fills a fresh profile with the same chats on every run (people, a group,
-chats in Chinese, message requests, messages waiting to send), starts the app with the network
-stubbed out, and walks it through SCREENS, saving each one as
+It fills a fresh profile with the same chats on every run (people, a
+group, chats in Chinese, message requests, messages waiting to send),
+starts the app with the network stubbed out, and walks it through SCREENS
+in the language asked for (English unless --lang), saving each one as
 OUTDIR/<theme>_<screen>.png at 392 x 840 dp, a common phone size. Each
 screen is also checked for layout problems: text that overflows or is cut
 off, parts that escape their box, and touch targets under 40 dp. Any problem
@@ -32,10 +34,12 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 #: Every screen, in the order they are captured.
-SCREENS = ("chats", "menu", "chat", "chat_info", "group", "emoji", "unread",
-           "notes", "chinese", "chinese_typing", "chinese_group", "requests",
+SCREENS = ("chats", "menu", "chat", "chat_info", "group", "emoji", "verify",
+           "verify_end", "unread", "notes", "chinese", "chinese_typing",
+           "chinese_group", "rtl", "rtl_typing", "scripts", "requests",
            "request", "report", "outbox", "large_group", "mobile_data",
-           "settings", "settings_privacy", "settings_downloads", "blocked")
+           "settings", "settings_privacy", "settings_downloads", "blocked",
+           "keep_running", "keep_running_set")
 
 parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
 parser.add_argument("client", help="the main.py to capture")
@@ -43,6 +47,10 @@ parser.add_argument("outdir", help="where the PNGs go")
 parser.add_argument("--theme", choices=("black", "dark", "light"),
                     default="black", help="black is dark with the black "
                     "background, the app's default on a dark phone")
+parser.add_argument("--set", default="axiom",
+                    help="the theme set (15.1): axiom, overclock or ferrite")
+parser.add_argument("--lang", default="en",
+                    help="the app's language (15.1): en or zh-CN")
 parser.add_argument("--only", default="", help="comma-separated screens")
 ARGS = parser.parse_args()
 ONLY = set(filter(None, ARGS.only.split(",")))
@@ -57,7 +65,11 @@ os.environ.update(KIVY_NO_ARGS="1", KIVY_NO_CONSOLELOG="1",
 os.environ["HOME"] = tempfile.mkdtemp(prefix="fext-capture-")
 os.makedirs(os.path.join(os.environ["HOME"], ".fext"))
 with open(os.path.join(os.environ["HOME"], ".fext", "prefs.json"), "w") as f:
-    f.write('{"black": %s}' % ("true" if ARGS.theme == "black" else "false"))
+    # keep_running_offered: the guide opens when asked, not by itself.
+    f.write('{"black": %s, "theme_set": "%s", "language": "%s", '
+            '"keep_running_offered": true}' % (
+                "true" if ARGS.theme == "black" else "false", ARGS.set,
+                ARGS.lang))
 
 import importlib.util                                           # noqa: E402
 import logging                                                  # noqa: E402
@@ -69,6 +81,9 @@ M = importlib.util.module_from_spec(_spec)
 sys.modules["fext_capture"] = M
 _spec.loader.exec_module(M)
 M.IS_MOBILE = True
+if hasattr(M, "phone_maker"):         # 15.1: a phone that stops background
+    M.phone_maker = lambda: "xiaomi"  # apps, for the keep-running guide
+    M.battery_unrestricted = lambda: False
 from kivy.clock import Clock                                    # noqa: E402
 from kivy.core.window import Window                             # noqa: E402
 from kivy.metrics import dp                                     # noqa: E402
@@ -322,6 +337,33 @@ came(big, "The new raised beds", at(61), author=alex, kind="image",
      media_state="pending")
 pending_photo = store.message_by_cid(
     big, store.messages_for(big)[-1]["client_msg_id"])
+
+# Right to left (15.1): Arabic, Persian and Hebrew, with the numbers,
+# brackets and Latin words written among them.
+amira = person("amira")
+came(amira, "مرحبا! الاجتماع غدا الساعة 10:30 مع John في المكتب "
+     "(الطابق 3).", at(70))
+went(amira, "Sounds good — أراك غدا 👍", at(71))
+came(amira, "שלום! המחיר הוא 1,234.50 ₪ לשני אנשים, כולל ארוחת בוקר.",
+     at(72))
+came(amira, "سلام! فردا ساعت ۹ صبح می‌بینمت.", at(73))
+came(amira, "السلام عليكم ورحمة الله، كيف حالك اليوم؟ أتمنى أن يكون كل "
+     "شيء على ما يرام 🌙", at(74), unread=True)
+# Every other script in everyday use.
+meera = person("meera")
+for i, text in enumerate((
+        "Καλημέρα! Τα λέμε αύριο.",
+        "ሰላም! ነገ እንገናኛለን።",
+        "Բարեւ, վաղը կհանդիպենք։",
+        "გამარჯობა! ხვალ შევხვდებით.",
+        "ආයුබෝවන්! හෙට හමුවෙමු.",
+        "မင်္ဂလာပါ၊ မနက်ဖြန် တွေ့ကြမယ်",
+        "ខ្ញុំនឹងទៅដល់ឆាប់ៗ",
+        "สวัสดีครับ พรุ่งนี้เจอกันที่สถานีรถไฟตอนแปดโมงเช้านะครับ",
+        "வணக்கம்! நாளை சந்திப்போம்.",
+        "আমি আসছি, দশ মিনিট লাগবে।",
+        "नमस्ते! कल सुबह क्षेत्रीय कार्यालय में मिलते हैं।")):
+    (went if i % 4 == 1 else came)(meera, text, at(75 + i / 4))
 store.close()
 
 
@@ -403,8 +445,34 @@ def close_sheets():
             view.dismiss(animation=False)
 
 
+def keep_running_set():
+    """The guide once both settings are made (15.1)."""
+    if not hasattr(M, "keep_running_left"):
+        return
+    M.battery_unrestricted = lambda: True
+    M.save_pref("autostart_opened", True)
+    M.KeepRunningSheet(app, "xiaomi").open()
+
+
+def verify_sheet():
+    """Verifying a contact (sam is not yet verified), with the scan rows a
+    phone shows."""
+    M.can_read_qr = lambda: True
+    if_present(app, "open_verify", sam)
+
+
+def scroll_sheet_to_end():
+    """Scroll the open sheet to its last row."""
+    for view in Window.children:
+        if isinstance(view, M.ModalView):
+            for w in walk(view):
+                if isinstance(w, ScrollView):
+                    w.scroll_y = 0
+
+
 def scroll_settings_to(title):
     """Scroll Settings until the row titled `title` is in view."""
+    title = getattr(M, "tr", str)(title)      # in the app's language (15.1)
     page = app.manager.get_screen("settings")
     for w in walk(page):
         if isinstance(w, Label) and title.lower() in (w.text or "").lower():
@@ -444,6 +512,9 @@ STEPS = [
     (lambda: app.open_conversation(group), 1.0, "group"),
     (app.go_back_to_chats, 0.4, None),
     (lambda: app.open_conversation(sam), 1.0, "emoji"),
+    (verify_sheet, 0.8, "verify"),
+    (scroll_sheet_to_end, 0.5, "verify_end"),
+    (close_sheets, 0.3, None),
     (app.go_back_to_chats, 0.4, None),
     (lambda: app.open_conversation(noor), 1.0, "unread"),
     (app.go_back_to_chats, 0.4, None),
@@ -454,6 +525,9 @@ STEPS = [
     (lambda: type_in(""), 0.3, None),
     (app.go_back_to_chats, 0.4, None),
     (lambda: app.open_conversation(hikers), 1.0, "chinese_group"),
+    (lambda: app.open_conversation(amira), 1.0, "rtl"),
+    (lambda: type_in("أراك غدا الساعة 10:30"), 0.6, "rtl_typing"),
+    (lambda: app.open_conversation(meera), 1.0, "scripts"),
     (app.go_back_to_chats, 0.4, None),
     (lambda: if_present(app.chats_screen, "show_view", "requests"), 0.6,
      "requests"),
@@ -476,6 +550,11 @@ STEPS = [
     (lambda: M.BlockedSheet(app).open()
      if hasattr(M, "BlockedSheet") else None, 0.8, "blocked"),
     (close_sheets, 0.3, None),
+    (lambda: M.KeepRunningSheet(app, "xiaomi").open()
+     if hasattr(M, "KeepRunningSheet") else None, 0.8, "keep_running"),
+    (close_sheets, 0.3, None),
+    (keep_running_set, 0.8, "keep_running_set"),
+    (close_sheets, 0.3, None),
 ]
 assert [s for *_, s in STEPS if s] == list(SCREENS)
 
@@ -494,11 +573,26 @@ def run(i=0):
         PROBLEMS.append(f"step {i} ({screen or 'between screens'}) raised "
                         f"{type(exc).__name__}: {exc}")
 
-    def capture(_dt):
+    def capture(_dt, first=True):
         if screen and (not ONLY or screen in ONLY):
-            check_layout(screen)
-            Window.screenshot(name=os.path.join(
-                ARGS.outdir, f"{ARGS.theme}_{screen}.png"))
+            try:
+                if first:
+                    check_layout(screen)
+                name = os.path.join(ARGS.outdir, f"{ARGS.theme}_{screen}.png")
+                Window.screenshot(name=name)
+                # Under Xvfb a frame is now and then read back all black;
+                # such a picture is taken again. (Its alpha is opaque, so
+                # only the colours tell.)
+                taken = name[:-4] + "0001.png"
+                if first and \
+                        Image.open(taken).convert("RGB").getbbox() is None:
+                    print(f"{screen}: read back all black, taken again")
+                    os.remove(taken)
+                    Clock.schedule_once(lambda dt: capture(dt, False), 0.5)
+                    return
+            except Exception as exc:    # else Kivy ends the run, silently
+                PROBLEMS.append(f"{screen}: capturing it raised "
+                                f"{type(exc).__name__}: {exc}")
         run(i + 1)
     Clock.schedule_once(capture, settle)
 

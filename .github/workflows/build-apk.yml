@@ -37,12 +37,12 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout (with tags, for the previous-release compatibility tests)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -107,16 +107,16 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -136,7 +136,7 @@ jobs:
           pip install "buildozer==1.5.0" "cython==0.29.33"
 
       - name: Cache Buildozer SDK/NDK and p4a
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.buildozer
           key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
@@ -233,7 +233,7 @@ jobs:
 
       - name: Upload the deliverables as a workflow artifact
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         # Kept a week: the Releases keep every version. A full artifact quota
         # leaves a warning here, not a failed build without its Release.
         continue-on-error: true

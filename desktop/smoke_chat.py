@@ -21,6 +21,7 @@ os.environ.setdefault("SDL_VIDEODRIVER", "x11")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 os.environ["KIVY_NO_CONSOLELOG"] = "1"
 os.environ["HOME"] = tempfile.mkdtemp(prefix="fext-chat-")
+os.environ["FEXT_LANG"] = "en"          # the English the checks read
 
 CLIENT = sys.argv[1] if len(sys.argv) > 1 else "main.py"
 

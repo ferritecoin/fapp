@@ -20,6 +20,7 @@ os.environ["KIVY_NO_CONSOLELOG"] = "1"
 os.environ.setdefault("SDL_VIDEODRIVER", "x11")
 HOME = tempfile.mkdtemp(prefix="fext-core-")
 os.environ["HOME"] = HOME
+os.environ["FEXT_LANG"] = "en"          # the English the checks read
 
 RESULTS = []
 

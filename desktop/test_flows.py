@@ -22,6 +22,7 @@ os.environ.setdefault("KIVY_NO_ARGS", "1")
 os.environ["KIVY_NO_CONSOLELOG"] = "1"
 os.environ.setdefault("SDL_VIDEODRIVER", "x11")
 os.environ["HOME"] = tempfile.mkdtemp(prefix="fext-flows-")
+os.environ["FEXT_LANG"] = "en"          # the English the checks read
 os.environ["FEXT_SERVER_HOST"] = "127.0.0.1:1"
 
 _spec = importlib.util.spec_from_file_location(
@@ -623,6 +624,16 @@ check("a larger text size scales every font",
 alice.set_appearance(theme="dark", text_size="default")
 check("...and back (dark, on black by default)",
       M.T.name == "black" and M.T.dark and M.APPEARANCE.scale == 1.0)
+alice.set_language("zh-CN")
+check("Settings › Language: the app is built again in Chinese, keeping the "
+      "open chat and its draft", M.LANG.code == "zh-CN" and
+      alice.settings_screen.appbar.title.text == "设置" and
+      alice.manager.current == "conversation" and
+      alice.conversation_screen.entry.text == "half-written")
+alice.set_language("system")
+check("...and back to the system's language (English here)",
+      M.LANG.code == "en" and
+      alice.settings_screen.appbar.title.text == "Settings")
 
 print("\nv14: the outbox (B15), a full relay (B10), counted uploads (B2)")
 api = alice.api

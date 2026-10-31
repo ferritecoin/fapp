@@ -1,25 +1,39 @@
 #!/usr/bin/env python3
 """Build Ferritext's bundled fonts into data/fonts/.
 
-    python3 -m pip install fonttools brotli
+    python3 -m pip install fonttools brotli uharfbuzz
     python3 tools/build_fonts.py            # downloads the pinned sources
+    python3 tools/build_fonts.py mono sans  # only these families
     python3 tools/build_fonts.py --colour   # only the colour stage, on the
                                             # fonts already in data/fonts
 
 Kivy draws a whole label with ONE font file and has no fallback, so a
 message mixing letters and emoji needs both in the same file. This merges
-EB Garamond (a serif with true italics) with Noto Emoji into "Ferritext
-Serif", in four styles, then (v12) lays Twemoji's colour layers over the
-emoji: a COLR/CPAL colour font, which FreeType draws in colour. Each Noto
-Emoji outline stays as its colour glyph's base, so a renderer without colour
-support draws the monochrome emoji as before. The capitals face, Titillium
-Web Light (data/fonts/ui.ttf), is shipped unmodified.
+each theme's text face with Noto Emoji (FAMILIES), then (v12) lays
+Twemoji's colour layers over the emoji: a COLR/CPAL colour font, which
+FreeType draws in colour. Each Noto Emoji outline stays as its colour
+glyph's base, so a renderer without colour support draws the monochrome
+emoji as before.
 
-EB Garamond, Noto Emoji and Titillium Web are under the SIL Open Font
-License 1.1; Twemoji's graphics, by Twitter, Inc and other contributors,
-under CC-BY 4.0. Their licence texts ship beside the fonts. The merged
-family is renamed, as the OFL asks of modified fonts, and keeps every
-original copyright notice.
+  Ferritext Serif  EB Garamond, four styles: Axiom, the app's own look
+  Ferritext Mono   IBM Plex Mono, regular and bold: Overclock (15.1)
+  Ferritext Sans   Open Sans, regular and bold: Ferrite (15.1)
+  Ferritext CJK    Noto Sans SC and KR, regular: Chinese, Japanese and
+                   Korean in every theme (15.1; see cjk_characters)
+  Ferritext World  Noto Sans and its faces for 21 more scripts, regular:
+                   every other script in everyday use (15.1; see WORLD)
+
+Kivy does not slant or embolden a face itself, so a style a family lacks
+is drawn upright or regular. The capitals faces, Titillium Web Light
+(data/fonts/ui.ttf, as supplied) and Silkscreen (CAPS), are shipped
+unmodified.
+
+EB Garamond, IBM Plex Mono, Open Sans, Silkscreen, Noto Sans and its script
+faces, Noto Sans SC and KR, Noto Emoji and Titillium Web are under the SIL
+Open Font License 1.1; Twemoji's graphics, by
+Twitter, Inc and other contributors, under CC-BY 4.0. Their licence texts
+ship beside the fonts. The merged families are renamed, as the OFL asks of
+modified fonts, and keep every original copyright notice.
 """
 import hashlib
 import io
@@ -47,22 +61,109 @@ SOURCES = {
                         "bba2c4499c93c9612b90b9825d32b07da52fce2fe57562a1eb6b833553f93c4e"),
     "emoji": ("notoemoji/NotoEmoji%5Bwght%5D.ttf",
               "de6c18832938afc99caf132b39d6a30a19bac7f2e812e28db2535b4608d27551"),
+    "plexmono": ("ibmplexmono/IBMPlexMono-Regular.ttf",
+                 "6a3412f058c7d8dfd9170c41e85ade48e5156ecb89356110ca57a0a27734af46"),
+    "plexmono_bold": ("ibmplexmono/IBMPlexMono-Bold.ttf",
+                      "ac27abd6450a64dd94467580a02fe6235156d5b92f2926ebbc8e7489df64e0be"),
+    "opensans": ("opensans/OpenSans%5Bwdth,wght%5D.ttf",
+                 "36643644f318a812aab2d2ed3bb98f8cf0872527f835fe9398d95fe6b9adb878"),
+    "notosanssc": ("notosanssc/NotoSansSC%5Bwght%5D.ttf",
+                   "a3041811a78c361b1de50f953c805e0244951c21c5bd412f7232ef0d899af0da"),
+    "notosanskr": ("notosanskr/NotoSansKR%5Bwght%5D.ttf",
+                   "194018e6b2b293a7964f037b25c0249ce1418bc9ab3c971060a03aa57861e252"),
 }
+#: v15.1: the scripts Unicode recommends for everyday use (UAX #31, table
+#: 4) that no other face has, each in its Noto face (Tibetan's is a serif:
+#: Noto has no sans), after Noto Sans for their Latin, Greek and Cyrillic.
+#: Merged whole, shaping rules and all: SDL_ttf shapes with HarfBuzz once
+#: told the script (shaping_script in main.py).
+WORLD = {
+    "notosans": ("notosans/NotoSans%5Bwdth,wght%5D.ttf",
+                 "bfb7bb691513f12e734dc346c03a03f784912432d7e3fa8e56efcf906fe86b3d"),
+    "arabic": ("notosansarabic/NotoSansArabic%5Bwdth,wght%5D.ttf",
+               "63111b5b2e074dd48cc67692e0a2726d86ee94c1c37fe8598257b7b4e87e869e"),
+    "armenian": ("notosansarmenian/NotoSansArmenian%5Bwdth,wght%5D.ttf",
+                 "0870908d8318435a5daf1cd280ae15063f990cd9ad60f3e94c734ce9e1ffef71"),
+    "bengali": ("notosansbengali/NotoSansBengali%5Bwdth,wght%5D.ttf",
+                "dcd42978094e584a849c84a51450eeac40c8826057d566ea6d4b9627a403a05a"),
+    "devanagari": ("notosansdevanagari/NotoSansDevanagari%5Bwdth,wght%5D.ttf",
+                   "14ec4af41f27482216d1c2229f417ff9b1425e1babb014e57d1d40d03229853e"),
+    "ethiopic": ("notosansethiopic/NotoSansEthiopic%5Bwdth,wght%5D.ttf",
+                 "0dbccc00b22d180ebd6a4bd8a733918a29e709fa6798023adc3e6cd40da65077"),
+    "georgian": ("notosansgeorgian/NotoSansGeorgian%5Bwdth,wght%5D.ttf",
+                 "dc591156f36842d38996c4a7a17fee9bb58e45da3e2cac7a31b7d33de700adb9"),
+    "gujarati": ("notosansgujarati/NotoSansGujarati%5Bwdth,wght%5D.ttf",
+                 "9901d8552f1dd5d2c50dbd4caa6f6e174e74e8264f06594ab259ae6e7b1ac428"),
+    "gurmukhi": ("notosansgurmukhi/NotoSansGurmukhi%5Bwdth,wght%5D.ttf",
+                 "1e6f728fa620e566f842d81e220265813faa12771214765d289c98e035adc5f2"),
+    "hebrew": ("notosanshebrew/NotoSansHebrew%5Bwdth,wght%5D.ttf",
+               "7ef36a2c3593758cdb622e1bdef4f84523e92fbc3ccc667438dd80ff54c2de88"),
+    "kannada": ("notosanskannada/NotoSansKannada%5Bwdth,wght%5D.ttf",
+                "cca4f3b3a8cb12fb261f1b43baf5d2f7f59d90fe123d41f0065ed3a183997ec9"),
+    "khmer": ("notosanskhmer/NotoSansKhmer%5Bwdth,wght%5D.ttf",
+              "f37a8431a0c5d5ed2f81a767417546aca576a81fb7eff9c924d46aecf828f2ca"),
+    "lao": ("notosanslao/NotoSansLao%5Bwdth,wght%5D.ttf",
+            "9608b94603a82d09a8038946f9775242f99e3b3459b7f1e4d5b335b578cd7ab3"),
+    "malayalam": ("notosansmalayalam/NotoSansMalayalam%5Bwdth,wght%5D.ttf",
+                  "312e0e7c3cc15fa09eb42a8f749eeb246b593ed420e3c81aafe8d910c3a6fb56"),
+    "myanmar": ("notosansmyanmar/NotoSansMyanmar%5Bwdth,wght%5D.ttf",
+                "7abbbfbe2514105d7ce94937aee3feb2ba89b73a256c8b77b5866bd9b83e32ec"),
+    "oriya": ("notosansoriya/NotoSansOriya%5Bwdth,wght%5D.ttf",
+              "910342275d619081b896b4ed25fd9ad6ff320c25591b810de1fcc4beb153ba82"),
+    "sinhala": ("notosanssinhala/NotoSansSinhala%5Bwdth,wght%5D.ttf",
+                "9bd93e407a278075be403324063bc94a7e306c44de4df81214e932330c22eecf"),
+    "tamil": ("notosanstamil/NotoSansTamil%5Bwdth,wght%5D.ttf",
+              "aa3a9b321f4b0bb2c40203ffbde9af89713227866e0e13f76e5b9eeea727cf88"),
+    "telugu": ("notosanstelugu/NotoSansTelugu%5Bwdth,wght%5D.ttf",
+               "e618af7bf999df192ed4f388eba2e563f2b5015034e9cbb317b5bd793bd7334d"),
+    "thaana": ("notosansthaana/NotoSansThaana%5Bwght%5D.ttf",
+               "a296795c892a9ec2b0f4d3af315568506ef9fd55920386170992d3935d8866ca"),
+    "thai": ("notosansthai/NotoSansThai%5Bwdth,wght%5D.ttf",
+             "5a1c559bb539583c8a1fd99d1c5b9491e5e14478c9cd2bd0970d5c3096cc9ef8"),
+    "tibetan": ("notoseriftibetan/NotoSerifTibetan%5Bwght%5D.ttf",
+                "060ec022b04c306de3f58d051fb0e1cf81a5b610c5910fbfc43bba154c057cda"),
+}
+SOURCES.update(WORLD)
+#: Capitals faces, shipped as they come: Overclock's spaced capitals.
+CAPS = {"Silkscreen-Regular.ttf": (
+    "silkscreen/Silkscreen-Regular.ttf",
+    "c845473330b94c2079ce9af01c51ac8ba2d99c24f4d14c039843bbb8e642ebd8")}
 LICENCES = {"OFL-EBGaramond.txt": "ebgaramond/OFL.txt",
             "OFL-NotoEmoji.txt": "notoemoji/OFL.txt",
-            "OFL-TitilliumWeb.txt": "titilliumweb/OFL.txt"}
-#: (output file, garamond source, weight, emoji weight, style name)
-STYLES = [("FerritextSerif-Regular.ttf", "garamond", 400, 400, "Regular"),
-          ("FerritextSerif-Italic.ttf", "garamond_italic", 400, 400, "Italic"),
-          ("FerritextSerif-Bold.ttf", "garamond", 600, 600, "Bold"),
-          ("FerritextSerif-BoldItalic.ttf", "garamond_italic", 600, 600,
-           "Bold Italic")]
-FAMILY = "Ferritext Serif"
-#: Emoji are drawn at this fraction of the em: Garamond's small x-height
-#: makes full-size emoji shout over the text around them.
-EMOJI_SCALE = 0.86
+            "OFL-TitilliumWeb.txt": "titilliumweb/OFL.txt",
+            "OFL-IBMPlexMono.txt": "ibmplexmono/OFL.txt",
+            "OFL-OpenSans.txt": "opensans/OFL.txt",
+            "OFL-Silkscreen.txt": "silkscreen/OFL.txt",
+            "OFL-NotoSansCJK.txt": "notosanssc/OFL.txt"}
+#: family name: (file prefix, emoji scale, styles). The emoji scale is the
+#: fraction of the em emoji are drawn at: Garamond's small x-height makes
+#: full-size emoji shout over the text around them. Each style is (style
+#: name, source, weight, emoji weight).
+FAMILIES = {
+    "Ferritext Serif": ("FerritextSerif", 0.86, [
+        ("Regular", "garamond", 400, 400),
+        ("Italic", "garamond_italic", 400, 400),
+        ("Bold", "garamond", 600, 600),
+        ("Bold Italic", "garamond_italic", 600, 600)]),
+    "Ferritext Mono": ("FerritextMono", 0.92, [
+        ("Regular", "plexmono", 400, 400),
+        ("Bold", "plexmono_bold", 700, 600)]),
+    "Ferritext Sans": ("FerritextSans", 0.92, [
+        ("Regular", "opensans", 400, 400),
+        ("Bold", "opensans", 700, 600)]),
+    "Ferritext CJK": ("FerritextCJK", 0.92, [
+        ("Regular", "cjk", 400, 400)]),
+    "Ferritext World": ("FerritextWorld", 0.92, [
+        ("Regular", "world", 400, 400)]),
+}
+#: Sources made from others: the CJK face (cjk_face) and the face for
+#: every other script (world_face).
+DERIVED = {"cjk": ("notosanssc", "notosanskr"), "world": tuple(WORLD)}
+#: The licence file of the face for every other script (world_licence).
+WORLD_LICENCE = "OFL-NotoSansWorld.txt"
 #: Layout and variation tables of the emoji font that the merge cannot
-#: reconcile and SDL_ttf (no HarfBuzz on Android) never reads.
+#: reconcile; the text face's own are kept, and add_colour() adds the
+#: emoji's sequences.
 EMOJI_DROP = ("GSUB", "GPOS", "GDEF", "STAT", "fvar", "gvar", "avar", "HVAR",
               "MVAR", "vhea", "vmtx", "meta", "DSIG")
 #: v12: the colour layers. The npm package carries Twemoji built as a COLR
@@ -112,9 +213,120 @@ def fetch(path: str, sha: str = "") -> bytes:
 
 
 def instance(data: bytes, weight: int) -> TTFont:
+    """A variable font at `weight`, every other axis at its default; a
+    static font as it is."""
     font = TTFont(io.BytesIO(data))
-    return instancer.instantiateVariableFont(font, {"wght": weight},
+    if "fvar" not in font:
+        return font
+    axes = {axis.axisTag: axis.defaultValue for axis in font["fvar"].axes}
+    axes["wght"] = weight
+    return instancer.instantiateVariableFont(font, axes,
                                              updateFontNames=False)
+
+
+def cjk_characters() -> tuple:
+    """(everything but Hangul, Hangul): the characters of everyday Chinese,
+    Japanese and Korean. GB2312 (Simplified Chinese), Big5's first level
+    (Traditional), JIS X 0208 (Japanese) and KS X 1001 (Korean: Hangul and
+    Hanja), each with its punctuation, kana, Greek, Cyrillic and full-width
+    forms; with ASCII, Latin-1 and the punctuation and currency signs, so
+    that a line of mixed text stays in one face. About 13,500 in all."""
+    def charset(codec: str, lead: range, trail: range) -> set:
+        out = set()
+        for a in lead:
+            for b in trail:
+                try:
+                    out.update(bytes([a, b]).decode(codec))
+                except UnicodeDecodeError:
+                    pass
+        return {ord(c) for c in out}
+    chars = (charset("gb2312", range(0xA1, 0xF8), range(0xA1, 0xFF))
+             | charset("big5", range(0xA1, 0xC7), range(0x40, 0xFF))
+             | charset("euc_jp", range(0xA1, 0xF5), range(0xA1, 0xFF))
+             | charset("euc_kr", range(0xA1, 0xFE), range(0xA1, 0xFF))
+             | set(range(0x20, 0x7F)) | set(range(0xA0, 0x100))
+             | set(range(0x2000, 0x2070)) | set(range(0x20A0, 0x20C1))
+             | set(range(0x3000, 0x3100)) | set(range(0xFF00, 0xFFF0)))
+    hangul = {c for c in chars if 0xAC00 <= c <= 0xD7A3}
+    return chars - hangul, hangul
+
+
+def cjk_face(sc: bytes, kr: bytes, *, weight: int, work: Path) -> bytes:
+    """Noto Sans SC cut to cjk_characters(), with Noto Sans KR's Hangul, as
+    one static face at `weight`."""
+    from fontTools import subset
+    han, hangul = cjk_characters()
+    parts = []
+    for data, chars, keep_layout in ((sc, han, True), (kr, hangul, False)):
+        font = instance(data, weight)
+        options = subset.Options()
+        options.layout_features = ["*"] if keep_layout else []
+        options.name_IDs = ["*"]
+        options.notdef_outline = True
+        cutter = subset.Subsetter(options)
+        cutter.populate(unicodes=chars)
+        cutter.subset(font)
+        for table in ("vhea", "vmtx", "VORG", "STAT", "DSIG") + (
+                () if keep_layout else ("GSUB", "GPOS", "GDEF")):
+            if table in font:
+                del font[table]
+        path = work / f"cjk-part{len(parts)}.ttf"
+        font.save(path)
+        parts.append(str(path))
+    merged = Merger().merge(parts)              # SC first: its Latin wins
+    out = io.BytesIO()
+    merged.save(out)
+    return out.getvalue()
+
+
+def world_face(*sources: bytes, weight: int, work: Path) -> bytes:
+    """Noto Sans and the WORLD script faces as one static face at
+    `weight`, Noto Sans first so that its Latin and its line height are
+    the ones kept: SDL_ttf makes a line taller for a script whose marks
+    stack higher, rather than every line. Their layout tables together
+    outgrow 16-bit offsets: fontTools repacks them with HarfBuzz's
+    repacker, from the uharfbuzz package."""
+    try:
+        import uharfbuzz  # noqa: F401
+    except ImportError:
+        raise SystemExit("the World face needs uharfbuzz: "
+                         "python3 -m pip install uharfbuzz")
+    parts, notices = [], []
+    for data in sources:
+        font = instance(data, weight)
+        for table in ("STAT", "DSIG", "vhea", "vmtx", "VORG", "BASE",
+                      "meta"):
+            if table in font:
+                del font[table]
+        notices.append(font["name"].getDebugName(0))
+        path = work / f"world-part{len(parts)}.ttf"
+        font.save(path)
+        parts.append(str(path))
+    merged = Merger().merge(parts)
+    first = TTFont(parts[0], lazy=True)
+    for table, fields in (("hhea", ("ascent", "descent", "lineGap")),
+                          ("OS/2", ("sTypoAscender", "sTypoDescender",
+                                    "sTypoLineGap", "usWinAscent",
+                                    "usWinDescent"))):
+        for field in fields:
+            setattr(merged[table], field, getattr(first[table], field))
+    merged["name"].setName(" / ".join(dict.fromkeys(notices)), 0, 3, 1,
+                           0x409)
+    out = io.BytesIO()
+    merged.save(out)
+    return out.getvalue()
+
+
+def world_licence(sources: dict) -> str:
+    """Each WORLD face's copyright line, then the licence they share."""
+    notices = [TTFont(io.BytesIO(sources[key]), lazy=True)["name"]
+               .getDebugName(0) for key in WORLD]
+    text = fetch(WORLD["notosans"][0].split("/")[0] + "/OFL.txt").decode(
+        "utf-8")
+    body = text[text.index("This Font Software"):]
+    return ("Ferritext World is made of these fonts, each under the SIL "
+            "Open Font License 1.1:\n\n" + "\n".join(notices) + "\n\n"
+            + body)
 
 
 def twemoji_licence(package: bytes) -> str:
@@ -360,10 +572,11 @@ def soften(cpal) -> None:
                                       alpha=colour.alpha)
 
 
-def build(garamond: bytes, emoji: bytes, weight: int, emoji_weight: int,
-          style: str, out: Path, work: Path,
+def build(source: bytes, emoji: bytes, weight: int, emoji_weight: int,
+          family: str, style: str, out: Path, work: Path,
           twemoji: TTFont = None) -> None:
-    text = instance(garamond, weight)
+    prefix, emoji_scale, _styles = FAMILIES[family]
+    text = instance(source, weight)
     for table in ("STAT",):
         if table in text:
             del text[table]
@@ -378,8 +591,8 @@ def build(garamond: bytes, emoji: bytes, weight: int, emoji_weight: int,
     for table in EMOJI_DROP:
         if table in marks:
             del marks[table]
-    scale_upem(marks, round(upm * EMOJI_SCALE))
-    marks["head"].unitsPerEm = upm          # glyphs stay at EMOJI_SCALE
+    scale_upem(marks, round(upm * emoji_scale))
+    marks["head"].unitsPerEm = upm          # glyphs stay at emoji_scale
     emoji_cps = set(marks.getBestCmap())
     for sub in text["cmap"].tables:
         if not hasattr(sub, "cmap"):
@@ -402,11 +615,11 @@ def build(garamond: bytes, emoji: bytes, weight: int, emoji_weight: int,
         | (0b100000 if bold else 0) | (0b1000000 if not (bold or italic) else 0)
     merged["head"].macStyle = (1 if bold else 0) | (2 if italic else 0)
     name = merged["name"]
-    ps = f"FerritextSerif-{style.replace(' ', '')}"
+    ps = f"{prefix}-{style.replace(' ', '')}"
     for rec_id, value in ((0, " / ".join(c for c in copyrights if c)),
-                          (1, FAMILY), (2, style),
-                          (3, f"{ps};{FAMILY} built by tools/build_fonts.py"),
-                          (4, f"{FAMILY} {style}"), (6, ps),
+                          (1, family), (2, style),
+                          (3, f"{ps};{family} built by tools/build_fonts.py"),
+                          (4, f"{family} {style}"), (6, ps),
                           (13, "This Font Software is licensed under the SIL "
                                "Open Font License, Version 1.1."),
                           (14, "https://openfontlicense.org")):
@@ -427,11 +640,25 @@ def name_colour(font: TTFont) -> None:
         "contributors (CC-BY 4.0)", 0, 3, 1, 0x409)
 
 
-def colour_only() -> None:
+def styles(names) -> list:
+    """(family, output file, source, weight, emoji weight, style) for each
+    style of the families named by their last word (serif, mono, sans), or
+    of every family."""
+    out = []
+    for family, (prefix, _scale, family_styles) in FAMILIES.items():
+        if names and family.split()[-1].lower() not in names:
+            continue
+        for style, source, weight, emoji_weight in family_styles:
+            out.append((family, f"{prefix}-{style.replace(' ', '')}.ttf",
+                        source, weight, emoji_weight, style))
+    return out
+
+
+def colour_only(names) -> None:
     """The colour stage alone, on the fonts already built in data/fonts."""
     package = fetch(*TWEMOJI)
     twemoji = twemoji_font(package)
-    for out, *_rest in STYLES:
+    for _family, out, *_rest in styles(names):
         # Keeps the fonts' own date, so running the stage again changes nothing.
         font = TTFont(OUT / out, recalcTimestamp=False)
         count = add_colour(font, twemoji)
@@ -444,19 +671,34 @@ def colour_only() -> None:
 
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
+    names = {a.lower() for a in sys.argv[1:] if not a.startswith("--")}
+    unknown = names - {f.split()[-1].lower() for f in FAMILIES}
+    if unknown:
+        sys.exit(f"no such family: {', '.join(sorted(unknown))}")
     if "--colour" in sys.argv[1:]:
-        colour_only()
+        colour_only(names)
         return
-    src = {key: fetch(path, sha) for key, (path, sha) in SOURCES.items()}
+    todo = styles(names)
+    needed = {source for _f, _o, source, *_r in todo} | {"emoji"}
+    needed = set().union(*(DERIVED.get(k, (k,)) for k in needed))
+    src = {key: fetch(*SOURCES[key]) for key in sorted(needed)}
     package = fetch(*TWEMOJI)
     twemoji = twemoji_font(package)
     with tempfile.TemporaryDirectory() as tmp:
-        for out, source, weight, emoji_weight, style in STYLES:
-            build(src[source], src["emoji"], weight, emoji_weight, style,
-                  OUT / out, Path(tmp), twemoji)
+        made = {"cjk": cjk_face, "world": world_face}
+        for family, out, source, weight, emoji_weight, style in todo:
+            data = (made[source](*(src[k] for k in DERIVED[source]),
+                                 weight=weight, work=Path(tmp))
+                    if source in DERIVED else src[source])
+            build(data, src["emoji"], weight, emoji_weight, family,
+                  style, OUT / out, Path(tmp), twemoji)
             print(f"{out:32} {(OUT / out).stat().st_size:>9,} B")
+    for out, (path, sha) in CAPS.items():
+        (OUT / out).write_bytes(fetch(path, sha))
     for out, path in LICENCES.items():
         (OUT / out).write_bytes(fetch(path))
+    if "world" in {source for _f, _o, source, *_r in todo}:
+        (OUT / WORLD_LICENCE).write_text(world_licence(src), "utf-8")
     (OUT / "CC-BY-Twemoji.txt").write_text(twemoji_licence(package), "utf-8")
     if not (OUT / "ui.ttf").exists():
         sys.exit("data/fonts/ui.ttf (Titillium Web Light) is missing")

@@ -22,12 +22,12 @@ same key (see [Release signing](#release-signing)).
 
 Every push to the default branch is tested and built, and each new version is
 published to a GitHub Release, whose files never change afterwards. Open the
-**Releases** page (or the **`v15.0.0`** tag) and take:
+**Releases** page (or the **`v15.1.0`** tag) and take:
 
 | Asset | For |
 | --- | --- |
-| `Ferritext-15.0.0.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r` |
-| `Ferritext-15.0.0-desktop.py` | Windows / macOS / Linux — one file with its fonts and icons inside. Run it with Python 3.11+ after `pip install kivy requests websocket-client cryptography qrcode pillow`. |
+| `Ferritext-15.1.0.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r` |
+| `Ferritext-15.1.0-desktop.py` | Windows / macOS / Linux — one file with its fonts and icons inside. Run it with Python 3.11+ after `pip install kivy requests websocket-client cryptography qrcode pillow`. |
 
 Both are also attached to each Actions run as the **`ferritext-release`**
 artifact, kept for a week. Pushes to other branches are tested and built, but
@@ -43,6 +43,46 @@ nothing breaks without it:
 | `pip install numpy` | voice notes at 1.5× and 2× |
 | `pip install av` (or the `ffmpeg` program) | playing voice notes recorded on a phone |
 | `pip install opencv-python` (or `pyzbar`) | reading a contact's QR code from a picture |
+
+**For China**, where GitHub's downloads are not dependable and WeChat
+renames an APK so that it will not install, give people a download page
+on your own host instead. `tools/download_page.py` makes one from a
+release's APK: one page in Simplified Chinese and English, fetching
+nothing from elsewhere, with the APK beside it, its size and SHA-256, a
+QR code of the page's address, and the steps to install the app and keep
+it running.
+
+```bash
+python3 tools/download_page.py Ferritext-15.1.0.apk site/ \
+    --url https://your.host/ferritext/        # then serve site/ there
+```
+
+Relay 12.2.1 and later can serve the page too, at `/download/` on the
+relay's own address: whoever can reach the relay can reach it.
+
+## What's in 15.1.0
+
+- **Three themes.** Axiom, the app as it was; Overclock, phosphor on
+  obsidian in a monospaced face; and Ferrite, graphite and cyan. Choose
+  under *Settings › Appearance › Theme*; each has a light and a dark side.
+- **Every script in everyday use.** Chinese, Japanese and Korean, Arabic,
+  Hebrew, the scripts of India, Thai, Burmese, Khmer, Georgian, Armenian,
+  Amharic and the rest showed as empty boxes. They are drawn now, letters
+  joined and marks in place, and right to left where they are written so.
+- **The app in Simplified Chinese**, by the phone's language or under
+  *Settings › Language*. Chinese lines break by Chinese rules.
+- **Keeps running on phones that stop it.** Where the maker stops apps in
+  the background (Xiaomi, Huawei, Honor, OPPO, vivo and others), the app
+  offers once to set itself up and opens each setting in turn. *Settings ›
+  Notifications › Keep Ferritext running* shows what is done.
+- **A download page** for people who cannot reach GitHub, such as in
+  mainland China: see *Downloads* above.
+- A new username asks for notifications and starts receiving at once,
+  not at the app's next start.
+- For developers: `desktop/capture.py` captures 28 screens, among them
+  chats in other scripts and the verification sheet.
+- **Coming from an earlier version?** Everything in 15.0.0 and before,
+  below, is new to you too.
 
 ## What's in 15.0.0
 
@@ -424,28 +464,110 @@ everyone has read it.
 
 ## Type and themes
 
-The serif is **EB Garamond**, merged with **Noto Emoji** into the four-style
-family *Ferritext Serif* (Kivy draws a label with one font file and cannot fall
-back to another, so the emoji must live in the same file). The emoji are drawn
-in colour, from **Twemoji**'s graphics, laid over Noto Emoji's outlines as the
-font's colour layers (COLR/CPAL), which FreeType draws at any size. Flags, skin
-tones, families and keycaps are joined into one picture by the font itself. A
-system that cannot draw colour fonts draws the outlines instead, in the colour
-of the text.
+**Three themes** (Settings › Appearance › Theme), each in a light and a dark
+side (Light or dark: system, light or dark):
 
-Capitals are set in the supplied `data/fonts/ui.ttf` (Titillium Web Light),
-with letter-spacing the app adds itself, since Kivy's text has none.
+| Theme | Its text | Its capitals | Its look |
+|---|---|---|---|
+| **Axiom** (the default) | EB Garamond | Titillium Web Light | warm paper and ink, gold marks; the dark side on black or a warm grey |
+| **Overclock** | IBM Plex Mono | Silkscreen | obsidian and phosphor by night, violet and neon by day (a dark page too), square corners |
+| **Ferrite** | Open Sans | Titillium Web Light | graphite with cyan by night, slate with teal by day |
 
-All three are under the SIL Open Font License 1.1, and Twemoji's graphics
-under CC-BY 4.0; the licence texts ship beside the fonts and inside the APK. `tools/build_fonts.py` rebuilds the merged
-family from pinned, checksummed upstream files.
+Kivy draws a label with one font file and cannot fall back to another, so
+the emoji must live in the same file as the text. Each theme's text face is
+merged with **Noto Emoji** (*Ferritext Serif*, *Mono* and *Sans*), and the
+emoji are drawn in colour, from **Twemoji**'s graphics, laid over Noto
+Emoji's outlines as the font's colour layers (COLR/CPAL), which FreeType
+draws at any size. Flags, skin tones, families and keycaps are joined into
+one picture by the font itself. A system that cannot draw colour fonts draws
+the outlines instead, in the colour of the text. Kivy neither slants nor
+emboldens a face itself, so Mono and Sans, which ship in two styles, show
+italic text upright.
 
-The two themes are sets of colour tokens at the top of the client's design
-system. `desktop/test_design.py` measures every text/ground pair both themes
-use against WCAG AA (4.5:1 for text, 3:1 for marks such as ticks).
+**Chinese, Japanese and Korean** are in one face for every theme,
+*Ferritext CJK*: Noto Sans SC with Noto Sans KR's Hangul, cut to the
+characters of everyday text (GB2312, Big5's first level, JIS X 0208 and
+KS X 1001: about 13,500), with the emoji. A label whose text has one of
+them is drawn in it (`_resolve_font_name` in `main.py`), and so is a text
+field holding one.
+
+**Every other script in everyday use** is in a second face, *Ferritext
+World*: Noto Sans (Latin, Greek, Cyrillic) with Noto's faces for the 21
+scripts Unicode recommends for everyday use that no other face has (UAX
+#31: Arabic, Hebrew, Thaana, Devanagari, Bengali, Gurmukhi, Gujarati,
+Oriya, Tamil, Telugu, Kannada, Malayalam, Sinhala, Thai, Lao, Tibetan,
+Myanmar, Khmer, Georgian, Armenian, Ethiopic), with the emoji. A label is
+drawn in its theme's face when that has every character it shows, else in
+the first of the CJK and World faces that does; each font's characters are
+read from the font itself (`font_characters`). So Greek, which IBM Plex
+Mono lacks, is drawn in the World face in Overclock only.
+
+Those scripts need more than their letters. SDL_ttf shapes text with
+HarfBuzz, which joins Arabic's letters, builds the clusters of the scripts
+of India and stacks South-East Asia's marks, once told the script: each
+label is told the first in its text that needs it (`shaping_script`).
+Arabic, Hebrew and Thaana run right to left, with numbers and Latin words
+in them left to right, and Kivy lays every line out left to right: so a
+paragraph is broken into lines in reading order, and each line is then put
+in the order it is shown by the Unicode bidirectional algorithm (UAX #9,
+`bidi_levels` and `display_order`, which agree with Unicode's own test
+file). A paragraph that begins right to left lines up on the right, and a
+name or preview cut short loses the end it is read to. Thai, Lao, Khmer and
+Burmese, whose words are not spaced, break between letters and never
+between a letter and its vowel or mark (between words would take a
+dictionary). A text field with right-to-left text lines up on the right
+and puts its caret where the characters are shown; selecting part of such
+text still follows the order it is stored in.
+
+Capitals carry letter-spacing the app adds itself, since Kivy's text has
+none. Every font here is under the SIL Open Font License 1.1, and Twemoji's
+graphics under CC-BY 4.0; the licence texts ship beside the fonts and inside
+the APK. `tools/build_fonts.py` rebuilds the merged faces from pinned,
+checksummed upstream files.
+
+The themes' colours are sets of tokens at the top of the client's design
+system. `desktop/test_design.py` measures every text/ground pair each theme
+uses against WCAG AA (4.5:1 for text, 3:1 for marks such as ticks).
 
 Kivy has no screen-reader support yet. Every control nonetheless carries a
 spoken label in the code, ready for when it does.
+
+## Languages
+
+The app is in English and Simplified Chinese (Settings › Language): the
+system's language when it is one of them (Chinese in Traditional characters
+is not taken for Simplified), or the one chosen there. A change rebuilds the
+screens at once, as a new theme does. What people write is never translated.
+
+Every phrase the app shows passes through `tr()` in `main.py`, which looks
+it up in the language's pack, `data/lang/<code>.json`: each English phrase
+and its translation, with the same `{fields}`. A phrase a pack lacks is
+shown in English. `trn()` chooses by number (1 message, 2 messages), a
+phrase kept in a table is marked `N_()` and translated where it is shown,
+and `date_text()` writes dates. What goes to another phone stays in
+English, as it always was: a control's text for apps that do not know the
+control, and a photo's or a voice message's text, which the app shows in
+its reader's language (`shown_body`).
+
+```bash
+python3 tools/phrases.py                         # every pack and its gaps
+python3 tools/phrases.py --missing zh-CN > todo.json
+python3 tools/phrases.py --merge zh-CN todo.json # the filled-in phrases
+```
+
+To add a language: give its code and own name in `LANGUAGES` (and add it to
+`ONE_IS_SINGULAR` if, like English, it says "1 message" but "2 messages"),
+translate its `--missing` phrases and `--merge` them, and teach
+`pick_language` its system tags if it needs to. `test_design.py` fails
+while any pack has a gap.
+
+Kivy breaks a line only at a space, so it cut a Chinese sentence wherever
+the room ran out, a full stop starting the next line. A wrapped label with
+Chinese, Japanese or Korean is now broken into lines first (`break_lines`):
+a full stop or comma never starts a line, an opening bracket never ends
+one. Android's notifications get their words (Reply, Answer, the channels'
+names) from the app (`android_notification_words`), and keep them for when
+it is closed.
 
 ## Media
 
@@ -566,6 +688,22 @@ FileProvider through which the camera app hands over a photo (its one folder
 is `android/fext_file_paths.xml`; the class comes from
 `androidx.core`).
 
+Some makers' phones stop background apps anyway, the service too, to save
+battery (Xiaomi, Huawei, Honor, OPPO, vivo and their brands, Meizu, ASUS,
+Samsung; dontkillmyapp.com keeps the list). Two settings keep it alive: the
+maker's list of apps that may start by themselves, and Android's question
+whether its battery use may go unrestricted
+(`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`). No app may make them itself, so
+on those phones the guide (`KeepRunningSheet`) opens by itself once, as
+soon as there is a username, and its *Set up* opens each page in turn: the
+next as the app comes back from the last, or regains focus after Android's
+dialog. Ticks show what is made, and *Settings → Notifications → Keep
+Ferritext running* opens it again. The maker's pages are in `KEEP_RUNNING`
+in `main.py`; one that a phone lacks gives way to the next, and the last
+to the app's own page in Android's settings. Whether an app may start by
+itself cannot be read back, so that one counts as made once its page has
+opened.
+
 ## Post-quantum encryption
 
 What is sent today can be recorded and kept until a quantum computer can
@@ -654,10 +792,13 @@ a phone only in a backup you make and seal here.
 | `main.py` | The complete client (Buildozer's entry point **must** be `main.py`), and its two Android services: Android starts them from it too, the sync service and the call service that keeps a call's microphone on while the app is off screen. |
 | `buildozer.spec` | Android packaging: requirements, permissions, service, icons. |
 | `data/` | The Ferrite Text Messenger mark (`ferritext_logo_packet.svg`; `ferritext_logo.svg` is the supplied disc it came from) and the images rendered from it, including the desktop window icons (`icon_desktop.png`, `.ico`). |
-| `data/fonts/` | Ferritext Serif (four styles), the capitals face `ui.ttf`, and their licences. |
+| `data/fonts/` | The themes' faces (Ferritext Serif, Mono and Sans), the CJK and World faces, the capitals faces (`ui.ttf`, Silkscreen) and their licences. |
+| `data/lang/` | Each language's phrases (`zh-CN.json`); English is the code's own. |
 | `tools/make_logo.py` | Renders every image in `data/`, and the notification icon, from the SVG — no dependency beyond Pillow. |
-| `tools/build_fonts.py` | Rebuilds Ferritext Serif from EB Garamond, Noto Emoji and Twemoji (needs fontTools). |
+| `tools/build_fonts.py` | Rebuilds the merged faces from their upstream fonts, Noto Emoji and Twemoji (needs fontTools, and uharfbuzz for the World face). |
 | `tools/bundle_desktop.py` | Builds the single-file desktop release, and `--verify` checks one against the source. |
+| `tools/phrases.py` | Lists the phrases the app shows and what each language's pack lacks, and merges translations in. |
+| `tools/download_page.py` | Makes a release's download page, to host off GitHub (for China). |
 | `tools/p4a_hook.py` | Build hook: the service types Android 14 requires, the notifications' receiver, and the camera's FileProvider. |
 | `recipes/libopus/` | A python-for-android recipe for libopus, for calls in Opus. |
 | `android/` | What Android compiles or ships beside the Python, in one folder. Java: `CallAudio` (a call's microphone and speaker, on threads of their own, and where the sound goes), `Notifier` and `NotifyReceiver` (notifications, and what is done to them), `QrReader` (QR codes in photos). Resources: the cleartext policy for the relay, the status-bar icon, the camera's folder, the launch screen at night. |
@@ -690,17 +831,17 @@ xvfb-run -a python3 desktop/test_privacy.py main.py
 | Suite | Covers |
 | --- | --- |
 | `test_core.py` | Envelope extension (incl. replay/tamper refusal), wire compatibility with the previous release, migrations both ways, delete-for-both authorisation, tombstones, extension sanitising, group membership rules (who may invite, change and remove), per-member receipts, reactions, ML-KEM-768 against NIST's vectors and the `cryptography` library, post-quantum envelopes (tampering, keys this device does not hold) |
-| `test_flows.py` | Three real app controllers over an in-memory relay: replies, forwards, stars, delete for both, photos (EXIF stripping, rotation), expiry → ask again → re-upload, voice notes, notification rules, notes to self, groups (create, write, rename, remove, leave), reactions and taking them back, the reaction strip and emoji panel, switching theme and text size, post-quantum keys passing between people and groups, a new install asking for a message again |
-| `test_design.py` | WCAG AA contrast of every text/ground pair in both themes, fonts registered and packaged with their licences, following the system theme, tracked capitals, stacking buttons, Back closing a sheet |
+| `test_flows.py` | Three real app controllers over an in-memory relay: replies, forwards, stars, delete for both, photos (EXIF stripping, rotation), expiry → ask again → re-upload, voice notes, notification rules, notes to self, groups (create, write, rename, remove, leave), reactions and taking them back, the reaction strip and emoji panel, switching theme, text size and language, post-quantum keys passing between people and groups, a new install asking for a message again |
+| `test_design.py` | WCAG AA contrast of every text/ground pair in every theme, each theme set's faces and corners, Chinese, Japanese and Korean in their face, fonts registered and packaged with their licences, following the system theme, tracked capitals, stacking buttons, Back closing a sheet, every language's pack complete, the language chosen, Chinese line breaking, every other script (its face, its shaping, right to left as Unicode's tests have it, unspaced scripts' line breaks) |
 | `test_composer.py` | Real mouse clicks reaching the message field and its keys, hidden parts never swallowing a touch, the composer's two states, recording through a capture command into WAV, photos from a camera, icons drawn smooth |
-| `test_bundle.py` | The single-file desktop release: built, verified, run from an empty folder (fonts and icons unpacked, checked, reused, repaired) |
+| `test_bundle.py` | The single-file desktop release: built, verified, run from an empty folder (fonts and icons unpacked, checked, reused, repaired); the download page |
 | `test_service.py` | Both services started from `main.py` as Android starts them, app ⇄ service hand-over, the manifest hook |
 | `smoke_desktop.py` | Launch, branding and loading screen through the real `App.run()` path |
 | `smoke_chat.py` | Bottom-anchored short chats, scrolling, text selection and copy |
 | `test_navigation.py` | Pages in layers, a long chat opening at once, the menu, back one step at a time, search and jumping into history, tap to react, holding chats (mute, pin, archive, unread, block, delete) |
 | `test_pictures.py` | Making a picture (crop, size limit, nothing of the original file kept), refusing bad ones, versions, who is sent one and when, asking for a lost one, group pictures from the admin only, blocking, discs following a new picture, the framing sheet |
 | `test_calls.py` | The codecs (ADPCM bit for bit audioop's; Opus with FEC and concealment), the packet seal (replay, tamper, direction), the jitter buffer, two call engines finding each other directly, through a relay and over the WebSocket, and two apps calling: ring, answer, talk, mute, hang up, decline, busy, cancel, no answer, a stale offer, blocking |
-| `test_notify.py` | Notifications from the sync thread (a paused app still notifies), what they are made of, mute and its end, blocking that holds and releases, replying and marking read from a notification, drafts, a call while the app is away |
+| `test_notify.py` | Notifications from the sync thread (a paused app still notifies), what they are made of, mute and its end, blocking that holds and releases, replying and marking read from a notification, drafts, a call while the app is away, the guide that keeps the app running |
 | `test_gestures.py` | Real taps and swipes through the window: back, the menu, reply, taps that are not swipes, voice notes at speed and seeking |
 | `test_privacy.py` | Disappearing messages, verifying a contact, links and where they lead, link previews (off by default; fetched only from public addresses), encrypted backup and restore |
 
@@ -723,14 +864,18 @@ xvfb-run -a python3 desktop/bench.py main.py > after.json
 git worktree remove ../before
 ```
 
-- **`capture.py`** saves 21 screens (`shots/after/black_chat.png`, …),
-  built from the same chats on every run. `--theme` picks `black` (the
-  default), `dark` or `light`. It lists any layout problem it finds (text
-  cut off or overflowing, parts outside their box, touch targets under
-  40 dp) and then exits 1. Compare the two folders screen by screen.
-- **`bench.py`** times drawing text, the store's reads on 50,000
-  messages, and sealing and opening a message, each the median of five
-  runs. Compare the two files. A
+- **`capture.py`** saves 28 screens (`shots/after/black_chat.png`, …), built
+  from the same chats on every run. `--theme` picks `black` (the default),
+  `dark` or `light`, `--set` the theme set: `axiom` (the default),
+  `overclock` or `ferrite`, and `--lang` the language: `en` (the default)
+  or `zh-CN`. It lists any layout problem it finds (text cut
+  off or overflowing, parts outside their box, touch targets under 40 dp)
+  and then exits 1. Compare the two folders screen by screen. Run one
+  capture at a time: two at once slow each other, and the check can then
+  disagree with itself about a label's height.
+- **`bench.py`** times drawing text (Chinese too, and in each theme set's
+  face), the store's reads on 50,000 messages, and sealing and opening a
+  message, each the median of five runs. Compare the two files. A
   difference under a tenth is noise, and timings differ between machines,
   so compare only runs from the same one.
 - In the change's description, say which screens changed and which
@@ -745,7 +890,7 @@ on first run.
 
 ```bash
 python3 -m pip install --user buildozer cython
-buildozer android debug          # produces bin/fext-15.0.0-*-debug.apk
+buildozer android debug          # produces bin/fext-15.1.0-*-debug.apk
 ```
 
 The mark and icons are regenerated with `python3 tools/make_logo.py` (Pillow
