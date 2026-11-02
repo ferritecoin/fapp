@@ -20,7 +20,10 @@ Everything else — the crypto core, the wire protocol, the relay discovery, the
 local SQLite store — is byte-for-byte the same code, which is the point: a
 desktop build can never drift from the phone build.
 
-For distribution, every GitHub Release carries `Ferritext-<version>-desktop.py`:
+For distribution, every GitHub Release carries two desktop files. The
+Windows executable, `Ferritext-<version>-windows.exe`, is this folder's
+Nuitka build, made by CI on a Windows runner (below). And
+`Ferritext-<version>-desktop.py`:
 `main.py` at that release's tag with the fonts and window icons appended as
 comment lines, so the one file is all a computer needs (Kivy draws each label
 in a single font, so without the bundled serif there would be no emoji). On
@@ -33,22 +36,28 @@ from a checkout of the tag.
 
 ```bash
 python3 -m venv env && . env/bin/activate
-pip install nuitka kivy requests urllib3 charset-normalizer idna certifi \
-            websocket-client cryptography qrcode pillow
-./build_desktop.sh              # -> desktop/dist/fext_client_v<version>.dist/fext
+pip install nuitka zstandard kivy requests urllib3 charset-normalizer idna \
+            certifi websocket-client cryptography qrcode pillow
+pip install sounddevice numpy av pyzbar pyogg   # optional: what they add
+./build_desktop.sh              # -> desktop/dist/ferritext.dist/
 ONEFILE=1 ./build_desktop.sh    # -> desktop/dist/fext   (single file)
+python3 smoke_exe.py dist/fext  # start it twice in an empty home, as a person would
 ```
 
-Linux also needs `gcc` and `patchelf`. Overrides: `PY=`, `OUT=`, `NAME=`,
-`SRC=`.
+Linux also needs `gcc` and `patchelf`; Windows, Git Bash and Visual
+Studio's C++ build tools (CI: `build-windows` in `build-apk.yml`, with
+`ONEFILE=1 NAME=Ferritext-<version>-windows.exe`). Overrides: `PY=`,
+`OUT=`, `NAME=`, `SRC=`.
 
-Standalone output is ~174 MB on disk (a 71 MB executable plus Kivy/SDL/Pillow/
-OpenSSL shared libraries). `--onefile` packs that into one self-extracting
-binary — smaller to hand out, marginally slower to start.
+A one-file build unpacks itself once per version into the user's cache
+folder (`%LOCALAPPDATA%\Ferritext\<version>` on Windows) and starts from
+there afterwards; it keeps its data in `~/.fext`, as the desktop file does.
+With the optional packages it is about 76 MB on Windows and 95 MB on
+Linux.
 
 ## Why the Nuitka flags are what they are
 
-Four of them are load-bearing; drop any one and you get a build that compiles
+These are load-bearing; drop any one and you get a build that compiles
 cleanly and then misbehaves at runtime, which is the worst failure mode to ship:
 
 - `--include-package-data=certifi` — the client calls `certifi.where()` for
@@ -61,12 +70,33 @@ cleanly and then misbehaves at runtime, which is the worst failure mode to ship:
 - `--include-package=qrcode` + `--include-package=PIL` — `qrcode` picks its
   image backend by dynamic import at call time, invisible to static analysis.
   The Settings screen renders a QR code; miss these and that screen raises.
-- `--enable-plugin=kivy` — pulls in Kivy's providers and its 38 data files
-  (fonts, shaders, the default atlas).
+- Nuitka's Kivy plugin, always on, pulls in Kivy's providers, its data
+  files and SDL's and GLEW's DLLs. It does not take ANGLE, whose DLLs sit
+  outside the package: `nuitka-package.config.yml` does, and PyOgg's Opus
+  DLL.
+- `--nofollow-import-to=kivy_deps` — on Windows, Kivy imports each package
+  in its `kivy_deps` namespace by its bare name, which a compiled package
+  does not answer to, so `import kivy` fails and the app never starts.
+  Those packages only put their DLL folders on the search path, and the
+  build carries the DLLs beside the executable instead.
+- The optional packages are imported inside functions, in `try/except`, so
+  each module the app imports is named (`--include-module`) when it is
+  installed; naming whole packages would bring their tests along.
+- `--include-data-dir=…/licences=licences` — every licence of what the
+  executable carries, collected from the build's environment by
+  `collect_licences.py`, with where to find the source of the LGPL parts.
 
-## Verification performed on this build
+## Verification
 
-Against real Kivy 2.3.1 / cryptography 50.0.1, Nuitka 4.2.1, Python 3.11:
+Every build: CI starts the Windows executable twice with `smoke_exe.py`
+(up, its window drawn, still running) and keeps its screenshots. With
+Kivy 2.3.1, Nuitka 4.3.4 and Python 3.11, 15.1.1's was up in 6.2 s the
+first time, which unpacks it, and in 2.0 s after; the Linux one-file
+build passes the same 6 checks (about 3 s, then 2 s). On GitHub's 2-core
+Windows runner a build takes about an hour with nothing cached, and 13
+minutes with Nuitka's cache, which CI keeps.
+
+Earlier, against Kivy 2.3.1 / cryptography 50.0.1, Nuitka 4.2.1, Python 3.11:
 
 - `smoke_desktop.py main.py` — imports under real Kivy; desktop
   platform detected; `~/.fext` data dir; 12 s timeout; `seal()` round-trips on

@@ -923,7 +923,7 @@ REQUIRE_TLS = _os.environ.get("FEXT_REQUIRE_TLS", "") not in ("", "0", "false")
 
 APP_NAME = "Ferritext"
 #: Must equal `version` in buildozer.spec — CI refuses to build if not.
-APP_VERSION = "15.1.0"
+APP_VERSION = "15.1.1"
 
 # The identity/QR payload keeps carrying the ORIGINAL tag. It is wire data
 # that older clients already produce and consume, so renaming the app must
@@ -9066,6 +9066,7 @@ class LocalStore:
         self._lock = threading.Lock()
         self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
+        self._early: dict = {}      # relay id -> (tier, when): apply_receipt
         # SQLite's LIKE folds ASCII only; search folds every script.
         self._db.create_function("fx_fold", 1, lambda s: s.casefold()
                                  if isinstance(s, str) else s)
@@ -9411,8 +9412,9 @@ class LocalStore:
             with self._lock:
                 self._claim_server_id(server_id, keep_local_id=local_id)
                 self._db.execute(
-                    "UPDATE messages SET server_id = ?, status = MAX(status, 1) "
-                    "WHERE id = ?", (server_id, local_id))
+                    "UPDATE messages SET server_id = ?, status = MAX(status, ?) "
+                    "WHERE id = ?",
+                    (server_id, max(1, self._take_early(server_id)), local_id))
                 self._db.commit()
             return True
         except sqlite3.Error:
@@ -9431,13 +9433,10 @@ class LocalStore:
                 "SELECT id, peer, status FROM messages WHERE server_id = ? "
                 "AND direction = 'out'", (server_id,)).fetchone()
             if row is None:
-                peer = self._group_receipt(server_id, tier)
-                if peer is not None:
-                    return peer
-                # Not an error: receipts for a conversation this identity no
-                # longer holds, or for a stale id we have already released.
-                log.debug("receipt '%s' for relay id %s matched no local "
-                          "outgoing message", status, server_id)
+                if self._db.execute("SELECT 1 FROM group_sends WHERE "
+                                    "server_id = ?", (server_id,)).fetchone():
+                    return self._group_receipt(server_id, tier)
+                self._hold_early(server_id, tier)
                 return None
             if row["status"] >= tier:
                 return None                  # already at or above this tier
@@ -9446,6 +9445,37 @@ class LocalStore:
                 (tier, row["id"]))
             self._db.commit()
             return row["peer"]
+
+    #: Seconds a receipt waits for its message's relay id (apply_receipt).
+    EARLY_RECEIPT_HOLD = 60.0
+
+    def _hold_early(self, server_id: int, tier: int) -> None:
+        """A receipt for a relay id no message holds yet. The relay can
+        report a delivery before this phone has noted the relay's answer to
+        its own send: the recipient was online and acknowledged it within
+        milliseconds. So it is kept a minute for mark_sent or
+        group_send_sent; the rest lapse (receipts for reactions and
+        invitations, which have no row; for a chat this identity no longer
+        holds; for a stale id already released). Lock held."""
+        log.debug("receipt %s for relay id %s: no message holds it yet",
+                  tier, server_id)
+        now = time.monotonic()
+        held = self._early
+        if len(held) > 64:
+            for sid in [sid for sid, (_t, at) in held.items()
+                        if now - at > self.EARLY_RECEIPT_HOLD]:
+                del held[sid]
+        tier = max(tier, held.get(server_id, (0, 0.0))[0])
+        held[server_id] = (tier, now)
+
+    def _take_early(self, server_id: int) -> int:
+        """The tier a held receipt gives `server_id` (0: none). Lock held."""
+        tier, at = self._early.pop(server_id, (0, 0.0))
+        if not tier or time.monotonic() - at > self.EARLY_RECEIPT_HOLD:
+            return 0
+        log.debug("receipt %s for relay id %s: given to its message",
+                  tier, server_id)
+        return tier
 
     def _group_receipt(self, server_id: int, tier: int) -> Optional[str]:
         """A receipt for one recipient's copy of a group message. Called
@@ -9483,8 +9513,9 @@ class LocalStore:
             with self._lock:
                 self._db.execute(
                     "UPDATE group_sends SET server_id = ?, status = "
-                    "MAX(status, 1) WHERE local_id = ? AND member = ?",
-                    (server_id, local_id, member))
+                    "MAX(status, ?) WHERE local_id = ? AND member = ?",
+                    (server_id, max(1, self._take_early(server_id)),
+                     local_id, member))
                 self._settle_group_status(local_id)
                 self._db.commit()
             return True

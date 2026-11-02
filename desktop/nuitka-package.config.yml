@@ -1,0 +1,39 @@
+# What Nuitka cannot see by itself in the desktop build (build_desktop.sh).
+# The format is Nuitka's own package configuration:
+# https://nuitka.net/user-documentation/nuitka-package-config.html
+# Its own files carry a checksum per entry; this one does not, so Nuitka
+# says "mismatching checksum ... pyogg" and checks the file against its
+# schema instead. That is expected.
+#
+# PyOgg's wheel carries Opus as a DLL beside its modules. The app does not
+# import PyOgg: it only looks in PyOgg's folder for that DLL (main.py,
+# _opus_candidates), so the DLL has to be taken along with the package.
+- module-name: 'pyogg'
+  dlls:
+    - from_filenames:
+        prefixes:
+          - 'opus'
+          - 'libopus'
+
+# ANGLE draws Kivy's OpenGL ES through Direct3D (KIVY_GL_BACKEND=angle_sdl2),
+# where OpenGL itself is missing or poor: a computer with no graphics card,
+# as CI's Windows runner is, a virtual machine, or Remote Desktop. Its DLLs
+# sit outside the package, in <prefix>/share/angle/bin, which kivy_deps.angle
+# names in dep_bins; they go beside the executable, where SDL finds them.
+# They hang on kivy, not on kivy_deps.angle: the build leaves kivy_deps out
+# (build_desktop.sh says why), and the DLLs are all it was for.
+- module-name: 'kivy'
+  dlls:
+    - by_code:
+        setup_code: |
+          import os
+          try:
+              from kivy_deps.angle import dep_bins
+          except ImportError:
+              dep_bins = []
+        filename_code: |
+          [os.path.join(folder, name)
+           for folder in dep_bins if os.path.isdir(folder)
+           for name in os.listdir(folder) if name.lower().endswith(".dll")]
+      dest_path: '.'
+      when: 'win32'

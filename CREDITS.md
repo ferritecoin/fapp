@@ -46,6 +46,17 @@ None of these is needed; each adds what it says.
 | [PyAV](https://pyav.basswood-io.com/), [FFmpeg](https://ffmpeg.org/) | playing voice notes recorded on a phone | BSD, LGPL 2.1+ |
 | [OpenCV](https://opencv.org/), [pyzbar](https://github.com/NaturalHistoryMuseum/pyzbar), [ZBar](https://github.com/mchehab/zbar) | reading QR codes from a picture | Apache 2.0, MIT, LGPL 2.1 |
 
+## In the Windows executable
+
+It carries all of *On computers, when installed* but OpenCV (pyzbar reads
+the QR codes), and, to run without Python installed, Python itself, Kivy's
+[SDL 2](https://www.libsdl.org/) (zlib), [GLEW](https://glew.sourceforge.net/)
+(BSD and MIT) and [ANGLE](https://chromium.googlesource.com/angle/angle)
+(BSD), compiled by [Nuitka](https://nuitka.net/) (AGPL 3, whose runtime
+exception leaves the program's licence as it is). Each project's licence
+is inside it, in `licences/`, with where to find the source of FFmpeg and
+ZBar, whose libraries you may replace there.
+
 ## Type
 
 | Font | Used for | Licence |

@@ -1,11 +1,14 @@
 name: Build Android APK
 
-# Tests first, then a release-signed .apk built with Buildozer on an
-# ubuntu-latest runner (GitHub runners can reach the Android SDK host
-# dl.google.com that Buildozer downloads from), then a GitHub Release that
-# carries both deliverables: the Android APK and the desktop Python client.
-# Every branch is tested and built; only the default branch publishes, and
-# each version only once, so a release's files never change after the fact.
+# Tests first; then, at once, a release-signed .apk built with Buildozer on
+# an Ubuntu runner (GitHub runners can reach the Android SDK host
+# dl.google.com that Buildozer downloads from) and the Windows .exe built
+# with Nuitka on a Windows runner; then a GitHub Release that carries the
+# deliverables: the Android APK, the Windows executable and the desktop
+# Python client. Every branch is tested and built (in a private repository,
+# the executable on the default branch only); only the default branch
+# publishes, and each version only once, so a release's files never change
+# after the fact (tools/publish_release.sh).
 #
 # Signing:
 #   * If you set the repo secrets FEXT_KEYSTORE_B64 / FEXT_KEYSTORE_PASSWORD /
@@ -22,6 +25,9 @@ on:
   push:
     branches:
       - "**"
+    # The private record changes no deliverable: no build for it.
+    paths-ignore:
+      - ".private/**"
   workflow_dispatch:
 
 permissions:
@@ -67,6 +73,9 @@ jobs:
       - name: Run the suites
         env:
           LIBGL_ALWAYS_SOFTWARE: "1"
+          # The suites end with os._exit, which drops what is still in a
+          # buffer: unbuffered, a failing check's line reaches the log.
+          PYTHONUNBUFFERED: "1"
         run: |
           set -euo pipefail
           # The newest release before this version: compatibility is checked
@@ -98,6 +107,113 @@ jobs:
           xvfb-run -a python desktop/test_notify.py main.py
           xvfb-run -a python desktop/test_gestures.py main.py
           xvfb-run -a python desktop/test_privacy.py main.py
+
+  build-windows:
+    name: Nuitka (Windows EXE)
+    needs: tests
+    # A private repository pays for Windows minutes at twice the Linux rate:
+    # there it is built on the default branch only. A public one (fapp)
+    # builds it on every push.
+    if: >-
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+      || !github.event.repository.private
+    # Pinned, as the Ubuntu jobs are: the build and its smoke test have run
+    # on this image.
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Published only where the APK is, so no Release lacks its APK.
+      HAS_KEY: ${{ secrets.FEXT_KEYSTORE_B64 != '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install Nuitka, the client's packages and the desktop extras
+        run: |
+          python -m pip install --upgrade pip
+          # The extras are what the README lists for computers: calls in
+          # Opus (pyogg), the microphone and speaker chosen (sounddevice),
+          # voice notes at 1.5x and 2x (numpy), phones' voice notes played
+          # (av), QR codes read from a picture (pyzbar).
+          pip install nuitka==4.3.4 zstandard "kivy[base]==2.3.1" requests \
+            urllib3 charset-normalizer idna certifi websocket-client \
+            cryptography qrcode pillow sounddevice numpy av pyzbar pyogg
+
+      # Nuitka's caches, the compiled C above all: compiling it is most of
+      # the build's hour. Later builds compile only what changed.
+      - name: Restore Nuitka's caches
+        id: nuitka-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/nuitka-cache
+          key: nuitka-windows-${{ hashFiles('main.py', 'desktop/build_desktop.sh', 'desktop/nuitka-package.config.yml') }}
+          restore-keys: nuitka-windows-
+
+      - name: Build the Windows executable
+        id: exe
+        env:
+          NUITKA_CACHE_DIR: ${{ runner.temp }}/nuitka-cache
+        run: |
+          set -euo pipefail
+          VER="$(grep -E '^version' buildozer.spec | head -1 | sed -E 's/.*=[[:space:]]*//')"
+          TITLE="$(grep -E '^title' buildozer.spec | head -1 | sed -E 's/.*=[[:space:]]*//')"
+          EXE="${TITLE}-${VER}-windows.exe"
+          ONEFILE=1 PY=python OUT="$PWD/release" NAME="$EXE" \
+            bash desktop/build_desktop.sh
+          ls -la release/
+          echo "exe=release/$EXE" >> "$GITHUB_OUTPUT"
+
+      # Kept as soon as the build succeeds, so that a failed start below does
+      # not cost the next build the hour again.
+      - name: Keep Nuitka's caches
+        if: steps.nuitka-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}/nuitka-cache
+          key: ${{ steps.nuitka-cache.outputs.cache-primary-key }}
+
+      - name: Start it as a person would
+        env:
+          # The runner has no graphics card: Kivy draws through ANGLE
+          # (Direct3D, which Windows renders in software) instead of OpenGL.
+          KIVY_GL_BACKEND: angle_sdl2
+        run: python desktop/smoke_exe.py "${{ steps.exe.outputs.exe }}" smoke_exe
+
+      - name: Keep the screenshots and logs of those starts
+        if: always()
+        uses: actions/upload-artifact@v6
+        continue-on-error: true
+        with:
+          name: windows-smoke
+          path: smoke_exe/
+          retention-days: 7
+
+      # Even when a start failed, so that it can be looked at.
+      - name: Upload the executable as a workflow artifact
+        if: always() && steps.exe.outcome == 'success'
+        uses: actions/upload-artifact@v6
+        continue-on-error: true
+        with:
+          name: ferritext-windows
+          path: ${{ steps.exe.outputs.exe }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish to a GitHub Release
+        if: success() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && env.HAS_KEY == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: bash tools/publish_release.sh "${{ steps.exe.outputs.exe }}"
 
   build-android:
     name: Buildozer (release APK)
@@ -249,34 +365,15 @@ jobs:
         if: success() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         env:
           GH_TOKEN: ${{ github.token }}
+          RUN_NUMBER: ${{ github.run_number }}
           VER: ${{ steps.assets.outputs.ver }}
-          TITLE: ${{ steps.assets.outputs.title }}
         run: |
           set -euo pipefail
-          TAG="v${VER}"
           if [ "${FEXT_THROWAWAY_KEY:-}" = 1 ]; then
-            echo "::error::Not publishing $TAG: this APK is signed with a throwaway key, and no later release could install over it. Add the FEXT_KEYSTORE_B64, FEXT_KEYSTORE_PASSWORD, FEXT_KEY_ALIAS and FEXT_KEY_PASSWORD secrets (README: Release signing), then re-run this build."
+            echo "::error::Not publishing v$VER: this APK is signed with a throwaway key, and no later release could install over it. Add the FEXT_KEYSTORE_B64, FEXT_KEYSTORE_PASSWORD, FEXT_KEY_ALIAS and FEXT_KEY_PASSWORD secrets (README: Release signing), then re-run this build."
             exit 1
           fi
-          NOTES="${TITLE} ${VER} (CI run #${{ github.run_number }}, commit ${GITHUB_SHA:0:7}). ${TITLE}-${VER}.apk: Android — sideload via 'Install unknown apps'. ${TITLE}-${VER}-desktop.py: the same client for Windows, macOS and Linux in one file, with its fonts and icons inside — run it with Python 3.11+ (see the README for the packages it needs)."
-          # Each version is published once. Re-running the build of the commit
-          # it was published from refreshes its Release; a later commit that
-          # kept the version leaves it as it is, so a version's files never
-          # change once people have downloaded them.
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            TAGGED="$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha 2>/dev/null || true)"
-            if [ -n "$TAGGED" ] && [ "$TAGGED" != "$GITHUB_SHA" ]; then
-              echo "::notice::$TAG is already published, from ${TAGGED:0:7}, and stays as it is. Raise the version in buildozer.spec and main.py to publish this build."
-              exit 0
-            fi
-            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --title "$TITLE $TAG" --notes "$NOTES"
-          else
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --target "$GITHUB_SHA" --title "$TITLE $TAG" --notes "$NOTES"
-          fi
-          gh release upload "$TAG" release/* --repo "$GITHUB_REPOSITORY" --clobber
-          echo "Published to release $TAG:"; ls release/
+          bash tools/publish_release.sh release/*
 
       - name: Keep every release's commit citation on its tag
         if: success() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)

@@ -22,19 +22,22 @@ same key (see [Release signing](#release-signing)).
 
 Every push to the default branch is tested and built, and each new version is
 published to a GitHub Release, whose files never change afterwards. Open the
-**Releases** page (or the **`v15.1.0`** tag) and take:
+**Releases** page (or the **`v15.1.1`** tag) and take:
 
 | Asset | For |
 | --- | --- |
-| `Ferritext-15.1.0.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r` |
-| `Ferritext-15.1.0-desktop.py` | Windows / macOS / Linux — one file with its fonts and icons inside. Run it with Python 3.11+ after `pip install kivy requests websocket-client cryptography qrcode pillow`. |
+| `Ferritext-15.1.1.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r` |
+| `Ferritext-15.1.1-windows.exe` | Windows 10 and 11 (64-bit) — the same app in one file, with nothing to install. Windows may say that it does not know the publisher: choose *More info*, then *Run anyway*. |
+| `Ferritext-15.1.1-desktop.py` | Windows / macOS / Linux — one file with its fonts and icons inside. Run it with Python 3.11+ after `pip install kivy requests websocket-client cryptography qrcode pillow`. |
 
-Both are also attached to each Actions run as the **`ferritext-release`**
-artifact, kept for a week. Pushes to other branches are tested and built, but
+Each Actions run keeps them for a week too: the APK and the desktop file as
+the **`ferritext-release`** artifact, the executable as
+**`ferritext-windows`**. Pushes to other branches are tested and built, but
 publish nothing.
 
 On a computer, each of these adds something when it is installed, and
-nothing breaks without it:
+nothing breaks without it. The Windows executable has them inside already
+(pyzbar for QR codes):
 
 | Install | Adds |
 | --- | --- |
@@ -53,12 +56,30 @@ QR code of the page's address, and the steps to install the app and keep
 it running.
 
 ```bash
-python3 tools/download_page.py Ferritext-15.1.0.apk site/ \
+python3 tools/download_page.py Ferritext-15.1.1.apk site/ \
     --url https://your.host/ferritext/        # then serve site/ there
 ```
 
 Relay 12.2.1 and later can serve the page too, at `/download/` on the
 relay's own address: whoever can reach the relay can reach it.
+
+## What's in 15.1.1
+
+- **Ferritext for Windows, in one file.** `Ferritext-15.1.1-windows.exe`
+  is the same app with nothing to install: Python, and what the desktop
+  file asks you to install for calls in Opus, phones' voice notes and the
+  choice of microphone and speaker, are inside it. It keeps its data where
+  the desktop file does (`%USERPROFILE%\.fext`), so you can move from one
+  to the other and keep everything. Its first start after a download
+  unpacks it, which takes a few seconds; later starts do not.
+- **Two ticks once it is delivered.** When the other phone took a message
+  within milliseconds of it reaching the relay (as phones that are online
+  do, in groups most of all), the relay's word that it was delivered could
+  arrive before the app had noted the message's number at the relay, and
+  was lost: the message kept one tick until it was read, or for good where
+  read receipts are off. The app now holds that word for its message.
+- **Checked against every version still in use**: see *Mixed versions,
+  and upgrading* under [Compatibility](#compatibility).
 
 ## What's in 15.1.0
 
@@ -353,6 +374,18 @@ been tested end to end against this app; media works once it is deployed.
   the Ferrite Text Messenger mark on the launcher icon and the loading screen.
 
 ## Compatibility
+
+**Mixed versions, and upgrading.** Before a release, every app release
+since 9.1.2 is run as itself, side by side, through every relay release
+since v8. Messages with both ticks, replies, reactions, photos, voice
+notes, delete for both and groups pass between every pair, both ways. An
+app upgraded in place — installed over the old one, or the new file run
+on the same computer — keeps its identity and every message, file and
+setting, and goes on talking to people who have not upgraded; on a
+computer, the release before still opens what the newest wrote. A relay
+upgraded in place delivers what was waiting for phones that were off, and
+phones reconnect by themselves. The one difference found is the lost tick
+that 15.1.1 fixes, which releases before it still show.
 
 **With 14.0 and earlier.** Earlier releases read every 15.0 message: the
 post-quantum key in its signed block is ignored. 15.0 seals a message
@@ -803,8 +836,9 @@ a phone only in a backup you make and seal here.
 | `recipes/libopus/` | A python-for-android recipe for libopus, for calls in Opus. |
 | `android/` | What Android compiles or ships beside the Python, in one folder. Java: `CallAudio` (a call's microphone and speaker, on threads of their own, and where the sound goes), `Notifier` and `NotifyReceiver` (notifications, and what is done to them), `QrReader` (QR codes in photos). Resources: the cleartext policy for the relay, the status-bar icon, the camera's folder, the launch screen at night. |
 | `CREDITS.md` | The open-source work Ferritext is made with, and its licences. |
-| `desktop/` | Desktop packaging (Nuitka), the headless test suites, and the tools that capture and time the app. |
-| `.github/workflows/build-apk.yml` | Tests → signed APK → GitHub Release with both deliverables. |
+| `tools/publish_release.sh` | Puts a build's files on its version's GitHub Release, once (run by CI). |
+| `desktop/` | Desktop packaging (Nuitka: `build_desktop.sh`, which builds the Windows executable), the headless test suites, and the tools that capture and time the app. |
+| `.github/workflows/build-apk.yml` | Tests → the signed APK and the Windows executable, side by side → a GitHub Release with the three deliverables. |
 
 ## Testing
 
@@ -826,6 +860,7 @@ xvfb-run -a python3 desktop/test_calls.py main.py
 xvfb-run -a python3 desktop/test_notify.py main.py
 xvfb-run -a python3 desktop/test_gestures.py main.py
 xvfb-run -a python3 desktop/test_privacy.py main.py
+python3 desktop/smoke_exe.py desktop/dist/Ferritext-15.1.1-windows.exe  # a built executable
 ```
 
 | Suite | Covers |
@@ -844,6 +879,7 @@ xvfb-run -a python3 desktop/test_privacy.py main.py
 | `test_notify.py` | Notifications from the sync thread (a paused app still notifies), what they are made of, mute and its end, blocking that holds and releases, replying and marking read from a notification, drafts, a call while the app is away, the guide that keeps the app running |
 | `test_gestures.py` | Real taps and swipes through the window: back, the menu, reply, taps that are not swipes, voice notes at speed and seeking |
 | `test_privacy.py` | Disappearing messages, verifying a contact, links and where they lead, link previews (off by default; fetched only from public addresses), encrypted backup and restore |
+| `smoke_exe.py` | A built executable started twice in an empty home, as a person would: up, its window drawn, no crash in its log; its size and both start times (CI runs it on Windows) |
 
 To get `old.py`: `git show v9.1.0:main.py > old.py` (or the latest tag before
 the version under test).
@@ -890,8 +926,21 @@ on first run.
 
 ```bash
 python3 -m pip install --user buildozer cython
-buildozer android debug          # produces bin/fext-15.1.0-*-debug.apk
+buildozer android debug          # produces bin/fext-15.1.1-*-debug.apk
 ```
+
+**The Windows executable** is built on Windows, as CI builds it: from Git
+Bash, with Python 3.11 and Visual Studio's C++ build tools.
+
+```bash
+pip install nuitka==4.3.4 zstandard "kivy[base]==2.3.1" requests urllib3 \
+  charset-normalizer idna certifi websocket-client cryptography qrcode \
+  pillow sounddevice numpy av pyzbar pyogg
+ONEFILE=1 PY=python NAME=Ferritext-15.1.1-windows.exe bash desktop/build_desktop.sh
+python desktop/smoke_exe.py desktop/dist/Ferritext-15.1.1-windows.exe
+```
+
+On Linux and macOS the same script builds that system's executable.
 
 The mark and icons are regenerated with `python3 tools/make_logo.py` (Pillow
 only).

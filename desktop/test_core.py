@@ -536,6 +536,29 @@ st.apply_receipt(501, "read")
 check("delivered to all, read by one: 2/3", st.message(local)["status"] == 2)
 st.apply_receipt(502, "read")
 check("read by everyone: 3/3", st.message(local)["status"] == 3)
+# The relay can report a delivery before this phone has noted the relay's
+# answer to its own send (the recipient acknowledged it within
+# milliseconds): the receipt waits for the id instead of being dropped.
+early = st.add_out(A, "quick reader", M.now_iso(), "fast" * 8)
+st.apply_receipt(701, "delivered")
+st.mark_sent(early, 701)
+check("a receipt that beats the send's own answer still ticks 2/3",
+      st.message(early)["status"] == 2)
+early_g = st.add_out(GPEER, "quick group", M.now_iso(), "fstg" * 8,
+                     recipients=[A, B])
+st.apply_receipt(702, "read")
+st.group_send_sent(early_g, A, 702)
+st.group_send_sent(early_g, B, 703)
+check("...and one for a member's copy of a group message",
+      {r["member"]: r["status"] for r in st.group_sends(early_g)}
+      == {A: 3, B: 1})
+hold, M.LocalStore.EARLY_RECEIPT_HOLD = M.LocalStore.EARLY_RECEIPT_HOLD, -1
+late = st.add_out(A, "an id seen long ago", M.now_iso(), "late" * 8)
+st.apply_receipt(704, "delivered")
+st.mark_sent(late, 704)
+M.LocalStore.EARLY_RECEIPT_HOLD = hold
+check("...but not one held past its minute (a stale id's)",
+      st.message(late)["status"] == 1)
 st.add_in(GPEER, "from ann", M.now_iso(), 601, "ann1" * 8, author=A)
 st.add_in(GPEER, "from ben", M.now_iso(), 602, "ben1" * 8, author=B)
 check("the same client id from two authors are two messages",
