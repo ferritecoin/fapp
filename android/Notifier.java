@@ -4,6 +4,7 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
+import android.app.Service;
 import android.app.Person;
 import android.app.RemoteInput;
 import android.content.Context;
@@ -36,6 +37,9 @@ import android.os.Build;
 public final class Notifier {
     public static final String CHANNEL_MESSAGES = "messages";
     public static final String CHANNEL_CALLS = "calls";
+    public static final String CHANNEL_SERVICE = "service";
+    /** The sync service's notice: below the chats' ids (1000 and up). */
+    public static final int SERVICE_NOTICE = 7;
     public static final String ACTION_REPLY = "org.fext.notify.REPLY";
     public static final String ACTION_READ = "org.fext.notify.READ";
     public static final String ACTION_DECLINE = "org.fext.notify.DECLINE";
@@ -120,6 +124,38 @@ public final class Notifier {
         calls.enableVibration(true);
         calls.setVibrationPattern(RING_VIBRATION);
         nm.createNotificationChannel(calls);
+    }
+
+    /** 18.1: the sync service's own notice, in place of the one
+     * python-for-android gives a service (private, so a locked phone
+     * showed "Ready for new messages" day and night). Android wants a
+     * running service to show one; this one is silent, has no badge, and
+     * is SECRET: a locked phone does not show it. Called by the service
+     * (main.android_service_notice); the earlier notice goes as this one
+     * takes its place. */
+    public static void serviceNotice(Service service) {
+        if (Build.VERSION.SDK_INT >= 26) {
+            NotificationChannel quiet = new NotificationChannel(
+                    CHANNEL_SERVICE, word(service, "service",
+                    "Receive messages while closed"),
+                    NotificationManager.IMPORTANCE_LOW);
+            quiet.setShowBadge(false);
+            quiet.setLockscreenVisibility(Notification.VISIBILITY_SECRET);
+            manager(service).createNotificationChannel(quiet);
+        }
+        Notification.Builder b = builder(service, CHANNEL_SERVICE)
+                .setSmallIcon(smallIcon(service))
+                .setContentTitle(word(service, "ready",
+                        "Ready for new messages"))
+                .setOngoing(true)
+                .setShowWhen(false)
+                .setVisibility(Notification.VISIBILITY_SECRET)
+                .setContentIntent(PendingIntent.getActivity(service, 0,
+                        launch(service, "fext://service"), immutable()));
+        if (Build.VERSION.SDK_INT < 26) {
+            b.setPriority(Notification.PRIORITY_MIN);
+        }
+        service.startForeground(SERVICE_NOTICE, b.build());
     }
 
     /** What a tap on the app's icon sends, so the running app resumes. */

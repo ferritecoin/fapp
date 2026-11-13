@@ -43,8 +43,10 @@ import time
 
 os.environ.setdefault("KIVY_NO_ARGS", "1")
 os.environ["KIVY_NO_CONSOLELOG"] = "1"
-os.environ.setdefault("SDL_VIDEODRIVER", "x11")
+if sys.platform.startswith("linux"):     # xvfb-run's X display
+    os.environ.setdefault("SDL_VIDEODRIVER", "x11")
 os.environ["HOME"] = tempfile.mkdtemp(prefix="fext-privacy-")
+os.environ["USERPROFILE"] = os.environ["HOME"]   # Path.home() on Windows
 os.environ["FEXT_LANG"] = "en"          # the English the checks read
 os.environ["FEXT_SERVER_HOST"] = "127.0.0.1:1"
 os.environ["NO_PROXY"] = os.environ["no_proxy"] = "127.0.0.1,localhost"
@@ -698,10 +700,25 @@ def tls_site(name):
                  .serial_number(x509.random_serial_number())
                  .not_valid_before(now - datetime.timedelta(days=1))
                  .not_valid_after(now + datetime.timedelta(days=2)))
+        # The extensions RFC 5280 asks for, which Python 3.13 checks
+        # (VERIFY_X509_STRICT), as a real authority's certificates have.
+        signer = (issuer_key or key).public_key()
+        built = built.add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(key.public_key()),
+            critical=False).add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(signer),
+            critical=False).add_extension(
+            x509.KeyUsage(digital_signature=True, key_cert_sign=issuer is None,
+                          crl_sign=issuer is None, content_commitment=False,
+                          key_encipherment=False, data_encipherment=False,
+                          key_agreement=False, encipher_only=False,
+                          decipher_only=False), critical=True)
         built = built.add_extension(
             x509.BasicConstraints(ca=True, path_length=None), critical=True) \
             if issuer is None else built.add_extension(
                 x509.SubjectAlternativeName([x509.DNSName(cn)]),
+                critical=False).add_extension(
+                x509.ExtendedKeyUsage([x509.ExtendedKeyUsageOID.SERVER_AUTH]),
                 critical=False)
         return key, built.sign(issuer_key or key, hashes.SHA256())
 
@@ -765,6 +782,20 @@ check("a picture's size is read from its header alone",
       M.image_header(VAST_PNG) is None and
       M.image_header(claimed_png(9000, 10)) is None and
       M.image_header(b"GIF89a" + b"\x00" * 40) is None)
+from PIL import XbmImagePlugin                                 # noqa: E402
+xbm = b"#define x_width 16\n#define x_height 16\nstatic char x_bits[] = {\n" \
+    + b", ".join([b"0x00"] * 32) + b"};\n"      # Pillow 13 wants the break
+read_as_xbm = []
+real_xbm_open = XbmImagePlugin.XbmImageFile._open
+XbmImagePlugin.XbmImageFile._open = \
+    lambda self: read_as_xbm.append(1) or real_xbm_open(self)
+refused = (M.image_header(xbm), M.open_foreign_image(xbm, 64),
+           M.clean_picture(xbm))
+XbmImagePlugin.XbmImageFile._open = real_xbm_open
+check("...and read as JPEG, PNG or WebP only: no other format's reader "
+      "(here XBM's) ever runs on bytes from elsewhere",
+      refused == (None, None, None) and not read_as_xbm and
+      Image.open(io.BytesIO(xbm)).format == "XBM", (refused, read_as_xbm))
 sent = io.BytesIO()
 Image.new("RGB", (1280, 960), (90, 110, 140)).save(sent, "JPEG", quality=70)
 check("a photo as this app sends it is kept as it came",
@@ -1070,6 +1101,248 @@ restore.dismiss(animation=False)
 alice.close_settings()
 tick(0.3)
 
+print("\nA newer app, as the relay names it (16.2, UPDATENOTE)")
+
+
+def shown_texts(widget):
+    return [w.text for w in widget.walk() if isinstance(w, M.Label)]
+
+
+newest = {"app_latest": {"version": "99.0.0", "url": "/download/"}}
+check("a newer version is taken; its link on the relay made whole over "
+      "TLS; over cleartext, or a link not https, the releases page",
+      M.app_latest_of(newest, "https://relay.example:50607") ==
+      ("99.0.0", "https://relay.example:50607/download/") and
+      M.app_latest_of(newest, "http://127.0.0.1:1") ==
+      ("99.0.0", M.RELEASES_URL) and
+      M.app_latest_of({"app_latest": {"version": "99.0.0",
+                                      "url": "http://x/a.apk"}}) ==
+      ("99.0.0", M.RELEASES_URL))
+check("this version, an older one, or nonsense: nothing to say",
+      all(M.app_latest_of({"app_latest": {"version": v, "url": "/d/"}},
+                          "https://r") is None
+          for v in (M.APP_VERSION, "1.0.0", "99.0", "99.0.0.1", None, 7))
+      and M.app_latest_of({}) is None and M.app_latest_of("x") is None)
+had = getattr(alice.api, "_features", None)
+alice.api._features = dict(had or {}, app_latest=("99.0.0",
+                                                  "https://r.example/dl/"))
+said = []
+_status = alice._set_status
+alice._set_status = lambda text, *_a, **_k: said.append(text)
+alice.tell_update()
+alice.tell_update()
+alice._set_status = _status
+check("said once on the chat list's line, however often it is asked",
+      said == ["Ferritext 99.0.0 is out: Settings › About"], said)
+alice.open_settings()
+tick(0.4)
+about = M.AboutSheet(alice)
+about.open()
+tick(0.3)
+lines = shown_texts(about)
+first = lines.index("Ferritext 99.0.0 is out") if \
+    "Ferritext 99.0.0 is out" in lines else -1
+check("...and Settings › About keeps saying it, its link first",
+      "99.0.0 is out" in shown_texts(alice.settings_screen) and first > 0
+      and lines[first + 1] == "Get it: https://r.example/dl/" and
+      first < lines.index(f"Version {M.APP_VERSION}"), lines[:6])
+about.dismiss(animation=False)
+alice.close_settings()
+alice.api._features = had
+tick(0.3)
+
+print("\nBackup reminders (16.2, S11)")
+M.save_pref("backup_every", 0)
+check("off: never due", M.backup_due() is None)
+M.save_pref("backup_every", 7)
+M.save_pref("backup_last", time.time() - 3 * 86400)
+fresh_enough = M.backup_due()
+M.save_pref("backup_last", time.time() - 9 * 86400)
+check("every week: due nine days on, not three; never made: due at once",
+      fresh_enough is None and M.backup_due() == 9 and
+      M.backup_due(now=M.load_prefs()["backup_last"] + 7 * 86400) == 7)
+said = []
+_status = alice._set_status
+alice._set_status = lambda text, *_a, **_k: said.append(text)
+M.save_pref("backup_told", "")
+alice.remind_backup()
+alice.remind_backup()
+alice._set_status = _status
+check("said once a day, on the chat list's line",
+      said == ["Your last backup was 9 days ago: Settings › Backup"], said)
+M.save_pref("backup_last", None)
+check("...and with no backup ever made, said as such",
+      M.backup_due() == -1)
+alice.open_settings()
+tick(0.4)
+remind = next((w for w in alice.settings_screen.walk()
+               if isinstance(w, M.Segmented) and
+               set(w.segments) == {"0", "1", "7", "30"}), None)
+if remind is not None:
+    remind.choose("30")
+check("Settings › Backup offers it: never, every day, week or month",
+      remind is not None and M.backup_reminder_days() == 30)
+alice.close_settings()
+M.save_pref("backup_every", 0)
+tick(0.3)
+
+print("\nApp lock and screen security (16.2, I1, I2)")
+check("screen security: on a phone until turned off, on a computer off "
+      "until turned on (17.0, F14); the app lock off",
+      M.screen_security_enabled() is M.IS_ANDROID and not M.AppLock.on())
+M.AppLock.turn_on("4321", 300)
+kept = M.load_prefs()["app_lock"]
+check("a code is kept only as a salted PBKDF2, never as itself",
+      "4321" not in json.dumps(kept) and len(kept["salt"]) == 32 and
+      M.AppLock.check("4321") and not M.AppLock.check("1234") and
+      M.AppLock.after() == 300)
+title, text, _m = M.notification_text(alice.store, bob.keys.address,
+                                      "the gate code is 4471", "text")
+check("17.0 (F9): while it is on, a notification is the chat's name and "
+      "\"New message\", no words", text == "New message" and
+      title == M.person_name(alice.store.get_contact(bob.keys.address),
+                             bob.keys.address, 12), (title, text))
+toasts = []
+_say = M.Toast.say
+M.Toast.say = staticmethod(lambda text, *_a, **_k: toasts.append(text))
+alice.on_start()
+tick(0.3)
+alice.open_settings()
+alice._set_status("New message from someone", M.T.accent)
+check("on, the app opens locked, and nothing is said over the lock",
+      alice.locked and toasts == [])
+lock = alice.__dict__["_lock_screen"]
+for _ in range(M.AppLock.TRIES):
+    lock.field.text = "0000"
+    lock.unlock()
+    wait_for(lambda: not lock.button.disabled)
+check("five wrong codes: each said, then a wait", alice.locked and
+      lock.status.text.startswith("Too many tries"), lock.status.text)
+lock.wait_until = 0
+lock.field.text = "4321"
+lock.unlock()
+check("the code opens it", wait_for(lambda: not alice.locked))
+alice._went_away()
+alice._came_back()
+check("back after less than its five minutes: still open",
+      not alice.locked)
+M.AppLock.set_after(0)
+alice._went_away()
+alice._came_back()
+check("at once: locked again on coming back", alice.locked)
+alice.unlocked()
+M.Toast.say = _say
+sheet = M.AppLockSheet(alice)
+sheet.open()
+tick(0.3)
+sheet.code.text = "9999"
+sheet._off()
+check("turning it off asks for the code", M.AppLock.on() and
+      sheet.status.text == "Wrong code")
+sheet.code.text = "4321"
+sheet._off()
+check("...and with it, it is off", not M.AppLock.on())
+sheet = M.AppLockSheet(alice)
+sheet.open()
+tick(0.3)
+sheet.code.text, sheet.again.text = "12", "12"
+sheet._on()
+short = sheet.status.text
+sheet.code.text, sheet.again.text = "123456", "654321"
+sheet._on()
+check("turning it on: a code too short, or two that differ, are said",
+      short.startswith("Use at least") and
+      sheet.status.text == "The two codes differ." and not M.AppLock.on())
+sheet.again.text = "123456"
+sheet._on()
+check("...and two that match turn it on, at the time chosen",
+      M.AppLock.on() and M.AppLock.check("123456") and
+      M.AppLock.after() == 60)
+M.AppLock.turn_off()
+M.save_pref("app_lock_offered", False)
+tick(0.5)                                  # the sheets above, faded out
+alice.offer_app_lock()
+check("a computer is not offered it (Settings › Privacy has it)",
+      not any(isinstance(v, M.AppLockOffer) for v in M.Window.children))
+M.IS_MOBILE, was_mobile = True, M.IS_MOBILE
+alice.offer_app_lock()
+offers = [v for v in M.Window.children if isinstance(v, M.AppLockOffer)]
+check("a phone is offered it once, with Maybe later", len(offers) == 1)
+for offer in offers:
+    offer.dismiss(animation=False)
+alice.offer_app_lock()
+check("...and not again", not any(isinstance(v, M.AppLockOffer)
+                                  for v in M.Window.children))
+M.IS_MOBILE = was_mobile
+asked = []
+saved_bio = M.android_biometric_available, M.android_biometric_ask
+M.android_biometric_available = lambda: True
+M.android_biometric_ask = lambda title, cancel, then: (
+    asked.append(title), then(True))
+M.AppLock.turn_on("4321", 0, bio=True)
+alice.lock_now()
+tick(0.5)
+check("with a fingerprint chosen: asked for at once, and it opens",
+      asked == ["Unlock Ferritext"] and not alice.locked, asked)
+M.android_biometric_ask = lambda title, cancel, then: then(False)
+alice.lock_now()
+tick(0.5)
+check("...refused, the code is still asked for", alice.locked)
+alice.unlocked()
+M.android_biometric_available, M.android_biometric_ask = saved_bio
+M.AppLock.turn_off()
+print("\nExperimental (16.2, I3, I4)")
+M.CLIP_FORGET, forget_after = 0.2, M.CLIP_FORGET
+M.save_pref("forget_clipboard", True)
+alice.foreground = True
+alice.copy_text("the code is 4321")
+tick(0.6)
+first = M.Clipboard.paste()
+alice.copy_text("kept by hand")
+M.Clipboard.copy("something else")
+tick(0.6)
+check("the clipboard that forgets: what was copied is wiped a minute on, "
+      "but not what replaced it", first == "" and
+      M.Clipboard.paste() == "something else", repr(first))
+M.save_pref("forget_clipboard", False)
+M.CLIP_FORGET = forget_after
+M.save_pref("private_keyboard", True)
+private = M.InkTextInput().keyboard_suggestions
+M.save_pref("private_keyboard", False)
+check("the keyboard that does not learn: fields ask for no suggestions",
+      private is False and M.InkTextInput().keyboard_suggestions is True)
+M.save_pref("backup_every", 1)
+M.save_pref("backup_last", time.time() - 2 * 86400)
+check("a backup reminder can be daily", M.backup_due() == 2)
+M.save_pref("backup_every", 0)
+os.environ["FEXT_SHOW_ANDROID_SETTINGS"] = "1"
+alice.settings_screen.show()
+tick(0.2)
+check("Settings › Privacy: the app lock, and (on a phone) screen security",
+      "App lock" in shown_texts(alice.settings_screen) and
+      "Screen security" in shown_texts(alice.settings_screen))
+del os.environ["FEXT_SHOW_ANDROID_SETTINGS"]
+alice.settings_screen._on_screen_security(False)
+check("...which can be turned off", not M.screen_security_enabled())
+alice.settings_screen._on_screen_security(True)
+row = next((w for w in alice.settings_screen.walk()
+            if isinstance(w, M.ListRow) and w.icon == "place"), None)
+switch = None if row is None else next(
+    (w for w in row.walk() if isinstance(w, M.ToggleSwitch)), None)
+check("Settings › Privacy: Hide my location in calls (18.1), off unless "
+      "turned on", switch is not None and
+      "Hide my location in calls" in shown_texts(alice.settings_screen) and
+      not switch.active and not M.calls_hidden())
+if switch is not None:
+    switch.flip()
+check("...on: this device's calls go through the relay only",
+      switch is not None and M.calls_hidden())
+if switch is not None:
+    switch.flip()
+check("...and off again", switch is not None and not M.calls_hidden())
+alice.close_settings()
+tick(0.3)
+
 print("\nTLS on the relay's own port (v12)")
 import http.server                                            # noqa: E402
 import ssl                                                    # noqa: E402
@@ -1083,7 +1356,9 @@ pki = M.Path(tempfile.mkdtemp(prefix="fext-tls-"))
 for argv in (
         ["req", "-x509", "-newkey", "ec", "-pkeyopt",
          "ec_paramgen_curve:P-256", "-nodes", "-keyout", "ca.key", "-out",
-         "ca.pem", "-days", "2", "-subj", "/CN=Test Relay CA"],
+         "ca.pem", "-days", "2", "-subj", "/CN=Test Relay CA",
+         # as RFC 5280 asks of an authority, which Python 3.13 checks
+         "-addext", "keyUsage=critical,keyCertSign,cRLSign"],
         ["req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
          "-nodes", "-keyout", "leaf.key", "-out", "leaf.csr", "-subj",
          "/CN=127.0.0.1"],

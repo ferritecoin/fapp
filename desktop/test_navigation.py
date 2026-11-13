@@ -26,8 +26,10 @@ from datetime import datetime, timedelta, timezone
 
 os.environ.setdefault("KIVY_NO_ARGS", "1")
 os.environ["KIVY_NO_CONSOLELOG"] = "1"
-os.environ.setdefault("SDL_VIDEODRIVER", "x11")
+if sys.platform.startswith("linux"):     # xvfb-run's X display
+    os.environ.setdefault("SDL_VIDEODRIVER", "x11")
 os.environ["HOME"] = tempfile.mkdtemp(prefix="fext-nav-")
+os.environ["USERPROFILE"] = os.environ["HOME"]   # Path.home() on Windows
 os.environ["FEXT_LANG"] = "en"          # the English the checks read
 os.environ["FEXT_SERVER_HOST"] = "127.0.0.1:1"
 
@@ -186,6 +188,49 @@ check("earlier messages join on above, never rebuilt",
 alice.go_back_to_chats()
 tick(0.3)
 
+print("\nA page changed again before it has settled (18.1)")
+
+
+def only(screen):
+    """`screen` alone is on show, whole and in place."""
+    return list(alice.manager.children) == [screen] and \
+        screen.opacity == 1 and screen.x == 0
+
+
+def settled():
+    """Ticks until the page change under way has ended, however slow the
+    frames (a chat drawn under Python's development mode can take 0.4 s),
+    then a little more: a change left running from before would have
+    ended too, and taken its page off."""
+    wait_for(lambda: not alice.manager.transition.is_active, 5)
+    tick(0.3)
+
+
+alice.open_conversation(B)
+tick(0.4)
+alice.go_back_to_chats()
+alice.open_conversation(B)          # at once: the way back is still moving
+settled()
+check("back, then the same chat again at once: the chat is on show, not "
+      "an empty page (the change still under way took it off again as it "
+      "ended)",
+      alice.manager.current == "conversation" and
+      only(alice.conversation_screen), str(list(alice.manager.children)))
+alice.go_back_to_chats()
+tick(0.05)
+alice.open_conversation(B)          # ...and part of the way through it
+settled()
+check("...the same part of the way through the change",
+      alice.manager.current == "conversation" and
+      only(alice.conversation_screen), str(list(alice.manager.children)))
+alice.go_back_to_chats()
+alice._navigate("settings", "left")
+alice._navigate("chats", "right")
+settled()
+check("three changes at once end on the last page asked for, alone",
+      alice.manager.current == "chats" and only(alice.chats_screen),
+      str(list(alice.manager.children)))
+
 print("\nOpening where the unread begin (v12)")
 # Laid out for real here: where a chat opens depends on the view's height.
 top = alice.manager
@@ -299,7 +344,9 @@ before = row_of("motion").glyph.state
 switch.flip()                                  # motion reduced: at once
 at_once = row_of("motion").glyph.state
 switch.flip()                                  # and back: the ball sets off
-tick(0.05)
+# The move begins on the frame after the screen is built again, which a
+# busy machine's frame can delay past a fixed wait: wait for it.
+wait_for(lambda: row_of("motion").glyph.state < 1.0, 2)
 moving = row_of("motion").glyph.state
 tick(0.6)
 check("a Settings icon shows its setting: reduced, the ball is still at "
@@ -327,6 +374,82 @@ check("the outermost page: back is taken, the app is not quit",
       alice._on_keyboard(None, 27) is True and
       alice.manager.current == "chats")
 
+
+def back_key(app=None):
+    """Back as Kivy's window delivers it: on_key_down first, and
+    on_keyboard only when nothing took that. `app`: the one of this
+    suite's two apps that is to hear it (both listen to the one window)."""
+    if not M.Window.dispatch("on_key_down", 27, 41, None, []):
+        if app is None:
+            M.Window.dispatch("on_keyboard", 27, 41, None, [])
+        else:
+            app._on_keyboard(M.Window, 27)
+    tick(0.3)
+
+
+# 18.1: a phone's keyboard takes Back first, to hide itself; the next
+# Back finds the message field still focused.
+field = alice.conversation_screen.entry.input
+alice.open_conversation(B)
+settled()
+field.focus = True
+tick(0.2)
+back_key(alice)
+check("a computer's Esc in the message field is the field's: the focus "
+      "goes, the chat stays (the check's own ground)",
+      not field.focus and alice.manager.current == "conversation")
+field.focus = True
+tick(0.2)
+M.Window.bind(on_key_down=alice._back_past_a_field)      # as on a phone
+back_key(alice)
+M.Window.unbind(on_key_down=alice._back_past_a_field)
+check("a phone's Back there is not spent on the field: the focus goes "
+      "and the chat is left, in the one press",
+      not field.focus and alice.manager.current == "chats",
+      f"focus {field.focus}, page {alice.manager.current}")
+
+# The self-test's Back check (debug builds, on the emulators): a sheet,
+# and what the real key did, said once it has arrived.
+said = []
+M._selftest_back(lambda *words: said.append(words))
+tick(0.5)
+check("the self-test leaves a sheet open, and says nothing until Back "
+      "is pressed", not said and
+      isinstance(M.Window.children[0], M.Sheet))
+back_key()
+tick(0.8)
+check("...pressed, it says the key arrived as Back and closed the "
+      "sheet",
+      [w[:2] for w in said] == [("back", "PASS")] and
+      not any(isinstance(w, M.Sheet) for w in M.Window.children), said)
+# A slow device draws the sheet's closing in its own time (Devices run
+# 26, Android 16: "still open" 0.6 s after the key, which had arrived).
+said.clear()
+M._selftest_back(lambda *words: said.append(words))
+tick(0.5)
+sheet = M.Window.children[0]
+close = sheet.dismiss
+sheet.dismiss = lambda *a, **k: M.Clock.schedule_once(lambda _dt: close(), 1.0)
+back_key()                              # 0.3 s pass in it
+tick(0.4)
+early = list(said)                      # 0.7 s after the key: still open
+tick(1.2)
+check("a sheet that takes a second to close is waited for, not failed "
+      "at 0.6 s", not early and [w[:2] for w in said] == [("back", "PASS")],
+      (early, said))
+said.clear()
+M._selftest_back(lambda *words: said.append(words), wait=0.6)
+tick(0.5)
+sheet = M.Window.children[0]
+close, sheet.dismiss = sheet.dismiss, lambda *a, **k: None
+back_key()
+tick(1.4)
+check("...and one that never closes fails, once, saying so",
+      [w[:2] for w in said] == [("back", "FAIL")] and
+      "still open" in said[0][2], said)
+close()
+tick(0.6)
+
 print("\nSearch")
 alice.open_search()
 alice.chats_screen.search_field.text = "NEEDLE"
@@ -349,8 +472,11 @@ tick(0.4)
 check("a found message far back opens the chat at it",
       needle in screen._bubbles and alice._chat_ceiling is not None and
       ids[-1] not in screen._bubbles)
+# The button fades in on the frames after the window is laid out, and a
+# busy machine's frame can outlast tick(0.4) above: wait for it.
 check("...with the way back to the end offered",
-      screen._newer > 0 and screen.jump_button.opacity > 0)
+      screen._newer > 0 and
+      wait_for(lambda: screen.jump_button.opacity > 0, 3))
 before = len(screen._bubbles)
 alice.load_newer_messages()
 tick(0.2)
@@ -457,6 +583,67 @@ check("a deleted chat's messages are gone, and so is its row",
 alice.store.add_in(C, "me again", M.now_iso(), 9001, uuid.uuid4().hex)
 convs = {c["peer"]: c for c in alice.store.conversations(me=A)}
 check("...until something new arrives", C in convs)
+
+print("\nA long chat list (18.1): its first screenful at once, the rest after")
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+now = datetime.now(timezone.utc)
+for i in range(70):
+    peer = "Fec" + "".join(B58[(i * 7 + j * 13) % 58] for j in range(31))
+    alice.store.upsert_contact(peer, f"person{i:02d}", "02" + "ab" * 32)
+    alice.store.add_in(peer, f"hello {i}", (now - timedelta(
+        minutes=i)).isoformat(), 70000 + i, uuid.uuid4().hex, unread=False)
+alice.go_back_to_chats()
+tick(0.3)
+chats = alice.chats_screen
+
+
+def listed():
+    return [w.peer for w in reversed(chats.list.children)
+            if isinstance(w, M.ConversationRow)]
+
+
+def afresh():
+    """The list built again from nothing, as at start."""
+    chats._rows = {}
+    alice.refresh_sidebar()
+
+
+first_paint = M.LIST_FIRST_PAINT
+M.LIST_FIRST_PAINT = 10_000                 # every row at once, as before
+afresh()
+want = listed()
+M.LIST_FIRST_PAINT = first_paint
+afresh()
+first = len(listed())
+whole = wait_for(lambda: len(listed()) == len(want), 5)
+check("74 chats: the first screenful drawn at once, the rest filled in "
+      "after it, in the same order", first == M.LIST_FIRST_PAINT and whole
+      and listed() == want, f"{first} at once, then {len(listed())}")
+afresh()
+tick(0.05)
+alice.refresh_sidebar()                     # again, while it fills
+wait_for(lambda: len(listed()) >= len(want), 5)
+tick(0.2)
+check("...a refresh while it fills starts over, nothing twice",
+      listed() == want, f"{len(listed())} rows")
+afresh()
+alice.open_conversation(B)
+tick(1.0)
+away = len(listed())
+alice.go_back_to_chats()
+wait_for(lambda: len(listed()) == len(want), 5)
+check("...out of sight it stops (a chunk at most once the chat opens), "
+      "and is finished when the list shows again",
+      away <= M.LIST_FIRST_PAINT + M.LIST_CHUNK and listed() == want,
+      f"{away} while away, then {len(listed())}")
+kept, moved = list(chats.list.children), []
+for row in kept:
+    row.bind(parent=lambda w, _v: moved.append(w))
+alice.refresh_sidebar()
+check("...and a list whose chats are as they were is left as it is: its "
+      "rows are not taken off and put back", not moved and
+      all(a is b for a, b in zip(kept, chats.list.children)),
+      f"{len(moved)} moved")
 
 print("\nA theme changed in Settings (last: it builds every screen again)")
 alice.open_settings()

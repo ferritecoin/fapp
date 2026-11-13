@@ -14,14 +14,17 @@ import importlib.util
 import os
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
 os.environ.setdefault("KIVY_NO_ARGS", "1")
 os.environ["KIVY_NO_CONSOLELOG"] = "1"
-os.environ.setdefault("SDL_VIDEODRIVER", "x11")
+if sys.platform.startswith("linux"):     # xvfb-run's X display
+    os.environ.setdefault("SDL_VIDEODRIVER", "x11")
 os.environ["HOME"] = tempfile.mkdtemp(prefix="fext-flows-")
+os.environ["USERPROFILE"] = os.environ["HOME"]   # Path.home() on Windows
 os.environ["FEXT_LANG"] = "en"          # the English the checks read
 os.environ["FEXT_SERVER_HOST"] = "127.0.0.1:1"
 
@@ -47,13 +50,18 @@ class Relay:
         self.mail, self.blobs, self.expired = [], {}, set()
         self.expects = {}         # v14: how many each upload said would fetch
         self.directory = {}       # address -> public key, as lookup gives it
+        self.forgotten = set()    # 16.0: no record of them (a reset relay)
         self._next = 1
+        self._lock = threading.Lock()   # one number each, as a relay's are
 
     def post(self, sender, recipient, envelope, cid):
-        sid = self._next
-        self._next += 1
-        self.mail.append({"id": sid, "sender": sender, "recipient": recipient,
-                          "envelope": envelope, "client_msg_id": cid})
+        with self._lock:
+            sid = self._next
+            self._next += 1
+            self.mail.append({"id": sid, "sender": sender,
+                              "recipient": recipient, "envelope": envelope,
+                              "client_msg_id": cid,
+                              "created_at": M.now_iso()})  # the relay's time
         return sid
 
 
@@ -71,6 +79,14 @@ class StubApi:
     def features(self):
         return self._features
 
+    clock_offset = 0.0              # the relay's clock less this device's
+
+    def relay_now(self):
+        return time.time() + self.clock_offset
+
+    def local_time(self, at):
+        return at - self.clock_offset
+
     def _reach(self, what):
         self.requests.append(what)
         if self.down:
@@ -78,6 +94,9 @@ class StubApi:
 
     def send_message(self, recipient, envelope, client_msg_id):
         self._reach(("send", recipient))
+        if recipient in self.relay.forgotten:
+            raise M.ApiClient.ApiError(404, "not_found",
+                                       "recipient not found")
         return {"server_id": self.relay.post(self.keys.address, recipient,
                                              envelope, client_msg_id)}
 
@@ -85,6 +104,9 @@ class StubApi:
         self._reach("send_many")
         return [{"error": {"code": "mailbox_full", "message": "full"}}
                 if item["recipient"] in self.refuse else
+                {"error": {"code": "not_found",
+                           "message": "recipient not found"}}
+                if item["recipient"] in self.relay.forgotten else
                 {"server_id": self.relay.post(
                     self.keys.address, item["recipient"], item["envelope"],
                     item["client_msg_id"])} for item in items]
@@ -115,6 +137,12 @@ class StubApi:
 
     def read(self, ids):
         return {"updated": len(ids)}
+
+    def room_get(self, what, params):       # no call rooms in this relay
+        raise M.requests.ConnectionError("no rooms here")
+
+    def room_post(self, what, body):
+        raise M.requests.ConnectionError("no rooms here")
 
     def set_ticks(self, peer, enabled):
         self.ticks[peer] = enabled
@@ -251,6 +279,116 @@ check("...but Alice can delete her copy of it",
       bob.store.message_by_cid(alice.keys.address,
                                theirs["client_msg_id"]) is not None)
 
+print("\n17.0: delete for everyone within three days (F11)")
+alice.send_text(bob.keys.address, "an old note")
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+old = alice.store.messages_for(bob.keys.address)[-1]
+four_days = (M.datetime.now(M.timezone.utc) -
+             M.timedelta(days=4)).isoformat(timespec="seconds")
+for store, direction in ((alice.store, "out"), (bob.store, "in")):
+    with store._lock:
+        store._db.execute("UPDATE messages SET created_at = ? WHERE "
+                          "client_msg_id = ? AND direction = ?",
+                          (four_days, old["client_msg_id"], direction))
+old = alice.store.message(old["id"])
+sheet = M.DeleteModal(alice, [old])
+labels = [w.text for w in sheet.walk() if isinstance(w, M.Label)]
+check("older than three days: only for me, and the sheet says why",
+      not any("everyone" in t or "Delete for me and" in t
+              for t in labels) and
+      any("older than three days" in t for t in labels), labels)
+relay.mail.clear()
+alice.delete_messages([old["id"]], for_everyone=True)
+time.sleep(0.3)
+check("...nor can it be sent for everyone from anywhere else",
+      not relay.mail and alice.store.message(old["id"]) is not None)
+alice._send_control(bob.keys.address, {"op": "delete",
+                                       "cids": [old["client_msg_id"]]},
+                    "Deleted a message")
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+check("...and an app that sends it anyway has it ignored: Bob keeps his copy",
+      bob.store.message_by_cid(alice.keys.address, old["client_msg_id"])
+      is not None)
+alice.delete_messages([old["id"]], for_everyone=False)
+
+print("\n16.2: editing a message (I5)")
+draft = alice.send_text(bob.keys.address, "see you at 6")
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+wait_for(lambda: alice.store.message(draft)["status"] >= 1)
+sent_row = alice.store.message(draft)
+bobs = next(m for m in bob.store.messages_for(alice.keys.address)
+            if m["direction"] == "out")              # "hi alice", his
+check("your own text, taken by the relay, can be edited; theirs cannot",
+      alice.can_edit(sent_row) and not alice.can_edit(dict(
+          sent_row, direction="in")))
+check("...and Bob learns Alice's app shows edits",
+      bob.store.get_contact(alice.keys.address)["caps"] &
+      M.LocalStore.CAP_EDIT)
+alice.edit_message(draft, "see you at 7")
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+wait_for(lambda: alice.store.message(draft)["body"] == "see you at 7")
+bob_row = bob.store.message_by_cid(alice.keys.address,
+                                   sent_row["client_msg_id"])
+check("an edit goes as a control; both copies read the new words, marked "
+      "edited", bob_row["body"] == "see you at 7" and
+      M.message_ext(bob_row).get("ed") and
+      M.message_ext(alice.store.message(draft)).get("ed"))
+bob.worker._handle_control(1, alice.keys.address, M.uuid.uuid4().hex,
+                           {"op": "edit", "cid": bobs["client_msg_id"],
+                            "b": "not mine"}, "alice", sent_at=M.now_iso())
+check("an edit of a message its sender did not write changes nothing",
+      bob.store.message(bobs["id"])["body"] == bobs["body"])
+late = M.datetime.fromisoformat(sent_row["created_at"]) + \
+    M.timedelta(seconds=M.EDIT_WINDOW + 120)
+bob.worker._handle_control(2, alice.keys.address, M.uuid.uuid4().hex,
+                           {"op": "edit", "cid": sent_row["client_msg_id"],
+                            "b": "too late"}, "alice",
+                           sent_at=late.isoformat())
+check("...nor one made after its fifteen minutes",
+      bob.store.message_by_cid(alice.keys.address,
+                               sent_row["client_msg_id"])["body"] ==
+      "see you at 7")
+old = dict(sent_row, created_at=(M.datetime.now(M.timezone.utc) -
+                                 M.timedelta(minutes=16)).isoformat())
+check("after fifteen minutes the app offers no edit", not alice.can_edit(old))
+alice.open_conversation(bob.keys.address)
+pump(alice)
+screen = alice.conversation_screen
+screen.entry.text = "half a thought"
+screen.toggle_selection(draft)
+pump(alice)
+check("held, Edit takes Share's place in the bar",
+      screen.actions["edit"].parent is screen.select_bar and
+      screen.actions["share"].parent is None)
+screen._act_edit()
+check("Edit: the composer holds its words, the bar above says so",
+      screen.entry.text == "see you at 7" and screen.editing is not None
+      and screen.reply_author.text.lower() == "editing",
+      (screen.entry.text, screen.editing is not None,
+       screen.reply_author.text))
+screen.cancel_reply()
+check("...cancelled, what was being written comes back",
+      screen.editing is None and screen.entry.text == "half a thought")
+screen.start_edit(alice.store.message(draft))
+screen.entry.text = "see you at 8"
+alice.send_current()
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+check("...sent: an edit, not a new message",
+      wait_for(lambda: alice.store.message(draft)["body"] == "see you at 8")
+      and bob.store.message_by_cid(alice.keys.address, sent_row[
+          "client_msg_id"])["body"] == "see you at 8" and
+      screen.entry.text == "" and screen.editing is None)
+pump(alice)
+shown = screen._bubbles.get(draft)
+check("...and the chat on screen shows the new words, marked edited",
+      shown is not None and "see you at 8" in shown.body.text and
+      "edited" in shown.meta.text, shown.body.text if shown else "none")
+
 print("\nPhotos: upload, download, expiry, resend")
 from PIL import Image                                          # noqa: E402
 src = os.path.join(os.environ["HOME"], "camera.jpg")
@@ -345,6 +483,122 @@ check("a voice note arrives with its length and waveform",
       M.message_ext(voice)["media"].get("wave"))
 check("the recording file is removed after sending (a copy is kept)",
       not os.path.exists(rec))
+
+print("\nVideo messages (18.1)")
+import struct                                                  # noqa: E402
+# x264's parameter sets for 480 × 640; the pictures are made-up bytes (a
+# file's layout is what is checked here: desktop/test_videomsg.py plays).
+SPS = bytes.fromhex("6742c01eda07814684000003000400000300c23c58ba80")
+PPS = bytes.fromhex("68ce3c80")
+
+
+class Recorded:
+    """VideoNoteRecorder's stop, write and cancel: two seconds in a real
+    file."""
+    stopped = cancelled = False
+
+    def stop(self):
+        self.stopped = True
+
+    def cancel(self):
+        self.cancelled = True
+
+    def write(self):
+        pictures = [(i * 42, i % 24 == 0, struct.pack(">I", 300) + bytes(
+            [0x65 if i % 24 == 0 else 0x41]) + os.urandom(299))
+            for i in range(48)]
+        path = os.path.join(str(M.MEDIA_DIR), "rec_video.mp4")
+        length, w, h = M.mp4_write(path, SPS, PPS, pictures, 16000, 1,
+                                   [os.urandom(60) for _ in range(31)])
+        return path, length, w, h, M.poster_b64(
+            (bytes([90, 140, 200]) * (32 * 24), 32, 24, "rgb"))
+
+
+pk, *_rest = M.mine_identity()
+dana = M.address_from_priv(pk)
+alice.store.upsert_contact(dana, "dana", M.pub_to_compressed(
+    M.priv_to_pub(pk)).hex(), listed=True)
+check("until someone's app has shown it plays them, the recording sheet "
+      "says what an older one shows; nothing is said of Bob, whose app "
+      "has written from 18.1, or in a note to self",
+      "dana" in alice.video_reach_note(dana) and
+      "18.1" in alice.video_reach_note(dana) and
+      alice.video_reach_note(bob.keys.address) == "" and
+      alice.video_reach_note(alice.keys.address) == "" and
+      alice.store.get_contact(bob.keys.address)["caps"] &
+      M.LocalStore.CAP_VIDEO,
+      (alice.video_reach_note(dana), alice.video_reach_note(
+          bob.keys.address)))
+blobs_before = len(relay.blobs)
+quoted = alice.store.messages_for(bob.keys.address)[0]
+alice.conversation_screen.reply_to = {
+    "cid": quoted["client_msg_id"], "snip": "hello", "kind": "text",
+    "from": alice.keys.address}
+made = Recorded()
+alice.send_video(made)
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+sent = alice.store.messages_for(bob.keys.address)[-1]
+video = bob.store.messages_for(alice.keys.address)[-1]
+vmedia = M.message_ext(video).get("media") or {}
+check("a video message is stopped, written, sealed and uploaded as one "
+      "blob; its recording file is not kept",
+      made.stopped and len(relay.blobs) == blobs_before + 1 and
+      not os.path.exists(os.path.join(str(M.MEDIA_DIR), "rec_video.mp4")))
+check("it arrives as a video with its length, size and still picture, "
+      "and words an older app can show",
+      video["kind"] == "video" and video["body"] == "Video message (0:02)"
+      and vmedia.get("mime") == "video/mp4" and
+      (vmedia.get("w"), vmedia.get("h")) == (480, 640) and
+      1900 <= vmedia.get("dur", 0) <= 2100 and vmedia.get("thumb"),
+      (video["kind"], video["body"], {k: v for k, v in vmedia.items()
+                                      if k != "thumb"}))
+check("...with the reply it was sent as (a note on a call goes this way)",
+      (M.message_ext(video).get("reply") or {}).get("cid") ==
+      quoted["client_msg_id"] and
+      alice.conversation_screen.reply_to is None)
+pump(bob)
+wait_for(lambda: bob.store.message(video["id"])["media_state"] == "ready")
+got = bob.store.message(video["id"])
+check("...downloads, and is the file that was sent: read as pictures "
+      "before it is kept",
+      got["media_state"] == "ready" and got["media_path"].endswith(".mp4")
+      and open(got["media_path"], "rb").read() ==
+      open(sent["media_path"], "rb").read() and
+      len(M.mp4_read(got["media_path"]).samples) == 48)
+check("a preview, a notification and a quote name it in this phone's "
+      "words",
+      M.shown_body("video", video["body"]) == "Video message (0:02)" and
+      M.message_text(video) == "" and
+      M.quote_text({"kind": "video", "snip": ""}) == "Video message")
+
+
+class Damaged(Recorded):
+    """A file that says it is a video and is not one."""
+
+    def write(self):
+        path, length, w, h, poster = super().write()
+        open(path, "wb").write(b"\x00\x00\x00\x18ftypisom" +
+                              os.urandom(2000))
+        return path, length, w, h, poster
+
+
+alice.send_video(Damaged())
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+bad = bob.store.messages_for(alice.keys.address)[-1]
+pump(bob)
+wait_for(lambda: bob.store.message(bad["id"])["media_state"] ==
+         "unreadable")
+check("a file that is no video is not kept, and its bubble says so",
+      bob.store.message(bad["id"])["media_state"] == "unreadable" and
+      not bob.store.message(bad["id"])["media_path"])
+gone = Recorded()
+alice.current_peer, held = None, alice.current_peer
+alice.send_video(gone)
+alice.current_peer = held
+check("with no chat open, the recording is let go and nothing is sent",
+      gone.cancelled)
 
 print("\nNotifications")
 seen = []
@@ -600,6 +854,75 @@ check("leaving tells the rest of the group",
       [m["a"] for m in alice.store.group(gid)["members"]] == [A] and
       bob.store.group(gid)["state"] == "left")
 
+print("\n16.2: mentions in a group (I7)")
+relay.mail.clear()
+gpeer = alice.create_group("Mentions", [B, K])
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+wait_for(lambda: (bob.store.group(M.gid_of(gpeer)) or {}).get("state") ==
+         "active")
+bob.open_conversation(gpeer)
+pump(bob)
+bscreen = bob.conversation_screen
+bscreen.entry.text = "thoughts, @al"
+bscreen.entry.input.cursor = bscreen.entry.input.get_cursor_from_index(
+    len(bscreen.entry.text))
+bscreen._sync_mentions()
+offered = [name for name, _a in bscreen.mention_strip.found]
+check("@ in a group offers the members whose names begin so (not you)",
+      offered == ["alice"], str(offered))
+bscreen.entry.text = "and @"
+bscreen.entry.input.cursor = bscreen.entry.input.get_cursor_from_index(5)
+bscreen._sync_mentions()
+check("...an @ alone offers every other member",
+      sorted(n for n, _a in bscreen.mention_strip.found) == ["alice",
+                                                              "cara"])
+bscreen.entry.text = "thoughts, @al"
+bscreen.entry.input.cursor = bscreen.entry.input.get_cursor_from_index(
+    len(bscreen.entry.text))
+bscreen.pick_mention("alice", A)
+check("...a tap writes the name, and the offer goes",
+      bscreen.entry.text == "thoughts, @alice " and
+      not bscreen.mention_strip.found)
+alice.store.set_mute(gpeer, 0)                 # muted until turned on
+relay.mail.clear()
+bob.send_current()
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+named = alice.store.messages_for(gpeer)[-1]
+row = next(c for c in alice.store.conversations(me=A) if c["peer"] == gpeer)
+item = M.ConversationRow(row, lambda _p: None)
+check("17.0 (F12): an @ beside the group in her chat list, until read",
+      row["mentioned"] and any(isinstance(w, M.UnreadBadge) and
+                               w.text == "@" for w in item.walk()))
+
+
+def alice_stamp(msg):
+    alice.open_conversation(gpeer)
+    pump(alice)
+    bubble = alice.conversation_screen._bubbles.get(msg["id"])
+    return bubble.meta.text if bubble is not None else ""
+
+
+check("the message names her address, and her bubble says so",
+      M.message_ext(named).get("mn") == [A] and
+      M.message_ext(bob.store.messages_for(gpeer)[-1]).get("mn") == [A]
+      and "mentions you" in alice_stamp(named),
+      (named["body"], M.message_ext(named)))
+check("...and once read, no @", not next(
+    c for c in alice.store.conversations(me=A)
+    if c["peer"] == gpeer)["mentioned"])
+check("her muted group still tells her, as it does not for the rest",
+      not M.notification_text(alice.store, gpeer, named["body"], "text", B,
+                              mentioned=True)[2] and
+      M.notification_text(alice.store, gpeer, named["body"], "text", B)[2])
+check("a mention outside a group, or of no one real, is not kept",
+      M.sanitize_mentions(["nope", A, A, 7]) == [A] and
+      M.sanitize_ext({"mn": "x"}) == {})
+alice.store.set_mute(gpeer, None)
+alice.go_back_to_chats()
+bob.go_back_to_chats()
+
 print("\nv9.1: a reaction in a direct chat, and the themes")
 relay.mail.clear()
 direct = bob.store.messages_for(A)[-1]
@@ -728,7 +1051,7 @@ for party in (bob, cara):
     pump(party)
 api.requests.clear()
 one = alice.send_text(g14, "all of you at once")
-wait_for(lambda: len(relay.mail) >= 2)
+wait_for(lambda: len(relay.mail) >= 2 and settled(one))
 check("a group message goes in one request, a copy for each member",
       api.requests.count("send_many") == 1 and
       not any(isinstance(r, tuple) and r[0] == "send"
@@ -879,6 +1202,61 @@ except M.ApiClient.ApiError as exc:
     asked = exc.detail.get("retry_after")
 check("...and a paused relay's Retry-After is kept", asked == 60)
 
+print("\n16.0: a relay that no longer knows someone (Deleted User)")
+
+
+def row_texts(app, peer):
+    rows = [w for w in app.chats_screen.list.walk()
+            if isinstance(w, M.ConversationRow) and w.peer == peer]
+    return [w.text for w in (rows[0].walk() if rows else ())
+            if isinstance(w, M.Label)]
+
+
+relay.forgotten.add(B)                 # reset: Bob has not registered again
+relay.mail.clear()
+tried = attempts(B)
+lost = alice.send_text(B, "still there?")
+wait_for(lambda: attempts(B) > tried and settled(lost))
+pump(alice)
+alice.refresh_sidebar()
+check("a send the relay refuses as 'recipient not found' waits at its "
+      "clock", alice.store.message(lost)["status"] == 0 and not relay.mail)
+check("...and its person is shown as Deleted User in the chat list",
+      "Deleted User" in row_texts(alice, B) and
+      "bob" not in row_texts(alice, B), row_texts(alice, B))
+alice.open_conversation(B)
+wait_for(lambda: alice.conversation_screen.peer == B)
+head = alice.conversation_screen
+check("...and over the chat, with who they were",
+      head.peer_name.text == "Deleted User" and
+      head.peer_sub.text.startswith("was @bob"), head.peer_sub.text)
+check("...the outbox does not undo it", alice.flush_outbox() == 0 and
+      alice.store.get_contact(B)["gone"] > 0)
+relay.forgotten.discard(B)             # Bob registers again, and writes
+bob.send_text(A, "back again")
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+pump(alice)
+alice.refresh_chat(B)
+check("a message from them brings their name back",
+      not alice.store.get_contact(B)["gone"] and
+      head.peer_name.text == "bob", head.peer_name.text)
+check("...and what waited goes", alice.flush_outbox() == 1 and
+      alice.store.message(lost)["status"] == 1)
+deliver(relay, parties)
+relay.forgotten.add(K)
+gone_too = alice.send_text(g14, "who is still here?")
+wait_for(lambda: relay.mail and settled(gone_too))
+check("in a group, a member the relay has no record of is a Deleted "
+      "User; the others are not", alice.store.get_contact(K)["gone"] > 0 and
+      not alice.store.get_contact(B)["gone"] and
+      alice.conversation_screen.author_name(K) == "Deleted User")
+relay.forgotten.discard(K)
+alice.flush_outbox()
+check("...and a copy the relay then takes undoes it",
+      not alice.store.get_contact(K)["gone"])
+deliver(relay, parties)
+
 print("\nv15: post-quantum encryption")
 fern, gus, hal = (make_party(n, relay) for n in ("fern", "gus", "hal"))
 F, G, H = fern.keys.address, gus.keys.address, hal.keys.address
@@ -958,6 +1336,7 @@ check("...and members who met only in the group now hold each other's key",
 old_kid = gus.keys.pq_kid
 gus.keys.find(G).pop("pq_seed_hex")
 gus.keys._pq.clear()
+gus.store.close()                    # the old install's, closed as it goes
 gus.store = M.LocalStore(M.Path(tempfile.mkdtemp(prefix="fext-new-")) /
                          "store.db")
 relay.mail.clear()
@@ -977,9 +1356,12 @@ check("the new install asks for it again, sending its new key",
       acked is None and asked.get("recipient") == F and
       x.get("ctl") == {"op": "reseal", "cids": [lost_cid]} and
       M.b64d(x.get("pqe", "")) == gus.keys.pq_public)
-deliver(relay, parties)
-wait_for(lambda: relay.mail)
-again = relay.mail[0] if relay.mail else {}
+asks = list(relay.mail)            # only the ask: deliver() would hand the
+relay.mail.clear()                 # copy it brings straight to gus as well
+for ask in asks:
+    parties[ask["recipient"]].worker._ingest_message(ask)
+wait_for(lambda: any(m["client_msg_id"] == lost_cid for m in relay.mail))
+again = next((m for m in relay.mail if m["client_msg_id"] == lost_cid), {})
 check("...and the sender sends the same message again, sealed to it",
       again.get("client_msg_id") == lost_cid and
       seen(again)[:2] == (True, gus.keys.pq_kid))
@@ -1004,6 +1386,1133 @@ fern.reseal(G, [old])
 time.sleep(0.5)
 check("a message is sent again once only, only to the person it was for, "
       "and only within a week", not relay.mail)
+
+print("\n17.4: what a group's members may do")
+rules = M.sanitize_group_rules(
+    {"deny": {"send": 100, "fly": 100, "calls": True},
+     "lim": {B: {"deny": ["media", "dance"], "at": 50, "until": 0},
+             K: {"deny": ["send"], "at": 50, "until": 40},
+             A: {"deny": ["send"], "at": 50, "until": 0},
+             "nobody": {"deny": ["send"], "at": 50, "until": 0}}}, {B, K})
+check("rules keep known rights with good times, and only members' "
+      "restrictions", rules == {"deny": {"send": 100.0},
+                                "lim": {B: {"deny": ["media"], "at": 50.0,
+                                            "until": 0.0}}}, rules)
+check("a stop says which right, until when, and whose; photos and voice "
+      "messages stop with messages",
+      M.group_denied(rules, {A}, B, "media", 60) == ("media", 0.0, True)
+      and M.group_denied(rules, {A}, K, "media", 150) == ("send", 0.0, False)
+      and M.group_denied(rules, {A}, K, "send", 99) is None)
+check("no admin is ever stopped",
+      M.group_denied(rules, {A, B}, B, "media", 60) is None)
+
+relay.mail.clear()
+rpeer = alice.create_group("Seventeen Four", [B, K])
+rgid = M.gid_of(rpeer)
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+check("a group without rules has a state as before, which older apps read",
+      "r" not in alice._group_state(rgid) and "r" not in
+      M.sanitize_group_state(alice._group_state(rgid)))
+
+
+def events(app, peer=rpeer):
+    return [m["body"] for m in app.store.messages_for(peer)
+            if m["kind"] == "event"]
+
+
+def bodies(app, peer=rpeer):
+    return [m["body"] for m in app.store.messages_for(peer)
+            if m["kind"] != "event"]
+
+
+check("the admin turns off members' new calls: said in each chat",
+      alice.set_group_permissions(rgid, ["calls"]) and
+      events(alice)[-1] == "You turned off new calls for members")
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+check("...and the members' apps keep the rule",
+      all("calls" in p.store.group(rgid)["rules"]["deny"]
+          for p in (bob, cara)) and
+      events(bob)[-1] == "alice turned off new calls for members")
+check("a member may no longer start a call there, and is told why",
+      bob.group_stop(rpeer, "calls") ==
+      "Only the group's admins can start calls here" and
+      not bob.group_stop(rpeer, "send") and not alice.group_stop(rpeer,
+                                                                 "calls"))
+check("a call's invite from a member is held by those who know; the "
+      "admin's is not", cara.worker._group_held(
+          rgid, B, {"k": "call"}, time.time()) == "calls" and
+      cara.worker._group_held(rgid, A, {"k": "call"}, time.time()) == "")
+
+bob.send_text(rpeer, "before the stop")
+wait_for(lambda: len(relay.mail) >= 2)
+early = list(relay.mail)
+relay.mail.clear()
+before = len(events(cara))
+check("the admin restricts one member's messages for an hour",
+      alice.restrict_member(rgid, B, ["send"], 3600) and
+      events(alice)[-1].startswith("You stopped bob's messages until "))
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+check("...which their chat says, until when", events(bob)[-1].startswith(
+    "alice stopped your messages here until "))
+check("...and nobody else's does", len(events(cara)) == before)
+check("their app keeps it, and stops photos and voice messages with it",
+      bob.group_stop(rpeer, "send").startswith(
+          "An admin has stopped your messages here until ") and
+      bob.group_stop(rpeer, "media"))
+relay.mail.extend(early)
+deliver(relay, parties)
+check("a message the relay took before the stop still arrives",
+      "before the stop" in bodies(cara))
+bob.open_conversation(rpeer)
+pump(bob)
+bscreen = bob.conversation_screen
+check("their composer gives way to a note saying so",
+      bscreen.closed_note.parent is not None and
+      bscreen.closed_note.text.startswith(
+          "An admin has stopped your messages here until "))
+check("...and nothing they write goes",
+      bob.send_text(rpeer, "let me in") is None and not relay.mail)
+sent = next(m for m in bob.store.messages_for(rpeer)
+            if m["body"] == "before the stop")
+check("...nor an edit", not bob.can_edit(sent))
+stop_words = bob.group_stop
+bob.group_stop = lambda *a, **k: ""      # an app that knows nothing of it
+bob.send_text(rpeer, "sent anyway")
+wait_for(lambda: len(relay.mail) >= 2)
+held = [m for m in relay.mail if m["recipient"] == K]
+check("what an app sends anyway is acknowledged by those who know, and "
+      "not shown", held and cara.worker._ingest_message(held[0]) ==
+      held[0]["id"] and "sent anyway" not in bodies(cara))
+relay.mail.clear()
+bob._send_control(rpeer, {"op": "edit", "cid": sent["client_msg_id"],
+                          "b": "changed my mind"}, "Edited a message")
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+check("...nor is an edit", "changed my mind" not in bodies(cara) and
+      "before the stop" in bodies(cara))
+bob.group_stop = stop_words
+bob.api.down = True
+bob.group_stop = lambda *a, **k: ""
+tried = bob.api.requests.count("send_many")
+queued = bob.send_text(rpeer, "written while away")
+wait_for(lambda: bob.api.requests.count("send_many") > tried and
+         queued not in bob._sends()[1])
+bob.group_stop = stop_words
+bob.api.down = False
+check("the outbox leaves what the stop holds", bob.flush_outbox() == 0 and
+      not relay.mail and bob.store.message(queued)["status"] == 0)
+
+check("the admin lifts it", alice.restrict_member(rgid, B, [], 0) and
+      events(alice)[-1] == "You lifted bob's restriction" and
+      not alice.restrict_member(rgid, B, [], 0))
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+pump(bob)
+bscreen._sync_closed()
+check("...their chat says so, and the composer is back",
+      events(bob)[-1] == "alice lifted your restriction here" and
+      bscreen.closed_note.parent is None)
+check("...and what waited goes", bob.flush_outbox() == 1)
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+check("...and arrives", "written while away" in bodies(cara))
+
+alice.restrict_member(rgid, K, ["media"], 1)
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+check("a restriction with an end stops only until then",
+      cara.group_stop(rpeer, "media") and not cara.group_stop(rpeer, "send"))
+time.sleep(1.2)
+check("...and then no more", not cara.group_stop(rpeer, "media") and
+      alice.member_restriction(rgid, K) is None)
+alice.restrict_member(rgid, K, [], 0)
+deliver(relay, parties)
+
+alice.set_group_permissions(rgid, ["send", "calls"])
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+cara.open_conversation(rpeer)
+pump(cara)
+check("with messages off for members, a member's composer says only the "
+      "admin can write", cara.conversation_screen.closed_note.text ==
+      "Only the group's admins can send messages here")
+alice.open_conversation(rpeer)
+pump(alice)
+check("...and the admin's is as ever",
+      alice.conversation_screen.closed_note.parent is None and
+      alice.send_text(rpeer, "announcements only") is not None)
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+check("...whose messages arrive", "announcements only" in bodies(cara))
+since = alice.store.group(rgid)["rules"]["deny"]["calls"]
+alice.set_group_permissions(rgid, ["calls"])
+check("turning one back on keeps when the others went off",
+      alice.store.group(rgid)["rules"]["deny"] == {"calls": since})
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+check("...and is said", events(cara)[-1] ==
+      "alice turned messages back on for members")
+
+state = alice._group_state(rgid)
+older = {k: v for k, v in state.items() if k != "r"}
+older["v"] += 1
+cara.worker._apply_group_state(A, M.sanitize_group_state(older))
+check("a newer state without rules (an admin's app before 17.4) clears "
+      "them", cara.store.group(rgid)["rules"] == {} and
+      events(cara)[-1] == "alice turned new calls back on for members")
+alice.restrict_member(rgid, B, ["calls"], 0)
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+with bob.store._lock:
+    bob.store._db.execute("UPDATE groups SET version = version + 1 "
+                          "WHERE gid = ?", (rgid,))
+    bob.store._db.commit()
+check("rules left behind by an older release's newer state are not used",
+      bob.store.group(rgid)["rules"] == {} and
+      M.LocalStore.SCHEMA_VERSION == 13)
+
+print("\n17.4: a group's topics")
+check("topics keep good ids and names, once each; none without a list",
+      M.sanitize_group_topics({"on": True, "x": 1, "list": [
+          {"id": "0a1b2c3d", "n": " Trip ", "c": True, "z": 2},
+          {"id": "0a1b2c3d", "n": "again"}, {"id": "nope", "n": "bad"},
+          {"id": "11223344", "n": ""}]}) ==
+      {"on": True, "list": [{"id": "0a1b2c3d", "n": "Trip", "c": True}]} and
+      M.sanitize_group_topics({"on": True}) == {} and
+      M.sanitize_group_topics({"list": []}) == {})
+relay.mail.clear()
+tpeer = alice.create_group("Walks", [B, K])
+tgid = M.gid_of(tpeer)
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+check("the admin turns topics on: said in each chat",
+      alice.change_topics(tgid, on=True) == "" and
+      events(alice, tpeer)[-1] == "You turned topics on")
+trip = alice.change_topics(tgid, add="Trip")
+books = alice.change_topics(tgid, add="Books")
+wait_for(lambda: len(relay.mail) >= 6)
+deliver(relay, parties)
+check("...and adds two; each member's app has them, in order",
+      [t["n"] for t in bob.store.group(tgid)["topics"]["list"]] ==
+      ["Trip", "Books"] and events(bob, tpeer)[-1] ==
+      "alice added the topic “Books”" and len({trip, books}) == 2)
+bob.open_conversation(tpeer)
+pump(bob)
+bscreen = bob.conversation_screen
+strip = bscreen.topic_strip
+check("the chat shows its topics under its head: All, General and each",
+      strip.opacity == 1 and len(strip.row.children) == 4 and
+      bscreen.topic is None)
+bscreen.choose_topic(trip)
+check("a message written in a topic goes to it",
+      bob.send_text(tpeer, "Train at nine") is not None)
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+row = next(m for m in cara.store.messages_for(tpeer)
+           if m["body"] == "Train at nine")
+check("...and arrives there", M.message_ext(row).get("tp") == trip)
+bscreen.choose_topic(None)
+bob.send_text(tpeer, "Hello all")
+reply = {"cid": row["client_msg_id"], "snip": "Train at nine", "from": B}
+bob.send_text(tpeer, "Which platform?", reply=reply)
+wait_for(lambda: len(relay.mail) >= 4)
+deliver(relay, parties)
+got = {m["body"]: M.message_ext(m).get("tp", "") for m in
+       cara.store.messages_for(tpeer) if m["kind"] != "event"}
+check("from All, a message goes to General; a reply, to its message's "
+      "topic", got.get("Hello all") == "" and
+      got.get("Which platform?") == trip, got)
+check("cara's chat marks the topic with something unread",
+      trip in cara.store.unread_topics(tpeer))
+cara.open_conversation(tpeer)
+pump(cara)
+cscreen = cara.conversation_screen
+cscreen.choose_topic(trip)
+pump(cara)
+shown = sorted(b.msg["body"] for b in cscreen._bubbles.values())
+check("a topic chosen, the chat shows its messages alone",
+      shown == ["Train at nine", "Which platform?"], shown)
+cscreen.choose_topic(None)
+pump(cara)
+labels = {b.msg["body"]: b.author.text.lower()
+          for b in cscreen._bubbles.values() if b.author is not None}
+check("all of them shown, each names its topic beside its author",
+      labels.get("Train at nine", "").endswith("· trip") and
+      "·" not in labels.get("Hello all", "·"), labels)
+cscreen.choose_topic(books)
+pump(cara)
+bob.send_text(tpeer, "Lunch after?")
+bscreen.choose_topic(books)
+bob.send_text(tpeer, "Anyone read Dune?")
+bscreen.choose_topic(None)
+wait_for(lambda: len(relay.mail) >= 4)
+deliver(relay, parties)
+pump(cara)
+unread = cara.store.unread_topics(tpeer)
+chips = cscreen.topic_strip.row.children[::-1]   # All, General, ...
+check("a topic shown, what comes to it is read; what comes to another "
+      "stays unread, a dot on its chip", unread == {""} and
+      len(chips[1].children) == 2, unread)
+cscreen.choose_topic("")
+pump(cara)
+check("...and is read once its topic is shown",
+      not cara.store.unread_topics(tpeer))
+cscreen.choose_topic(None)
+
+alice.change_topics(tgid, close=(books, True))
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+bscreen.choose_topic(books)
+pump(bob)
+check("a closed topic takes nothing from a member: the composer says so",
+      bscreen.closed_note.parent is not None and
+      bscreen.closed_note.text.startswith("This topic is closed") and
+      bob.send_text(tpeer, "can I?") is None)
+alice.open_conversation(tpeer)
+pump(alice)
+alice.conversation_screen.choose_topic(books)
+check("...and the admin's own goes in",
+      alice.send_text(tpeer, "Reading list is up") is not None)
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+bscreen.choose_topic(None)
+
+alice.change_topics(tgid, on=False)
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+pump(bob)
+bob.refresh_chat(tpeer)
+labels = {b.msg["body"]: b.author.text.lower()
+          for b in bscreen._bubbles.values() if b.author is not None}
+check("topics turned off: the strip goes, every message stays in the one "
+      "chat with its topic named", strip.opacity == 0 and
+      bscreen.topic is None and labels.get("Reading list is up", "")
+      .endswith("· books") and events(bob, tpeer)[-1] ==
+      "alice turned topics off: every message shows in one chat", labels)
+check("...and what is written then goes to the chat as a whole",
+      bob.compose_topic(tpeer) == "")
+alice.change_topics(tgid, on=True)
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+pump(bob)
+bob.refresh_chat(tpeer)
+bscreen.choose_topic(trip)
+check("turned on again, each topic is back with its messages",
+      strip.opacity == 1 and sorted(b.msg["body"] for b in
+                                    bscreen._bubbles.values()) ==
+      ["Train at nine", "Which platform?"])
+bscreen.choose_topic(None)
+alice.group_info_screen.show(tgid)
+texts = [w.text for w in alice.group_info_screen.body.walk()
+         if isinstance(w, M.Label)]
+check("the group's page says so to its admin", "Topics" in texts and
+      "On · 2 topics" in texts)
+
+print("\n18.0: a group's admins")
+check("a state's other admins: members only, not the owner, known rights "
+      "in order; one made by someone gone is the owner's",
+      M.sanitize_group_admins(
+          {B: {"r": ["delete", "info", "fly"], "by": K},
+           A: {"r": ["info"]}, K: {"r": []}, "nobody": {"r": ["add"]}},
+          {A, B, K}, A) == {B: {"r": ["info", "delete"], "by": K}} and
+      M.sanitize_group_admins({B: {"r": ["add"], "by": "gone"}}, {A, B},
+                              A) == {B: {"r": ["add"], "by": A}})
+good = {"v": 3, "a": B, "e": "name", "t": " Mods ", "at": 100.0}
+check("an admin log keeps good entries only, the newest fifty",
+      M.sanitize_admin_log([good, dict(good, a="bad"), dict(good, e="fly"),
+                            dict(good, at=-1), "junk"]) ==
+      [dict(good, t="Mods")] and
+      len(M.sanitize_admin_log([good] * 80)) == M.ADMIN_LOG_MAX == 50)
+held = {"version": 5, "admin": A, "by": A, "name": "G",
+        "members": [{"a": A}, {"a": B}, {"a": K}],
+        "admins": {B: {"r": ["info", "admins"], "by": A}},
+        "rules": {}, "topics": {}}
+same = {"v": 5, "name": "H", "admin": A, "members": held["members"],
+        "ad": held["admins"]}
+check("at the same version the owner's state wins, then the lower "
+      "address's; a newer one always does",
+      M.state_wins(dict(held, by=B), same, A) and
+      not M.state_wins(held, same, B) and
+      M.state_wins(held, dict(same, v=6), B))
+allowed = M.admin_change_allowed
+check("another admin may change what his rights cover, and step down",
+      allowed(held, same, B) and allowed(held, dict(same, ad={}), B))
+check("...not anything else: members, the owner, rules, more rights",
+      not allowed(held, dict(same, members=held["members"][:2]), B) and
+      not allowed(held, dict(same, admin=B), B) and
+      not allowed(held, dict(same, r={"deny": {"send": 9.0}}), B) and
+      not allowed(held, dict(same, ad={B: {"r": ["info", "add", "admins"],
+                                           "by": A}}), B))
+check("...and makes admins only with rights of his own, changing none "
+      "he did not make",
+      allowed(held, dict(same, ad=dict(held["admins"], **{
+          K: {"r": ["info"], "by": B}})), B) and
+      not allowed(held, dict(same, ad=dict(held["admins"], **{
+          K: {"r": ["delete"], "by": B}})), B) and
+      not allowed(dict(held, admins=dict(held["admins"], **{
+          K: {"r": ["info"], "by": A}})), same, B))
+
+relay.mail.clear()
+apeer = alice.create_group("Moderators", [B, K])
+agid = M.gid_of(apeer)
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+rights = ["info", "add", "remove", "delete", "admins"]
+check("the owner makes bob an admin with some rights: said in her chat",
+      alice.set_group_admin(agid, B, ["admins"] + rights + ["fly"]) and
+      events(alice, apeer)[-1] == "You made bob an admin")
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+check("...each member's app holds it, says it, and logs who did it",
+      all(p.store.group(agid)["admins"] == {B: {"r": rights, "by": A}}
+          for p in (bob, cara)) and
+      events(bob, apeer)[-1] == "alice made you an admin" and
+      events(cara, apeer)[-1] == "alice made bob an admin" and
+      [(e["a"], e["e"], e.get("t")) for e in cara.store.group(agid)["log"]]
+      == [(A, "admin", B)])
+
+with alice.store._lock:                  # as if cara's app were older
+    alice.store._db.execute("UPDATE contacts SET caps = caps & ? WHERE "
+                            "address = ?", (~M.LocalStore.CAP_V18, K))
+    alice.store._db.commit()
+check("bob, who may change its info, renames it",
+      bob.rename_group(agid, "Mods"))
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+check("...alice and cara take it from him, and their logs say so",
+      all(p.store.group(agid)["name"] == "Mods" and
+          [e["e"] for e in p.store.group(agid)["log"]] == ["admin", "name"]
+          for p in (alice, cara)) and
+      events(cara, apeer)[-1] == "bob renamed the group “Mods”")
+pump(alice)
+wait_for(lambda: relay.mail)
+fwd = list(relay.mail)
+ctl = seen(fwd[0])[2].get("ctl", {}) if len(fwd) == 1 else {}
+check("the owner sends his change on, as it is, to an app older than "
+      "18.0 (one that follows her alone), marked as a copy",
+      len(fwd) == 1 and fwd[0]["recipient"] == K and
+      ctl.get("op") == "group" and "lg" not in ctl["g"] and
+      ctl.get("fw") == 1 and
+      ctl["g"]["v"] == alice.store.group(agid)["version"], fwd)
+before = (len(events(cara, apeer)), cara.store.group(agid)["log"])
+deliver(relay, parties)
+check("...which an 18.0 app leaves: it has his own",
+      (len(events(cara, apeer)), cara.store.group(agid)["log"]) == before)
+alice.store.add_caps(K, M.LocalStore.CAP_V18)
+
+check("bob may not set what members can do: that is not his right",
+      not bob.set_group_permissions(agid, ["calls"]))
+forged = bob._group_state(agid)
+forged["v"] += 1
+forged["r"] = {"deny": {"send": 100.0}}
+version = cara.store.group(agid)["version"]
+cara.worker._apply_group_state(B, M.sanitize_group_state(forged))
+check("...nor can his app do it behind the screen: members refuse it",
+      cara.store.group(agid)["rules"] == {} and
+      cara.store.group(agid)["version"] == version)
+
+bob.send_text(apeer, "buy cheap watches")
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+spam = next(m for m in alice.store.messages_for(apeer)
+            if m["body"] == "buy cheap watches")
+cara._send_control(apeer, {"op": "delete", "adm": 1,
+                           "cids": [spam["client_msg_id"]]}, "x")
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+check("a member who is no admin cannot delete another's message",
+      any(m["body"] == "buy cheap watches"
+          for m in alice.store.messages_for(apeer)))
+check("bob, an admin with the right, makes cara one with only rights of "
+      "his own", bob.set_group_admin(agid, K, ["delete", "topics"]) and
+      bob.store.group(agid)["admins"][K] == {"r": ["delete"], "by": B})
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+pump(alice)
+check("...which alice and cara take", alice.store.group(agid)["admins"]
+      .get(K) == {"r": ["delete"], "by": B} == cara.store.group(agid)
+      ["admins"].get(K))
+crow = next(m for m in cara.store.messages_for(apeer)
+            if m["body"] == "buy cheap watches")
+modal = M.DeleteModal(cara, [crow])
+buttons = [w.text.lower() for w in modal.body.walk()
+           if isinstance(w, M.Btn)]
+check("cara's delete sheet offers deleting bob's message for everyone",
+      "delete for everyone" in buttons, buttons)
+cara.delete_messages([crow["id"]], True)
+wait_for(lambda: len(relay.mail) >= 4)
+deliver(relay, parties)
+check("...and does: it is gone from every member's chat",
+      not any(m["body"] == "buy cheap watches"
+              for p in (alice, bob, cara)
+              for m in p.store.messages_for(apeer)))
+check("...and the log says who did it, and whose it was, not the words",
+      alice.store.group(agid)["log"][-1]["e"] == "delete" and
+      alice.store.group(agid)["log"][-1].get("t") == B and
+      "watches" not in str(alice.store.group(agid)["log"]))
+
+alice.group_info_screen.show(agid)
+texts = [w.text.lower() for w in alice.group_info_screen.body.walk()
+         if isinstance(w, (M.Label, M.CapsLabel))]
+bob.group_info_screen.show(agid)
+btexts = [w.text.lower() for w in bob.group_info_screen.body.walk()
+          if isinstance(w, (M.Label, M.CapsLabel))]
+check("the group's page tags its owner and admins",
+      "owner" in texts and texts.count("admin") == 2, texts)
+check("an admin's page offers what his rights allow, his rights, and the "
+      "log; not what they do not",
+      {"rename the group", "add members", "your rights as an admin",
+       "admin log"} <= set(btexts) and "topics" not in btexts, btexts)
+sheet = M.AdminRightsSheet(bob, agid, K, "cara", lambda: None)
+check("making an admin, the rights he does not have cannot be given",
+      sheet.switches["topics"].disabled and
+      sheet.switches["rules"].disabled and
+      not sheet.switches["delete"].disabled and
+      sheet.switches["delete"].active)
+check("the log says 'your' to the member it is about",
+      M.admin_log_line({"v": 1, "a": A, "e": "rights", "t": B, "at": 1.0},
+                       lambda a, start: "alice" if a == A else
+                       "You" if start else "you", B) ==
+      "alice changed your rights as an admin")
+log = M.AdminLogSheet(alice, agid)
+lines = [w.text for w in log.body.walk() if isinstance(w, M.Label)]
+check("the admin log says what each admin did, newest first",
+      lines.index("cara deleted bob's messages") <
+      lines.index("bob renamed the group “Mods”") <
+      lines.index("You made bob an admin"), lines)
+
+relay.mail.clear()
+v0 = alice.store.group(agid)["version"]
+alice.rename_group(agid, "Alpha")
+bob.rename_group(agid, "Beta")
+wait_for(lambda: len(relay.mail) >= 4)
+deliver(relay, parties)
+check("two admins change it at once: every app keeps the owner's",
+      all(p.store.group(agid)["name"] == "Alpha"
+          for p in (alice, bob, cara)))
+check("...bob is told his change gave way",
+      events(bob, apeer)[-1].startswith("Your change crossed alice's"))
+check("...and every log has her entry at that version, not his",
+      all([(e["a"], e.get("t")) for e in p.store.group(agid)["log"]
+           if e["v"] == v0 + 1] == [(A, "Alpha")]
+          for p in (alice, bob, cara)))
+
+check("cara steps down", cara.set_group_admin(agid, K, []) and
+      events(cara, apeer)[-1] == "You're no longer an admin")
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+check("...which the others take",
+      K not in alice.store.group(agid)["admins"] and
+      events(alice, apeer)[-1] == "cara is no longer an admin",
+      (alice.store.group(agid)["admins"], events(alice, apeer)[-3:]))
+pump(alice)
+relay.mail.clear()
+alice.set_group_admin(agid, B, [])
+alice.set_group_admin(agid, K, ["info"])
+wait_for(lambda: len(relay.mail) >= 4)
+deliver(relay, parties)
+relay.mail.clear()
+alice.leave_group(agid)
+wait_for(lambda: len(relay.mail) >= 4)
+sent = {}
+for msg in relay.mail:
+    sent.setdefault(msg["recipient"], []).append(
+        seen(msg)[2].get("ctl", {}))
+check("the owner leaving first names the next owner — the first other "
+      "admin, where an older app would take the first member",
+      all([c.get("op") for c in sent.get(a, [])] == ["group", "leave"] and
+          sent[a][0]["g"]["admin"] == K for a in (B, K)), sent)
+deliver(relay, parties)
+pump(cara)
+wait_for(lambda: relay.mail, 1.0)
+deliver(relay, parties)
+check("...so every app follows cara, who now owns the group",
+      bob.store.group(agid)["admin"] == K == cara.store.group(agid)["admin"]
+      and "cara now owns the group" in events(bob, apeer) and
+      [m["a"] for m in bob.store.group(agid)["members"]] == [B, K])
+
+for x, y in ((bob, dave), (dave, bob), (cara, dave), (dave, cara)):
+    x.store.upsert_contact(y.keys.address, y.keys.username,
+                           y.keys.public_key_hex)
+relay.mail.clear()
+cara.set_group_admin(agid, B, ["add"])
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+check("an admin who may add members invites one",
+      bob.add_group_members(agid, [D]) == 1)
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+check("...whose app takes the invitation from him, log and all",
+      dave.store.group(agid) is not None and
+      dave.store.group(agid)["state"] == "active" and
+      dave.store.group(agid)["log"] == bob.store.group(agid)["log"] and
+      [m["a"] for m in cara.store.group(agid)["members"]] == [B, K, D])
+check("...but may not remove anyone: that is not his right",
+      not bob.remove_group_member(agid, D) and
+      not bob.may_manage(bob.store.group(agid), D, "remove"))
+pump(cara)
+relay.mail.clear()
+cara.restrict_member(agid, D, ["send"], 0)
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+check("a restricted member made an admin is restricted no more",
+      cara.set_group_admin(agid, D, ["info"]) and
+      not cara.member_restriction(agid, D))
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+check("...in every app", dave.group_rule(M.group_peer(agid),
+                                         "send") is None and
+      D in bob.store.group(agid)["admins"])
+
+print("\n18.0: joining by a link, let in by its maker (JOIN174)")
+
+
+def drained(app):
+    """What the app's UI queue holds, taken off it unhandled."""
+    got = []
+    while not app.ui_queue.empty():
+        got.append(app.ui_queue.get_nowait())
+    return got
+
+
+url = M.join_link("https://relay.example", A, "0123456789abcdef", "group",
+                  gid, "The Reading Circle")
+raw = url.split("#" + M.JOIN_LINK_MARK)[1]
+sent_fields = set(M.json.loads(M.base64.urlsafe_b64decode(
+    raw + "=" * (-len(raw) % 4))))
+check("a link for anyone says who lets people in, and to what; no token, "
+      "no key", M.parse_join_link(url) == {
+          "h": A, "l": "0123456789abcdef", "k": "group", "t": gid,
+          "n": "The Reading Circle", "v": False} and
+      sent_fields == {"h", "l", "k", "n", "g"})
+check("...and a damaged one is no link",
+      M.parse_join_link(url.replace("fx2.", "fx1.")) is None and
+      M.parse_join_link(M.join_link("https://r", "nobody", "0" * 16,
+                                    "group", gid, "x")) is None and
+      M.parse_join_link(M.join_link("https://r", A, "short", "group",
+                                    gid, "x")) is None and
+      M.parse_join_link(M.join_link("https://r", A, "0" * 16, "dance",
+                                    gid, "x")) is None)
+
+relay.mail.clear()
+glink = alice.join_link_for("group", gid)
+gdata = M.parse_join_link(glink)
+check("an admin who may add members makes the group's link; asked again, "
+      "the same one", gdata is not None and
+      alice.join_link_for("group", gid) == glink and
+      gdata["n"] == alice.store.group(gid)["name"])
+check("a member who may not add members has none",
+      bob.join_link_for("group", gid) is None)
+erin.ask_to_join(gdata)
+wait_for(lambda: relay.mail)
+knock = seen(relay.mail[0])[2].get("ctl") if relay.mail else None
+check("erin asks in: one sealed knock, to alice alone",
+      [m["recipient"] for m in relay.mail] == [A] and
+      knock == {"op": "knock", "l": gdata["l"]}, relay.mail)
+deliver(relay, parties)
+erin.ask_to_join(gdata)
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+check("alice's app keeps the ask, once, though erin is a message request "
+      "there", [a["sender"] for a in alice.store.join_asks("group", gid)]
+      == [E] and alice.store.is_request(E))
+alice.group_info_screen.show(gid)
+texts = [w.text for w in alice.group_info_screen.body.walk()
+         if isinstance(w, M.Label)]
+check("the group's page says someone is asking to join",
+      "Asking to join" in texts and "1 person" in texts)
+drained(alice)
+room, M.MAX_GROUP_MEMBERS = M.MAX_GROUP_MEMBERS, len(
+    alice.store.group(gid)["members"])                 # as if it were full
+full = alice.answer_join_ask(gdata["l"], E, True)
+M.MAX_GROUP_MEMBERS = room
+check("a full group has no room for her: said so, and her ask is kept",
+      "full" in full and [a["sender"] for a in alice.store.join_asks(
+          "group", gid)] == [E], full)
+check("alice lets her in: she is added as any new member is",
+      alice.answer_join_ask(gdata["l"], E, True) == "")
+wait_for(lambda: len(relay.mail) >= 3)
+deliver(relay, parties)
+check("...erin's app has the group, from alice, and nobody is left "
+      "asking", (erin.store.group(gid) or {}).get("state") == "active" and
+      [m["a"] for m in erin.store.group(gid)["members"]] ==
+      [m["a"] for m in alice.store.group(gid)["members"]] and
+      E in [m["a"] for m in alice.store.group(gid)["members"]] and
+      not alice.store.join_asks("group", gid))
+alice.stop_join_link("group", gid)
+dave.ask_to_join(gdata)
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+check("a stopped link takes no more asks",
+      not alice.store.join_asks() and
+      alice.join_link_for("group", gid) != glink)
+
+hosted = M.new_group_call(gpeer, A, False)
+hosted.room = "ab" * 8
+hosted.preview()
+hosted.confirm_join()
+alice._call_sessions()[hosted.id] = hosted
+cdata = M.parse_join_link(alice.join_link_for("call", hosted.id))
+check("the host of a call makes its link, with their name on it",
+      cdata["k"] == "call" and cdata["t"] == hosted.id and
+      cdata["n"] == alice.keys.username)
+check("one who is not its host cannot", bob.join_link_for("call",
+                                                          hosted.id) is None)
+relay.mail.clear()
+dave.ask_to_join(cdata)
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+pump(alice)
+sheet = M.JoinAsksSheet.current
+check("during the call, who is asking shows at once, with Let in and "
+      "Decline", sheet is not None and sheet.kind == "call" and
+      {"decline", "let in"} <= {w.text.lower() for w in sheet.body.walk()
+                                if isinstance(w, M.Btn)})
+sheet.dismiss()
+relay.mail.clear()
+cara._send_control_to(D, {"op": "admit", "l": cdata["l"], "no": 1}, "x",
+                      pub=dave.keys.public_key_hex)
+deliver(relay, parties)
+pump(dave)
+check("someone else's answer to dave's ask (the link is anyone's) is let "
+      "go, and his ask stands", dave.store._db.execute(
+          "SELECT COUNT(*) FROM join_asked WHERE link = ?",
+          (cdata["l"],)).fetchone()[0] == 1 and
+      "did not let you in" not in getattr(M.Toast.current, "text", ""))
+check("let in: the call's invite goes to dave, sealed to him alone",
+      alice.answer_join_ask(cdata["l"], D, True) == "")
+wait_for(lambda: relay.mail)
+admit = seen(relay.mail[0])[2].get("ctl", {}) if relay.mail else {}
+check("...room, token and key in it",
+      [m["recipient"] for m in relay.mail] == [D] and
+      admit.get("op") == "admit" and
+      admit.get("call", {}).get("t") == hosted.token)
+deliver(relay, parties)
+card = dave.store.call_card(A, hosted.id)
+check("dave's app keeps the call's card in his chat with alice, now "
+      "listed", card is not None and card["token"] == hosted.token and
+      dave.store.get_contact(A)["listed"])
+pump(dave)
+lobby = dave.__dict__.get("_lobby")
+check("...and opens its lobby", lobby is not None and
+      lobby.session.id == hosted.id)
+if lobby is not None:
+    lobby.cancel()
+alice._send_control_to(K, {"op": "admit", "l": "f" * 16,
+                           "call": M.call_invite(hosted)}, "x")
+deliver(relay, parties)
+check("an admission nobody asked for is let go",
+      cara.store.call_card(A, hosted.id) is None)
+relay.mail.clear()
+erin.ask_to_join(cdata)
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+alice.answer_join_ask(cdata["l"], E, False)
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+pump(erin)
+check("declined: erin is told so, and has no card",
+      erin.store.call_card(A, hosted.id) is None and
+      M.Toast.current is not None and
+      M.Toast.current.text == "alice did not let you in")
+alice.store.end_join_links("call", hosted.id)
+check("its call over, the link takes no asks", alice.store.join_link(
+    cdata["l"]) is None and alice.join_link_for("call", "f" * 32) is None)
+asked_as = []
+ask_sheet = M.AskToJoinSheet(erin, cdata)
+ask_sheet.mine = [{"address": "Fother", "username": "erin_work"}]
+ask_sheet.chosen = "Fother"
+erin._activate_identity = lambda address: asked_as.append(address)
+erin.ask_to_join = lambda data: asked_as.append(data["l"])
+ask_sheet._ask()
+del erin._activate_identity, erin.ask_to_join
+check("asking as another identity of one's own switches to it first "
+      "(INVITEAS)", asked_as == ["Fother", cdata["l"]])
+
+print("\n18.0: one more person into a 1-to-1 call (F19)")
+grown = M.new_group_call(B, A, False)
+grown.room, grown.grew_from = "cd" * 8, "e" * 32
+check("a room grown from a 1-to-1 call says which call it grew from",
+      M.call_invite(grown)["up"] == "e" * 32)
+relay.mail.clear()
+drained(bob)
+alice.invite_to_room(grown, B)
+deliver(relay, parties)
+check("its invite lands in the 1-to-1 chat, as a card there",
+      bob.store.call_card(A, grown.id) is not None)
+check("...and the app is told to follow, if it was in that call",
+      ("call_follow", A, grown.id, "e" * 32) in drained(bob))
+joined = []
+bob.join_call = lambda session, state: joined.append(
+    (session.id, session.me.mic, state is not None))
+bob.__dict__["_last_direct"] = ("e" * 32, A, time.time(), False)
+bob.follow_call(A, grown.id, "e" * 32)
+first = list(joined)
+joined.clear()
+bob.__dict__["_last_direct"] = ("e" * 32, A, time.time() - 600, False)
+bob.follow_call(A, grown.id, "e" * 32)
+bob.__dict__["_last_direct"] = ("f" * 32, A, time.time(), False)
+bob.follow_call(A, grown.id, "e" * 32)
+del bob.join_call
+check("bob's app follows into it at once, the microphone as it was",
+      first == [(grown.id, True, True)])
+check("...but not into a room from another call, or long after",
+      joined == [])
+stranger = M.new_group_call(A, E, False)
+stranger.room = "ef" * 8
+erin.invite_to_room(stranger, A)
+deliver(relay, parties)
+check("a call's room offered by someone not yet accepted is let go",
+      alice.store.call_card(E, stranger.id) is None)
+direct = M.Call(B, outgoing=True, call_id=uuid.uuid4().hex)
+direct.connected_at = time.time()
+direct.session = M.CallSession(B, A, group=False, video=False, host=A,
+                               session_id=direct.id)
+alice.call, alice.api._features["rooms"] = direct, True
+
+
+def menu_words():
+    """The rows of the menu on top, as they read; then it goes."""
+    sheets = [v for v in M.Window.children if isinstance(v, M.MenuSheet)]
+    words = [w.text for w in sheets[0].walk()
+             if isinstance(w, M.Label)] if sheets else []
+    for view in sheets:
+        view.dismiss(animation=False)
+    return words
+
+
+direct.state = "active"
+alice.call_more()
+check("the 1-to-1 call's More offers Add someone once it is answered (a "
+      "1-to-1 call is never on the group call's screen)",
+      "Add someone" in menu_words())
+alice.set_blocked([D], True)
+alice.choose_call_addition()
+offered = menu_words()
+alice.set_blocked([D], False)
+check("...any of your contacts but the one on the call and the blocked",
+      "cara" in offered and "bob" not in offered and "dave" not in offered,
+      offered)
+with alice.store._lock:
+    alice.store._db.execute("UPDATE contacts SET caps = caps & ? WHERE "
+                            "address = ?", (~M.LocalStore.CAP_V18, B))
+    alice.store._db.commit()
+check("adding someone to a call with an app older than 18.0 says why not",
+      not alice.add_to_call(K) and not direct.ended)
+alice.store.add_caps(B, M.LocalStore.CAP_V18)
+moved = []
+alice.join_call = lambda session, state: moved.append(session)
+relay.mail.clear()
+check("adding cara: the 1-to-1 call ends, and a room grown from it is "
+      "joined, asking cara in", alice.add_to_call(K) and direct.ended and
+      len(moved) == 1 and moved[0].grew_from == direct.id and
+      moved[0].also == [K] and moved[0].joined)
+wait_for(lambda: relay.mail)
+end = seen(relay.mail[0])[2].get("ctl", {}) if relay.mail else {}
+check("...the other side is told the call ended",
+      end.get("op") == "end" and end.get("id") == direct.id)
+del alice.join_call
+alice.call = None
+relay.mail.clear()
+
+print("\n18.0: notes on calls")
+over = M.CallSession(B, A, group=False, video=False, host=A)
+over.stage, over.outcome, over.ended_at = "ended", "unanswered", time.time()
+for party, chat in ((alice, B), (bob, A)):
+    party.store.add_call_card(chat, M.card_of_session(over))
+alice.open_conversation(B)
+pump(alice)
+ascreen = alice.conversation_screen
+card = alice.__dict__["_cards"].get(over.id)
+check("a 1-to-1 call nobody answered offers Leave a note on its card",
+      card is not None and "leave a note" in [
+          w.text.lower() for w in card.walk() if isinstance(w, M.Btn)])
+row = alice.store.message_by_cid(B, over.id)
+ascreen.note_on_call(over, row)
+note = ascreen.take_reply()
+check("...which writes a reply to the call, by the call's id",
+      note == {"snip": "Voice call", "from": A, "kind": "call",
+               "cid": over.id})
+relay.mail.clear()
+alice.send_text(B, "Call me when you land", reply=note)
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+check("...and the other side finds it under the same call",
+      [m["body"] for m in bob.store.replies_to(A, over.id)] ==
+      ["Call me when you land"])
+alice.go_back_to_chats()
+
+met = M.new_group_call(gpeer, A, False)
+met.room, met.stage, met.ended_at = "ab" * 8, "ended", time.time()
+for party in (alice, bob):
+    party.store.add_call_card(gpeer, M.card_of_session(met))
+mrow = alice.store.message_by_cid(gpeer, met.id)
+relay.mail.clear()
+for text in ("Minutes are in the folder", "Next one Friday?"):
+    alice.send_text(gpeer, text, reply=ascreen._call_reply(met, mrow))
+alice.send_text(gpeer, "Unrelated chatter")
+members = len(alice.store.group(M.gid_of(gpeer))["members"])
+wait_for(lambda: len(relay.mail) >= 3 * (members - 1))   # each, to each
+deliver(relay, parties)
+check("a group call's notes are the replies to its card",
+      [m["body"] for m in bob.store.replies_to(gpeer, met.id)] ==
+      ["Minutes are in the folder", "Next one Friday?"])
+bob.open_conversation(gpeer)
+pump(bob)
+bscreen = bob.conversation_screen
+gcard = bob.__dict__["_cards"].get(met.id)
+check("its card says how many, as a way into them",
+      gcard is not None and "2 notes" in [w.text for w in gcard.walk()
+                                          if isinstance(w, M.Label)])
+brow = bob.store.message_by_cid(gpeer, met.id)
+bscreen.note_on_call(met, brow)
+pump(bob)
+shown = sorted(b.msg["body"] for b in bscreen._bubbles.values())
+check("opened, the chat shows the notes alone, under a bar back to it",
+      shown == ["Minutes are in the folder", "Next one Friday?"] and
+      bscreen.thread_bar.opacity == 1, shown)
+check("...and what is written there replies to the call",
+      bscreen.take_reply()["cid"] == met.id)
+bscreen.set_reply(next(m for m in bob.store.replies_to(gpeer, met.id)
+                       if m["body"] == "Next one Friday?"))
+bob.send_text(gpeer, "Friday works", reply=bscreen.take_reply())
+pump(bob)
+shown = sorted(b.msg["body"] for b in bscreen._bubbles.values())
+check("a note quoted there: the answer stays in the thread, one of the "
+      "call's notes", "Friday works" in shown and
+      len(bob.store.replies_to(gpeer, met.id)) == 3, shown)
+# Back closes the sheet on top first, and alice's and bob's apps share one
+# window here: what the join steps left open on hers goes now.
+for view in [v for v in M.Window.children if isinstance(v, M.ModalView)]:
+    view.dismiss(animation=False)
+wait_for(lambda: not any(isinstance(v, M.ModalView)
+                         for v in M.Window.children), 2)
+bob._on_keyboard(None, 27)
+pump(bob)
+check("Back closes the thread, not the chat: the whole chat is back",
+      "Unrelated chatter" in {b.msg["body"]
+                              for b in bscreen._bubbles.values()} and
+      bscreen.thread is None and bscreen.take_reply() is None and
+      bob.manager.current == "conversation",
+      (bscreen.thread is None, bob.manager.current,
+       [type(v).__name__ for v in M.Window.children]))
+bob.go_back_to_chats()
+
+print("\n18.0.1: a chat's messages in their order")
+# The relay numbers messages as they come, and the other side's chat shows
+# them in that order: what is written one after another goes so.
+words = [f"step {n} of 8" for n in range(1, 9)]
+relay.mail.clear()
+for text in words:
+    alice.send_text(bob.keys.address, text)
+wait_for(lambda: len(relay.mail) >= len(words))
+deliver(relay, parties)
+got = [r["body"] for r in bob.store.messages_for(alice.keys.address)][-8:]
+check("messages written one after another are in that order on the other "
+      "side", got == words, got)
+mine = [r["id"] for r in alice.store.messages_for(bob.keys.address)][-8:]
+alice.forward_messages(mine, [bob.keys.address])
+wait_for(lambda: len(relay.mail) >= len(words))
+deliver(relay, parties)
+got = [r["body"] for r in bob.store.messages_for(alice.keys.address)][-8:]
+check("...and so are several forwarded at once", got == words, got)
+last = alice.store.messages_for(bob.keys.address)[-1]
+for emoji in ("👍", "👍", "❤️"):          # given, taken back, another
+    alice.react(last["id"], emoji)
+wait_for(lambda: len(relay.mail) >= 3)
+deliver(relay, parties)
+given = bob.store.reactions_of(alice.keys.address, last["client_msg_id"],
+                               alice.keys.address)
+check("...and a chat's reactions: what was taken back at once stays so",
+      given == ["❤️"], given)
+
+print("\n18.1: away replies")
+# Settings › Away: a message in a chat with one person is answered with a
+# few words of the user's own. Every party here reads one prefs.json, so
+# while Away is on they are all away: what two away devices do to each
+# other is in every check below.
+ivy, jon = make_party("ivy", relay), make_party("jon", relay)
+I, J = ivy.keys.address, jon.keys.address
+parties.update({I: ivy, J: jon})
+ivy.store.upsert_contact(J, "jon", jon.keys.public_key_hex)
+jon.store.upsert_contact(I, "ivy", ivy.keys.public_key_hex)
+
+
+def autos(party, peer):
+    """The automatic replies in a party's chat `peer`: (direction, words)."""
+    return [(m["direction"], m["body"])
+            for m in party.store.messages_for(peer)
+            if M.message_ext(m).get("auto")]
+
+
+def hand_over():
+    """The relay's oldest message goes to the one it is for."""
+    if not wait_for(lambda: relay.mail):
+        return None
+    msg = relay.mail.pop(0)
+    parties[msg["recipient"]].worker._ingest_message(msg)
+    return msg
+
+
+def written(sender, to, text):
+    """`sender` writes in chat `to`, and it arrives. An automatic reply to
+    it arrives too: returned as the relay had it (None without one)."""
+    me, there = sender.keys.address, parties[to]
+    had = len(autos(there, me))
+    relay.mail.clear()
+    sender.send_text(to, text)
+    hand_over()
+    return hand_over() if len(autos(there, me)) > had else None
+
+
+def away_row(app):
+    """The chat list's reminder that Away is on, if it shows."""
+    return next((w for w in app.chats_screen.list.children
+                 if isinstance(w, M.ArchiveRow) and any(
+                     getattr(c, "text", "") == "Away replies are on"
+                     for c in w.children)), None)
+
+
+def away_switch(app):
+    """Settings › Away's switch, flipped as a tap does."""
+    app.open_settings()
+    next(w for w in app.settings_screen.away_card.walk(restrict=True)
+         if isinstance(w, M.ToggleSwitch)).flip()
+    app.close_settings()
+
+
+def away_sheet(app):
+    """Settings › Away › What the reply says, opened."""
+    app.settings_screen._edit_away()
+    return next(v for v in M.Window.children
+                if isinstance(v, M.TextPromptSheet))
+
+
+check("off: a message gets no reply",
+      M.away_since() == 0 and written(jon, I, "Are you there?") is None
+      and autos(ivy, J) == [])
+ivy.go_back_to_chats()
+away_switch(ivy)
+check("Settings › Away turns it on, and the chat list says that it is on",
+      M.away_since() > 0 and away_row(ivy) is not None)
+away_row(ivy).dispatch("on_release")
+check("...a tap on that opens Settings", ivy.manager.current == "settings")
+ivy.close_settings()
+
+usual = M.tr(M.AWAY_DEFAULT)
+env = written(jon, I, "Hello Ivy")
+check("on: a message is answered with the usual words",
+      autos(ivy, J) == [("out", usual)], autos(ivy, J))
+check("...the chat remembers when",
+      M.away_since() <= ivy.store.get_contact(J)["away_at"] <= time.time())
+check("...it goes out marked as an automatic reply",
+      env is not None and seen(env)[2].get("k") == "text"
+      and seen(env)[2].get("auto") == 1, env and seen(env)[2])
+check("...and an automatic reply is not answered by one",
+      autos(jon, I) == [("in", usual)], autos(jon, I))
+check("a second message soon after gets none",
+      written(jon, I, "One more thing") is None
+      and len(autos(ivy, J)) == 1)
+
+M.save_pref("away_since", time.time() - 2 * M.AWAY_EVERY)
+ivy.store.set_away_at(J, time.time() - M.AWAY_EVERY + 60)
+check("...nor one a minute short of four hours later",
+      written(jon, I, "Hello?") is None)
+ivy.store.set_away_at(J, time.time() - M.AWAY_EVERY - 1)
+check("...and one after four hours does",
+      written(jon, I, "Hello again") is not None
+      and len(autos(ivy, J)) == 2 == len(autos(jon, I)))
+
+ivy.open_settings()
+was = M.away_since()
+away_sheet(ivy)._save()
+check("the words, saved as they were, change nothing",
+      M.away_since() == was and written(jon, I, "Still there?") is None)
+box = away_sheet(ivy)
+box.entry.text = "  Back on Monday.  "
+box._save()
+check("new words are kept, and every chat is due them",
+      M.away_words() == "Back on Monday."
+      and M.away_since() > ivy.store.get_contact(J)["away_at"]
+      and "Back on Monday." in [
+          w.hint.text for w in ivy.settings_screen.away_card.children
+          if isinstance(w, M.ListRow) and w.hint])
+ivy.close_settings()
+check("...the next message gets them",
+      written(jon, I, "And now?") is not None
+      and autos(jon, I)[-1] == ("in", "Back on Monday."), autos(jon, I))
+
+ivy.store.set_away_at(J, 0)
+relay.mail.clear()
+club = jon.create_group("Away Club", [I])
+hand_over()                                         # the invitation
+jon.send_text(club, "Anyone about?")
+hand_over()
+check("a group's messages get none, nor does an invitation to one",
+      ivy.store.messages_for(club)[-1]["body"] == "Anyone about?"
+      and autos(ivy, club) == [] and len(autos(ivy, J)) == 3,
+      (autos(ivy, club), autos(ivy, J)))
+
+alice.store.upsert_contact(I, "ivy", ivy.keys.public_key_hex)
+check("a request gets none: a reply would accept it",
+      written(alice, I, "Hello, is this Ivy?") is None
+      and ivy.store.is_request(A) and autos(ivy, A) == [])
+relay.mail.clear()
+ivy.accept_request(A)
+hand_over()                                         # "accepted"
+pump(ivy)
+check("...and once accepted, it does",
+      written(alice, I, "Thank you!") is not None
+      and autos(alice, I) == [("in", "Back on Monday.")], autos(alice, I))
+check("none to notes to self, nor to someone unknown",
+      ivy.away_reply(I, None) is None and ivy.away_reply(B, None) is None)
+check("the mark is kept only as a plain yes",
+      M.sanitize_ext({"auto": 1}).get("auto") == 1
+      == M.sanitize_ext({"auto": True}).get("auto")
+      and not any("auto" in M.sanitize_ext({"auto": v})
+                  for v in (0, 2, "1", [1], None)))
+M.save_pref("away_text", 7)
+check("words that are not words are not sent: the usual ones are",
+      M.away_words() == usual)
+M.save_pref("away_text", "y" * 300)
+check("...and long ones are cut", M.away_words() == "y" * M.AWAY_MAX)
+M.save_pref("away_text", "Back on Monday.")
+
+notes = []
+for app, peer in ((ivy, J), (jon, I)):
+    app.open_conversation(peer)
+    pump(app)
+    wait_for(lambda: app.conversation_screen._bubbles)
+    notes.append([getattr(b.fwd, "text", None)
+                  for b in app.conversation_screen._bubbles.values()
+                  if M.message_ext(b.msg).get("auto")])
+    app.go_back_to_chats()
+check("both sides' chats say which messages are automatic replies",
+      all(n and set(n) == {"Automatic reply"} for n in notes), notes)
+
+# The background service's app (the phone, with Ferritext closed) answers
+# too, and the app sees that it has when it is opened again.
+svc = M.HeadlessApp(ivy.keys)
+svc.api = StubApi(relay, ivy.keys)
+svc.worker = M.SyncWorker(svc)
+parties[I] = svc
+ivy.store.set_away_at(J, 0)
+env = written(jon, I, "Is your phone on?")
+parties[I] = ivy
+check("the background service answers as the app does, once between them",
+      env is not None and seen(env)[2].get("auto") == 1
+      and written(jon, I, "Good.") is None)
+svc.close()
+
+ivy.store.set_away_at(J, 0)
+away_switch(ivy)
+check("off again: the reminder goes, and so do the replies",
+      M.away_since() == 0 and away_row(ivy) is None
+      and written(jon, I, "Welcome back") is None)
+M.save_pref("away_text", "")
 
 print("\nIdentity rename")
 old_user = alice.keys.username

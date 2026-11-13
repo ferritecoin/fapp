@@ -8,13 +8,15 @@ the loop. This is the desktop equivalent of "does it survive initial launch".
 import os, sys, tempfile, traceback
 
 os.environ.setdefault("KIVY_WINDOW", "sdl2")
-os.environ.setdefault("SDL_VIDEODRIVER", "x11")
+if sys.platform.startswith("linux"):     # xvfb-run's X display
+    os.environ.setdefault("SDL_VIDEODRIVER", "x11")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 os.environ.setdefault("KIVY_AUDIO", "sdl2")
 os.environ.setdefault("KIVY_NO_ARGS", "1")
 os.environ["KIVY_NO_CONSOLELOG"] = "1"
 HOME = tempfile.mkdtemp(prefix="fext-desktop-")
 os.environ["HOME"] = HOME                         # a FRESH install
+os.environ["USERPROFILE"] = HOME                 # Path.home() on Windows
 os.environ["FEXT_LANG"] = "en"          # the English the checks read
 
 CLIENT = sys.argv[1]

@@ -27,8 +27,10 @@ import wave
 
 os.environ.setdefault("KIVY_NO_ARGS", "1")
 os.environ["KIVY_NO_CONSOLELOG"] = "1"
-os.environ.setdefault("SDL_VIDEODRIVER", "x11")
+if sys.platform.startswith("linux"):     # xvfb-run's X display
+    os.environ.setdefault("SDL_VIDEODRIVER", "x11")
 os.environ["HOME"] = tempfile.mkdtemp(prefix="fext-composer-")
+os.environ["USERPROFILE"] = os.environ["HOME"]   # Path.home() on Windows
 os.environ["FEXT_LANG"] = "en"          # the English the checks read
 os.environ["FEXT_SERVER_HOST"] = "127.0.0.1:1"
 os.environ.pop("FEXT_THEME", None)
@@ -76,6 +78,7 @@ M.SplashOverlay.HOLD = 0.2
 app = M.FextApp()
 SENT = {}
 OPENED = []
+REAL_CHOOSER = M.ImageChooserModal       # click_attach stands in for it
 
 # A capture command that "records" a 440 Hz tone in real time, and one that
 # finds no microphone and exits at once.
@@ -142,21 +145,31 @@ STEPS = []
 
 
 def step(fn, delay=0.4):
+    """A step, then `delay` seconds. A step that returns False is not
+    ready yet: it runs again every 0.2 s, for 10 s at the most, and then
+    counts as a failed check."""
     STEPS.append((fn, delay))
 
 
-def run(i=0):
+def run(i=0, tries=0):
     if i >= len(STEPS):
         finish()
         return
     fn, delay = STEPS[i]
     try:
-        fn()
+        ready = fn() is not False
     except Exception as exc:
         import traceback
         traceback.print_exc()
         check(f"step {i} ({getattr(fn, '__name__', '?')}) ran", False,
               f"{type(exc).__name__}: {exc}")
+        ready = True
+    if not ready and tries < 50:
+        Clock.schedule_once(lambda _dt: run(i, tries + 1), 0.2)
+        return
+    if not ready:                   # its checks never ran: say so
+        check(f"step {i} ({getattr(fn, '__name__', '?')}) was ready in "
+              "10 s", False)
     Clock.schedule_once(lambda _dt: run(i + 1), delay)
 
 
@@ -452,6 +465,13 @@ def hold_start():
     press(screen().action_button)
 
 
+def hold_heard():
+    """Held until there is a second of sound, not for a fixed time: the
+    tone's process starts late on a slow computer (run 7, Windows)."""
+    s = screen()
+    return s.recorder is None or s.recorder.elapsed_ms >= 1000
+
+
 def hold_release():
     s = screen()
     check("holding the microphone records, red under the finger, with "
@@ -523,7 +543,8 @@ def hold_locked_sent():
 
 
 step(record_silent_check, 0.2)
-step(hold_start, 1.4)
+step(hold_start, 0.2)
+step(hold_heard, 0.1)
 step(hold_release, 0.6)
 step(hold_sent, 0.9)
 step(hold_cancel, 0.5)
@@ -533,6 +554,67 @@ step(hold_locked, 0.8)
 step(hold_paused, 0.8)
 step(hold_resumed, 0.6)
 step(hold_locked_sent, 0.4)
+
+
+def call_hold_start():
+    print("\nA call while recording (18.1)")
+    SENT.clear()
+    press(screen().action_button)
+
+
+def call_while_held():
+    s = screen()
+    if s.recorder is None or s.recorder.elapsed_ms < 1000:
+        return False                 # a second of it (0.7 s is the least)
+    HOLD["rec"] = s.recorder
+    s.app._call_begins()
+    check("a call that begins while a voice message is held down pauses "
+          "it, hands-free, with delete and send: nothing is sent",
+          s.recorder is HOLD["rec"] and s._rec_locked and
+          s.recorder.paused and s.rec_send.parent is s.composer and
+          s.rec_pause.icon == "mic" and not SENT.get("voice"))
+    release()
+    HOLD["paused_at"] = s.recorder.elapsed_ms
+
+
+def call_kept():
+    s = screen()
+    check("...lifting the finger sends nothing, and its clock holds "
+          "still: it is never sent by itself at its limit",
+          s.recorder is HOLD["rec"] and not SENT.get("voice") and
+          s.recorder.elapsed_ms == HOLD["paused_at"],
+          str((s.recorder and s.recorder.elapsed_ms, HOLD["paused_at"])))
+    x, y = centre(s.rec_send)
+    click(x, y)
+
+
+def call_kept_sent():
+    got = SENT.get("voice")
+    check("...after the call, Send sends what was recorded before it",
+          got is not None and 1000 <= got[1] <= HOLD["paused_at"] + 100,
+          str(got and got[1]))
+    SENT.clear()
+    app._pending_status = ("", None)
+    screen().start_recording()               # hands-free
+    screen().recorder.can_pause = False      # as Android 6's recorder
+
+
+def call_no_pause():
+    s = screen()
+    s.app._call_begins()
+    check("...where a recording cannot pause (Android 6) it is deleted, "
+          "and that is said: nothing goes out by itself",
+          s.recorder is None and not SENT.get("voice") and
+          s.entry.parent is s.composer and
+          app._pending_status[0] == "Recording deleted: a call began",
+          str(app._pending_status))
+
+
+step(call_hold_start, 0.2)
+step(call_while_held, 0.6)
+step(call_kept, 0.6)
+step(call_kept_sent, 0.6)
+step(call_no_pause, 0.3)
 
 
 class FakeCameraView(KivyImage):
@@ -625,6 +707,7 @@ def icons():
     names |= set(re.findall(r'(?:set_icon|morph|show_icon)\(\s*"([a-z_]+)"',
                             src))
     names |= set(re.findall(r'key\("([a-z_]+)"', src))
+    names |= set(re.findall(r'ListRow\(\s*"([a-z_]+)"', src))   # 18.1
     names |= {"mic", "send", "smile", "keyboard"}
     # Every name must draw something: compare against an unknown one.
     blank = M.offscreen_texture(("test", "blank"), 40, 40, lambda k: None)
@@ -654,6 +737,185 @@ def icons():
 
 
 step(icons, 0.2)
+
+
+def chooser_short_window():
+    print("\nA file chooser on a resized window (16.0)")
+    CHOOSER["was"] = tuple(Window.size)
+    # The app's own list, as Linux and a Mac show it (and Windows, where
+    # its own dialog will not open).
+    M.IS_WINDOWS = False
+    CHOOSER["sheet"] = REAL_CHOOSER(lambda path: None)
+    CHOOSER["sheet"].open(animation=False)
+    Window.size = (dp(360), dp(560))
+
+
+CHOOSER = {}
+step(chooser_short_window, 1.0)
+
+
+def chooser_fits():
+    sheet = CHOOSER["sheet"]
+    buttons = sheet.body.children[0]              # the last row: its buttons
+    bottom = buttons.to_window(buttons.x, buttons.y)[1]
+    check("on a short window its list gives way, and its buttons stay in "
+          "view", sheet.scroller.height >= sheet.body.height - 1 and
+          bottom >= 0 and sheet.chooser.height < dp(360),
+          f"scroller {sheet.scroller.height:.0f}, body "
+          f"{sheet.body.height:.0f}, list {sheet.chooser.height:.0f}")
+    CHOOSER["short"] = sheet.chooser.height
+    # Taller again, but not the app's own 820 dp: Windows' runner has a
+    # 768-pixel screen, and a window cannot be taller (run 7).
+    Window.size = (dp(420), dp(680))
+
+
+step(chooser_fits, 1.0)
+
+
+def chooser_drag_on():
+    """A person's drag gives the window one size after another. On Windows
+    the first, asked for here, reaches the sheet before the window's own
+    height has changed (Kivy reads that from the drawing surface, which
+    follows once the system has resized the window): the next one finds
+    it changed (runs 7, 8 and 10: the list kept its short height)."""
+    Window.size = (dp(421), dp(680))
+
+
+step(chooser_drag_on, 0.5)
+
+
+def chooser_grows_back():
+    sheet = CHOOSER["sheet"]
+    # Back to its 360 dp, or to all the room a sheet has (90% of the
+    # window), where the window is too short for that.
+    whole = abs(sheet.chooser.height - dp(360)) < 1 or \
+        abs(sheet.height - Window.height * 0.9) < 1
+    check("...and grows back when the window does",
+          sheet.chooser.height > CHOOSER["short"] + 1 and whole,
+          f"list {sheet.chooser.height:.0f} (short {CHOOSER['short']:.0f}), "
+          f"sheet {sheet.height:.0f} in {tuple(Window.size)}")
+    sheet.dismiss(animation=False)
+    Window.size = CHOOSER["was"]
+
+
+step(chooser_grows_back, 0.3)
+
+# ---- 18.1: on Windows, Windows' own Open dialog ------------------------------
+import ctypes                                                 # noqa: E402
+
+DIALOG = {"picked": [], "title": f"Ferritext check {os.getpid()}"}
+
+
+def dialog_asks():
+    """What Windows is handed, read back from the structure itself."""
+    seen = {}
+
+    def windows(pointer):
+        box = pointer._obj
+        if "kinds" not in seen:            # the first call's, 25 long
+            seen["kinds"] = ctypes.wstring_at(box.lpstrFilter, 25)
+        seen["title"], seen["flags"] = box.lpstrTitle, box.Flags
+        seen["room"], seen["start"] = box.nMaxFile, box.lpstrInitialDir
+        path = ctypes.create_unicode_buffer("C:\\photos\\a b.png")
+        ctypes.memmove(box.lpstrFile, path, ctypes.sizeof(path))
+        return seen.get("answer", 1)
+
+    got = M.windows_open_dialog("Send a photo", ["*.jpg", "*.png"],
+                                "C:\\photos", ask=windows)
+    check("Windows' Open dialog is asked for the kinds of file by name "
+          "and pattern, under the sheet's title, in the folder given, for "
+          "a file that exists; the one chosen comes back",
+          got == "C:\\photos\\a b.png" and
+          seen["kinds"] == "*.jpg;*.png\0*.jpg;*.png\0\0" and
+          seen["title"] == "Send a photo" and seen["start"] == "C:\\photos"
+          and seen["flags"] & 0x1000 and seen["flags"] & 0x80000 and
+          seen["room"] == 32768, (got, seen))
+    seen["answer"] = 0
+    check("...closed without a choice, nothing comes back",
+          M.windows_open_dialog("Send a photo", ["*.png"],
+                                ask=windows) is None)
+
+
+step(dialog_asks, 0.1)
+
+
+def dialog_in_place():
+    """As on Windows: the sheet's open() goes to Windows' dialog."""
+    DIALOG["real"] = M.IS_WINDOWS, M.windows_open_dialog
+    M.IS_WINDOWS = True
+    M.windows_open_dialog = lambda title, kinds, start="", owner=None: \
+        DIALOG.setdefault("asked", (title, kinds)) and "C:\\photos\\a.png"
+    REAL_CHOOSER(DIALOG["picked"].append, title="Their code").open()
+
+
+step(dialog_in_place, 0.6)
+
+
+def dialog_picked():
+    check("on Windows a photo is chosen in Windows' own dialog, not the "
+          "app's list: no sheet opens, and the file comes back to the app "
+          "on its own thread",
+          DIALOG["picked"] == ["C:\\photos\\a.png"] and
+          DIALOG["asked"] == ("Their code", REAL_CHOOSER.KINDS) and
+          not any(isinstance(w, REAL_CHOOSER) for w in Window.children),
+          (DIALOG["picked"], DIALOG.get("asked")))
+
+    def broken(title, kinds, start="", owner=None):
+        raise OSError("no dialog here")
+    M.windows_open_dialog = broken
+    REAL_CHOOSER(DIALOG["picked"].append).open()
+
+
+step(dialog_picked, 0.6)
+
+
+def dialog_falls_back():
+    sheets = [w for w in Window.children if isinstance(w, REAL_CHOOSER)]
+    check("...and where Windows' dialog will not open, the app's own list "
+          "does", len(sheets) == 1 and len(DIALOG["picked"]) == 1)
+    for sheet in sheets:
+        sheet.dismiss(animation=False)
+    M.IS_WINDOWS, M.windows_open_dialog = DIALOG["real"]
+
+
+step(dialog_falls_back, 0.3)
+
+if sys.platform == "win32":
+    # The real one, on Windows itself: it opens under its title over the
+    # app's window, and closed, gives nothing back.
+    USER32 = ctypes.windll.user32
+    USER32.FindWindowW.restype = ctypes.c_void_p
+    USER32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+    USER32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                    ctypes.c_size_t, ctypes.c_size_t]
+
+    def real_dialog_opens():
+        DIALOG["gave"] = []
+        DIALOG["thread"] = threading.Thread(
+            target=lambda: DIALOG["gave"].append(M.windows_open_dialog(
+                DIALOG["title"], ["*.png"], tempfile.gettempdir(),
+                Window.get_window_info().window)), daemon=True)
+        DIALOG["thread"].start()
+
+    def real_dialog_shown():
+        found = USER32.FindWindowW("#32770", DIALOG["title"])
+        if not found and DIALOG["thread"].is_alive():
+            return False                       # not up yet: asked again
+        check("Windows itself: its Open dialog opens under the title "
+              "asked for, while the app goes on", bool(found),
+              DIALOG["gave"])
+        if found:
+            USER32.PostMessageW(found, 0x0010, 0, 0)          # WM_CLOSE
+
+    def real_dialog_closed():
+        if DIALOG["thread"].is_alive():
+            return False
+        check("...and closed without a choice, it gives nothing back",
+              DIALOG["gave"] == [None], DIALOG["gave"])
+
+    step(real_dialog_opens, 1.0)
+    step(real_dialog_shown, 0.5)
+    step(real_dialog_closed, 0.3)
 
 
 def finish():

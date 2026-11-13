@@ -8,8 +8,10 @@ option for either of these.
   service whose manifest entry has no android:foregroundServiceType. The
   sync service is 'dataSync' (fetch data / sync work); the call service is
   'microphone', which is what lets a call's microphone stay on while the
-  app is off screen. Their permissions, FOREGROUND_SERVICE_DATA_SYNC and
-  FOREGROUND_SERVICE_MICROPHONE, are requested in buildozer.spec.
+  app is off screen; 18.0's share service is 'mediaProjection', which
+  Android wants running while the screen is shared. Their permissions,
+  FOREGROUND_SERVICE_DATA_SYNC, FOREGROUND_SERVICE_MICROPHONE and
+  FOREGROUND_SERVICE_MEDIA_PROJECTION, are requested in buildozer.spec.
 
 * The FileProvider through which the camera app hands over a photo: it
   writes straight into the app's private cache (android_take_photo in
@@ -21,12 +23,16 @@ option for either of these.
   reply typed into it, Mark as read, Decline on a call — which hands each
   to the app as a small file (android/NotifyReceiver.java). Not
   exported: only the app's own notifications can reach it.
+
+* 17.2: the app's activity may shrink to picture in picture (a video
+  call over other apps, main.py: android_pip).
 """
 import re
 from pathlib import Path
 
 SERVICE_TYPES = {"ServiceFextsync": "dataSync",
-                 "ServiceFextcall": "microphone"}
+                 "ServiceFextcall": "microphone",
+                 "ServiceFextshare": "mediaProjection"}
 
 PROVIDER = """
         <provider android:name="androidx.core.content.FileProvider"
@@ -85,10 +91,24 @@ def declare_notify_receiver(text: str) -> str:
     return text.replace("</application>", RECEIVER + "    </application>")
 
 
+def declare_picture_in_picture(text: str) -> str:
+    if "android:supportsPictureInPicture" in text:
+        return text
+    text, count = re.subn(
+        r'(<activity\s+android:name="org\.kivy\.android\.PythonActivity")',
+        r'\1 android:supportsPictureInPicture="true"'
+        r' android:resizeableActivity="true"', text)
+    if count != 1:
+        raise RuntimeError(f"p4a_hook: expected one PythonActivity, found "
+                           f"{count} — a video call could not float")
+    print("p4a_hook: the activity may go to picture in picture")
+    return text
+
+
 def before_apk_assemble(toolchain):
     manifest = Path("src/main/AndroidManifest.xml")
     text = manifest.read_text(encoding="utf-8")
-    new = declare_notify_receiver(
-        declare_file_provider(declare_service_types(text)))
+    new = declare_picture_in_picture(declare_notify_receiver(
+        declare_file_provider(declare_service_types(text))))
     if new != text:
         manifest.write_text(new, encoding="utf-8")

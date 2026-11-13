@@ -9,8 +9,8 @@ on Windows, macOS and Linux.
 Its security model is transparency: no plaintext ever leaves the device.
 Messages are signed (secp256k1 ECDSA), sealed (ephemeral ECDH, with ML-KEM-768
 once the recipient's post-quantum key is known → HKDF-SHA256 → AES-256-GCM),
-and only opaque ciphertext is transmitted. Photos and voice notes
-are sealed with a fresh key per file before they are uploaded.
+and only opaque ciphertext is transmitted. Photos, voice notes and video
+messages are sealed with a fresh key per file before they are uploaded.
 
 The Android application id stays `org.fext.fext` (`package.domain` +
 `package.name`), and the identity/QR payload keeps its original `FEXT` tag:
@@ -22,13 +22,13 @@ same key (see [Release signing](#release-signing)).
 
 Every push to the default branch is tested and built, and each new version is
 published to a GitHub Release, whose files never change afterwards. Open the
-**Releases** page (or the **`v15.1.1`** tag) and take:
+**Releases** page (or the **`v18.1.0`** tag) and take:
 
 | Asset | For |
 | --- | --- |
-| `Ferritext-15.1.1.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r` |
-| `Ferritext-15.1.1-windows.exe` | Windows 10 and 11 (64-bit) — the same app in one file, with nothing to install. Windows may say that it does not know the publisher: choose *More info*, then *Run anyway*. |
-| `Ferritext-15.1.1-desktop.py` | Windows / macOS / Linux — one file with its fonts and icons inside. Run it with Python 3.11+ after `pip install kivy requests websocket-client cryptography qrcode pillow`. |
+| `Ferritext-18.1.0.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r`. Calls need Android 6 or later |
+| `Ferritext-18.1.0-windows.exe` | Windows 10 and 11 (64-bit) — the same app in one file, with nothing to install. Windows may say that it does not know the publisher: choose *More info*, then *Run anyway*. |
+| `Ferritext-18.1.0-desktop.py` | Windows / macOS / Linux — one file with its fonts and icons inside. Run it with Python 3.11+ after `pip install kivy requests websocket-client cryptography qrcode pillow`. |
 
 Each Actions run keeps them for a week too: the APK and the desktop file as
 the **`ferritext-release`** artifact, the executable as
@@ -44,8 +44,9 @@ nothing breaks without it. The Windows executable has them inside already
 | Opus — `apt install libopus0`, `brew install opus`, or `pip install pyogg` (Windows) | calls in Opus: clearer, on about half the data |
 | `pip install sounddevice` | the best call audio, and choosing the microphone and speaker |
 | `pip install numpy` | voice notes at 1.5× and 2× |
-| `pip install av` (or the `ffmpeg` program) | playing voice notes recorded on a phone |
+| `pip install av` | video calls: the camera, sharing the screen, recording a call (17.0); recording video messages, and playing them in the chat (18.1); playing voice notes recorded on a phone (the `ffmpeg` program plays those too) |
 | `pip install opencv-python` (or `pyzbar`) | reading a contact's QR code from a picture |
+| `pip install coincurve` | sealing and opening each message several times faster (libsecp256k1, 16.0) |
 
 **For China**, where GitHub's downloads are not dependable and WeChat
 renames an APK so that it will not install, give people a download page
@@ -56,12 +57,431 @@ QR code of the page's address, and the steps to install the app and keep
 it running.
 
 ```bash
-python3 tools/download_page.py Ferritext-15.1.1.apk site/ \
+python3 tools/download_page.py Ferritext-18.1.0.apk site/ \
     --url https://your.host/ferritext/        # then serve site/ there
 ```
 
 Relay 12.2.1 and later can serve the page too, at `/download/` on the
 relay's own address: whoever can reach the relay can reach it.
+
+## What's in 18.1.0
+
+- **Video messages**: the camera key beside the message field offers
+  *Record a video message*: up to a minute, with sound, sent sealed as
+  a photo is and played in its bubble. Nothing is recorded out of
+  sight: a recording stops where it is when you leave the app or a call
+  begins, and waits for *Send* or *Delete*.
+- **Away replies** (*Settings › Away*): someone who writes to you gets
+  your words back, once a chat every four hours, never in a group.
+  Nothing reads their message to answer it: the reply is a sentence of
+  yours, sent by this device while it receives messages.
+- **Where you are, in calls**: a phone that is called gives away no
+  network address until it is answered, and *Settings › Privacy › Hide
+  my location in calls* keeps every call on the relay.
+- **Calls catch up sooner**: a call's first moments go through the
+  relay, and its extra delay is now given back in the pauses between
+  words, about four seconds sooner with a distant relay.
+- Taking a photo asks for the camera permission first, as Android
+  requires of an app that declares it: a phone that had never made a
+  video call could not open its camera for a photo.
+- A call that begins pauses a voice message you are recording, which
+  then waits for *Send* or *Delete*: before, one recorded hands-free
+  went on through the call and was sent by itself after five minutes.
+- A call answered the moment it arrives is heard: the one called could
+  be left silent, the microphone shown on but never opened.
+- Going back and opening the same chat again at once no longer leaves
+  an empty page.
+- **Lists fade at their edges** where there is more to scroll to, in the
+  chat list and in a chat; *Settings › Appearance › Fade the edges of
+  lists* turns it off.
+- **Quicker with many chats**: the chat list shows its first screenful at
+  once and the rest just after, so the app opens and changes theme
+  several times faster; a message arriving in a long chat no longer
+  moves every message above it, and is drawn three times as fast.
+- **A message that cannot be read no longer stops the ones behind it.**
+  A malformed message could end the connection each time it arrived,
+  so nothing after it came, in every version before this one. It is
+  now shown as a message that could not be read, and the rest arrive.
+  Updating is recommended for this alone.
+- Text is shown as written: a group's name or a line in a call's chat
+  that looked like formatting could close the app.
+- **Back on a phone** goes back in one press when the keyboard has just
+  closed; before, that press was spent on the message field.
+- **The lock screen** no longer shows *Ready for new messages* all the
+  time: the notification that keeps messages arriving is silent, and
+  hidden while the phone is locked.
+- **Video calls on a phone, the right way up**: the picture follows how
+  the phone is held. Before, it could arrive on its side and squeezed.
+- **Less delay in calls on a phone**: sound waits 40 ms to be played
+  instead of all the phone would hold, and a picture that arrives late
+  is skipped instead of queued. A phone asks for 360 lines of a camera.
+- **A call to someone who has not accepted your chat request** shows
+  them a missed call under *Message requests*. Nothing rings.
+- **One identity on several devices**: each device rings, the one that
+  answers has the call, and the others say *Answered on another
+  device*. Set a second device up from a backup, not from the private
+  key alone: a backup carries the identity's post-quantum key too.
+- **On Windows**, a photo or a chat to import is chosen in Windows' own
+  Open dialog.
+
+## What's in 18.0.2
+
+18.0.1's, and one more from the emulators:
+
+- Sharing your screen from a slow phone no longer gives up while Android
+  is still starting the share: the app waits up to 20 seconds for it,
+  where it waited 6, which an emulator on a busy machine overran.
+
+## What's in 18.0.1
+
+18.0.0's features, with what the emulators (Android 5, 11 and 16) and the
+Windows and Ubuntu runners found in it:
+
+- Messages sent one after another, or several forwarded at once, arrive
+  in the order you sent them; before, a quick burst could arrive
+  shuffled. Edits, reactions and deletes keep their order too.
+- A theme switch that cannot be read no longer changes the theme: a
+  phone whose dark setting could not be read once switched to dark,
+  rebuilt every screen and closed whatever sheet was open, then switched
+  back four seconds later.
+- On Windows, a setting changed while the app is busy is no longer lost:
+  the app's own threads read the settings file as it was being
+  replaced, which Windows refuses.
+- The debug build's self-test skips a call's checks on Android 5, where
+  calls are off, and the device checks wait out a just-booted emulator.
+
+## What's in 18.0.0
+
+- **A group's admins**: its owner can make other members admins, each
+  with rights of their own (*Group › a member › Make … an admin*): to
+  change the group's name, photo and timer, add members, remove them,
+  set what members can do, manage topics, delete members' messages, and
+  make admins of their own. The group's page marks the owner and each
+  admin, and an admin sees which rights they have. Leaving, the owner
+  hands the group to their first other admin.
+- **The admin log** (*Group › Admin log*): who changed what, newest
+  first, the last fifty changes. It travels in the group's own state,
+  as its members do, so it needs no relay.
+- **An admin deletes members' messages for everyone**, whatever their
+  age (with that right); the admin log says who did.
+- **A link for anyone** (*Group › Invite with a link*; in a call you host,
+  *More › Invite with a link*): whoever opens it asks to join, as
+  whichever of their identities they choose, and you let each one in or
+  not (*Asking to join*). The link carries no key and no token: nobody
+  gets in by holding it. *Stop the link* ends it. *New conversation ›
+  Join with a link* opens one sent to you.
+- **One more person into a 1-to-1 call** (*More › Add someone*): the call
+  becomes a group call on the relay. The other side comes along by
+  itself, and the one you add is asked in.
+- **Notes on a call**: *Leave a note* on a 1-to-1 call nobody answered
+  writes a reply to its card. A group call's card counts its notes and
+  opens them as a thread of their own: what you write there goes to that
+  call, and Back returns to the whole chat.
+- **A phone's screen in a call** (Android, *More › Share your screen*),
+  after Android's own question. Android shows that the screen is shared,
+  and its own *Stop* ends it.
+- Fixes found by the evaluation pass: a reply to a note stays in its
+  thread; a full group says it is full when you let someone in; two
+  admins changing a group at the same moment end the same on every phone,
+  apps before 18.0 included; only the link's maker can answer your ask
+  to join (anyone else holding the link could cancel it).
+
+## What's in 17.4.0
+
+- **What a group's members may do**, set by its admin (*Group › What
+  members can do*): sending messages, sending photos and voice messages,
+  and starting calls, each on or off for every member. The admin can
+  always do all three. Anyone can still join a call, react, and delete
+  their own messages.
+- **Restrict one member** (*Group › a member › Restrict*): their
+  messages, their photos and voice messages, or their new calls, for an
+  hour, a day, a week or with no end. Their chat tells them what is
+  stopped and until when; nobody else is told. The admin's page marks
+  them *Restricted*, and *Lift restriction* ends it.
+- These rules travel inside the group's own state, like its members and
+  name, so they need no relay. The restricted member's app keeps to them:
+  the composer gives way to a note saying until when, and the outbox
+  waits. Every other member's app also holds back what is sent anyway (by
+  an app older than 17.4, or before the rules arrived), judged by when the
+  relay took it. A message the relay took before a stop still arrives.
+- **Several calls in one group**: while calls go on, the call button
+  offers to join each of them, or to start another beside them (unless
+  the admin keeps new calls to themselves). The banner says how many are
+  going on.
+- **Topics** (*Group › Topics*): the admin divides a group into topics,
+  each a thread of its own beside General. A strip under the group's
+  name shows All, General and each topic, with a dot where
+  something is unread: the chat marks read only the topic it shows. A
+  message goes to the topic shown, or to its original's topic for a
+  reply. Under *All*, each message names its topic beside its author. A
+  closed topic takes new messages from the admin alone. **Turning topics
+  off loses nothing**: every message shows in the one chat with its topic
+  named, and turning them on again brings each topic back with its
+  messages.
+- An app before 17.4 ignores the rules and the topics. It sees one chat,
+  writes to General, and is not stopped by the rules, but what it sends
+  against them is held back by 17.4 apps.
+- **ARCHITECTURE_client.md**: how the app is built, for whoever works on
+  it next.
+
+## What's in 17.3.0
+
+- **Calls on Android 5.0 and 5.1 say why they cannot start**: the call
+  and video buttons say calls need Android 6 or later, where 17.2 started
+  a voice call that never connected and a video call that closed the
+  app. Messages and the rest work there as before.
+- **A phone's video coder that fails ends the video, not the app**: the
+  camera stops, the call says why, and the call goes on. Before, a fault
+  on the coder's own thread closed the app.
+- **React in a 1-to-1 call**: *More › React*, as in a group's call. The
+  emoji shows over your side of the call on both screens for four
+  seconds. It goes as its own sealed packet, sent three times in case one
+  is lost, and is shown once; an app before 17.3 ignores it.
+- **A notice from the relay's operator** (relay 13.4) opens once, in a
+  sheet of its own that says who it is from, and the app tells the relay
+  it was shown. The operator still cannot read your messages.
+- **What the relay's operator stopped, in words**: relay 13.4 can stop an
+  identity's messages to groups, its calls, its media or all its messages
+  for a time. The app says which and until when. A message waits in its
+  chat, with its clock, and goes when the stop ends, as any unsent one
+  does (by itself within a day, then at a tap); the outbox leaves it
+  until then instead of asking every 30 s. A call ends at once, saying
+  so. Messages to you still arrive.
+
+## What's in 17.2.1
+
+- **Windows: a setting saved at the wrong moment is no longer lost.**
+  Windows refuses to put a file in place while anything has it open
+  (another part of the app, or the virus scanner), and the app gave up at
+  once. It now waits a moment and tries again: settings, profile
+  pictures, backups (and automatic ones put in a folder), and its own
+  fonts and icons. The new Windows test environment found it.
+- **Android video: a picture the phone's decoder has no room for** counts
+  as a damaged one, so the call asks for a fresh key frame at once; before,
+  the pictures after it showed broken until the next key frame, up to
+  10 s later.
+- The emulators' self-test hands the camera's pictures to the decoder at
+  a call's pace and waits for the last ones (on Android 11 it had counted
+  12 of 24 back), and three in four must come back.
+- Device checks: Android 5.0's install, Windows' slower starts, its
+  smaller screen and its `bash`; a suite that stops early shows how in
+  the job's log.
+- **Known: calls do not work on Android 5.0 and 5.1** (a voice call
+  cannot start; a video call closes the app). Messages and the rest do.
+  The new Android 5 test environment found it; the next version
+  addresses it.
+
+## What's in 17.2.0
+
+- **A call's controls in three groups** on a computer: the devices (the
+  microphone and the camera, each with a ▾ for which one and its
+  settings; the screen), the call's own (*Raise*, *React*, *Chat*,
+  *More*), and *Leave* set apart, with a host's *End for everyone*. A
+  phone has one row: Microphone, Camera, Raise, Chat, More, Leave.
+  *More* holds the people, the view, recording, the call's details and
+  its timer, and the call's settings, so nothing needs leaving the call.
+- **A meter of the connection**: bars on the call's screen; a tap shows
+  the numbers (the delay there and back, the packets' length, what is
+  lost, the jitter, the picture's size and rate). Voice and video,
+  1-to-1 and groups.
+- **The best the connection allows, in group calls too**: while it is
+  very good, a group call's sound goes in 5 ms packets, played from 15 ms
+  in hand (a click through two apps: 36 ms, from 46), and the camera
+  climbs back to *Settings › Calls › Video quality*; while it is poor,
+  20 ms packets and a smaller picture.
+- **The lobby offers each device**: a phone's front or back camera; a
+  computer's cameras, microphones and speakers, each with an ⓘ that says
+  what it does (a tap, or the pointer).
+- **A call that floats**: leave the call's screen and it shrinks to a
+  small window you can drag over any chat; a tap brings it back. On
+  Android 8 and later, a video call goes into picture in picture when you
+  leave the app. On a wide screen your chats stay beside the call.
+- **React**: an emoji over your tile in a group call.
+- **Call waiting**: a call while you are in one rings softly in a bar
+  over your call: *Decline*, or *End and answer* (*Leave and answer* in a
+  group's call). Unanswered, it is a missed call, as before.
+- **Every identity rings**: a call for another identity on this device
+  rings with its name ("for @kgt03"), and answering switches to it. Its
+  bell in *Identities* keeps it quiet. Each one keeps its own connection
+  to its relay.
+- **A shared screen opens the focus view by itself**, unless you chose a
+  layout in that call, and the gallery comes back when it stops.
+- **Call links** for a group's members: *More › Copy the call's link*,
+  sent in any chat, opens the call's lobby for any member. The call's
+  key stays in the link's fragment, which the relay never sees.
+- **Send later**: hold *Send* (or right-click it) and choose a time. The
+  message waits in the chat with its clock and goes at that time, from
+  the app or Android's background service; until then *Send now* or
+  delete it.
+- **Plan a call** (the chat's ⋮ menu): a card with its time for everyone
+  in the chat, a reminder five minutes before, and *Join* on the card
+  from ten minutes before.
+- Recordings can go into backups: *Settings › Calls › Recordings in
+  backups* (off unless turned on).
+- A camera nobody shows is sent at its smallest size until it is shown;
+  the call's words stay readable over a light shared screen.
+- Android: the video decoder's class is found as a call opens, as 17.1
+  did for the others (an emulator's self-test found it missing).
+- Device checks: `.github/workflows/devices.yml` runs a debug APK's
+  self-test on Android emulators (5.0, 11 and 16) and the desktop suites
+  on Windows and Ubuntu, when started by hand (`tools/devices/`).
+
+## What's in 17.1.0
+
+- **Calls that ring.** A call's offer is timed by the relay's clock, which
+  both devices share: a phone whose clock was a minute off made each call
+  it placed a missed call on the other side, while it rang on for nothing.
+  An offer that does arrive too late is a missed call there, and the
+  caller's phone stops ringing at once. The relay's clock also signs this
+  app's requests, so a device with a wrong clock still connects.
+- **Sound and video on more phones.** A call's Android parts (CallAudio,
+  VideoCall) are found as the call opens: looked for from a call's own
+  thread, Android searched only the system's classes, and the call's sound
+  failed ("JVM … org.fext.call.CallAudio"); a phone could also be told it
+  "cannot code video". H.264 is always offered: every Android phone codes
+  it.
+- **Who called.** A 1-to-1 call's card sits on the caller's side of the
+  chat, with the caller's picture: "alex is calling" or "Calling alex…",
+  then "Missed voice call" in red, "Outgoing" or "Incoming". *Call back* (or
+  *Call again*) under a call that was not answered. An offer that never
+  rang here (this device in another call, or offline) leaves the same card.
+- **A voice call stays a voice call**: no camera in its lobby or on its
+  screen; a video call is chosen as one. A computer can still share its
+  screen.
+- **The presenter's face**: a shared screen shows its presenter's camera in
+  a corner, in a 1-to-1 call and on a group's stage (*Settings › Calls ›
+  Their face while they present*, on unless turned off).
+- **An incoming call you set aside** stays under the app bar on every
+  screen while it rings: tap to answer.
+- **Clearer**: "You can call alex once they accept your chat request or
+  write to you" (accepting a request now tells the other app, so calls
+  open both ways at once); "alex needs a newer Ferritext to take calls".
+  Calling another identity on this same device says why it cannot.
+- **Deleted User sooner**: once connected, the relay is asked after the
+  people of your newest chats, and after anyone whose chat you open (each
+  at most every six hours), not only when a message to them fails.
+- The app names its version to the relay ("Ferritext/17.1.0 (android;
+  Python 3.11)"), so the relay's console says which versions connect;
+  nothing that tells one person from another.
+
+## What's in 17.0.0
+
+- **Video calls.** A chat's header has a video button, left of the call
+  button: its lobby opens with your camera on, showing what the others
+  will see. A voice call can turn its camera on at any time. In a 1-to-1
+  call their picture fills the screen and yours sits in a corner (on a
+  phone, a tap on it turns to the other camera); the picture goes straight
+  between the two devices when it can, as the sound does. In a group's call
+  each camera is a tile of the gallery or the focus view.
+- **Share your screen** from a computer, as a tile of its own. Phones come
+  later; on Linux it needs X11 (Wayland lets no app read the screen).
+- **A picture that fits.** *Settings › Calls › Video quality*: 360p to 1080p
+  at 60 frames a second, 720p unless chosen; a computer also picks its
+  camera there. A picture is never sent larger than the other side shows it,
+  and steps down while packets are lost, its sound with it. In a group's
+  call each camera is sent in three sizes, and each member is passed only
+  the size its tile needs, nothing for a tile out of view or a call set
+  aside (relay 13.2 or later; an older relay's calls stay voice only).
+- **H.264 everywhere**; HEVC or AV1 when the sender codes it in hardware and
+  everyone in the call decodes it.
+- **Less delay:** *Settings › Calls › Prefer*. *Latency* (the default)
+  sends the sound in packets of 5 or 10 ms, 20 only while the connection
+  struggles; *Quality* sends 20 ms packets, which code speech best and use
+  the least data. Group calls follow it too (20 ms while anyone in the call
+  is on an app before 17.0).
+- **Record a call**, off unless turned on in *Settings › Calls*: a Record
+  button in calls; everyone in the call is told and sees a red mark while it
+  runs. The recording (the picture on your stage and every voice) is sealed
+  on this device as a backup is; *Settings › Calls › Recordings* plays it,
+  saves a plain copy or deletes it. Computers only, for now.
+- **Automatic backups**, off unless turned on in *Settings › Backup*: every
+  day, week or month, with or without photos and voice notes, to a folder
+  chosen once (on a phone, one the system's picker gives, a cloud drive
+  too); the last three are kept. The passphrase is asked once: this
+  device's keystore keeps the key, and each backup opens anywhere with the
+  passphrase.
+- **Delete for everyone** within three days of sending (editing stays 15
+  minutes); an older message is deleted only for you.
+- **An @ beside a group** in the chat list while a message that mentions
+  you is unread.
+- **While the app lock is on**, a notification says only the chat's name and
+  *New message*.
+- **Screen security on Windows** 10 (2004) and later, off unless turned on:
+  the window stays out of screenshots and screen sharing.
+- Video on a phone is coded by Android's own coders (`android/VideoCall.java`)
+  and waits for a phone to prove it.
+
+## What's in 16.2.0
+
+- **Group calls.** A group's chat has a call button: *Start call* opens a
+  lobby with your microphone and camera off, and nothing of yours is sent
+  until you join. The call shows in the chat as a card, live while it
+  lasts, then *Call ended* with its in-call chat folded under it; members
+  see a banner at the top of the chat and join from it. In the call:
+  gallery and focus views, raised hands in the order they went up, an
+  in-call chat, and who is speaking ringed. Sound goes through the relay
+  (relay 13.1 or later), sealed with a key only the call's members hold.
+  Video and screen sharing come in a later update.
+- **For the host:** *Mute everyone* and *Lower all hands* (each can turn
+  theirs back on), and *End call for everyone*.
+- **On a computer, keys as in Meet:** Ctrl+D the microphone, Ctrl+E the
+  camera, Ctrl+Alt+H the hand. Back sets a call aside under a bar that
+  says who is speaking, and leads back to it.
+- **Edit a message** within 15 minutes of sending it: hold it, then
+  *Edit*. It shows as edited on both sides (on apps from 16.2; older apps
+  keep the first words, and you are told when one will).
+- **Mentions in groups:** write @ and the start of a name. A muted group
+  still tells you when it mentions you.
+- **App lock:** *Settings › Privacy › App lock* asks for a code when the
+  app opens and when it comes back after the time you choose; on a phone
+  with one, a fingerprint or face opens it too. Phones offer it once
+  (*Maybe later* says no for now). It locks the screen; a backup's
+  passphrase seals the files.
+- **Screen security** on phones, on unless turned off: chats stay out of
+  screenshots, screen recordings and the app switcher.
+- **Backup reminders:** *Settings › Backup*: never, daily, weekly or
+  monthly.
+- **Experimental**, off unless turned on: a clipboard that forgets what
+  you copied a minute later, and a keyboard asked for no suggestions.
+- **A new version is said once** when the relay names one, and
+  *Settings › About* keeps saying it, with where to get it.
+- **A theme change shows in about a third of the time**, and a group
+  call's screen keeps up when the speaker changes often.
+
+## What's in 16.0.0
+
+- **Send and Call work on phones again.** A tap on Send was taken for the
+  start of holding the microphone, and sent nothing; the call button did
+  nothing at all. Both work by finger now, and holding the microphone
+  still records. Each finger is also one touch, where Android had made it
+  two.
+- **What your finger is on lights up**, in lists too, the moment you touch
+  it: release quickly, or hold, and it acts.
+- **Calls at 48 kHz in stereo**, between two phones or computers on 16.0:
+  *Settings › Calls › Call quality*, Standard, High or Ultra (96, 128 or
+  192 kbit/s; a call sends no more than the other side chose). With
+  *Adapt to the connection* on, packets shorten to 5 ms on a steady
+  connection, for less delay, and the bitrate steps down while packets are
+  lost. Each call's line in the chat now says how it went: its quality, the
+  way it took, the round trip and what was lost, on your device alone.
+  Calls with an older app are as before.
+- **A call that cannot be made says why**, in the chat, not only on the
+  chat list's line.
+- **Deleted User.** When the relay no longer knows someone (it was reset,
+  or they left it), their chat says so. What you write waits, with its
+  clock, and goes by itself once they are back.
+- **Backup and restore, tested end to end**, and three faults fixed: a
+  backup whose database was damaged no longer adds its identity before the
+  damage is found; on Android a large backup is read and written without
+  freezing the app; and a file the phone cannot read is said to be so.
+- **Messages sealed and opened several times faster** where libsecp256k1
+  is installed (the Windows executable has it), and post-quantum keys
+  about a quarter faster everywhere.
+- **On computers:** text is firmer on ordinary screens, and file choosers
+  fit a window made smaller. The Windows executable runs on Python 3.13,
+  with every package at a pinned, current version (Pillow 13).
+- **Pictures from elsewhere** are read as JPEG, PNG or WebP only, so no
+  other picture reader ever sees what someone sends.
 
 ## What's in 15.1.1
 
@@ -218,7 +638,11 @@ relay's own address: whoever can reach the relay can reach it.
   kept on your device, still sealed, unseen and unannounced, and their calls
   are refused. Unblock them and it all arrives, in order.
 - **Calls in Opus**, where both sides have it: clearer, on about half the
-  data, and losses concealed. **Bluetooth** headsets and a choice of where the
+  data, and losses concealed. Between 16.0 apps, **48 kHz stereo** at the
+  quality chosen in Settings (Standard, High or Ultra: 96, 128 or 192 kbit/s),
+  with packets that **adapt to the connection** — down to 5 ms on a steady
+  one — and a line under each call in the chat saying how it went, kept on
+  the device alone. **Bluetooth** headsets and a choice of where the
   sound goes; an **incoming-call screen** over the lock screen with Answer
   and Decline; a ringing tone for the caller; on a computer, echo cancelled
   by the system, and the microphone and speaker chosen in Settings.
@@ -387,6 +811,32 @@ upgraded in place delivers what was waiting for phones that were off, and
 phones reconnect by themselves. The one difference found is the lost tick
 that 15.1.1 fixes, which releases before it still show.
 
+**Video messages (18.1).** An app before 18.1 shows one as a text
+message with its words ("Video message (0:42)"), acknowledges it as
+any message, and takes a reply to one as a reply. Its file needs
+nothing new of the relay (a sealed blob, as a photo). 18.1 says it
+plays them in the features it sends with every message (bit 32).
+
+**With relay 13.4.** Its operator can send a notice and stop an
+identity sending (see What's in 17.3.0). An app before 17.3 ignores the
+notice (the relay keeps it until an app shows it: 17.3, once they
+update), and shows a stopped message as not sent yet, trying it again
+every 30 s until the stop ends. Nothing else changes for any app since
+9.1.2, and 17.3 talks to every earlier relay as 17.2 does.
+
+**With relay 13.5.** It changes only its operator's dashboard: every app
+talks to it as to 13.4. **Between 17.4 and older apps**, a group's rules
+and topics are ignored by the older app (see What's in 17.4.0); messages,
+calls and everything else pass as before.
+
+**With relay 13.6.** It adds its operator's explorer log and the relay's
+resources to the dashboard: every app talks to it as to 13.5. **Between
+18.0 and older apps**, an app before 18.0 follows the group's owner alone:
+another admin's change reaches it when the owner's app sends it on, at
+once. It does not take another admin's photo, timer or deletions. Links
+for anyone, notes and Add someone need 18.0 on both sides (Add someone
+says so); a note shows to an older app as a reply to the call.
+
 **With 14.0 and earlier.** Earlier releases read every 15.0 message: the
 post-quantum key in its signed block is ignored. 15.0 seals a message
 post-quantum only to someone whose key it holds, and only 15.0 sends one,
@@ -494,6 +944,18 @@ relay limits how many requests one connection may make a minute.
 Each copy has its own delivery and read receipt. The sender's ticks show the
 slowest member: two grey ticks once it is on every phone, two gold once
 everyone has read it.
+
+**What members may do (17.4).** The group's state, signed by its admin,
+also carries its rules: which of sending messages, sending photos and
+voice messages, and starting calls every member may do, and any one
+member's restriction with its end. Each app keeps to the rules for its own
+messages, and holds back a member's message that broke them, judged by
+the time the relay took it, so an older app cannot get round them.
+
+**Topics (17.4).** The state can also list the group's topics. A message
+names its topic inside its signed extension block; the relay still sees
+ordinary one-to-one traffic. Turned off, the list stays in the state and
+each message keeps its topic, so turning topics on again loses nothing.
 
 ## Type and themes
 
@@ -630,6 +1092,56 @@ arrives downloads by itself, except:
 Its small preview shows at once. A tap on mobile data asks first, unless
 *Ask before using mobile data* is off. Computers count as on Wi-Fi.
 
+### Video messages (18.1)
+
+The camera key beside the message field offers *Take a photo* or *Record
+a video message*. The sheet shows the camera, as a mirror; *Record*
+starts it, with sound, and *Send* sends it. A message is a minute at the
+most, and is sent by itself when the minute is up. *Delete* keeps
+nothing. Once it records, only *Delete* and *Send* close the sheet: a
+tap beside it, or Back, loses no recording. In the chat it is a bubble
+with its still picture, a play mark and its length: a tap plays it where
+it is, a second tap stops it. A note left on a call (*Leave a note*) can
+be one.
+
+- **What is sent**: one MP4 (H.264 at 480 lines and 24 pictures a
+  second, AAC sound: about 5.5 MB a minute), sealed and uploaded as a
+  photo is, under the same 8 MB limit; a recording ends by itself before
+  it would pass it. Where a relay takes smaller files, the sheet says
+  how long a message may be there. Its still picture, a JPEG under
+  16 kB, travels in the message, so the bubble shows before anything is
+  downloaded.
+- **Nothing is recorded unseen**: when the app leaves the screen, a call
+  begins on this device (it rings, is placed or joined) or the camera
+  fails or goes quiet, the recording stops where it is and the camera
+  and the microphone are let go. What was recorded waits for *Send* or
+  *Delete*. A call that begins also stops a message that was playing,
+  and pauses a voice message being recorded, which then waits for
+  *Send* or *Delete* too: it is never sent by itself (on Android 6,
+  which cannot pause a recording, it is deleted, and the app says so).
+- **Made the same way everywhere**: `main.py` writes and reads the MP4
+  in plain Python (`mp4_write`, `mp4_read`), from the pictures of a
+  call's camera and coder and the sound of the voice messages' recorder.
+  No Java was added. A received file is read before it is kept: one that
+  is not a video is not kept, and its bubble says so.
+- **Downloads**: by itself on Wi-Fi; on mobile data it waits for a tap
+  and says how large it is.
+- **Older apps** show a video message as its words, "Video message
+  (0:42)", and cannot play it. Until someone's app has shown it is 18.1,
+  the recording sheet says so.
+- **Where it runs**: recording needs what a video call needs (Android 6
+  or later, or a computer with PyAV and a camera), and waits while a
+  call is on. Where no video can be recorded the camera key takes a
+  photo at once, as before. A computer without PyAV opens a received
+  video in its own player. On a phone whose decoder does not open, the
+  sound plays over the still picture.
+
+Taking a photo now asks for the camera permission first. Since 17.0 the
+app declares that permission (video calls), and Android refuses the
+camera app to an app that declares it without holding it: on a phone
+that had never made a video call, *Take a photo* could not open the
+camera.
+
 ## Calls
 
 A call is set up with end-to-end messages, like everything else: an offer,
@@ -638,14 +1150,24 @@ pair for that call alone and the two agree a secret from them; the offer and
 the reply are signed and sealed, so not even the relay can put its own key
 in between, and from that secret comes one key for each direction.
 
-The sound travels as small UDP packets, 20 ms of 16 kHz speech each, every
-one sealed with AES-256-GCM and decodable on its own. Where both sides have
-it the codec is **Opus** at 24 kbit/s, with in-band FEC: a lost packet is
-rebuilt from the next one, or concealed. Otherwise (or with a 9.1.2 phone)
-it is IMA ADPCM, about 80 kbit/s each way, where a lost packet costs 20 ms
-and nothing more. A short buffer, growing only when the network is uneven,
-smooths out arrival. Android's Opus is libopus, built by the local recipe in
-`recipes/libopus`; a computer uses its system's.
+The sound travels as small UDP packets, every one sealed with AES-256-GCM
+and decodable on its own. Between two 16.0 apps (codec `opus48`) it is
+**Opus at 48 kHz in stereo**, at the lower of the two sides' Call quality
+(Standard 96, High 128, Ultra 192 kbit/s). The microphone is read in mono,
+for the echo cancelling, and carried in both channels. Each side says, in
+its answers to the other's pings, how many of the other's packets were lost
+and how unevenly they came; with *Adapt to the connection* on (the default),
+the sender then chooses every two seconds: packets of 5, 10, 20 or 40 ms —
+5 ms straight to the other device on a steady connection, 10 at the
+shortest through a relay that takes 150 packets a second from each side
+(13.0), 20 over the WebSocket — and a lower bitrate while packets are being
+lost, stepping back up once they are not. With an older app it is as
+before: 20 ms of 16 kHz speech a packet, **Opus** at 24 kbit/s with in-band
+FEC (a lost packet is rebuilt from the next one, or concealed), or else
+(and with a 9.1.2 phone) IMA ADPCM, about 80 kbit/s each way. A short buffer,
+counted in milliseconds of sound and growing only when the network is
+uneven, smooths out arrival. Android's Opus is libopus, built by the local
+recipe in `recipes/libopus`; a computer uses its system's.
 
 Each device learns from the relay the public address it is seen from, offers
 it to the other with its local ones, and both send to each other at once —
@@ -655,6 +1177,16 @@ blocked altogether, over the relay's WebSocket. Every packet that arrives
 shows which way works; the most direct one heard from in the last few
 seconds is used, and that changes as the network does. The call screen
 shows which way the sound goes and the round-trip time.
+
+A direct path shows each device the other's network address, which says
+roughly where it is. A device that calls offers its addresses with the
+call. A device that is called offers none, and sends nothing straight,
+until the call is answered on it (18.1): what passes while it rings goes
+through the relay, so a call that is not answered tells the caller nothing
+of where that device is. With *Settings → Privacy → Hide my location in
+calls* on, a device offers no address at all and its calls stay on the
+relay, with a little more delay. A group's calls always go through the
+relay.
 
 On Android the phone's own call audio is used — its echo cancelling, the
 earpiece, the loudspeaker, a wired or Bluetooth headset, chosen from the call
@@ -672,9 +1204,41 @@ Echo is cancelled by the system: a headset or a speakerphone that cancels
 it, or on Linux PulseAudio's or PipeWire's echo-cancel module, which is used
 whenever it is loaded.
 
+**One identity on several devices (18.1).** Every device connected as you
+rings. The one you answer on has the call; the others stop and say
+*Answered on another device* (or *Declined call*). Messages are not shared
+between devices: each gets what arrives while it is connected, and set a
+second device up from a backup, not from the private key alone (see
+*Post-quantum encryption*).
+
 Calls need **relay v10**, which advertises them in `/api/health` and opens a
 UDP port for them (by default the same number as its HTTP port). On an older
-relay the call button says so.
+relay the call button says so. A phone needs **Android 6** or later: on
+Android 5 the call buttons say so (17.3).
+
+### Video (17.0)
+
+Pictures are coded as **H.264**: by libx264 through PyAV on a computer
+(the Windows EXE has it; `desktop/requirements-exe.txt`), by Android's own
+hardware coder on a phone. HEVC or AV1 is used instead when the sender has a
+hardware coder for it and every receiver decodes it (each says so: in a
+group's sealed state, `vd`; in a 1-to-1 call, every second in its media
+packet). Each picture is cut into pieces of at most 1,000 bytes, sealed as
+the sound is; a picture that loses a piece is dropped, and a key frame asked
+for (no piece is sent again: a key frame costs less than the wait).
+
+A 1-to-1 call's picture goes the way its sound does (straight, else the
+relay, else the WebSocket), at the rung of the ladder (360p24 at 0.5 Mbit/s
+to 1080p60 at 5) that Settings allows, the way can take, and the other side
+shows it at; it steps down while pictures are lost and back up after six
+clean seconds, and the sound steps down with it (each rung's pair). A
+group's call sends each camera in three sizes (a quarter, half and the
+whole of the top rung), and **relay 13.2** passes each member only the size
+of the tile it shows, switching at a key frame it asks the sender for; a
+sender codes only the sizes someone shows. On a computer the camera is read
+by FFmpeg (`v4l2`, `dshow`, `avfoundation`) and the screen too (`x11grab`,
+`gdigrab`, `avfoundation`); on a phone Camera2 draws, upright, into each size's coder.
+
 
 ## Sending, and the outbox
 
@@ -695,6 +1259,24 @@ When a relay stops for an update it tells connected phones when to come
 back, and they wait that long, plus a few seconds at random, so they do
 not all return at once.
 
+## Away replies
+
+*Settings → Away → Reply while away* (18.1) answers for you while you are
+not there. Someone who writes to you gets your words back (*What the
+reply says*, up to 200 characters), under the note *Automatic reply*, at
+most once every four hours a chat. While it is on, the chat list says
+*Away replies are on* at its top: a tap on that opens its switch.
+
+- **Never** in a group, to someone you have not accepted (a reply would
+  accept them), or to a message that is itself an automatic reply: two
+  people who are both away do not answer each other for ever.
+- **No AI, and nothing reads your messages.** The reply is your own
+  sentence, written and sealed on your device like any message; the relay
+  sees a message go out, as with any other.
+- So a reply goes out only while Ferritext receives messages on that
+  device (the app open, or its background service running). A message
+  that waited at the relay is answered when it arrives.
+
 ## Background delivery
 
 Android closes apps in the background. While Ferritext's own process is alive
@@ -704,6 +1286,10 @@ over, and steps aside again when the app returns. The two coordinate through
 heartbeat files so only one ever holds the connection. It can be switched off
 under *Settings → Notifications*, at the cost of notifications only arriving
 while the app is open.
+
+Android requires a running service to show a notification. It is the
+app's own (18.1): silent, with no badge, in the pulled-down shade only,
+and not on a locked screen.
 
 Whichever holds the connection announces a message the moment it arrives,
 from the thread that received it — so a paused app, whose screen Android has
@@ -754,8 +1340,9 @@ two secrets together, so reading it takes breaking both.
 - **Groups** seal each member's copy as that member's own chat is sealed.
 - **Calls** exchange their keys inside the call's own messages, so a call
   in a chat that is post-quantum both ways is too.
-- **Photos and voice notes** are sealed with their own AES-256 key, which
-  travels inside the message, so they are covered with it.
+- **Photos, voice notes and video messages** are sealed with their own
+  AES-256 key, which travels inside the message, so they are covered
+  with it.
 - **A new install from the private key alone** (WIF) has a new ML-KEM key.
   A message sealed to the old one is asked for again, with the new key;
   the sender's app sends that message again once, if it is under a week
@@ -777,7 +1364,9 @@ is installed, against the `cryptography` library's own ML-KEM.
 
 - **Message requests.** The first messages from someone you have never
   talked to wait under *Message requests*: no notification text, no
-  download, no call. Until you answer, the relay is told to send them no
+  download, and nothing rings: a call from them is shown there as a
+  missed call (18.1), as yours to them is until they accept. Until you
+  answer, the relay is told to send them no
   receipts, so they see one tick. *Accept* turns receipts on and gives you
   the composer. *Decline* removes the request without blocking them: if
   they write again, it is a request again. *Report* tells the relay's
@@ -799,6 +1388,14 @@ is installed, against the `cryptography` library's own ML-KEM.
   or without one, first shows where it really leads: letters borrowed from
   other alphabets in their plain `xn--` form, and a note for bare numbers
   and unencrypted pages.
+- **Where you are.** A network address says roughly where a device is,
+  and whatever a device connects to sees its address. The app connects to
+  the relay; to a link's own site, only when you write a link with *Link
+  previews* on (a preview you receive came inside the message, and nothing
+  is fetched to show it; a link you open goes to your browser); and, in a
+  call with one person, to their device where a direct path can be opened:
+  not before you answer, and not at all with *Hide my location in calls*
+  on (see [Calls](#calls)). It connects to nothing else.
 
 ## Backup
 
@@ -823,6 +1420,7 @@ a phone only in a backup you make and seal here.
 | Path | Purpose |
 | --- | --- |
 | `main.py` | The complete client (Buildozer's entry point **must** be `main.py`), and its two Android services: Android starts them from it too, the sync service and the call service that keeps a call's microphone on while the app is off screen. |
+| `ARCHITECTURE_client.md` | How the app is built: its layers, threads, a message end to end, groups, calls, storage, and where to change what (17.4). |
 | `buildozer.spec` | Android packaging: requirements, permissions, service, icons. |
 | `data/` | The Ferrite Text Messenger mark (`ferritext_logo_packet.svg`; `ferritext_logo.svg` is the supplied disc it came from) and the images rendered from it, including the desktop window icons (`icon_desktop.png`, `.ico`). |
 | `data/fonts/` | The themes' faces (Ferritext Serif, Mono and Sans), the CJK and World faces, the capitals faces (`ui.ttf`, Silkscreen) and their licences. |
@@ -834,11 +1432,15 @@ a phone only in a backup you make and seal here.
 | `tools/download_page.py` | Makes a release's download page, to host off GitHub (for China). |
 | `tools/p4a_hook.py` | Build hook: the service types Android 14 requires, the notifications' receiver, and the camera's FileProvider. |
 | `recipes/libopus/` | A python-for-android recipe for libopus, for calls in Opus. |
+| `tools/apk-next/recipes/` | The next APK platform's own recipes (16.0, on trial): OpenSSL, cryptography, libjpeg-turbo, libpng, libwebp and Pillow, each pinned by SHA-256. |
+| `tools/seed_download.sh` | Seeds a recipe's download from whichever of its official hosts answers with the pinned file (CI). |
+| `tools/vuln_audit.py` | PyPI's advisories for every pinned package (CI); `desktop/requirements*.txt` hold the pins. |
 | `android/` | What Android compiles or ships beside the Python, in one folder. Java: `CallAudio` (a call's microphone and speaker, on threads of their own, and where the sound goes), `Notifier` and `NotifyReceiver` (notifications, and what is done to them), `QrReader` (QR codes in photos). Resources: the cleartext policy for the relay, the status-bar icon, the camera's folder, the launch screen at night. |
 | `CREDITS.md` | The open-source work Ferritext is made with, and its licences. |
 | `tools/publish_release.sh` | Puts a build's files on its version's GitHub Release, once (run by CI). |
 | `desktop/` | Desktop packaging (Nuitka: `build_desktop.sh`, which builds the Windows executable), the headless test suites, and the tools that capture and time the app. |
 | `.github/workflows/build-apk.yml` | Tests → the signed APK and the Windows executable, side by side → a GitHub Release with the three deliverables. |
+| `.github/workflows/apk-next.yml` | The APK on the next platform, a debug build for phones to try (16.0). |
 
 ## Testing
 
@@ -859,26 +1461,34 @@ xvfb-run -a python3 desktop/test_pictures.py main.py
 xvfb-run -a python3 desktop/test_calls.py main.py
 xvfb-run -a python3 desktop/test_notify.py main.py
 xvfb-run -a python3 desktop/test_gestures.py main.py
+xvfb-run -a python3 desktop/test_touch.py main.py
 xvfb-run -a python3 desktop/test_privacy.py main.py
-python3 desktop/smoke_exe.py desktop/dist/Ferritext-15.1.1-windows.exe  # a built executable
+python3 desktop/test_backup.py main.py      # runs each device under xvfb-run itself
+xvfb-run -a python3.13 desktop/test_video.py main.py   # needs PyAV (requirements-exe.txt)
+xvfb-run -a python3 desktop/test_videomsg.py main.py   # more is checked where PyAV is
+python3 desktop/smoke_exe.py desktop/dist/Ferritext-17.0.0-windows.exe  # a built executable
 ```
 
 | Suite | Covers |
 | --- | --- |
-| `test_core.py` | Envelope extension (incl. replay/tamper refusal), wire compatibility with the previous release, migrations both ways, delete-for-both authorisation, tombstones, extension sanitising, group membership rules (who may invite, change and remove), per-member receipts, reactions, ML-KEM-768 against NIST's vectors and the `cryptography` library, post-quantum envelopes (tampering, keys this device does not hold) |
-| `test_flows.py` | Three real app controllers over an in-memory relay: replies, forwards, stars, delete for both, photos (EXIF stripping, rotation), expiry → ask again → re-upload, voice notes, notification rules, notes to self, groups (create, write, rename, remove, leave), reactions and taking them back, the reaction strip and emoji panel, switching theme, text size and language, post-quantum keys passing between people and groups, a new install asking for a message again |
+| `test_core.py` | Envelope extension (incl. replay/tamper refusal), wire compatibility with the previous release, migrations both ways, delete-for-both authorisation, tombstones, extension sanitising, group membership rules (who may invite, change and remove), per-member receipts, reactions, ML-KEM-768 against NIST's vectors and the `cryptography` library, post-quantum envelopes (tampering, keys this device does not hold), a video message (18.1) as the release before shows it |
+| `test_flows.py` | Three real app controllers over an in-memory relay: replies, forwards, stars, delete for both, photos (EXIF stripping, rotation), expiry → ask again → re-upload, voice notes, notification rules, notes to self, groups (create, write, rename, remove, leave), reactions and taking them back, the reaction strip and emoji panel, switching theme, text size and language, post-quantum keys passing between people and groups, a new install asking for a message again, away replies (18.1): who gets one and how often, the mark it carries, its words, the chat list's reminder, the background service answering as the app does, video messages (18.1): sealed and uploaded, downloaded and read before they are kept, the reply they go with, a file that is no video refused |
 | `test_design.py` | WCAG AA contrast of every text/ground pair in every theme, each theme set's faces and corners, Chinese, Japanese and Korean in their face, fonts registered and packaged with their licences, following the system theme, tracked capitals, stacking buttons, Back closing a sheet, every language's pack complete, the language chosen, Chinese line breaking, every other script (its face, its shaping, right to left as Unicode's tests have it, unspaced scripts' line breaks) |
-| `test_composer.py` | Real mouse clicks reaching the message field and its keys, hidden parts never swallowing a touch, the composer's two states, recording through a capture command into WAV, photos from a camera, icons drawn smooth |
+| `test_composer.py` | Real mouse clicks reaching the message field and its keys, hidden parts never swallowing a touch, the composer's two states, recording through a capture command into WAV (held, locked, paused, and paused by a call that begins, never sent by itself), photos from a camera, icons drawn smooth |
 | `test_bundle.py` | The single-file desktop release: built, verified, run from an empty folder (fonts and icons unpacked, checked, reused, repaired); the download page |
 | `test_service.py` | Both services started from `main.py` as Android starts them, app ⇄ service hand-over, the manifest hook |
 | `smoke_desktop.py` | Launch, branding and loading screen through the real `App.run()` path |
 | `smoke_chat.py` | Bottom-anchored short chats, scrolling, text selection and copy |
-| `test_navigation.py` | Pages in layers, a long chat opening at once, the menu, back one step at a time, search and jumping into history, tap to react, holding chats (mute, pin, archive, unread, block, delete) |
+| `test_navigation.py` | Pages in layers, a page changed again before the last change has settled (18.1: back, then the same chat at once, left an empty page), a long chat opening at once, the menu, back one step at a time, search and jumping into history, tap to react, holding chats (mute, pin, archive, unread, block, delete) |
 | `test_pictures.py` | Making a picture (crop, size limit, nothing of the original file kept), refusing bad ones, versions, who is sent one and when, asking for a lost one, group pictures from the admin only, blocking, discs following a new picture, the framing sheet |
-| `test_calls.py` | The codecs (ADPCM bit for bit audioop's; Opus with FEC and concealment), the packet seal (replay, tamper, direction), the jitter buffer, two call engines finding each other directly, through a relay and over the WebSocket, and two apps calling: ring, answer, talk, mute, hang up, decline, busy, cancel, no answer, a stale offer, blocking |
+| `test_calls.py` | The codecs (ADPCM bit for bit audioop's; Opus with FEC and concealment; 16.0's 48 kHz stereo at each quality, in 5 to 40 ms packets), the packet seal (replay, tamper, direction), the jitter buffer, two call engines finding each other directly, through a relay and over the WebSocket, packets and bitrate adapting to each, and two apps calling: ring, answer, talk, mute, hang up, decline, busy, cancel, no answer, a stale offer, blocking, the line each call leaves, where a device is (18.1): no address offered and nothing sent straight while it rings, or at all with *Hide my location in calls* on, a call answered while it is still being prepared (the microphone as the lobby left it), and a call that begins stopping a message that was playing |
 | `test_notify.py` | Notifications from the sync thread (a paused app still notifies), what they are made of, mute and its end, blocking that holds and releases, replying and marking read from a notification, drafts, a call while the app is away, the guide that keeps the app running |
 | `test_gestures.py` | Real taps and swipes through the window: back, the menu, reply, taps that are not swipes, voice notes at speed and seeking |
-| `test_privacy.py` | Disappearing messages, verifying a contact, links and where they lead, link previews (off by default; fetched only from public addresses), encrypted backup and restore |
+| `test_touch.py` | A phone's finger (SDL's touch, no mouse button) through Kivy's input: Send, holding the microphone, a switch, one touch per finger on Android, a call's refusal said in the chat, the microphone permission |
+| `test_privacy.py` | Disappearing messages, verifying a contact, links and where they lead, link previews (off by default; fetched only from public addresses), the *Hide my location in calls* switch, encrypted backup and restore |
+| `test_backup.py` | Backup and restore end to end, each device a process of its own: a full phone restored through the screens (every table, its files, writing and reading again), beside another identity, Unicode passphrases, without media, a damaged database changing nothing, backups from 11.0, 13.0 and 15.1.1, a full disk, a large backup timed, Android's document copies off the UI thread, automatic backups (made with no one there, the last three kept, the newest restored elsewhere with the passphrase) |
+| `test_video.py` | 17.0's pictures (PyAV): the ladder and a room's three sizes, pieces and how they are put back (losses, key frames), what a 1-to-1 picture may take through each relay, the pictures' thread when someone leaves, a camera coded at three sizes at once, decoding to a tile's size, a group's and a 1-to-1 call's engines trading sealed pictures (sizes asked for, key frames, the sound stepping down with the picture), recording a call and its seal |
+| `test_videomsg.py` | 18.1's video messages. Without any video library, as a phone's Python runs them: NAL units, a picture's size from its parameter set (sets written bit by bit here, and x264's own), ADTS sound, the MP4 written and read back, 4,000 files with their tables changed at random (read with every picture inside the file, or refused), the recorder against stand-ins for a phone's camera coder and recorder (where a recording begins, what ends it, a camera that goes quiet, a relay that takes smaller files, the sound cut to the pictures, what is let go), the bubble and what it says while not here, the camera key, the recording sheet (stopped where it is when the app leaves the screen or a call begins; closed only by Delete and Send once it records), a phone's permissions, and taking a photo once Android gives the camera. With PyAV: a real recording opened by FFmpeg without a warning, a flash and a tone within a tenth of a second of each other, and one recorded, sent and played in the app |
 | `smoke_exe.py` | A built executable started twice in an empty home, as a person would: up, its window drawn, no crash in its log; its size and both start times (CI runs it on Windows) |
 
 To get `old.py`: `git show v9.1.0:main.py > old.py` (or the latest tag before
@@ -900,7 +1510,8 @@ xvfb-run -a python3 desktop/bench.py main.py > after.json
 git worktree remove ../before
 ```
 
-- **`capture.py`** saves 28 screens (`shots/after/black_chat.png`, …), built
+- **`capture.py`** saves the screens in its `SCREENS` list
+  (`shots/after/black_chat.png`, …; `--only chat,menu` saves a few), built
   from the same chats on every run. `--theme` picks `black` (the default),
   `dark` or `light`, `--set` the theme set: `axiom` (the default),
   `overclock` or `ferrite`, and `--lang` the language: `en` (the default)
@@ -926,18 +1537,25 @@ on first run.
 
 ```bash
 python3 -m pip install --user buildozer cython
-buildozer android debug          # produces bin/fext-15.1.1-*-debug.apk
+buildozer android debug          # produces bin/fext-17.0.0-*-debug.apk
 ```
 
+The next platform is on trial in the same spec, as its `next` profile
+(python-for-android 2026.5.9 with our own builds of OpenSSL, cryptography,
+libjpeg-turbo, libpng, libwebp and Pillow, `tools/apk-next/recipes`): `cp -r recipes/libopus
+tools/apk-next/recipes/` then `buildozer --profile next android debug` with
+Buildozer 1.6.0. `.github/workflows/apk-next.yml` builds it.
+
 **The Windows executable** is built on Windows, as CI builds it: from Git
-Bash, with Python 3.11 and Visual Studio's C++ build tools.
+Bash, with Python 3.13 and Visual Studio's C++ build tools. Its packages are
+pinned in `desktop/requirements-exe.txt` (the client's own in
+`desktop/requirements.txt`, which the tests run with); raise a pin on purpose,
+once the suites pass with the new version.
 
 ```bash
-pip install nuitka==4.3.4 zstandard "kivy[base]==2.3.1" requests urllib3 \
-  charset-normalizer idna certifi websocket-client cryptography qrcode \
-  pillow sounddevice numpy av pyzbar pyogg
-ONEFILE=1 PY=python NAME=Ferritext-15.1.1-windows.exe bash desktop/build_desktop.sh
-python desktop/smoke_exe.py desktop/dist/Ferritext-15.1.1-windows.exe
+pip install -r desktop/requirements-exe.txt
+ONEFILE=1 PY=python NAME=Ferritext-17.0.0-windows.exe bash desktop/build_desktop.sh
+python desktop/smoke_exe.py desktop/dist/Ferritext-17.0.0-windows.exe
 ```
 
 On Linux and macOS the same script builds that system's executable.

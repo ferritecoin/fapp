@@ -34,7 +34,7 @@ source.exclude_dirs = tests, bin, venv, .git, .github, .buildozer, __pycache__, 
 # (v15.1) each language's phrases from data/lang/*.json.
 
 # (str) Application versioning (method 1)
-version = 15.1.1
+version = 18.1.0
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy
@@ -90,7 +90,10 @@ fullscreen = 0
 # lock screen (Android 14 asks the user; earlier versions grant it).
 # 15.1: REQUEST_IGNORE_BATTERY_OPTIMIZATIONS lets Settings › Keep Ferritext
 # running ask Android, which asks the user, to leave its battery use alone.
-android.permissions = INTERNET,ACCESS_NETWORK_STATE,POST_NOTIFICATIONS,RECORD_AUDIO,FOREGROUND_SERVICE,FOREGROUND_SERVICE_DATA_SYNC,FOREGROUND_SERVICE_MICROPHONE,MODIFY_AUDIO_SETTINGS,WAKE_LOCK,VIBRATE,USE_FULL_SCREEN_INTENT,REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+# 16.2: USE_BIOMETRIC, the app lock's fingerprint or face. 17.0: CAMERA,
+# video calls (asked the first time the camera is turned on in a call; the
+# camera is used only while the call is on screen).
+android.permissions = INTERNET,ACCESS_NETWORK_STATE,POST_NOTIFICATIONS,RECORD_AUDIO,FOREGROUND_SERVICE,FOREGROUND_SERVICE_DATA_SYNC,FOREGROUND_SERVICE_MICROPHONE,FOREGROUND_SERVICE_MEDIA_PROJECTION,MODIFY_AUDIO_SETTINGS,WAKE_LOCK,VIBRATE,USE_FULL_SCREEN_INTENT,REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,USE_BIOMETRIC,CAMERA
 
 # (list) Put these files or directories in the apk res directory.
 # Ships res/xml/network_security_config.xml, which permits cleartext for the
@@ -176,9 +179,10 @@ p4a.bootstrap = sdl2
 
 # (list) Background services, each started from main.py in a process of its
 # own (main.py reads which from PYTHON_NAME): the sync service that keeps
-# notifications arriving after Android has closed the app, and the call
-# service that keeps a call's microphone on while the app is off screen.
-services = Fextsync:main.py:foreground:sticky,Fextcall:main.py:foreground
+# notifications arriving after Android has closed the app, the call
+# service that keeps a call's microphone on while the app is off screen,
+# and (18.0) the share service Android wants running while a screen is shared.
+services = Fextsync:main.py:foreground:sticky,Fextcall:main.py:foreground,Fextshare:main.py:foreground
 
 # (str) Hook run during the p4a build: declares the services' types, which
 # Android 14 requires and p4a's manifest template cannot express.
@@ -219,3 +223,19 @@ warn_on_root = 1
 
 # (str) Path to build artifact storage, absolute or relative to spec file
 # bin_dir = ./bin
+
+
+# ---------------------------------------------------------------------------
+# The next platform, on trial (16.0):  buildozer --profile next android debug
+# python-for-android 2026.5.9 (Python 3.14, NDK 28c), with our own builds
+# of what opens what others send — OpenSSL 3.5, cryptography 50,
+# libjpeg-turbo 3.2, libpng 1.6.59, libwebp 1.6 and Pillow 13
+# (tools/apk-next/recipes, each pinned by SHA-256) — the pure-Python
+# packages pinned, and coincurve (libsecp256k1, 16.0). Built by
+# .github/workflows/apk-next.yml; once an APK from it has passed on phones,
+# these lines replace the ones above and the recipes move to ./recipes.
+[app@next]
+requirements = python3,kivy,pillow,libwebp,requests==2.34.2,urllib3==2.8.0,charset-normalizer==3.5.2,idna==3.20,certifi==2026.10.23,websocket-client==1.9.2,cryptography,qrcode==8.2,pyjnius,android,libopus,coincurve
+p4a.branch = v2026.05.09
+p4a.local_recipes = ./tools/apk-next/recipes
+android.ndk = 28c

@@ -1,0 +1,14 @@
+# The client's packages on a computer, pinned (16.0): what the tests run
+# with and the Windows EXE is built from. Raise a pin on purpose, once the
+# suites pass with the new version (README: Building the desktop client).
+kivy==2.3.1                 # not kivy[base]: it holds Pillow below 11
+requests==2.34.2
+urllib3==2.8.0
+charset-normalizer==3.5.2
+idna==3.20
+certifi==2026.10.23
+websocket-client==1.9.2
+cryptography==50.0.2
+qrcode==8.2
+pillow==13.0.0
+coincurve==21.0.0           # messages sealed and opened in libsecp256k1

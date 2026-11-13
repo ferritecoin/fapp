@@ -12,7 +12,7 @@
   * main.py run from a checkout uses data/ and unpacks nothing;
   * tools/check_keystore.sh, which the release build runs first, accepts
     the key that FEXT_KEY_SHA256 names, written either way, and refuses
-    any other (needs keytool; skipped without it);
+    any other (needs keytool and a bash; skipped without them);
   * (15.1) tools/download_page.py makes a page that fetches nothing from
     elsewhere, gives the APK's size and SHA-256, and a true QR code.
 """
@@ -53,7 +53,10 @@ print("PROBE " + json.dumps({
 
 
 def probe(path: Path, home: Path) -> dict:
-    env = dict(os.environ, HOME=str(home), SDL_VIDEODRIVER="x11")
+    env = dict(os.environ, HOME=str(home),
+               USERPROFILE=str(home))            # Path.home() on Windows
+    if sys.platform.startswith("linux"):         # xvfb-run's X display
+        env["SDL_VIDEODRIVER"] = "x11"
     out = subprocess.run([sys.executable, "-c", PROBE, str(path)], env=env,
                          capture_output=True, text=True, timeout=120)
     for line in out.stdout.splitlines():
@@ -135,6 +138,11 @@ check("main.py beside data/ uses data/ and unpacks nothing",
 
 print("\nThe signing key's check")
 KEYTOOL = shutil.which("keytool")
+# A POSIX bash by its full path: on Windows, Git's (on PATH), never
+# System32's bash.exe, which starts WSL (run 7: "no installed distributions").
+BASH = shutil.which("bash")
+if BASH and Path(BASH).parent.name.lower() == "system32":
+    BASH = None
 
 
 def keystore(name: str) -> str:
@@ -154,17 +162,17 @@ def keystore(name: str) -> str:
 
 def check_key(expected: str):
     """Run check_keystore on the 'project' key with FEXT_KEY_SHA256 set."""
-    script = (f'. "{ROOT / "tools" / "check_keystore.sh"}"; '
+    script = (f'. "{(ROOT / "tools" / "check_keystore.sh").as_posix()}"; '
               f'STOREPASS=pw-test-1; KEYPASS=pw-test-1; '
-              f'check_keystore "{work / "project.p12"}" fext')
-    out = subprocess.run(["bash", "-c", script], capture_output=True,
+              f'check_keystore "{(work / "project.p12").as_posix()}" fext')
+    out = subprocess.run([BASH, "-c", script], capture_output=True,
                          text=True, env=dict(os.environ,
                                              FEXT_KEY_SHA256=expected))
     return out.returncode, out.stdout + out.stderr
 
 
-if KEYTOOL is None:
-    print("  (skipped: no keytool here)")
+if KEYTOOL is None or BASH is None:
+    print("  (skipped: no keytool or no bash here)")
 else:
     ours, theirs = keystore("project"), keystore("another")
     rc, out = check_key("")

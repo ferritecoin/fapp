@@ -1,0 +1,7 @@
+# pip for the APK trial's build (apk-next.yml sets PIP_CONSTRAINT to this file).
+# python-for-android 2026.5.9 makes one venv for every architecture, in the
+# same folder, and runs "pip install -U pip" in it each time. With pip 26
+# from PyPI and Python 3.14's own older pip, trial run 3's venv was left with
+# files of both, and pip could not start ("cannot import name
+# 'capture_logging'"). Below 26, the two agree.
+pip<26

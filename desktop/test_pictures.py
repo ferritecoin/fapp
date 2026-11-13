@@ -19,8 +19,10 @@ import time
 
 os.environ.setdefault("KIVY_NO_ARGS", "1")
 os.environ["KIVY_NO_CONSOLELOG"] = "1"
-os.environ.setdefault("SDL_VIDEODRIVER", "x11")
+if sys.platform.startswith("linux"):     # xvfb-run's X display
+    os.environ.setdefault("SDL_VIDEODRIVER", "x11")
 os.environ["HOME"] = tempfile.mkdtemp(prefix="fext-pictures-")
+os.environ["USERPROFILE"] = os.environ["HOME"]   # Path.home() on Windows
 os.environ["FEXT_LANG"] = "en"          # the English the checks read
 os.environ["FEXT_SERVER_HOST"] = "127.0.0.1:1"
 
@@ -61,6 +63,9 @@ class StubApi:
 
     def features(self):
         return self._features
+
+    def relay_now(self):            # 18.0: an admin's log notes the time
+        return time.time()
 
     def send_message(self, recipient, envelope, client_msg_id):
         return {"server_id": self.relay.post(self.keys.address, recipient,

@@ -1,0 +1,239 @@
+name: Devices (Android emulators, Windows, Ubuntu)
+
+# 17.2: the app on the systems people run it on, before a release.
+#   * Android, old, modern and new (API 21, the oldest the APK installs on;
+#     30, Android 11 as on the owner's Realme 7 5G; 36, Android 16): a debug
+#     APK built for x86_64 runs on emulators (KVM), started with its
+#     self-test (main.py: android_selftest), which uses the call's sound,
+#     codecs, camera and (18.0) the screen shared as a call does
+#     (tools/devices/emulator.sh and android_check.sh); the screen and the
+#     logs are kept as artifacts (when the account's storage has room; the
+#     job's log says what failed either way).
+#   * Windows (Python 3.13, the EXE's), Ubuntu 22.04 (Python 3.11) and
+#     Ubuntu 24.04 (its own Python 3.12): every client suite
+#     (tools/devices/run_suites.py).
+# By hand only (Actions › Devices › Run workflow): a run takes about two
+# hours of runners, Windows' counted twice in a private repository.
+
+on:
+  workflow_dispatch:
+    inputs:
+      android:
+        description: "Android API levels, a JSON list (empty: none)"
+        default: '["21", "30", "36"]'
+      desktop:
+        description: "Windows and Ubuntu too"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devices-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    name: Debug APK for emulators (x86_64)
+    if: inputs.android != '[]' && inputs.android != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    outputs:
+      key: ${{ steps.key.outputs.key }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # The APK is kept by what goes into it (buildozer.spec's source and
+      # its Android parts): a run after a change to these checks alone
+      # takes the one already built.
+      - name: The APK's key
+        id: key
+        run: echo "key=devices-apk-${{ hashFiles('main.py', 'data/**', 'android/**', 'recipes/**', 'tools/p4a_hook.py', 'buildozer.spec') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Built already?
+        id: built
+        uses: actions/cache/restore@v5
+        with:
+          path: ferritext-x86_64-debug.apk
+          key: ${{ steps.key.outputs.key }}
+          lookup-only: true
+
+      - name: Set up JDK 17
+        if: steps.built.outputs.cache-hit != 'true'
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python 3.11
+        if: steps.built.outputs.cache-hit != 'true'
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install native build dependencies (as build-apk.yml)
+        if: steps.built.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ccache git zip unzip autoconf automake libtool \
+            libltdl-dev pkg-config zlib1g-dev libncurses-dev cmake \
+            libffi-dev libssl-dev
+          python -m pip install --upgrade pip
+          pip install "buildozer==1.5.0" "cython==0.29.33"
+
+      - name: Cache Buildozer SDK/NDK and p4a (x86_64)
+        if: steps.built.outputs.cache-hit != 'true'
+        uses: actions/cache@v5
+        with:
+          path: ~/.buildozer
+          key: buildozer-x86_64-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            buildozer-x86_64-${{ runner.os }}-
+
+      - name: Pre-fetch FreeType (as build-apk.yml)
+        if: steps.built.outputs.cache-hit != 'true'
+        run: |
+          bash tools/seed_download.sh freetype freetype-2.10.1.tar.gz \
+            3a60d391fd579440561bf0e7f31af2222bc610ad6ce4d9d7bd2165bca8669110 \
+            https://download.savannah.gnu.org/releases/freetype/freetype-2.10.1.tar.gz \
+            https://sourceforge.net/projects/freetype/files/freetype2/2.10.1/freetype-2.10.1.tar.gz/download
+
+      - name: Build the debug APK, for x86_64 alone
+        if: steps.built.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          # Emulators run x86_64 fast; the release APK is ARM only.
+          sed -i -E 's/^android\.archs = .*/android.archs = x86_64/' buildozer.spec
+          buildozer android debug
+          cp "$(ls bin/*-debug.apk | head -1)" ferritext-x86_64-debug.apk
+
+      # A cache, not an artifact: artifacts count against the account's
+      # storage, which a week of release builds fills.
+      - name: Keep the APK for the emulators
+        if: steps.built.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ferritext-x86_64-debug.apk
+          key: ${{ steps.key.outputs.key }}
+
+  android:
+    name: Android API ${{ matrix.api }}
+    needs: apk
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        api: ${{ fromJSON(inputs.android) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: The debug APK
+        uses: actions/cache/restore@v5
+        with:
+          path: ferritext-x86_64-debug.apk
+          key: ${{ needs.apk.outputs.key }}
+          fail-on-cache-miss: true
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Start the emulator
+        run: bash tools/devices/emulator.sh "${{ matrix.api }}"
+
+      - name: The app and its self-test
+        run: bash tools/devices/android_check.sh ferritext-x86_64-debug.apk "out/api${{ matrix.api }}"
+
+      - name: Keep the screen and the logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        continue-on-error: true
+        with:
+          name: android-api${{ matrix.api }}
+          path: out/
+          retention-days: 14
+
+  desktop:
+    name: ${{ matrix.name }}
+    if: inputs.desktop
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows (Python 3.13)
+            os: windows-2022
+            python: "3.13"
+          - name: Ubuntu 22.04 (Python 3.11)
+            os: ubuntu-22.04
+            python: "3.11"
+          - name: Ubuntu 24.04 (its own Python 3.12)
+            os: ubuntu-24.04
+            python: system
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python ${{ matrix.python }}
+        if: matrix.python != 'system'
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: A virtual display (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb libgl1 libgl1-mesa-dri libmtdev1 xclip libopus0 \
+            libportaudio2 libzbar0 python3-venv
+
+      - name: Ubuntu's own Python, in a virtual environment
+        if: matrix.python == 'system'
+        run: |
+          /usr/bin/python3 -m venv "$RUNNER_TEMP/venv"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
+      - name: The client's packages
+        run: |
+          python --version
+          python -m pip install --upgrade pip
+          # The EXE's set (the README's extras: Opus, sound devices, PyAV for
+          # video) where its pins install, Python 3.12 or later; else the
+          # client's own packages.
+          if python -c 'import sys; sys.exit(sys.version_info < (3, 12))'; then
+            python -m pip install -r desktop/requirements-exe.txt
+          else
+            python -m pip install -r desktop/requirements.txt
+          fi
+
+      - name: Every client suite
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          PYTHONUNBUFFERED: "1"
+        run: |
+          # Windows' runner has no graphics card: Kivy draws through ANGLE
+          # (Direct3D in software), as the EXE's start in build-apk.yml.
+          if [ "$RUNNER_OS" = Windows ]; then export KIVY_GL_BACKEND=angle_sdl2; fi
+          python tools/devices/run_suites.py main.py out
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        continue-on-error: true
+        with:
+          name: suites-${{ matrix.os }}-py${{ matrix.python }}
+          path: out/
+          retention-days: 14

@@ -37,8 +37,10 @@ from datetime import datetime, timedelta, timezone
 
 os.environ.setdefault("KIVY_NO_ARGS", "1")
 os.environ["KIVY_NO_CONSOLELOG"] = "1"
-os.environ.setdefault("SDL_VIDEODRIVER", "x11")
+if sys.platform.startswith("linux"):     # xvfb-run's X display
+    os.environ.setdefault("SDL_VIDEODRIVER", "x11")
 os.environ["HOME"] = tempfile.mkdtemp(prefix="fext-gest-")
+os.environ["USERPROFILE"] = os.environ["HOME"]   # Path.home() on Windows
 os.environ["FEXT_LANG"] = "en"          # the English the checks read
 os.environ["FEXT_SERVER_HOST"] = "127.0.0.1:1"
 
@@ -562,7 +564,8 @@ M.android_has_permission = lambda p: True
 M.calls_possible_here = lambda: True
 app._place_call = lambda call: None
 app.store.add_caps(other, M.LocalStore.CAP_CALL | M.LocalStore.CAP_V9)
-app.start_call(other)
+app.start_call(other)                   # 16.1: the lobby first,
+app.__dict__["_lobby"].join()           # then Start call
 check("on a phone the call service starts the moment one dials",
       started == [True] and app._call_service_on)
 app.call.ended = True

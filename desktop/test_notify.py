@@ -31,8 +31,10 @@ import uuid
 
 os.environ.setdefault("KIVY_NO_ARGS", "1")
 os.environ["KIVY_NO_CONSOLELOG"] = "1"
-os.environ.setdefault("SDL_VIDEODRIVER", "x11")
+if sys.platform.startswith("linux"):     # xvfb-run's X display
+    os.environ.setdefault("SDL_VIDEODRIVER", "x11")
 os.environ["HOME"] = tempfile.mkdtemp(prefix="fext-notify-")
+os.environ["USERPROFILE"] = os.environ["HOME"]   # Path.home() on Windows
 os.environ["FEXT_LANG"] = "en"          # the English the checks read
 os.environ["FEXT_SERVER_HOST"] = "127.0.0.1:1"
 
@@ -240,6 +242,25 @@ M.subprocess.Popen, M.shutil.which = real_popen, real_which
 M.platform.system = real_system
 M.IS_ANDROID = M.IS_MOBILE = True
 
+print("\nThe system's theme, when it cannot be read (18.0)")
+# Windows' runner played Android here in its light theme: the theme watcher
+# could not read Android's switch (no JNI on a computer), took that for
+# dark, and rebuilt the app, closing every sheet (Devices runs 8, 12, 13).
+real_dark, real_name, real_mode = M.system_prefers_dark, M.T.name, \
+    M.APPEARANCE.mode
+rebuilt, real_rebuild = [], bob._rebuild_ui
+M.system_prefers_dark = lambda: None
+M.T.name, M.APPEARANCE.mode = M.APPEARANCE.themed(False), "system"
+bob._rebuild_ui = rebuilt.append
+try:
+    bob._watch_system_theme(0)
+finally:
+    bob._rebuild_ui = real_rebuild
+    M.system_prefers_dark = real_dark
+    M.T.name, M.APPEARANCE.mode = real_name, real_mode
+check("a theme switch that cannot be read leaves the theme as it is: no "
+      "rebuild, so no open sheet is closed", rebuilt == [], rebuilt)
+
 print("\nMute: 12 hours, 3 days, until turned back on")
 bob.choose_mute([A])
 tick(0.3)
@@ -249,7 +270,8 @@ labels = [r.title.text for r in sheet.body.walk()
           if isinstance(r, M.ListRow)] if sheet else []
 check("muting offers 12 hours, 3 days and until turned back on",
       labels[:3] == ["For 12 hours", "For 3 days", "Until I turn it back on"],
-      str(labels))
+      str(labels) if sheet else "no MuteSheet; the window holds "
+      f"{[type(w).__name__ for w in Window.children]}")
 check("...and says messages keep coming",
       sheet is not None and "still arrive" in " ".join(
           w.text for w in sheet.walk() if isinstance(w, M.InfoLabel)))
@@ -447,9 +469,10 @@ check("...on a phone, the call's own notification, with Answer/Decline",
       rang and rang[-1] == (A, cid, "alice"))
 M.IS_ANDROID = False
 bob.call_signal_arrived(A, {"op": "end", "id": cid, "why": "cancelled"})
-check("given up on before anyone answered, it is a missed call",
-      not offer.exists() and
-      bob.store.messages_for(A)[-1]["body"] == "Missed call")
+card = bob.store.call_card(A, cid) or {}
+check("given up on before anyone answered, it is a missed call's card",
+      not offer.exists() and card.get("outcome") == "missed" and
+      card.get("host") == A, card)
 bob._declined_calls.add(cid)
 bob.call_signal_arrived(A, sig)
 check("a call declined from its notification never rings again",

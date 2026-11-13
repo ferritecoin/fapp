@@ -13,14 +13,13 @@
 # build folders keep their paths from one version to the next and its cache
 # of compiled C (kept by CI) stays valid.
 #
-# Prerequisites (in a venv):
-#   pip install nuitka zstandard kivy requests urllib3 charset-normalizer \
-#               idna certifi websocket-client cryptography qrcode pillow
-#   and, to carry what they add on a computer (README, Downloads), any of:
-#   pip install sounddevice numpy av pyzbar pyogg
-#   Linux also needs a C compiler and patchelf (and libmtdev1 to silence a
-#   harmless Kivy touch-provider probe at startup); Windows, Visual Studio's
-#   C++ build tools.
+# Prerequisites (in a venv, Python 3.13 as CI builds it):
+#   pip install -r desktop/requirements-exe.txt
+#   — the client's packages, the extras it carries on a computer (README,
+#   Downloads) and Nuitka, at the versions CI builds with. Linux also needs
+#   a C compiler and patchelf (and libmtdev1 to silence a harmless Kivy
+#   touch-provider probe at startup); Windows, Visual Studio's C++ build
+#   tools.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -60,7 +59,7 @@ esac
 # what it is given. (The module, not its whole package: that would bring the
 # package's tests along.)
 EXTRAS=()
-for module in sounddevice numpy av pyzbar.pyzbar pyogg; do
+for module in sounddevice numpy av pyzbar.pyzbar pyogg coincurve._cffi_backend; do
   if "$PY" -c "import importlib.util, sys; sys.exit(not importlib.util.find_spec('${module%%.*}'))"; then
     EXTRAS+=(--include-module="$module")
   fi

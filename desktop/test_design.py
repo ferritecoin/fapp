@@ -13,7 +13,9 @@
   * capitals are tracked and end in an ellipsis rather than overflowing;
     buttons stack when their labels will not fit; Back closes a sheet first;
   * (15.1) every language's pack is complete, its language is chosen from
-    Settings or the system's, and Chinese lines break by its rules.
+    Settings or the system's, and Chinese lines break by its rules;
+  * (18.1) a list's edges fade into the page where there is more to
+    scroll to, and Settings turns that off at once.
 """
 import importlib.util
 import json
@@ -24,8 +26,10 @@ import unicodedata
 
 os.environ.setdefault("KIVY_NO_ARGS", "1")
 os.environ["KIVY_NO_CONSOLELOG"] = "1"
-os.environ.setdefault("SDL_VIDEODRIVER", "x11")
+if sys.platform.startswith("linux"):     # xvfb-run's X display
+    os.environ.setdefault("SDL_VIDEODRIVER", "x11")
 os.environ["HOME"] = tempfile.mkdtemp(prefix="fext-design-")
+os.environ["USERPROFILE"] = os.environ["HOME"]   # Path.home() on Windows
 os.environ["FEXT_LANG"] = "en"          # the English the checks read
 os.environ.pop("FEXT_THEME", None)
 
@@ -488,6 +492,32 @@ def drawn(text, color=(1, 1, 1, 1), **style):
     return core.texture.width, hues(core.texture.pixels)
 
 
+box = BoxLayout(size_hint_y=None, height=dp(64))
+M.hairline(box, "top")
+rule = [i for i in box.canvas.after.children
+        if type(i).__name__ == "Rectangle"][0]
+edges = []
+for height in (116, 64, 90):
+    box.height = dp(height)
+    edges.append(round(rule.pos[1] / dp(1)))
+check("a rule along a box's top follows it as the box grows and shrinks "
+      "(it stayed behind, and crossed the chat, 16.1)",
+      edges == [115, 63, 89], str(edges))
+
+
+def raises(label) -> bool:
+    """Whether drawing `label` raises. It is emptied after: a label draws
+    itself again on the next frame, and one that raises there ends the
+    app (which is the fault these checks are about)."""
+    try:
+        label.texture_update()
+        return False
+    except Exception:                                      # noqa: BLE001
+        return True
+    finally:
+        label.text = ""
+
+
 class Harness(App):
     def build(self):
         Window.size = (dp(360), dp(780))
@@ -624,7 +654,128 @@ class Harness(App):
         check("people, groups and notes to self have distinct discs",
               avatars[0]._initial.text == "A" and avatars[1].kind == "group"
               and avatars[2]._initial is None)
+        self.faded_list()
+
+    def faded_list(self):
+        """18.1 (the owner's note on BUILT23): a list as tall as three
+        views, in a vivid colour so the fade shows in its pixels."""
+        from kivy.graphics import Color, Rectangle
+        view = M.ScrollView(do_scroll_x=False, fade=M.T.bg,
+                            size_hint=(None, None), size=(dp(300), dp(400)))
+        content = BoxLayout(orientation="vertical", size_hint_y=None,
+                            height=dp(1200))
+        with content.canvas:
+            Color(1, 0, 0, 1)
+            paint = Rectangle()
+        content.bind(pos=lambda w, v: setattr(paint, "pos", v),
+                     size=lambda w, v: setattr(paint, "size", v))
+        view.add_widget(content)
+        self.root_box.clear_widgets()
+        self.root_box.add_widget(view)
+        self.view, self.content = view, content
+        Clock.schedule_once(self.fades, 0.4)
+
+    def fades(self, _dt):
+        view, content = self.view, self.content
+        head, top, foot, bottom = view._fades
+
+        def at(y):
+            view.scroll_y = y
+            return round(head.a, 3), round(foot.a, 3)
+        ends = [at(1.0), at(0.5), at(0.0)]
+        check("a list fades at an edge only where there is more beyond it: "
+              "at the top, the foot alone; between, both; at the end, the "
+              "head alone (18.1)", ends == [(0, 1), (1, 1), (1, 0)],
+              str(ends))
+        beyond = view.viewport_size[1] - view.height
+        view.scroll_y = 1 - dp(14) / beyond
+        check("...each growing in as the list leaves that edge: half after "
+              "half a fade's height (14 dp)", abs(head.a - .5) < .02,
+              f"{head.a:.3f}")
+        view.scroll_y = 0.5
+        check("...in the page's colour, opaque at the edge itself, 28 dp tall "
+              "at most and a quarter of a short view",
+              tuple(head.rgb) == tuple(M.C(M.T.bg)[:3]) and
+              tuple(foot.rgb) == tuple(M.C(M.T.bg)[:3]) and
+              abs(top.size[1] - dp(28)) < .5 and
+              abs(top.pos[1] + top.size[1] - view.top) < .5 and
+              abs(bottom.pos[1] - view.y) < .5 and
+              top.tex_coords[1] < top.tex_coords[5] and
+              bottom.tex_coords[1] > bottom.tex_coords[5],
+              f"{head.rgb} {top.pos} {top.size} {bottom.pos}")
+        pixels = view.export_as_image().texture.pixels
+        width, height = int(view.width), int(view.height)
+
+        def row(r):
+            i = (r * width + width // 2) * 4
+            return tuple(pixels[i:i + 3])
+        page = tuple(round(c * 255) for c in M.C(M.T.bg)[:3])
+        near = lambda a, b: all(abs(x - y) <= 3 for x, y in zip(a, b))
+        middle = row(height // 2)
+        check("...drawn: between the ends, both edge rows are the page and "
+              "the middle is the list", near(row(0), page) and
+              near(row(height - 1), page) and near(middle, (255, 0, 0)),
+              f"{row(0)} {middle} {row(height - 1)} page {page}")
+        view.scroll_y = 1.0
+        pixels = view.export_as_image().texture.pixels
+        edges = {row(0), row(height - 1)}
+        check("...and at the top the top edge is the list's own colour, "
+              "unfaded", any(near(e, (255, 0, 0)) for e in edges) and
+              any(near(e, page) for e in edges), str(edges))
+
+        class Shell:
+            def apply_appearance(self, force=False):
+                M.APPEARANCE.resolve()
+        view.scroll_y = 0.5
+        M.FextApp.set_appearance(Shell(), edge_fade=False)
+        off = (head.a, foot.a)
+        check("Settings › Fade the edges of lists, off: the lists open now "
+              "are drawn again at once, unfaded", off == (0, 0) and
+              M.load_prefs().get("edge_fade") is False, str(off))
+        M.FextApp.set_appearance(Shell(), edge_fade=True)
+        check("...and on again", (head.a, foot.a) == (1, 1),
+              f"{head.a} {foot.a}")
+        content.height = dp(300)
+        Clock.schedule_once(self.short, 0.2)
+
+    def short(self, _dt):
+        head, _top, foot, _bottom = self.view._fades
+        check("a list shorter than its view does not fade",
+              (head.a, foot.a) == (0, 0), f"{head.a} {foot.a}")
+        self.as_written()
         Clock.schedule_once(lambda _dt: self.stop(), 0.2)
+
+    def as_written(self):
+        """18.1: Kivy's markup is an instruction to the label, and a wrong
+        one raises as it is drawn, which ends the app. What a person wrote
+        (a name, a message) is never read as one."""
+        from kivy.uix.label import Label
+        hostile = ("[size=abc]x", "[size=100000]A", "[font=NoSuch]x",
+                   "[color=zzz]x [b]bold", "&bl;[/size][ref=1]")
+        check("these would end the app, read as markup (the check's own "
+              "ground)", all(raises(Label(text=text, markup=True))
+                             for text in hostile[:3]))
+        faults = []
+        for text in hostile:
+            label = M.InfoLabel(text)
+            if label.markup or label.text != text or raises(label):
+                faults.append(text)
+        check("text on a page is shown as written: markup in a name or a "
+              "message is letters, not an instruction", not faults,
+              str(faults))
+        check("...and a label of markup built here still says so itself",
+              M.InfoLabel("[b]x[/b]", markup=True).markup)
+        faults = []
+        for text in hostile:
+            linked = text + " https://example.org/a[b]"
+            marked = (M.link_markup(linked, M.link_spans(linked), "ffffff"),
+                      M.search_snippet(text, "x"),
+                      M.search_snippet(text, "size"))
+            if any(raises(Label(text=m, markup=True)) for m in marked):
+                faults.append(text)
+        check("...and where the app adds its own (a link underlined, a "
+              "found word in gold), what was written is escaped first",
+              not faults, str(faults))
 
 
 Harness().run()

@@ -1,0 +1,10 @@
+# The Windows EXE (Python 3.13): the client's packages, the extras the
+# README lists for computers, and the compiler.
+-r requirements.txt
+pyogg==0.6.14a1             # calls in Opus (PyOgg has only alpha releases)
+sounddevice==0.5.6          # the microphone and speaker chosen
+numpy==2.5.4                # voice notes at 1.5x and 2x
+av==19.0.2                  # phones' voice notes played; video (17.0)
+pyzbar==0.1.9               # QR codes read from a picture
+nuitka==4.3.4
+zstandard==0.25.0

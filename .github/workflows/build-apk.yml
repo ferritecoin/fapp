@@ -5,10 +5,14 @@ name: Build Android APK
 # dl.google.com that Buildozer downloads from) and the Windows .exe built
 # with Nuitka on a Windows runner; then a GitHub Release that carries the
 # deliverables: the Android APK, the Windows executable and the desktop
-# Python client. Every branch is tested and built (in a private repository,
-# the executable on the default branch only); only the default branch
-# publishes, and each version only once, so a release's files never change
-# after the fact (tools/publish_release.sh).
+# Python client. Every push is tested. In a private repository, whose
+# minutes are paid, the deliverables are built only for a version that has
+# no Release yet, or when the workflow is run by hand (the owner's
+# CIMINUTES, round 23): a push of work in progress costs its suites alone
+# (9 minutes, not 98). A public repository builds every push, the
+# executable on the default branch only where private. Only the default
+# branch publishes, and each version only once, so a release's files never
+# change after the fact (tools/publish_release.sh).
 #
 # Signing:
 #   * If you set the repo secrets FEXT_KEYSTORE_B64 / FEXT_KEYSTORE_PASSWORD /
@@ -25,9 +29,15 @@ on:
   push:
     branches:
       - "**"
-    # The private record changes no deliverable: no build for it.
+    # The private record changes no deliverable: no build for it. Nor do
+    # the APK trial, which apk-next.yml builds, and the device checks,
+    # which devices.yml runs by hand.
     paths-ignore:
       - ".private/**"
+      - "tools/apk-next/**"
+      - ".github/workflows/apk-next.yml"
+      - "tools/devices/**"
+      - ".github/workflows/devices.yml"
   workflow_dispatch:
 
 permissions:
@@ -41,16 +51,21 @@ jobs:
     # moves on. Both jobs use the same image.
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    outputs:
+      build: ${{ steps.release.outputs.build }}
     steps:
       - name: Checkout (with tags, for the previous-release compatibility tests)
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      - name: Set up Python 3.11
+      - name: Set up Python 3.13 (the EXE's) and 3.11
         uses: actions/setup-python@v6
         with:
-          python-version: "3.11"
+          # The last one is the default `python`; 3.13 is python3.13.
+          python-version: |
+            3.13
+            3.11
 
       - name: Install a virtual display and the client's dependencies
         run: |
@@ -60,8 +75,18 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             xvfb libgl1 libgl1-mesa-dri libmtdev1 xclip libopus0
           python -m pip install --upgrade pip
-          pip install "kivy[base]==2.3.1" requests urllib3 charset-normalizer \
-            idna certifi websocket-client cryptography qrcode pillow
+          # The client's packages at their pinned versions (coincurve too:
+          # libsecp256k1's tier is tested against the others, test_core).
+          pip install -r desktop/requirements.txt
+          # 17.0: video is coded by PyAV, as in the Windows EXE (its pin),
+          # which wants Python 3.12 or later: its suite runs on 3.13.
+          python3.13 -m pip install -r desktop/requirements.txt \
+            "$(grep -E '^av==' desktop/requirements-exe.txt | cut -d' ' -f1)"
+
+      - name: Known vulnerabilities in the pinned packages
+        # PyPI's advisories for every pin, the executable's included: one
+        # with an advisory fails the build until its pin is raised.
+        run: python tools/vuln_audit.py -r desktop/requirements-exe.txt
 
       - name: Version in main.py matches buildozer.spec
         run: |
@@ -69,6 +94,24 @@ jobs:
           CODE=$(grep -E '^APP_VERSION = ' main.py | sed -E 's/.*"(.*)".*/\1/')
           echo "spec=$SPEC main.py=$CODE"
           test "$SPEC" = "$CODE"
+
+      - name: Build the APK and the EXE? (a new version, by hand, or a public repository)
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          VER="$(grep -E '^version' buildozer.spec | head -1 | sed -E 's/.*=[[:space:]]*//')"
+          BUILD=true
+          # Asked of the Release itself, as publish_release.sh does; should
+          # the question fail, the build runs.
+          if [ "$EVENT" != workflow_dispatch ] && [ "$PRIVATE" = true ] &&
+             gh release view "v$VER" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            BUILD=false
+            echo "::notice::v$VER is released already, so this push runs the suites alone. A new version (buildozer.spec and main.py) builds the APK and the EXE, as does Actions › Build Android APK › Run workflow."
+          fi
+          echo "build=$BUILD" | tee -a "$GITHUB_OUTPUT"
 
       - name: Run the suites
         env:
@@ -104,9 +147,18 @@ jobs:
           xvfb-run -a python desktop/test_navigation.py main.py
           xvfb-run -a python desktop/test_pictures.py main.py
           xvfb-run -a python desktop/test_calls.py main.py
+          xvfb-run -a python desktop/test_conference.py main.py
           xvfb-run -a python desktop/test_notify.py main.py
           xvfb-run -a python desktop/test_gestures.py main.py
+          xvfb-run -a python desktop/test_touch.py main.py
           xvfb-run -a python desktop/test_privacy.py main.py
+          xvfb-run -a python desktop/test_screen.py main.py
+          # Video messages (18.1): the file and the recorder as a phone's
+          # Python 3.11 runs them; then with PyAV, recorded and played.
+          xvfb-run -a python desktop/test_videomsg.py main.py
+          python desktop/test_backup.py main.py
+          xvfb-run -a python3.13 desktop/test_video.py main.py
+          xvfb-run -a python3.13 desktop/test_videomsg.py main.py
 
   build-windows:
     name: Nuitka (Windows EXE)
@@ -115,12 +167,16 @@ jobs:
     # there it is built on the default branch only. A public one (fapp)
     # builds it on every push.
     if: >-
+      needs.tests.outputs.build == 'true' && (
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-      || !github.event.repository.private
+      || !github.event.repository.private)
     # Pinned, as the Ubuntu jobs are: the build and its smoke test have run
     # on this image.
     runs-on: windows-2022
-    timeout-minutes: 90
+    # With its cache cold (a new Python, or the cache evicted after a week
+    # unused) the build compiles for over an hour: 66 minutes on Python 3.13.
+    # A build that times out saves no cache, so the next would time out too.
+    timeout-minutes: 120
     defaults:
       run:
         shell: bash
@@ -132,21 +188,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Set up Python 3.11
+      - name: Set up Python 3.13
         uses: actions/setup-python@v6
         with:
-          python-version: "3.11"
+          python-version: "3.13"
 
       - name: Install Nuitka, the client's packages and the desktop extras
         run: |
           python -m pip install --upgrade pip
-          # The extras are what the README lists for computers: calls in
-          # Opus (pyogg), the microphone and speaker chosen (sounddevice),
-          # voice notes at 1.5x and 2x (numpy), phones' voice notes played
-          # (av), QR codes read from a picture (pyzbar).
-          pip install nuitka==4.3.4 zstandard "kivy[base]==2.3.1" requests \
-            urllib3 charset-normalizer idna certifi websocket-client \
-            cryptography qrcode pillow sounddevice numpy av pyzbar pyogg
+          # Pinned (desktop/requirements-exe.txt): the client's packages, the
+          # extras the README lists for computers, and Nuitka.
+          pip install -r desktop/requirements-exe.txt
 
       # Nuitka's caches, the compiled C above all: compiling it is most of
       # the build's hour. Later builds compile only what changed.
@@ -155,8 +207,8 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ${{ runner.temp }}/nuitka-cache
-          key: nuitka-windows-${{ hashFiles('main.py', 'desktop/build_desktop.sh', 'desktop/nuitka-package.config.yml') }}
-          restore-keys: nuitka-windows-
+          key: nuitka-windows-py313-${{ hashFiles('main.py', 'desktop/build_desktop.sh', 'desktop/nuitka-package.config.yml', 'desktop/requirements*.txt') }}
+          restore-keys: nuitka-windows-py313-
 
       - name: Build the Windows executable
         id: exe
@@ -206,7 +258,7 @@ jobs:
           name: ferritext-windows
           path: ${{ steps.exe.outputs.exe }}
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 2              # as the release's, above
 
       - name: Publish to a GitHub Release
         if: success() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && env.HAS_KEY == 'true'
@@ -218,6 +270,7 @@ jobs:
   build-android:
     name: Buildozer (release APK)
     needs: tests
+    if: needs.tests.outputs.build == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
 
@@ -260,30 +313,12 @@ jobs:
             buildozer-${{ runner.os }}-
 
       - name: Pre-fetch FreeType from either of its official hosts
+        # python-for-android fetches it from savannah alone (tools/seed_download.sh).
         run: |
-          set -euo pipefail
-          # python-for-android downloads FreeType from download.savannah.gnu.org
-          # alone, and a build has failed after 11 minutes on that host being
-          # unreachable. Seed its download cache (the file plus the .mark-
-          # file that tells it the download completed) from savannah or from
-          # SourceForge, FreeType's other official host — pinned by sha256,
-          # so either host is enough and neither has to be trusted blindly.
-          ARCHS="$(grep -E '^android.archs' buildozer.spec | sed -E 's/.*=//; s/[[:space:]]//g; s/,/_/g')"
-          PKG=".buildozer/android/platform/build-${ARCHS}/packages/freetype"
-          FILE="freetype-2.10.1.tar.gz"
-          SHA="3a60d391fd579440561bf0e7f31af2222bc610ad6ce4d9d7bd2165bca8669110"
-          mkdir -p "$PKG"
-          for URL in "https://download.savannah.gnu.org/releases/freetype/$FILE" \
-                     "https://sourceforge.net/projects/freetype/files/freetype2/2.10.1/$FILE/download"; do
-            if curl -fsSL --retry 3 --connect-timeout 20 --max-time 300 -o "$PKG/$FILE" "$URL" \
-                && echo "$SHA  $PKG/$FILE" | sha256sum -c --quiet -; then
-              touch "$PKG/.mark-$FILE"
-              echo "FreeType $FILE from $URL (sha256 verified)"
-              exit 0
-            fi
-            rm -f "$PKG/$FILE"
-          done
-          echo "::warning::Could not pre-fetch FreeType; python-for-android will try savannah itself"
+          bash tools/seed_download.sh freetype freetype-2.10.1.tar.gz \
+            3a60d391fd579440561bf0e7f31af2222bc610ad6ce4d9d7bd2165bca8669110 \
+            https://download.savannah.gnu.org/releases/freetype/freetype-2.10.1.tar.gz \
+            https://sourceforge.net/projects/freetype/files/freetype2/2.10.1/freetype-2.10.1.tar.gz/download
 
       - name: Build & sign the release APK
         env:
@@ -350,14 +385,16 @@ jobs:
       - name: Upload the deliverables as a workflow artifact
         if: success()
         uses: actions/upload-artifact@v6
-        # Kept a week: the Releases keep every version. A full artifact quota
-        # leaves a warning here, not a failed build without its Release.
+        # Kept two days: the Releases keep every version, and a week of
+        # these filled the account's artifact storage, which the device
+        # checks' logs share (17.2). A full quota leaves a warning here,
+        # not a failed build without its Release.
         continue-on-error: true
         with:
           name: ferritext-release
           path: release/*
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 2
 
       - name: Publish to a GitHub Release
         # Only from the default branch: other branches are tested and built

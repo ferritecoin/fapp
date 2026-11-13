@@ -1,0 +1,61 @@
+# Pillow 13.0.0: what python-for-android 2026.5.9 changes in 11.3.0, again:
+# no library or Python folder of the build machine is searched, and each
+# X_ROOT the recipe sets is "lib_dir:include_dir".
+--- a/setup.py
++++ b/setup.py
+@@ -169,6 +169,7 @@
+ 
+ 
+ def _find_library_dirs_ldconfig() -> list[str]:
++    return []
+     # Based on ctypes.util from Python 2
+ 
+     ldconfig = "ldconfig" if shutil.which("ldconfig") else "/sbin/ldconfig"
+@@ -523,13 +524,9 @@
+             root = globals()[root_name]
+ 
+             if root is None and root_name in os.environ:
+-                root_prefix = os.environ[root_name]
+-                root = (
+-                    os.path.join(root_prefix, "lib"),
+-                    os.path.join(root_prefix, "include"),
+-                )
++                root = tuple(os.environ[root_name].split(":"))
+ 
+-            if root is None and pkg_config:
++            if root is None and False:
+                 for lib_name2 in (
+                     [lib_name] if isinstance(lib_name, str) else lib_name
+                 ):
+@@ -572,21 +569,11 @@
+                 for d in os.environ[k].split(os.path.pathsep):
+                     _add_directory(library_dirs, d)
+ 
+-        _add_directory(
+-            library_dirs,
+-            (sys.prefix == sys.base_prefix and sysconfig.get_config_var("LIBDIR"))
+-            or os.path.join(sys.prefix, "lib"),
+-        )
+-        _add_directory(
+-            include_dirs,
+-            (sys.prefix == sys.base_prefix and sysconfig.get_config_var("INCLUDEDIR"))
+-            or os.path.join(sys.prefix, "include"),
+-        )
+ 
+         #
+         # add platform directories
+ 
+-        if self.disable_platform_guessing:
++        if True:  # python-for-android: never the build machine's folders
+             pass
+ 
+         elif sys.platform == "cygwin":
+@@ -689,7 +676,7 @@
+         # FIXME: check /opt/stuff directories here?
+ 
+         # standard locations
+-        if not self.disable_platform_guessing:
++        if False:  # python-for-android: as above
+             _add_directory(library_dirs, "/usr/local/lib")
+             _add_directory(include_dirs, "/usr/local/include")
+ 

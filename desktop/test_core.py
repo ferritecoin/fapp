@@ -17,9 +17,11 @@ import tempfile
 
 os.environ.setdefault("KIVY_NO_ARGS", "1")
 os.environ["KIVY_NO_CONSOLELOG"] = "1"
-os.environ.setdefault("SDL_VIDEODRIVER", "x11")
+if sys.platform.startswith("linux"):     # xvfb-run's X display
+    os.environ.setdefault("SDL_VIDEODRIVER", "x11")
 HOME = tempfile.mkdtemp(prefix="fext-core-")
 os.environ["HOME"] = HOME
+os.environ["USERPROFILE"] = HOME                 # Path.home() on Windows
 os.environ["FEXT_LANG"] = "en"          # the English the checks read
 
 RESULTS = []
@@ -307,11 +309,16 @@ class StubApp:
         self.store = M.LocalStore(db)
         self.ui_queue = queue.Queue()
         self.notified = []
+        self.away_asked = []
         self.api = StubRelay()
 
     # v11: the worker announces from its own thread
-    def notify_incoming(self, peer, body, kind, author=None):
+    def notify_incoming(self, peer, body, kind, author=None,
+                        mentioned=False):
         self.notified.append((peer, body, kind, author))
+
+    def away_reply(self, peer, ext):       # 18.1: asked, not answered
+        self.away_asked.append((peer, dict(ext or {})))
 
     def call_signal_arrived(self, sender, sig):
         self.ui_queue.put(("call_signal", sender, sig))
@@ -361,6 +368,11 @@ check("a plain message is stored and acked", acked and row and
 check("...and is announced for a notification, from the sync thread",
       app.notified and app.notified[-1][:3] == (sender.address,
                                                 "first message", "text"))
+check("...and the app is asked once whether an away reply is due (18.1)",
+      app.away_asked == [(sender.address, {})], app.away_asked)
+again, _c = deliver("first message", cid=first)
+check("...not again for a copy of it that comes twice",
+      again and len(app.away_asked) == 1, app.away_asked)
 app.events()
 
 acked, reply = deliver("a reply", x={"k": "text", "reply": {
@@ -398,6 +410,7 @@ check("hostile reply fields are dropped or bounded",
 # --- delete for both -------------------------------------------------------
 ours = app.store.add_out(sender.address, "ours", M.now_iso(), "ours" * 8)
 before = app.store.message_count(sender.address)
+asked = len(app.away_asked)
 acked, ctl = deliver("Deleted a message", x={"k": "ctl", "ctl": {
     "op": "delete", "cids": [first, "ours" * 8]}})
 check("delete-for-both control is acked and not stored",
@@ -408,6 +421,8 @@ check("it removes the author's message but not ours",
       app.store.message_count(sender.address) == before - 1)
 check("a re-delivered copy of the same control is a no-op",
       not app.store.consume_control(sender.address, ctl))
+check("...and a control is not something to answer while away",
+      len(app.away_asked) == asked, (asked, app.away_asked))
 
 app.events()
 acked, _c = deliver("Please resend", x={"k": "ctl", "ctl": {
@@ -452,6 +467,7 @@ if OLD is not None:
             self.store = OLD.LocalStore(db)
             self.ui_queue = queue.Queue()
             self.notified = []
+            self.away_asked = []
             self.api = StubRelay()        # a 14.0 client's requests use it
 
     old_receiver = Party(OLD, "old-receiver")
@@ -491,6 +507,26 @@ if OLD is not None:
           acked and old_app.store.reaction_of(sender.address, c912,
                                               sender.address) ==
           "\u2764\ufe0f")
+    # 18.1: a video message, and a reply to one, at the release before.
+    acked, cvid = deliver_old(M.video_label(42000), {
+        "k": "media", "ft": M.FEATURES, "media": {
+            "kind": "video", "mime": "video/mp4", "size": 5_000_000,
+            "blob": "b" * 32, "sha": "0" * 64, "key": M.b64e(bytes(32)),
+            "dur": 42000, "w": 480, "h": 640}})
+    row = old_app.store.message_by_cid(sender.address, cvid)
+    check("the release before shows a video message as its words: a "
+          "text message, with nothing to download",
+          acked and row and row["kind"] == "text" and
+          row["body"] == "Video message (0:42)" and
+          not row.get("media_state"), row and dict(row))
+    acked, cre = deliver_old("nice one", {"k": "text", "ft": M.FEATURES,
+                                          "reply": {"cid": cvid,
+                                                    "kind": "video"}})
+    row = old_app.store.message_by_cid(sender.address, cre)
+    check("...and takes a reply to one as a reply to that message",
+          acked and row and row["body"] == "nice one" and
+          OLD.message_ext(row).get("reply", {}).get("cid") == cvid,
+          row and row.get("ext"))
     old_app.store.close()
 app.store.close()
 
@@ -841,6 +877,164 @@ gapp.store.close()
 
 
 # =============================================================================
+section("18.0 sync: a group's admins, with a member on the previous release")
+# Phones: the owner's, an 18.0 member's (receiver) and, given the previous
+# release, a member on it (elder): an app before 18.0 follows the owner
+# alone. The co-admins, deputy and other, only send.
+owner, deputy, other = (Party(M, n) for n in ("owner", "deputy", "other"))
+elder = Party(OLD or M, "elder")
+GID4 = "34" * 16
+phones = {"owner": StubApp(owner, DB_DIR / "admins_owner.db"),
+          "new": StubApp(receiver, DB_DIR / "admins_new.db")}
+if OLD is not None:
+    phones["old"] = OldStubApp(elder, DB_DIR / "admins_old.db")
+workers = {name: (OLD if name == "old" else M).SyncWorker(phone)
+           for name, phone in phones.items()}
+AT = 1_780_000_000.0
+ORDER = [owner, receiver, deputy, other, elder]   # the owner's heir: deputy
+
+
+def held(name):
+    return phones[name].store.group(GID4)
+
+
+def send(frm, ctl, to=("new", "old")):
+    """`ctl` from `frm`, to each phone named that there is."""
+    for name in to:
+        if name not in phones:
+            continue
+        party = {"owner": owner, "new": receiver, "old": elder}[name]
+        cid = uuid.uuid4().hex
+        env, _ = frm.crypto.build_envelope(
+            "Group updated", party.pub, x={"k": "ctl", "ctl": ctl,
+                                           "ft": M.FEATURES},
+            recipient=party.address, cid=cid)
+        _sid[0] += 1
+        workers[name]._ingest_message({"id": _sid[0], "sender": frm.address,
+                                       "client_msg_id": cid,
+                                       "envelope": env})
+
+
+def gstate(v, name, by=owner, adm=owner, base=None, event=None):
+    """The state `by` sends at version `v`: `base`'s admins and log (a
+    state), and `event` (e, t) of theirs logged."""
+    out = {"id": GID4, "name": name, "v": v, "admin": adm.address,
+           "members": [member(p) for p in ORDER]}
+    ad, lg = dict((base or {}).get("ad") or {}), list(
+        (base or {}).get("lg") or [])
+    if event:
+        lg.append({"v": v, "a": by.address, "e": event[0], "t": event[1],
+                   "at": AT + v})
+    out.update({k: val for k, val in (("ad", ad), ("lg", lg)) if val})
+    return out
+
+
+s1 = gstate(1, "Field notes")
+phones["owner"].store.save_group(dict(s1, by=owner.address), "active")
+send(owner, {"op": "group", "g": s1})
+check("every phone takes the owner's invitation",
+      all(held(n)["state"] == "active" and held(n)["admin"] == owner.address
+          for n in phones))
+rights = {"r": ["info", "add", "remove"], "by": owner.address}
+s2 = gstate(2, "Field notes", event=("admin", deputy.address))
+s2["ad"] = {deputy.address: rights, other.address: rights}
+s2["lg"].append(dict(s2["lg"][0], t=other.address))
+phones["owner"].store.save_group(dict(s2, by=owner.address), "active")
+send(owner, {"op": "group", "g": s2})
+check("...and her next, though it names admins and a log the previous "
+      "release does not know",
+      held("new")["admins"] == s2["ad"] and len(held("new")["log"]) == 2 and
+      all(held(n)["version"] == 2 for n in phones))
+
+s3 = gstate(3, "Field notes, 2026", deputy, base=s2,
+            event=("name", "Field notes, 2026"))
+phones["owner"].events()
+send(deputy, {"op": "group", "g": s3}, to=("owner", "new", "old"))
+check("a co-admin's change: 18.0 apps take it from him",
+      all(held(n)["name"] == "Field notes, 2026" and
+          held(n)["by"] == deputy.address for n in ("owner", "new")))
+if OLD is not None and hasattr(OLD, "admin_change_allowed"):
+    # From 18.0.1 on, the previous release is an 18.0 one (CI's baseline).
+    check("...as the previous release, an 18.0 one, does",
+          held("old")["name"] == "Field notes, 2026" and
+          held("old")["version"] == 3)
+elif OLD is not None:
+    check("...an app before 18.0 only from the owner",
+          held("old")["name"] == "Field notes" and held("old")["version"] == 2)
+check("...whose app sends it on, as it is, for those",
+      ("group_forward", GID4, []) in phones["owner"].events())
+copy = {k: v for k, v in s3.items() if k != "lg"}
+send(owner, {"op": "group", "g": copy, "fw": 1})
+if OLD is not None:
+    check("...which brings the older app up to date",
+          held("old")["name"] == "Field notes, 2026" and
+          held("old")["version"] == 3)
+check("...while an 18.0 app leaves the copy: it has his own",
+      held("new")["by"] == deputy.address and len(held("new")["log"]) == 3)
+
+# Two co-admins change it at the same moment: the lower address wins (the
+# owner's would, over either). The owner's app takes the loser's first.
+first, second = sorted((deputy, other), key=lambda p: p.address)
+won = gstate(4, "Picked by the first", first, base=s3,
+             event=("name", "Picked by the first"))
+lost = gstate(4, "Picked by the second", second, base=s3,
+              event=("name", "Picked by the second"))
+send(second, {"op": "group", "g": lost}, to=("owner",))
+check("two co-admins at once: the owner's app takes the one it gets first, "
+      "and sends it on",
+      held("owner")["name"] == "Picked by the second" and
+      ("group_forward", GID4, []) in phones["owner"].events())
+# Its copy goes to the 18.0 phone too, as if her app did not know it yet.
+send(owner, {"op": "group", "g": {k: v for k, v in lost.items()
+                                   if k != "lg"}, "fw": 1})
+send(first, {"op": "group", "g": won}, to=("owner", "new"))
+send(second, {"op": "group", "g": lost}, to=("new",))
+check("...then the other, which wins on every 18.0 phone",
+      all(held(n)["name"] == "Picked by the first" and held(n)["version"] == 4
+          for n in ("owner", "new")))
+check("...and the log keeps the winner's entry, not the loser's",
+      [(e["a"], e["v"]) for e in held("owner")["log"]][-2:] ==
+      [(deputy.address, 3), (first.address, 4)])
+check("...which, as an older app may hold the other, the owner's app "
+      "publishes at the next version",
+      ("group_publish", GID4, []) in phones["owner"].events())
+s5 = dict(M.group_row_state(held("owner")), v=5)
+phones["owner"].store.save_group(dict(s5, by=owner.address), "active")
+send(owner, {"op": "group", "g": s5})
+check("...so every phone holds the same group",
+      all(held(n)["name"] == "Picked by the first" and held(n)["version"] == 5
+          for n in phones))
+
+grab = gstate(6, "Mine now", other, adm=other, base=s5)
+grab["ad"] = {deputy.address: rights}
+send(other, {"op": "group", "g": grab})
+check("a co-admin cannot make himself the owner",
+      held("new")["admin"] == owner.address and held("new")["version"] == 5)
+
+# The owner leaves: her app sends the state that makes her first other
+# admin (deputy, not the first member) the owner, then her leave.
+handover = dict(M.group_row_state(held("owner")), v=6,
+                admin=deputy.address)
+handover["ad"] = {a: e for a, e in handover["ad"].items()
+                  if a != deputy.address}
+send(owner, {"op": "group", "g": handover})
+send(owner, {"op": "leave", "grp": GID4})
+check("the owner leaves: every phone, older ones too, has her first other "
+      "admin as its owner",
+      all(held(n)["admin"] == deputy.address and owner.address not in
+          {m["a"] for m in held(n)["members"]}
+          for n in ("new", "old") if n in phones))
+s7 = gstate(7, "Field notes, kept", deputy, adm=deputy, base=handover)
+s7["members"] = [m for m in s7["members"] if m["a"] != owner.address]
+send(deputy, {"op": "group", "g": s7})
+check("...and follows him from then on",
+      all(held(n)["name"] == "Field notes, kept" and held(n)["version"] == 7
+          for n in ("new", "old") if n in phones))
+for phone in phones.values():
+    phone.store.close()
+
+
+# =============================================================================
 section("v15: private keys in Ferrite Core's own format")
 KEY_1 = (1).to_bytes(32, "big") + b"\x01"          # key 1, compressed
 check("Copy WIF gives Ferrite Core's format (version 163), which its "
@@ -983,6 +1177,337 @@ if OLD is not None:
     except Exception as exc:                      # noqa: BLE001
         check("the previous release reads a message carrying our key",
               False, f"{type(exc).__name__}: {exc}")
+
+
+# =============================================================================
+section("secp256k1: every tier gives the same bytes (16.0)")
+# libsecp256k1 (coincurve, where installed) now also multiplies and signs;
+# the windowed pure-Python tier and the affine reference must agree with it
+# byte for byte, or messages would stop opening between the two.
+import hashlib                                                # noqa: E402
+
+native = M.HAVE_NATIVE_SECP256K1
+print(f"  (libsecp256k1 here: {native})")
+rng = __import__("random").Random(1604)
+
+
+def pure(fn, *args):
+    """`fn` with the native tier switched off."""
+    saved = M.HAVE_NATIVE_SECP256K1
+    M.HAVE_NATIVE_SECP256K1 = False
+    try:
+        return fn(*args)
+    finally:
+        M.HAVE_NATIVE_SECP256K1 = saved
+
+
+same_sign = same_mul = same_ecdh = True
+for _ in range(40):
+    priv = rng.randrange(1, M._N)
+    other = rng.randrange(1, M._N)
+    msg = bytes(rng.randrange(256) for _ in range(rng.randrange(1, 300)))
+    point = M._ec_mul_affine(other, M._G)
+    sig = M.ecdsa_sign(msg, priv)
+    same_sign &= sig == pure(M.ecdsa_sign, msg, priv) == \
+        M.ecdsa_sign_affine(msg, priv) and M.ecdsa_verify_affine(
+            msg, sig, M._ec_mul_affine(priv, M._G))
+    same_mul &= M._ec_mul(priv, point) == pure(M._ec_mul, priv, point) == \
+        M._ec_mul_affine(priv, point) and \
+        M.priv_to_pub(priv) == M._ec_mul_affine(priv, M._G)
+    same_ecdh &= M.ecdh_shared_secret(priv, point) == pure(
+        M.ecdh_shared_secret, priv, point) == hashlib.sha256(
+        M.pub_to_compressed(M._ec_mul_affine(priv, point))).digest()
+check("signatures: the same bytes from every tier, and they verify",
+      same_sign)
+check("scalar multiples (each message's own key, a public key) agree",
+      same_mul)
+check("shared secrets (ECDH) agree", same_ecdh)
+edges = [(1, M._G), (M._N - 1, M._G), (M._N, M._G), (0, M._G),
+         (M._N + 5, M.priv_to_pub(7))]
+check("...at the edges: 1, N-1, N and 0 (no point), and k past N",
+      all(M._ec_mul(k, p) == pure(M._ec_mul, k, p) ==
+          (M._ec_mul_affine(k % M._N, p) if k % M._N else None)
+          for k, p in edges))
+
+
+print("\nA file put in place while something has it open (17.2.1)")
+# Windows refuses a rename onto a file anything has open: the Devices runs
+# lost a setting that way. The refusal is played here on any system.
+real_replace, waits, tries = M.os.replace, M.RENAME_WAITS, []
+
+
+def refusing(src, dst):
+    tries.append(dst)
+    if len(tries) <= 2:
+        raise PermissionError(13, "in use", str(dst))
+    real_replace(src, dst)
+
+
+M.os.replace, M.RENAME_WAITS = refusing, (0.001, 0.001, 0.001)
+try:
+    M.save_pref("put_in_place", 1)
+finally:
+    M.os.replace, M.RENAME_WAITS = real_replace, waits
+check("a setting is saved though the first two renames are refused",
+      M.load_prefs().get("put_in_place") == 1 and len(tries) == 3, tries)
+# 18.0: the Devices run's Windows job lost a setting again. The app's
+# own threads read prefs.json all the time, and Windows refuses the
+# rename while any of them has it open: played here, with readers on
+# four threads while fifty settings are saved, no try again.
+import threading                                               # noqa: E402
+import time                                                    # noqa: E402
+open_now, refused, stop = [0], [], threading.Event()
+real_read_text = Path.read_text
+
+
+def reading(path, *args, **kwargs):
+    if path.name != "prefs.json":
+        return real_read_text(path, *args, **kwargs)
+    open_now[0] += 1
+    try:
+        time.sleep(0.001)                   # a reader holds it a moment
+        return real_read_text(path, *args, **kwargs)
+    finally:
+        open_now[0] -= 1
+
+
+def as_windows(src, dst):
+    if Path(dst).name == "prefs.json" and open_now[0]:
+        refused.append(dst)
+        raise PermissionError(13, "in use", str(dst))
+    real_replace(src, dst)
+
+
+def keep_reading():
+    while not stop.is_set():
+        M.load_prefs()
+
+
+Path.read_text, M.os.replace, M.RENAME_WAITS = reading, as_windows, ()
+readers = [threading.Thread(target=keep_reading) for _ in range(4)]
+for each in readers:
+    each.start()
+saved = []
+try:
+    for n in range(50):
+        M.save_pref("read_meanwhile", n)
+        saved.append(M.load_prefs().get("read_meanwhile"))
+finally:
+    stop.set()
+    for each in readers:
+        each.join()
+    Path.read_text, M.os.replace, M.RENAME_WAITS = \
+        real_read_text, real_replace, waits
+check("a setting saved while the app's own threads read the settings is "
+      "never refused by them (Windows' rule played)",
+      saved == list(range(50)) and not refused,
+      f"{len(refused)} refused; {saved[:8]}")
+source = Path(M.__file__).read_text(encoding="utf-8")
+check("...and every file the app puts in place whole goes through "
+      "replace_file", source.count("os.replace(") == 2 and
+      ".replace(DATA_DIR" not in source)
+
+
+# =============================================================================
+section("18.1: what arrives malformed is refused or let go, never raised")
+# Before 18.1 a message that opened and then raised ended the session; the
+# relay sent it again on every reconnect, and the mailbox waited behind it.
+import ast                                                     # noqa: E402
+import base64                                                  # noqa: E402
+import random                                                  # noqa: E402
+
+mapp = StubApp(receiver, DB_DIR / "malformed.db")       # a mailbox of its own
+mapp.store.upsert_contact(sender.address, "sender", sender.pub)
+mworker = M.SyncWorker(mapp)
+
+
+def sealed(x=None, body="hello", change=None):
+    """A frame from `sender` whose signed payload `change` alters just
+    before it is sealed: what an app made to do harm could send."""
+    real, cid = json.dumps, uuid.uuid4().hex
+
+    def dumps(obj, **kw):
+        if change and isinstance(obj, dict) and "signature" in obj:
+            change(obj)
+        return real(obj, **kw)
+    try:
+        json.dumps = dumps
+        env, _ = sender.crypto.build_envelope(
+            body, receiver.pub, x=x, recipient=receiver.address, cid=cid)
+    finally:
+        json.dumps = real
+    _sid[0] += 1
+    return {"id": _sid[0], "sender": sender.address, "client_msg_id": cid,
+            "envelope": env}
+
+
+def taken(frame):
+    """What the worker answers for `frame`, or the exception it raised."""
+    try:
+        return mworker._ingest_message(frame)
+    except Exception as exc:                               # noqa: BLE001
+        return exc
+
+
+def named(name):
+    return lambda payload: payload["sender"].update(username=name)
+
+
+got = taken(sealed(change=lambda p: p.update(body=["not", "text"])))
+check("a body that is not text: refused as an envelope that will not open, "
+      "left on the relay for now", got is None, repr(got))
+before = mapp.store.get_contact(sender.address)["username"]
+frames = [sealed(body=f"named {n}", change=named(name)) for n, name in
+          enumerate((2 ** 200, {"a": 1}, "x" * 500, "[size=abc]"))]
+got = [taken(frame) for frame in frames]
+check("a sender's name that is no name (a number too large to store, an "
+      "object, 500 letters, markup): the message is kept, the name is not",
+      got == [f["id"] for f in frames] and
+      mapp.store.get_contact(sender.address)["username"] == before,
+      f"{got} {mapp.store.get_contact(sender.address)['username']!r}")
+got = taken(sealed(change=named("\ud800")))
+check("half of a surrogate pair anywhere in it (no database stores it, no "
+      "screen draws it): refused whole", got is None, repr(got))
+frame = sealed(x={"k": "media", "media": dict(media_ref(), kind={"a": 1})},
+               body="a photo, its kind an object")
+got = taken(frame)
+check("a media block whose kind is not a word: the words arrive, as a "
+      "plain message", got == frame["id"] and mapp.store.message_by_cid(
+          sender.address, frame["client_msg_id"])["kind"] == "text",
+      repr(got))
+
+real_ext = M.sanitize_ext_with_body
+
+
+def faulty(*_a):
+    raise RuntimeError("a fault of this app's own")
+
+
+M.sanitize_ext_with_body = faulty
+try:
+    frame = sealed(x={"k": "msg"}, body="opened, not taken in")
+    got = [taken(frame) for _n in range(M.SyncWorker.MAX_DECRYPT_ATTEMPTS)]
+finally:
+    M.sanitize_ext_with_body = real_ext
+last = mapp.store.messages_for(sender.address)[-1]
+check("a message that opens and cannot be taken in (a fault here) is left "
+      "on the relay twice, then recorded as unreadable and acknowledged: "
+      "it never holds up what comes after it",
+      got == [None, None, frame["id"]] and "could not read" in last["body"]
+      and last["read"], f"{got} {last['body'][:40]!r}")
+real_control = mworker._handle_control
+mworker._handle_control = faulty
+try:
+    frame = sealed(x={"k": "ctl", "ctl": {"op": "timer"}})
+    got = taken(frame)
+finally:
+    mworker._handle_control = real_control
+check("...and an instruction that cannot be followed is acknowledged at "
+      "once: it is no better for coming again", got == frame["id"],
+      repr(got))
+
+
+def link_of(mark, payload):
+    raw = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+    return f"https://example.org{M.CALL_LINK_PATH}#{mark}{raw}"
+
+
+# Past the depth Python's JSON reader follows (1,000 on 3.11, some
+# 10,000 on 3.13): a RecursionError, which is not a ValueError.
+deep = b"[" * 50_000
+try:
+    got = (M.parse_call_link(link_of(M.CALL_LINK_MARK, deep)),
+           M.parse_join_link(link_of(M.JOIN_LINK_MARK, deep)),
+           M.address_in_qr("[" * 50_000),
+           M.address_in_qr("{" + '"a":[' * 50_000))
+except Exception as exc:                                   # noqa: BLE001
+    got = exc
+check("a link or a scanned code holding JSON nested tens of thousands deep "
+      "is not one of ours, and says so without raising",
+      got == (None, None, None, None), repr(got)[:80])
+
+rng = random.Random(181)
+ODD = [None, True, 0, -1, 2 ** 200, 1.5, float("nan"), float("inf"), "", "a",
+       "9" * 5000, "\x00", "\u202eabc", "[size=abc]", "../..", "x" * 9000,
+       "ab" * 16, "0f" * 32, sender.address, M.now_iso(), "image", "video"]
+WORDS = sorted(set(__import__("re").findall(
+    r'[\[(]"([a-z_]{1,10})"[\]),]', source)))
+
+
+def odd(depth=0):
+    roll = rng.random()
+    if depth > 3 or roll < 0.5:
+        return rng.choice(ODD)
+    if roll < 0.65:
+        return [odd(depth + 1) for _n in range(rng.choice((0, 1, 3, 40)))]
+    return {rng.choice(WORDS): odd(depth + 1)
+            for _n in range(rng.choice((1, 2, 4, 8)))}
+
+
+TAKERS = [getattr(M, name) for name in sorted(dir(M))
+          if name.startswith("sanitize_")]
+people = [sender.address, receiver.address]
+raised = []
+for _n in range(1500):
+    value = odd()
+    for take in TAKERS:
+        args = {"sanitize_stamp": (value, M.now_iso()),
+                "sanitize_preview": (value, "see https://example.org/"),
+                "sanitize_ext_with_body": (value, "see https://example.org/"),
+                "sanitize_group_rules": (value, people),
+                "sanitize_group_admins": (value, set(people), people[0]),
+                "sanitize_call_signal": ("call", value)}.get(
+            take.__name__, (value,))
+        try:
+            take(*args)
+        except Exception as exc:                           # noqa: BLE001
+            raised.append(f"{take.__name__}: {type(exc).__name__}")
+check(f"1,500 values nobody meant to send, through each of the "
+      f"{len(TAKERS)} sanitizers: none raises",
+      not raised and len(TAKERS) >= 20, str(sorted(set(raised)))[:200])
+
+tree = ast.parse(source)
+check("no assert guards anything in the app (the APK is compiled without "
+      "them): a column a setting may not name is refused by a raise",
+      not [n for n in ast.walk(tree) if isinstance(n, ast.Assert)] and
+      expect_reject(lambda: mapp.store.set_contact_setting(
+          sender.address, "address", 1), "a column outside the list")[0])
+opened = []
+real_open = __import__("webbrowser").open
+__import__("webbrowser").open = opened.append
+try:
+    M.open_url("https://example.org/page")
+    refused = [expect_reject(lambda u=u: M.open_url(u), "not a web link")[0]
+               for u in ("file:///etc/passwd", "intent://x#Intent;end",
+                         "javascript:alert(1)", "", "ftp://example.org")]
+finally:
+    __import__("webbrowser").open = real_open
+check("only a web link is ever handed to the browser, whoever asks",
+      opened == ["https://example.org/page"] and all(refused),
+      f"{opened} {refused}")
+
+key = M.b64e(os.urandom(32))
+real_run, real_platform = M.subprocess.run, sys.platform
+said = []
+real_warning = M.log.warning
+M.log.warning = lambda *a, **_kw: said.append(" ".join(map(str, a)))
+
+
+def failing(argv, **_kw):
+    raise M.subprocess.CalledProcessError(1, argv)
+
+
+try:
+    sys.platform, M.subprocess.run = "darwin", failing
+    ok, why = expect_reject(lambda: M.DeviceKeystore.seal(M.b64d(key)),
+                            "the keychain refused")
+finally:
+    sys.platform, M.subprocess.run = real_platform, real_run
+    M.log.warning = real_warning
+check("a keystore that refuses is reported without the key (a failed "
+      "command's own text holds its arguments, the key among them on a "
+      "Mac)", ok and key not in why and key not in " ".join(said) and
+      "BackupError" in why, why[:90])
 
 
 # =============================================================================

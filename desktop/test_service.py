@@ -20,6 +20,7 @@ from pathlib import Path
 os.environ["PYTHON_NAME"] = "Fextsync"        # as python-for-android sets it
 os.environ.pop("DISPLAY", None)
 os.environ["HOME"] = tempfile.mkdtemp(prefix="fext-svc-")
+os.environ["USERPROFILE"] = os.environ["HOME"]   # Path.home() on Windows
 os.environ["FEXT_LANG"] = "en"          # the English the checks read
 ROOT = Path(__file__).resolve().parent.parent
 MAIN = Path(sys.argv[1] if len(sys.argv) > 1 else "main.py").resolve()
@@ -120,15 +121,17 @@ check("a stale heartbeat means gone", not M2.heartbeat_fresh("app"))
 print("\nBoth services start from main.py, as Android starts them")
 
 
-def service(name, argument=""):
+def service(name, argument="", stderr=subprocess.PIPE):
     """main.py run as python-for-android runs a service: its name in
-    PYTHON_NAME, a home of its own, every import it makes listed."""
+    PYTHON_NAME, a home of its own, every import it makes listed (on
+    `stderr`, with what it logs)."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("KIVY_")}
+    home = tempfile.mkdtemp(prefix="fext-svc-")
     env.update(PYTHON_NAME=name, PYTHON_SERVICE_ARGUMENT=argument,
-               HOME=tempfile.mkdtemp(prefix="fext-svc-"))
+               HOME=home, USERPROFILE=home)      # Path.home() on Windows
     return subprocess.Popen([sys.executable, "-X", "importtime", str(MAIN)],
-                            env=env, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE)
+                            env=env, stdout=subprocess.DEVNULL,
+                            stderr=stderr)
 
 
 flag = Path(tempfile.mkdtemp(prefix="fext-call-")) / ".call_active"
@@ -151,11 +154,21 @@ except subprocess.TimeoutExpired:
     _out, err = call.communicate()
 check("...and waits while its flag file is there, ending when it goes",
       waited and call.returncode == 0, err[-300:])
-sync = service("Fextsync")
-time.sleep(8)
-running = sync.poll() is None
-sync.terminate()
-_out, err = sync.communicate(timeout=10)
+# Until it says it started, then a few seconds of its loop: not a fixed
+# 8 s, which a first start on Windows' runner needs more than (run 7).
+log = Path(tempfile.mkdtemp(prefix="fext-sync-")) / "stderr.txt"
+with open(log, "wb") as sink:
+    sync = service("Fextsync", stderr=sink)
+    for _ in range(120):                         # a minute at the most
+        if sync.poll() is not None or \
+                b"background service: started" in log.read_bytes():
+            break
+        time.sleep(0.5)
+    time.sleep(3)
+    running = sync.poll() is None
+    sync.terminate()
+    sync.wait(timeout=10)
+err = log.read_bytes()
 check("the sync service runs its loop, windowless",
       running and b"background service: started" in err and
       b"Traceback" not in err, err[-300:])
@@ -170,14 +183,18 @@ work = Path(tempfile.mkdtemp(prefix="dist-"))
 (work / "src" / "main").mkdir(parents=True)
 manifest = work / "src" / "main" / "AndroidManifest.xml"
 # What p4a v2024.01.21's template renders for `services = Fextsync:...,
-# Fextcall:...`:
+# Fextcall:..., Fextshare:...`:
 manifest.write_text('''<manifest><application>
+        <activity android:name="org.kivy.android.PythonActivity"
+                  android:label="@string/app_name" />
         <service android:name="org.kivy.android.PythonService"
                  android:process=":pythonservice" />
         <service android:name="org.fext.fext.ServiceFextsync"
                  android:process=":service_fextsync" />
         <service android:name="org.fext.fext.ServiceFextcall"
                  android:process=":service_fextcall" />
+        <service android:name="org.fext.fext.ServiceFextshare"
+                 android:process=":service_fextshare" />
 </application></manifest>''')
 cwd = os.getcwd()
 os.chdir(work)
@@ -195,7 +212,15 @@ check("declares foregroundServiceType on OUR services only",
 check("...the call service as 'microphone', so a call keeps its microphone "
       "off screen",
       'ServiceFextcall" android:foregroundServiceType="microphone"' in once)
+check("...(18.0) the share service as 'mediaProjection', so a phone's "
+      "screen may be captured",
+      'ServiceFextshare" android:foregroundServiceType="mediaProjection"'
+      in once)
 check("running the hook twice changes nothing", once == twice)
+check("(17.2) the app's activity may shrink to picture in picture, for a "
+      "video call over other apps",
+      'PythonActivity" android:supportsPictureInPicture="true" '
+      'android:resizeableActivity="true"' in once)
 inside = once[once.index("<application>"):once.index("</application>")]
 check("declares the camera's FileProvider once, inside <application>",
       once.count("androidx.core.content.FileProvider") == 1 and
@@ -255,6 +280,86 @@ check("...with the classes that draw and answer them, and a call's "
       "USE_FULL_SCREEN_INTENT" in perms)
 check("(15.1) the keep-running guide may ask Android to leave the battery "
       "alone", "REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" in perms)
+
+# 18.1: the sync service's notification is the app's own, and secret.
+java = (ROOT / "android" / "Notifier.java").read_text("utf-8")
+notice = java[java.index("public static void serviceNotice("):]
+notice = notice[:notice.index("\n    }\n")]
+check("the sync service's own notice: a channel and a notification that "
+      "a locked phone does not show, silent, without a badge, put in the "
+      "place of python-for-android's",
+      notice.count("VISIBILITY_SECRET") == 2 and
+      "IMPORTANCE_LOW" in notice and "setShowBadge(false)" in notice and
+      "service.startForeground(SERVICE_NOTICE" in notice, notice)
+
+
+class FakeNotifier:
+    SERVICE_NOTICE = 7
+    given = []
+
+    @classmethod
+    def serviceNotice(cls, service):
+        cls.given.append(service)
+
+
+class FakePythonService:
+    mService = "the service"
+
+
+real = M._notifier, M._jni, M.IS_ANDROID
+M._notifier = lambda: FakeNotifier
+M._jni = lambda: ((lambda name: FakePythonService), None)
+try:
+    took = M.android_service_notice()
+    check("the service hands itself to the notifier for it",
+          took and FakeNotifier.given == ["the service"], FakeNotifier.given)
+    M.IS_ANDROID = True
+    M.run_background_service(max_cycles=0)
+    check("...as it starts, before anything else",
+          FakeNotifier.given == ["the service"] * 2, FakeNotifier.given)
+    M._notifier = lambda: None
+    check("an APK built without the notifier keeps the notification it "
+          "has", M.android_service_notice() is False)
+finally:
+    M._notifier, M._jni, M.IS_ANDROID = real
+
+# ...and the emulators' self-test asks Android what is shown.
+said, started, shown = [], [], []
+real_sdk, M._SDK[:] = list(M._SDK), [34]
+
+
+def say(*words):
+    said.append(words)
+    return words[1]
+
+
+def notices():
+    """python-for-android's notice (its id 1) first; the app's own after."""
+    shown.append(1)
+    return ([], [1]) if len(shown) < 3 else ([M.NOTICE_SECRET], [])
+
+
+try:
+    verdict = M._selftest_service_notice(say, 5.0, started.append, notices)
+    check("the self-test starts the service, waits until its own secret "
+          "notice is the only one a service shows, and stops it",
+          verdict == "PASS" and started == [True, False] and
+          len(shown) == 3, (verdict, started, shown, said))
+    shown.clear()
+    verdict = M._selftest_service_notice(
+        say, 1.0, started.append, lambda: ([0], []))
+    check("...a notice a locked phone would show fails it",
+          verdict == "FAIL" and "visibility [0]" in said[-1][2], said[-1])
+    verdict = M._selftest_service_notice(
+        say, 1.0, started.append, lambda: ([M.NOTICE_SECRET], [1]))
+    check("...and so does python-for-android's notice still there",
+          verdict == "FAIL", said[-1])
+    M._SDK[:] = [21]
+    check("...before Android 6, which cannot be asked, it is skipped",
+          M._selftest_service_notice(say, 1.0, started.append,
+                                     notices) == "SKIP")
+finally:
+    M._SDK[:] = real_sdk
 manifest.write_text("<manifest><application></application></manifest>")
 os.chdir(work)
 try:

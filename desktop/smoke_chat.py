@@ -17,10 +17,12 @@ import sys
 import tempfile
 
 os.environ.setdefault("KIVY_NO_ARGS", "1")
-os.environ.setdefault("SDL_VIDEODRIVER", "x11")
+if sys.platform.startswith("linux"):     # xvfb-run's X display
+    os.environ.setdefault("SDL_VIDEODRIVER", "x11")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 os.environ["KIVY_NO_CONSOLELOG"] = "1"
 os.environ["HOME"] = tempfile.mkdtemp(prefix="fext-chat-")
+os.environ["USERPROFILE"] = os.environ["HOME"]   # Path.home() on Windows
 os.environ["FEXT_LANG"] = "en"          # the English the checks read
 
 CLIENT = sys.argv[1] if len(sys.argv) > 1 else "main.py"
@@ -247,6 +249,27 @@ class Harness(App):
         b = self.screen._bubbles[100]
         check("...and shown again when the two no longer say the same",
               b.meta_row.parent is b and "mark read" in b.meta.text)
+        # 18.1: a page of older messages joined on above, its run going on
+        # in the first message shown (only the rows at the seam are joined).
+        msgs = [dict(m, read=1) for m in self.run_msgs]
+        s = self.screen
+        s._rendered_peer = None
+        s.render(msgs[2:], True, lambda *a: None, peer=PEER + "y")
+        s.prepend_messages(msgs[:2], True)
+        Clock.schedule_once(self.check_runs_joined_on, 0.5)
+
+    def check_runs_joined_on(self, _dt):
+        s = self.screen
+        rows = [s._rows[100 + i] for i in range(5)]
+
+        def joins():
+            return [(r.bubble.joined_above, r.bubble.joined_below,
+                     r.bubble.meta_row.parent is not None) for r in rows]
+        seam = joins()
+        s._join_rows()
+        check("a page of older messages closes up a run with the first "
+              "message shown, as drawing them together would",
+              seam[1][1] and seam[2][0] and seam == joins(), str(seam))
         Clock.schedule_once(self.big_emoji, 0.1)
 
     # -- v12: big emoji -----------------------------------------------------------
@@ -290,7 +313,10 @@ class Harness(App):
     # -- v12 (S7): the day floats over a long chat as you scroll ---------------
     def days(self, _dt):
         from datetime import datetime, timedelta
-        now = datetime.now().replace(microsecond=0)
+        # Noon, so that every message falls on the day meant for it: run
+        # just after midnight, "now - 30 minutes" was yesterday.
+        now = datetime.now().replace(hour=12, minute=0, second=0,
+                                     microsecond=0)
         msgs = []
         for i in range(24):
             when = now - timedelta(days=1 if i < 12 else 0, minutes=30 - i)
@@ -408,6 +434,99 @@ class Harness(App):
         check("...a new message of theirs, joining the run, takes it over",
               rows[0].face.parent is None and rows[1].face is not None and
               rows[1].face.parent is rows[1])
+        Clock.schedule_once(self.arrivals, 0.1)
+
+    # -- 18.1: a message arriving moves no row above it -----------------------
+    def arrivals(self, _dt):
+        from datetime import datetime, timedelta
+        now = datetime.now().replace(hour=12, minute=0, second=0,
+                                     microsecond=0)
+
+        def msg(i):
+            when = now - timedelta(days=1 if i < 20 else 0, minutes=60 - i)
+            return {"id": 500 + i, "server_id": None,
+                    "direction": "in" if i % 3 else "out",
+                    "body": f"arriving {i} " + "lorem ipsum " * (i % 5),
+                    "status": 3, "read": 1, "created_at": when.isoformat()}
+        # Counted from their making: a row's layout trigger holds the
+        # method it was made with, found again by its name.
+        self.laid, real = [], M.BubbleRow.do_layout
+
+        def do_layout(row, *a):
+            self.laid.append(row.msg_id)
+            return real(row, *a)
+        M.BubbleRow.do_layout = do_layout
+        self.arriving = [msg(i) for i in range(45)]
+        s = self.screen
+        s._rendered_peer = None
+        s.render(self.arriving[:40], True, lambda *a: None, peer=PEER + "a")
+        Clock.schedule_once(self.arrive_five, 1.0)
+
+    def where(self):
+        """Each row's place in the content, and on screen."""
+        rows = self.screen._rows
+        return ({i: rows[i].y for i in rows},
+                {i: rows[i].to_window(rows[i].x, rows[i].y)[1]
+                 for i in rows})
+
+    def arrive_five(self, _dt):
+        s = self.screen
+        s.scroll.scroll_y = 0
+        self.before = self.where()
+        self.laid.clear()
+        s.render(self.arriving, True, lambda *a: None, peer=PEER + "a")
+        Clock.schedule_once(self.check_arrived, 1.0)
+
+    def check_arrived(self, _dt):
+        s = self.screen
+        (content, screen), old = self.where(), range(500, 540)
+        moved = [i for i in old if abs(content[i] - self.before[0][i]) > .01]
+        check("18.1: five messages arriving move no row above them in the "
+              "content (the column's foot sinks instead)",
+              not moved and s.messages.lift > 0,
+              f"moved {moved[:5]}, lift {s.messages.lift}")
+        again = sorted(set(self.laid) & set(old))
+        check("...so none of their bubbles is laid out again (before: all "
+              "40, for each message)", not again, f"{len(again)}: {again[:5]}")
+        rise = s.messages.lift
+        lifted = [i for i in old
+                  if abs(screen[i] - self.before[1][i] - rise) > 1]
+        foot = s.scroll.to_window(s.scroll.x, s.scroll.y)[1]
+        check("...while on screen they rise by the new rows' height, and "
+              "the newest message rests on the composer, as before",
+              not lifted and abs(screen[544] - foot -
+                                 s.messages.padding[3]) < 2,
+              f"{lifted[:5]} newest {screen[544]} foot {foot}")
+        # The view's top just inside today (the rows sunk below would put
+        # it in yesterday), then in yesterday, then further into today.
+        s._user_scrolling, seen = True, []
+        for target in (521, 510, 530):
+            s.scroll.scroll_y = 0
+            s.scroll.update_from_scroll()
+            s.scroll.scroll_to(s._rows[target], padding=4, animate=False)
+            s.scroll.update_from_scroll()
+            s.float_day()
+            top = s.scroll.to_window(s.scroll.x, s.scroll.top)[1]
+            row = next(w for w in reversed(s.messages.children)
+                       if isinstance(w, M.BubbleRow) and
+                       w.to_window(w.x, w.y)[1] < top - dp(2))
+            seen.append((s.day_float.shown, s.day_float.caps.text,
+                         "YESTERDAY" if row.msg_id < 520 else "TODAY"))
+        s._user_scrolling = False
+        check("...the floating day still reads the rows at the top of the "
+              "view", all(shown and day == want for shown, day, want in seen),
+              str(seen))
+        s.scroll.scroll_to(s._rows[503], padding=0, animate=False)
+        Clock.schedule_once(self.check_scrolled_to, 0.3)
+
+    def check_scrolled_to(self, _dt):
+        s = self.screen
+        row = s._rows[503]
+        y = row.to_window(row.x, row.y)[1]
+        foot = s.scroll.to_window(s.scroll.x, s.scroll.y)[1]
+        check("...and scrolling to an old message brings it into view",
+              foot - 1 <= y and y + row.height <= foot + s.scroll.height + 1,
+              f"row {y}..{y + row.height}, view {foot}..{foot + s.scroll.height}")
         Clock.schedule_once(lambda *_a: self.stop(), 0.1)
 
 

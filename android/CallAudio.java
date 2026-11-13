@@ -15,7 +15,9 @@ import android.os.Build;
 import android.os.Process;
 import android.util.Base64;
 
+import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -25,8 +27,11 @@ import java.util.concurrent.TimeUnit;
  *
  * The microphone is read and the speaker fed on two threads of their own,
  * at audio priority, so speech keeps its pace whatever Python is doing.
- * Python takes captured frames and hands over frames to play, 20 ms at a
- * time, as base64 text: pyjnius passes a String across in one piece.
+ * Python takes every captured frame and hands over frames to play in one
+ * call each, as base64 text: pyjnius passes a String across in one piece.
+ * Frames are 20 ms of 16 kHz mono; in 16.0's calls 5 ms of 48 kHz stereo.
+ * The microphone is read in mono either way (the echo cancelling works on
+ * one channel) and, for a stereo call, copied into both channels.
  *
  * The microphone is the platform's voice-call source, which carries the
  * phone's own echo cancelling where it has any; the cancellers are also
@@ -42,11 +47,14 @@ import java.util.concurrent.TimeUnit;
  */
 public class CallAudio {
     private final AudioManager audioManager;
-    private final ArrayBlockingQueue<byte[]> captured =
+    private volatile ArrayBlockingQueue<byte[]> captured =
             new ArrayBlockingQueue<byte[]>(25);
-    private final ArrayBlockingQueue<byte[]> toPlay =
+    private volatile ArrayBlockingQueue<byte[]> toPlay =
             new ArrayBlockingQueue<byte[]>(10);
     private volatile boolean running = false;
+    /** 16.1: whether the microphone records (a group call's member who
+     * has not turned it on hears the others, and records nothing). */
+    private volatile boolean capturing = true;
     private AudioRecord record;
     private AudioTrack track;
     private AcousticEchoCanceler echo;
@@ -54,7 +62,17 @@ public class CallAudio {
     private AutomaticGainControl gain;
     private Thread micThread;
     private Thread speakerThread;
-    private int frameBytes = 640;
+    private int frameBytes = 640;     // a frame as Python sees it
+    private int micBytes = 640;       // a frame from the (mono) microphone
+    private int channels = 1;
+    private int frameMs = 20;
+    /** 18.1: the sound waiting inside the speaker, kept short (tune). */
+    private int rateHz = 16000;
+    private int depth = 0;            // samples it may hold; 0: all it can
+    private int depthMost = 0;
+    private int gaps = 0;             // times it ran dry, as last counted
+    private int gapsThen = 0;         // ...and a second ago
+    private long gapsAt = 0;
     private int previousMode = AudioManager.MODE_NORMAL;
     private String lastError = "";
     private String route = "earpiece";
@@ -72,20 +90,38 @@ public class CallAudio {
                 Context.AUDIO_SERVICE);
     }
 
-    public synchronized boolean start(int rate, int frameSamples) {
+    public synchronized boolean start(int rate, int frameSamples,
+                                      int channelCount) {
+        return start(rate, frameSamples, channelCount, true);
+    }
+
+    /** 16.1: with capture false the microphone stays closed until
+     * setCapturing(true): a group call's sound starts that way. */
+    public synchronized boolean start(int rate, int frameSamples,
+                                      int channelCount, boolean capture) {
         if (running) {
             return true;
         }
-        frameBytes = frameSamples * 2;
+        capturing = capture;
+        rateHz = rate;
+        channels = channelCount == 2 ? 2 : 1;
+        micBytes = frameSamples * 2;
+        frameBytes = micBytes * channels;
+        frameMs = Math.max(1, frameSamples * 1000 / rate);
+        // Half a second captured, 200 ms to play, whatever a frame's length.
+        captured = new ArrayBlockingQueue<byte[]>(Math.max(25, 500 / frameMs));
+        toPlay = new ArrayBlockingQueue<byte[]>(Math.max(10, 200 / frameMs));
+        int outMask = channels == 2 ? AudioFormat.CHANNEL_OUT_STEREO
+                : AudioFormat.CHANNEL_OUT_MONO;
         try {
             int minIn = AudioRecord.getMinBufferSize(rate,
                     AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT);
-            int minOut = AudioTrack.getMinBufferSize(rate,
-                    AudioFormat.CHANNEL_OUT_MONO,
+            int minOut = AudioTrack.getMinBufferSize(rate, outMask,
                     AudioFormat.ENCODING_PCM_16BIT);
             if (minIn <= 0 || minOut <= 0) {
-                lastError = "this phone cannot record or play 16 kHz sound";
+                lastError = "this phone cannot record or play " + rate
+                        + " Hz sound";
                 return false;
             }
             previousMode = audioManager.getMode();
@@ -97,7 +133,7 @@ public class CallAudio {
                     MediaRecorder.AudioSource.VOICE_COMMUNICATION, rate,
                     AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT,
-                    Math.max(minIn, frameBytes * 4));
+                    Math.max(minIn, micBytes * 4));
             if (record.getState() != AudioRecord.STATE_INITIALIZED) {
                 lastError = "the microphone is not available";
                 release();
@@ -129,11 +165,10 @@ public class CallAudio {
             AudioFormat format = new AudioFormat.Builder()
                     .setSampleRate(rate)
                     .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .setChannelMask(outMask)
                     .build();
-            track = new AudioTrack(attributes, format,
-                    Math.max(minOut, frameBytes * 3), AudioTrack.MODE_STREAM,
-                    AudioManager.AUDIO_SESSION_ID_GENERATE);
+            track = speaker(attributes, format,
+                    Math.max(minOut, frameBytes * 3));
             if (track.getState() != AudioTrack.STATE_INITIALIZED) {
                 lastError = "the speaker is not available";
                 release();
@@ -142,7 +177,9 @@ public class CallAudio {
             captured.clear();
             toPlay.clear();
             running = true;
-            record.startRecording();
+            if (capturing) {
+                record.startRecording();
+            }
             track.play();
             // A headset, if one is connected; else the earpiece.
             String all = routes();
@@ -172,19 +209,126 @@ public class CallAudio {
         }
     }
 
+    /** 16.1: open or close the microphone while the sound goes on. Closed,
+     * it records nothing, and the phone shows no microphone in use. */
+    public synchronized void setCapturing(boolean on) {
+        if (!running || record == null || on == capturing) {
+            return;
+        }
+        try {
+            if (on) {
+                record.startRecording();
+            } else {
+                record.stop();
+                captured.clear();
+            }
+            capturing = on;
+        } catch (IllegalStateException e) {
+            lastError = e.toString();
+        }
+    }
+
+    /** The speaker. 18.1: asked for Android's low-latency path (Android
+     * 8; a phone that has none gives its usual one), and holding no more
+     * sound than it needs: 40 ms to begin with, where it could hold 80 or
+     * more and, written to as fast as it takes, always did. That wait was
+     * heard as delay in every call. tune() gives it more when it runs
+     * dry. */
+    private AudioTrack speaker(AudioAttributes attributes,
+                               AudioFormat format, int bytes) {
+        AudioTrack made = null;
+        if (Build.VERSION.SDK_INT >= 26) {
+            try {
+                made = new AudioTrack.Builder()
+                        .setAudioAttributes(attributes)
+                        .setAudioFormat(format)
+                        .setBufferSizeInBytes(bytes)
+                        .setTransferMode(AudioTrack.MODE_STREAM)
+                        .setPerformanceMode(
+                                AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                        .build();
+            } catch (Exception refused) {
+                made = null;
+            }
+        }
+        if (made == null) {
+            made = new AudioTrack(attributes, format, bytes,
+                    AudioTrack.MODE_STREAM,
+                    AudioManager.AUDIO_SESSION_ID_GENERATE);
+        }
+        depth = depthMost = gaps = gapsThen = 0;
+        gapsAt = System.nanoTime();
+        if (Build.VERSION.SDK_INT >= 24
+                && made.getState() == AudioTrack.STATE_INITIALIZED) {
+            depthMost = made.getBufferCapacityInFrames();
+            depth = made.setBufferSizeInFrames(
+                    Math.min(depthMost, rateHz * 40 / 1000));
+        }
+        return made;
+    }
+
+    /** After each frame written: a speaker that ran dry twice or more in
+     * the last second holds 10 ms more from now on, up to all it can. A
+     * phone that needs more than 40 ms finds its own depth in its first
+     * seconds; one that does not keeps the delay saved. Once in a second
+     * is the app itself held up for a moment, which no depth mends. */
+    private void tune() {
+        if (Build.VERSION.SDK_INT < 24 || depth <= 0) {
+            return;
+        }
+        gaps = track.getUnderrunCount();
+        long at = System.nanoTime();
+        if (at - gapsAt < 1000000000L) {
+            return;
+        }
+        if (gaps - gapsThen >= 2 && depth < depthMost) {
+            depth = track.setBufferSizeInFrames(
+                    Math.min(depthMost, depth + rateHz / 100));
+        }
+        gapsAt = at;
+        gapsThen = gaps;
+    }
+
+    /** 18.1, for the app's log: what the speaker holds, in ms, of what it
+     * could, how often it ran dry, and whether Android gave its
+     * low-latency path. */
+    public String facts() {
+        try {
+            String path = "";
+            if (Build.VERSION.SDK_INT >= 26 && track != null) {
+                path = track.getPerformanceMode()
+                        == AudioTrack.PERFORMANCE_MODE_LOW_LATENCY
+                        ? ", low-latency path" : ", usual path";
+            }
+            return "speaker holds " + depth * 1000 / rateHz + " of "
+                    + depthMost * 1000 / rateHz + " ms, ran dry " + gaps
+                    + " times" + path;
+        } catch (Exception gone) {
+            return "";
+        }
+    }
+
     private void micLoop() {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
-        byte[] buffer = new byte[frameBytes];
+        byte[] buffer = new byte[micBytes];
         while (running) {
+            if (!capturing) {
+                try {
+                    Thread.sleep(frameMs);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                continue;
+            }
             int got = 0;
-            while (got < frameBytes && running) {
-                int n = record.read(buffer, got, frameBytes - got);
+            while (got < micBytes && running) {
+                int n = record.read(buffer, got, micBytes - got);
                 if (n <= 0) {
                     break;
                 }
                 got += n;
             }
-            if (got < frameBytes) {
+            if (got < micBytes) {
                 if (running) {
                     try {
                         Thread.sleep(5);
@@ -194,12 +338,24 @@ public class CallAudio {
                 }
                 continue;
             }
-            byte[] frame = buffer.clone();
+            byte[] frame = channels == 1 ? buffer.clone() : stereo(buffer);
             if (!captured.offer(frame)) {
                 captured.poll();            // Python fell behind: drop the oldest
                 captured.offer(frame);
             }
         }
+    }
+
+    /** A mono frame in both channels of a stereo one. */
+    private static byte[] stereo(byte[] mono) {
+        byte[] out = new byte[mono.length * 2];
+        for (int i = 0, j = 0; i < mono.length; i += 2, j += 4) {
+            out[j] = mono[i];
+            out[j + 1] = mono[i + 1];
+            out[j + 2] = mono[i];
+            out[j + 3] = mono[i + 1];
+        }
+        return out;
     }
 
     private void speakerLoop() {
@@ -208,32 +364,41 @@ public class CallAudio {
         while (running) {
             byte[] frame;
             try {
-                frame = toPlay.poll(30, TimeUnit.MILLISECONDS);
+                frame = toPlay.poll(frameMs + 10, TimeUnit.MILLISECONDS);
             } catch (InterruptedException e) {
                 return;
             }
             // Nothing in time: a frame of silence keeps the speaker running
             // without a click.
             track.write(frame != null ? frame : silence, 0, frameBytes);
+            tune();
         }
     }
 
-    /** One captured frame as base64, or null if none is waiting. */
-    public String readFrame() {
+    /** Every captured frame, one after another, as base64; null if none
+     * is waiting. */
+    public String readFrames() {
         byte[] frame = captured.poll();
-        return frame == null ? null
-                : Base64.encodeToString(frame, Base64.NO_WRAP);
+        if (frame == null) {
+            return null;
+        }
+        ByteArrayOutputStream all = new ByteArrayOutputStream(frame.length * 4);
+        while (frame != null) {
+            all.write(frame, 0, frame.length);
+            frame = captured.poll();
+        }
+        return Base64.encodeToString(all.toByteArray(), Base64.NO_WRAP);
     }
 
-    /** A frame to play, as base64. */
-    public void writeFrame(String b64) {
-        byte[] frame = Base64.decode(b64, Base64.NO_WRAP);
-        if (frame.length != frameBytes) {
-            return;
-        }
-        if (!toPlay.offer(frame)) {
-            toPlay.poll();
-            toPlay.offer(frame);
+    /** Whole frames to play, one after another, as base64. */
+    public void writeFrames(String b64) {
+        byte[] all = Base64.decode(b64, Base64.NO_WRAP);
+        for (int at = 0; at + frameBytes <= all.length; at += frameBytes) {
+            byte[] frame = Arrays.copyOfRange(all, at, at + frameBytes);
+            if (!toPlay.offer(frame)) {
+                toPlay.poll();             // too far behind: drop the oldest
+                toPlay.offer(frame);
+            }
         }
     }
 
