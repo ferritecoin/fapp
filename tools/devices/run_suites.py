@@ -23,9 +23,9 @@ from pathlib import Path
 SUITES = ("test_service", "test_core", "test_flows", "test_design",
           "test_composer", "test_bundle", "smoke_desktop", "smoke_chat",
           "test_navigation", "test_pictures", "test_calls", "test_remote",
-          "test_conference", "test_notify", "test_gestures", "test_touch",
-          "test_privacy", "test_screen", "test_backup", "test_video",
-          "test_videomsg", "playthrough")
+          "test_security", "test_conference", "test_notify",
+          "test_gestures", "test_touch", "test_privacy", "test_screen",
+          "test_backup", "test_video", "test_videomsg", "playthrough")
 #: Suites that open no window (as build-apk.yml runs them).
 NO_WINDOW = {"test_service", "test_backup"}
 PASSED = re.compile(r"(\d+)/(\d+) passed")

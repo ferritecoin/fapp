@@ -556,6 +556,54 @@ be that computer. A session that drops is placed again
 what is not built (a service before sign-in) are in
 `.private/PLAN_REMOTE.md`.
 
+**Remote access for the long term (19.0.1).** A computer reached from
+afar may have nobody at it for months, so the two sides talk about the
+computer itself in `PKT_RCMD` packets (sealed JSON, at most
+`RCMD_BYTES`; `parse_rcmd`). The computer says its `state` every few
+seconds while controlled (`_remote_tick`): what Windows shows
+(`remote_screen_state`: `ok`, `secure` for its sign-in, lock or
+Ctrl+Alt+Del screen, `admin` for an administrator's window in front,
+none of which takes injected input), its name, its device id, when the
+controller's access ends and whether it signs in by itself. The other
+side puts that in a band under the call (`remote_note_words`). The
+controller asks, numbered and asked again until answered (`remote_ask`):
+`list` (the open windows, `windows_programs`, in parts), `end` (one
+closed: `WM_CLOSE`, or ended if it does not answer; never one run as
+administrator nor Windows' own, `REMOTE_KEEP_PROGRAMS`), `restart`
+(`computer_restart`, after which the controller waits
+`REMOTE_RESTART_WAIT` and places the session again) and `limit` (Data
+saver, `REMOTE_SAVER_KBPS`). Each is let in by role (`_remote_cmd`):
+only the controlled side acts, only on its controller's asking. The
+keys Windows keeps (Ctrl+Alt+Del) cannot be sent by any program:
+`RemoteCadSheet` says so and offers what can be done instead.
+**Which computer.** Each computer has an id of its own (`device_id`,
+tied to the machine by `_machine_mark`, so a copied data folder is a new
+computer) and a name (`device_name`). The answer carries both; the
+controller keeps them (`remote_computer_seen`) and, with two or more,
+asks which (`RemoteComputersSheet`); the offer then names it (`to`) and
+every other computer sets it aside. An offer is also refused when its
+signed time is more than `REMOTE_OFFER_SKEW` away, or seen before
+(`remote_offer_for_here`, `remote_offer_once`): a relay that replays an
+old offer, or sends it to another computer, starts nothing.
+**Before you leave.** `remote_checklist` reads what can be read
+(`windows_signs_in_by_itself`, `windows_screen_locks_itself`, the
+watcher, the last sessions, a restart that came back:
+`remote_restart_back`) and says what cannot (the firmware's power-on).
+`remote_reminders` tells the controller a week and a day before an
+access ends, as it can only be made longer from the computer.
+
+**A shared screen over mobile data (19.0.1).** A screen is coded only
+when it changed (`frame_signature`, a CRC of its planes), once more
+`SCREEN_SETTLE` after it stopped (x264 has had time to sharpen it), and
+with a key frame only when asked or every `VIDEO_SCREEN_KEY_EVERY` if it
+changed: a still screen sends nothing. Its VBV buffer is `SCREEN_VBV` of
+a second (`FfmpegEncoder._buffer`), so one large picture does not wait
+behind a full second of bits. The receiver keeps a stream across the
+quiet (`VideoAssembler.follows`, `VideoReceiver` `QUIET`, `GONE`). The
+sender's ceiling steps through `SCREEN_STEPS` on loss or a delay that
+grows (`_plan_screen`, `_delay_grew`: the round trip against its
+lowest), and back up when the link is clean; Data saver caps it.
+
 The design notes for calls are in `CallSession`'s, `RoomCall`'s and
 `CallEngine`'s docstrings.
 
@@ -585,6 +633,12 @@ timers), `pictures`, `held` (a blocked sender's frames), `call_chat`,
   identity's Remote access list, the sessions kept and the window's place),
   `media/`, `pictures/`,
   `commands/` (notification actions on Android), `cache/`.
+- **A power cut (19.0.1).** `identities.json` and `prefs.json` are
+  written by `write_durably`: a new file, flushed to the disk, then put
+  in place, with the last good one kept as `.bak`; `read_durably` falls
+  back to it. A removed identity is written to both, so it does not come
+  back from the copy. `instance.lock` is held by the one Ferritext that
+  runs on a data folder (`hold_lock`); the watcher's files are §14's.
 
 ## 12. The relay, as the app sees it
 
@@ -603,6 +657,17 @@ Requests are signed with the identity's key over the relay's time
 | `POST /api/blobs`, `GET /api/blobs/<id>` | Sealed media |
 | `GET /api/calls/ticket`; `POST /api/calls/rooms`, `/api/calls/rooms/<step>` | A call's ticket for the relay's UDP port; rooms (make, join, view, chat, watch, …) |
 | `POST /api/prefs/ticks`, `POST /api/reports` | Per-contact receipts; reporting someone to the operator |
+
+**The relay is not trusted (19.0.1, `desktop/test_security.py`).** It
+carries every message and call and answers the directory, so the app
+takes nothing from it on its word: an envelope's signature and seal are
+checked against the sender's key and this identity's address
+(`open_envelope`); a lookup's key must be its address's
+(`key_matches_address` in `ApiClient.lookup`); a contact's key is never
+replaced by one that is not its address's (`LocalStore.upsert_contact`);
+a call's signals are signed, its keys travel inside them, and a remote
+session's offer is bound to a computer and a time (§10). What the relay
+can still do is drop or delay, and see who talks to whom and when.
 
 A feature the relay does not list is not used, so the app works with older
 relays. The operator can warn an identity (a notice the app shows once)
@@ -725,6 +790,21 @@ outbox waits.
   own account names it with `--startup`, which opens it minimised
   (`set_start_with_windows`, `built_exe`); no administrator, nothing
   before sign-in.
+- **Kept running (19.0.1).** While someone is listed in Remote access
+  and *Keep Ferritext running* is on, the app starts a watcher: the same
+  program with `--guard` (`GUARD_FLAG`), which imports nothing past the
+  standard library and holds `guard.lock`, so one runs at a time
+  (`guard_loop`). The app writes `keepup.json` (its process, the program
+  file it runs, how to start it, whether its person closed it:
+  `guard_tell`) and touches `keepup.beat` every `GUARD_BEAT` s from its UI
+  thread (`guard_beat`). A Ferritext gone without being closed is started
+  again, after `GUARD_WAITS`; one whose beat is `GUARD_HANG` s old for a
+  minute more is ended first. Started again, it says so (`--again`,
+  `_told_again`). A window closed while someone is listed comes back
+  for that reason (`guard_closed`). A second Ferritext on the same data
+  folder brings the first one's window forward and ends
+  (`show_running_window`). After a relay reset a computer with Remote
+  access on registers its name again by itself (`_register_again`).
 - **Device tests**: `tools/devices/` starts the app on Android emulators
   (old, current, newest) and on Windows and Ubuntu, and runs its
   self-test (the `devices` workflow): a call's classes and sound, the
@@ -782,7 +862,8 @@ Every suite runs headless (`xvfb-run`) against a given `main.py`:
 | `test_core.py` | Crypto, envelopes, sanitisers, storage; the previous release's real code both ways |
 | `test_flows.py` | Two and three real apps through an in-memory relay: messages, groups, group rules, media, the outbox, receipts |
 | `test_calls.py`, `test_conference.py`, `test_video.py` | 1-to-1 calls between two engines, rooms, video, several calls in one chat |
-| `test_remote.py` | Remote control: the input packets, where a touch lands, the access list, two apps in a remote session and an ordinary call's control; X11's injector against Xvfb, Windows' on the Devices workflow |
+| `test_remote.py` | Remote control: the input packets, where a touch lands, the access list, two apps in a remote session and an ordinary call's control; 19.0.1's computer state, keys, programs, restart, two computers, checklist and watcher; X11's injector against Xvfb, Windows' on the Devices workflow |
+| `test_security.py` | Attacks on this client, each expected refused: a relay acting as the server, someone acting as someone else, crossing into another computer or identity, a power cut (19.0.1) |
 | `test_videomsg.py` | Video messages: the MP4 written and read in plain Python, files that are not what they say, the recorder against stand-ins for a phone, the bubble and the sheet; with PyAV, recorded, opened by FFmpeg and played |
 | `test_design.py`, `test_composer.py`, `test_navigation.py`, `test_touch.py`, `test_gestures.py` | Themes, contrast, phrases; the composer; navigation; touch |
 | `test_backup.py`, `test_privacy.py`, `test_notify.py`, `test_pictures.py`, `test_service.py`, `test_bundle.py` | Backups, privacy, notifications, pictures, the Android service, the desktop bundle |
@@ -830,6 +911,12 @@ the fact.
 | change what a call to someone not yet accepted does | `FextApp._call_as_request`, `CALL_ASK_EVERY`; `SyncWorker._called` |
 | change remote control | asking and letting: `RemoteControlMixin`, `ControlAskSheet`, the flags in `CALL_MEDIA_FLAGS`; input: `RemoteSurface`, `pack_input`, `InputOut`, `InputIn`, `REMOTE_KEYS` (new keys at the end); the computer's side: `WindowsInjector`, `X11Injector`, `remote_injector` |
 | change remote sessions | who: `remote_access_*`, `RemoteAccessSheet`, `REMOTE_GRANTS`; answering: `_lets_in`, `_remote_answer`; placing again: `_remote_call_over`, `REMOTE_RETRY_*`; coming back: `starts_by_itself`, `keep_awake` |
+| change what a remote session can ask of the computer | `PKT_RCMD`, `parse_rcmd`, `CallEngine.send_rcmd`; `RemoteControlMixin.remote_ask`, `_remote_cmd` (who may ask what), `_remote_here`, `_remote_there`; Windows: `windows_screen_state`, `windows_programs`, `windows_close_program`, `computer_restart`; the sheets `RemoteKeysSheet`, `RemoteCadSheet`, `RemoteProgramsSheet`, `RemoteRestartSheet` |
+| change which computer answers | `device_id`, `device_name`, `remote_computer_seen`, `remote_computers`, `RemoteComputersSheet`; the offer's checks: `remote_offer_for_here`, `remote_offer_once`, `REMOTE_OFFER_SKEW` |
+| change the Before you leave list | `remote_checklist`, `RemoteAccessSheet`; reading Windows: `windows_signs_in_by_itself`, `windows_screen_locks_itself` |
+| change how a shared screen spends bits | `frame_signature`, `SCREEN_SETTLE`, `VIDEO_SCREEN_KEY_EVERY`, `SCREEN_VBV` (`FfmpegVideoCoder.poll`, `FfmpegEncoder._buffer`); `SCREEN_STEPS`, `CallEngine._plan_screen`, `_delay_grew`; Data saver: `remote_saver`, `REMOTE_SAVER_KBPS` |
+| change the watcher | `guard_loop`, `GUARD_*`, `guard_tell`, `guard_beat`, `_guard_alive`; the app's side: `FextApp.keep_running`, `_guard_beat`, `guard_closed` |
+| change how a settings file is written | `write_durably`, `read_durably` (`save_pref`, `load_prefs`, `IdentityManager._save`) |
 | change a tapped message's menu, or the reply's options | `ConversationScreen.message_actions`, `MessageMenu`, `_place_menu`; `reply_options`, `QuoteSheet`, `ChatPickSheet` |
 | change what happens when a screen raises | `CrashNet` (`AGAIN`, `STORM`) |
 | change pinned messages | the control in `SyncWorker._handle_control` (`op == "pin"`); `LocalStore.set_pin`, `unpin_all`, `pins`, `PINS_MAX`; who may: `group_may_pin`, `FextApp.can_pin`; `pin_message`, `unpin_all`; `PinBar`, `PinsSheet`; the menu's row in `message_actions` |

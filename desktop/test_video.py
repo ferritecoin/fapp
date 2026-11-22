@@ -952,6 +952,157 @@ check("a shared screen is coded for its quality under its ceiling: a still "
       "its whole budget on it",
       spent[True] * 5 < spent[False] and spent[True] < 60000, spent)
 
+print("\nA shared screen over mobile data (19.0.1, MOBILE191)")
+check("a shared screen's coder holds a quarter of a second of its ceiling "
+      "(19.0: a whole second), a camera's a second",
+      M.FfmpegEncoder("h264", 1920, 1080, 30, 8000,
+                      screen=True).ctx.rc_buffer_size == 2_000_000 and
+      M.FfmpegEncoder("h264", 1280, 720, 30, 2500).ctx.rc_buffer_size ==
+      2_500_000)
+grab = M.VideoCapture(M.video_sources("screen")[0])
+grab.start()
+first = grab.next_frame(0, 3.0)
+time.sleep(0.2)
+second = grab.next_frame(first[0], 3.0)[1]
+grab.stop()
+first = first[1]
+check("two captures of a moving screen differ by their signature, the same "
+      "one does not", M.frame_signature(first) != M.frame_signature(second)
+      and M.frame_signature(first) == M.frame_signature(first))
+
+
+class StillCapture:
+    """A screen that changes only when the test says (its `frame`)."""
+
+    def __init__(self, frame):
+        self.frame, self.serial, self.gave, self.error = frame, 0, None, ""
+
+    def next_frame(self, _serial, _timeout):
+        time.sleep(1 / 30)
+        self.serial += 1
+        return self.serial, self.frame
+
+    def stop(self):
+        pass
+
+
+def still_coder(kind, frame):
+    coder = M.FfmpegVideoCoder(M.video_sources(kind)[0])
+    coder.capture.stop()
+    coder.capture = StillCapture(frame)
+    coder.set_plan([(0, 1080, 30, 8000)], "h264")
+    return coder
+
+
+coder = still_coder("screen", first)
+
+
+def polled(seconds):
+    """What the coder sends while the screen is polled for `seconds`."""
+    out, until = [], time.monotonic() + seconds
+    while time.monotonic() < until:
+        out += coder.poll(0.5)
+    return out
+
+
+opened = coder.poll(0.5)
+settling = polled(M.SCREEN_SETTLE + 0.3)
+unchanged = polled(0.7)
+coder.capture.frame = second
+changed = coder.poll(0.5)
+check("a screen that stops changing is coded on for a second (sharpened), "
+      "then sends nothing; a change is sent at once, without a key frame",
+      len(opened) == 1 and opened[0][2] and 15 <= len(settling) <= 45 and
+      not any(p[2] for p in settling) and not unchanged and
+      len(changed) == 1 and not changed[0][2],
+      (len(opened), len(settling), len(unchanged), [p[2] for p in changed]))
+polled(M.SCREEN_SETTLE + 0.3)
+coder.ask_key(0)
+owed = coder.poll(0.5)
+check("a key frame asked for (a picture lost there) is sent though nothing "
+      "changed", len(owed) == 1 and owed[0][2])
+polled(M.SCREEN_SETTLE + 0.3)
+coder._coders[0][2] = time.monotonic() - M.VIDEO_SCREEN_KEY_EVERY - 1
+still_due = polled(0.3)
+coder.capture.frame = first
+due = coder.poll(0.5)
+check("its own key frame, once due, waits for a change to send",
+      not still_due and len(due) == 1 and due[0][2])
+coder.close()
+camera = still_coder("camera", first)
+coded = [p for _ in range(10) for p in camera.poll(0.5)]
+camera.close()
+check("a camera is coded every frame, still or not, as before",
+      len(coded) >= 9, len(coded))
+
+
+class Quiet:
+    """A decoder that takes every picture and shows none."""
+    codec, hands_out_late = "h264", False
+
+    def decode(self, data, box, fill):
+        return None
+
+
+asked_keys = []
+recv = M.VideoReceiver(on_key=lambda *a: asked_keys.append(a),
+                       decoder=lambda codec: Quiet())
+now = time.monotonic()
+recv._piece("ann", "s", whole_picture(0, key=True), now, 0.0)
+recv._piece("ann", "s", whole_picture(1), now + 0.1, 0.0)
+stream = recv._streams[("ann", "s", 0)]
+recv._check(now + 120)
+recv._piece("ann", "s", whole_picture(2), now + 120, 0.0)
+check("still for two minutes, the stream goes on with the next picture: no "
+      "key frame asked for (19.0 started again after two seconds, and asked)",
+      recv._streams[("ann", "s", 0)] is stream and not stream.need_key and
+      not asked_keys and stream.whole == 3, (stream.whole, asked_keys))
+recv._piece("ann", "s", whole_picture(9), now + 240, 0.0)
+check("…but after a gap where pictures are missing, a key frame first",
+      recv._streams[("ann", "s", 0)] is not stream)
+recv._check(now + 240 + M.VideoReceiver.GONE + 1)
+check("a stream silent for ten minutes is let go",
+      ("ann", "s", 0) not in recv._streams)
+plans = []
+eng = M.CallEngine(os.urandom(16).hex(), os.urandom(8), 0, None, "",
+                   on_event=lambda kind, value: plans.append(value)
+                   if kind == "video_plan" else None)
+eng.path, eng.media = "direct", {"flags": 4, "shows": {}}
+eng.their_media = {"shows": {"v": (0, 0), "s": (1280, 720)}, "whole": 0,
+                   "lost": 0, "decoders": ["h264"]}
+
+
+def adapt(at, whole=0, lost=0, rtt=None):
+    eng.their_media.update(whole=whole, lost=lost)
+    eng.rtt_ms = rtt
+    eng._adapt_video(at)
+    return plans[-1] if plans else None
+
+
+first_plan = adapt(100.0)
+check("a screen drawn at 720 lines (a phone) is still sent at its own "
+      "1080 (x264 codes a screen best at its own size), its ceiling 8 "
+      "Mbit/s to start", first_plan == ("s", (1080, 30, 8000), "h264"),
+      first_plan)
+lossy = adapt(102.1, whole=90, lost=10)
+check("pictures lost there: a step lower (5 Mbit/s)",
+      lossy == ("s", (1080, 30, 5000), "h264"), lossy)
+eng.screen_cap = 1500
+capped = adapt(104.2, whole=190, lost=10)
+check("Data saver there: 1.5 Mbit/s at the most",
+      capped == ("s", (1080, 30, 1500), "h264"), capped)
+eng.screen_cap = 0
+adapt(106.3, whole=290, lost=10, rtt=40)
+queued = adapt(108.4, whole=390, lost=10, rtt=300)
+check("the way's delay grown from 40 to 300 ms (a queue filling): a step "
+      "lower before anything is lost", queued == ("s", (1080, 30, 3000),
+                                                     "h264"), queued)
+for n in range(3):
+    adapt(110.5 + 2.1 * n, whole=490 + 100 * n, lost=10, rtt=45)
+check("six clean seconds: a step back up",
+      plans[-1] == ("s", (1080, 30, 5000), "h264"), plans[-1])
+eng.sock.close()
+
 print("\nSent, received, decoded (threads)")
 received = M.VideoReceiver(on_key=lambda *a: asked.append(a))
 asked = []

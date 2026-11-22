@@ -34,7 +34,7 @@ source.exclude_dirs = tests, bin, venv, .git, .github, .buildozer, __pycache__, 
 # (v15.1) each language's phrases from data/lang/*.json.
 
 # (str) Application versioning (method 1)
-version = 19.0.0
+version = 19.0.1
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy

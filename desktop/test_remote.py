@@ -19,15 +19,18 @@ workflow) it moves the cursor and reads it back.
 import ctypes
 import ctypes.util
 import importlib.util
+import json
 import os
 import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import types
 from datetime import datetime, timezone
+from pathlib import Path
 
 os.environ.setdefault("KIVY_NO_ARGS", "1")
 os.environ["KIVY_NO_CONSOLELOG"] = "1"
@@ -726,7 +729,8 @@ texts = [w.text for w in sheet.walk() if hasattr(w, "text") and
          isinstance(getattr(w, "text"), str)]
 check("the sheet lists alice, the checklist and the last session",
       any("alice" in t for t in texts) and
-      any("Sign in by itself" in t for t in texts) and
+      any("Signs in by itself" in t for t in texts) and
+      any("BEFORE YOU LEAVE" in t.upper() for t in texts) and
       any("10 min" in t for t in texts), texts[:12])
 sheet._remove(A)
 check("Remove takes her off the list", not M.remote_access_allows(B, A))
@@ -805,6 +809,380 @@ check("an ordinary call for it still waits in the bar, as before",
 for name in ("_activate_identity", "_stop_link", "_wait_call"):
     del bob.__dict__[name]
 bob.__dict__.pop("_links", None)
+
+# ---- 19.0.1: for the long term (the owner's note of 22 November) ------------
+print("\n19.0.1: one computer of several, and an old offer played again")
+now = time.time()
+here = M.device_id()
+check("a computer has a number of its own, kept",
+      len(here) == 16 and M.device_id() == here)
+real_mark = M._machine_mark
+M._machine_mark = lambda: "another machine"
+copied = M.device_id()
+M._machine_mark = real_mark
+check("its data folder copied to another computer: a new number there",
+      copied != here and len(copied) == 16)
+M.save_pref("device", None)
+here = M.device_id()
+check("an offer naming this computer, or none, is for it",
+      M.remote_offer_for_here({"t": now, "to": here}) and
+      M.remote_offer_for_here({"t": now}))
+check("one naming another computer of the identity is not",
+      not M.remote_offer_for_here({"t": now, "to": "0" * 16}))
+check("one signed eleven minutes ago, or ahead, or not at all, is not: "
+      "whatever time the relay says it took it",
+      not M.remote_offer_for_here({"t": now - 660}) and
+      not M.remote_offer_for_here({"t": now + 660}) and
+      not M.remote_offer_for_here({}))
+check("a computer whose own clock drifted 20 minutes from the relay's (months "
+      "alone) is judged by the relay's: a fresh offer is answered, an old one "
+      "not", M.remote_offer_for_here({"t": now}, now=now + 1200,
+                                     relay_now=now) and
+      not M.remote_offer_for_here({"t": now - 660}, now=now + 1200,
+                                  relay_now=now))
+check("…and one whose clock agrees with the relay's is judged by its own",
+      not M.remote_offer_for_here({"t": now - 660}, now=now,
+                                  relay_now=now - 600))
+check("the same offer is answered once", M.remote_offer_once("e" * 32) and
+      not M.remote_offer_once("e" * 32))
+check("the wire keeps a computer's number, a wrong one dropped",
+      M.sanitize_call_signal("call", dict(offer, rc=True, to=here))["to"] ==
+      here and "to" not in M.sanitize_call_signal(
+          "call", dict(offer, rc=True, to=here + "0")) and
+      "to" not in M.sanitize_call_signal("call", dict(offer, rc=False,
+                                                      to=here)))
+answer = M.sanitize_call_signal("answer", {
+    "id": "a" * 32, "k": offer["k"], "c": [], "dev": here,
+    "dn": "Home\nPC\x00" + "x" * 90})
+check("…and its name, one printable line of 40 characters at most",
+      answer["dev"] == here and "\n" not in answer["dn"] and
+      len(answer["dn"]) == 40 and answer["dn"].startswith("Home PC"),
+      answer)
+
+print("\n19.0.1: the session names its computer")
+M.REMOTE_RETRY_EVERY = 0.3
+M.save_pref("remote_computers", None)
+M.remote_access_grant(B, A, 7)
+M.save_pref("device_name", "Home PC")
+settle(lambda: alice.call is None or alice.call.ended, 3)
+alice.call = None
+alice.connect_remote(B)
+check("connected, bob's computer said which it is, and alice keeps it",
+      settle(lambda: alice.controlling() and bob.call.lets, 6) and
+      [c["dev"] for c in M.remote_computers(A, B)] == [here] and
+      M.remote_computers(A, B)[0]["n"] == "Home PC",
+      M.remote_computers(A, B))
+check("bob's computer tells alice its state: its screen usable, its name, "
+      "the grant's end", settle(lambda: alice.call.rc_state is not None, 4)
+      and alice.call.rc_state["s"] == "ok" and
+      alice.call.rc_state["n"] == "Home PC" and
+      abs(alice.call.rc_state["u"] - (now + 7 * 86400)) < 60,
+      alice.call.rc_state)
+check("alice's call screen: Keys while she controls",
+      alice._call_overlay is not None and
+      alice._call_overlay.keys_button.parent is not None)
+os.environ["FEXT_REMOTE_SCREEN"] = "admin"
+check("a window run as administrator in front: alice is told, under the "
+      "band", settle(lambda: alice.call.rc_state["s"] == "admin", 8) and
+      settle(lambda: "administrator" in
+             alice._call_overlay.remote_note_words.text, 2) and
+      alice._call_overlay.remote_note.opacity == 1,
+      alice._call_overlay.remote_note_words.text)
+os.environ["FEXT_REMOTE_SCREEN"] = "secure"
+check("a Windows security screen: alice is told it cannot be used from "
+      "afar", settle(lambda: "security screen" in
+                     alice._call_overlay.remote_note_words.text, 8))
+os.environ["FEXT_REMOTE_SCREEN"] = "ok"
+check("usable again: the note now says the access ends within two weeks "
+      "(its grant was for seven days)",
+      settle(lambda: "ends" in alice._call_overlay.remote_note_words.text and
+             "security" not in alice._call_overlay.remote_note_words.text, 8),
+      alice._call_overlay.remote_note_words.text)
+M.remote_access_grant(B, A, 0)
+bob.call.__dict__.pop("rc_mine", None)    # read again now, not in 30 s
+check("…and once it is until removed, the note goes",
+      settle(lambda: not alice._call_overlay.remote_note_words.text, 10) and
+      alice._call_overlay.remote_note.opacity == 0,
+      alice._call_overlay.remote_note_words.text)
+
+print("\n19.0.1: Data saver, the keys, the programs, a restart")
+alice.set_remote_saver(True)
+check("Data saver on: bob's computer holds its screen to 1.5 Mbit/s",
+      settle(lambda: bob.call.engine.screen_cap == M.REMOTE_SAVER_KBPS, 4))
+alice.set_remote_saver(False)
+check("…and off: no limit", settle(lambda: bob.call.engine.screen_cap == 0,
+                                   4))
+start = len(bob_done())
+alice.remote_keys(("ctrl", "shift", "escape"))
+check("Task Manager's keys: each down in order, then up in reverse",
+      settle(lambda: len(bob_done()) >= start + 6, 4) and
+      bob_done()[start:start + 6] == [
+          ("key", "ctrl", True), ("key", "shift", True),
+          ("key", "escape", True), ("key", "escape", False),
+          ("key", "shift", False), ("key", "ctrl", False)],
+      bob_done()[start:])
+M._REMOTE_TEST_PROGRAMS[:] = [
+    {"w": 100 + n, "p": 10 + n, "t": f"Window {n}", "x": f"app{n}.exe",
+     "a": n == 2, "h": n == 3} for n in range(8)]
+shown = []
+real_show = M.RemoteProgramsSheet.show
+M.RemoteProgramsSheet.show = classmethod(
+    lambda cls, app, programs: shown.append(programs))
+alice.remote_programs()
+check("Programs: bob's computer's windows, in two parts put together",
+      settle(lambda: shown, 4) and [p["t"] for p in shown[-1]] ==
+      [f"Window {n}" for n in range(8)] and shown[-1][2]["a"] and
+      shown[-1][3]["h"], shown[-1:])
+said = []
+alice._set_status = lambda text, *a, **k: said.append(text)
+alice.remote_ask({"op": "end", "w": 103, "p": 13})
+check("one not answering ended, and the list asked for again",
+      settle(lambda: len(shown) >= 2, 5) and
+      103 not in [p["w"] for p in shown[-1]] and
+      any("close" in t.lower() for t in said), (said, shown[-1:]))
+alice.remote_ask({"op": "end", "w": 102, "p": 12})
+check("one run as administrator: not closed, and why",
+      settle(lambda: any("administrator" in t for t in said), 4) and
+      102 in [p["w"] for p in M._REMOTE_TEST_PROGRAMS], said)
+before = len(M._REMOTE_TEST_RESTARTS)
+waiting = alice.call.rc_waiting
+alice.remote_ask({"op": "restart"})
+check("Restart: bob's computer restarts, says who asked, and alice waits "
+      "for it", settle(lambda: alice.call.restarting, 4) and
+      len(M._REMOTE_TEST_RESTARTS) == before + 1 and
+      "alice" in M._REMOTE_TEST_RESTARTS[-1] and
+      M.load_prefs()["remote_restart"]["by"] == A and not waiting)
+restarted = alice.call
+bob.end_call()                      # it goes down
+check("its call ends: alice keeps placing it, for longer, and says why",
+      settle(lambda: alice.__dict__.get("_remote_retry") is not None, 4) and
+      alice.__dict__["_remote_retry"]["restart"] and
+      alice.__dict__["_remote_retry"]["to"] == here and
+      any("restart and sign in" in t for t in said), said[-3:])
+check("…and is controlling again once it answers",
+      settle(lambda: alice.call is not restarted and alice.controlling(), 10)
+      and alice.call.session.remote_to == here)
+took = M.remote_restart_back(M.load_prefs()["remote_restart"]["at"] + 95)
+check("its next start says how long it took, for Remote access",
+      took is not None and abs(took - 95) < 1 and
+      M.load_prefs()["remote_back"]["took"] == took and
+      M.load_prefs().get("remote_restart") is None)
+del alice._set_status
+M.RemoteProgramsSheet.show = real_show
+alice.end_call()
+settle(lambda: bob.call is None or bob.call.ended, 4)
+settle(lambda: False, 1.6)
+
+print("\n19.0.1: another computer named, the app lock, the checklist")
+fake = "1" * 16
+M.remote_computer_seen(A, B, fake, "Office PC", now=time.time() + 5)
+opened = []
+real_pick = M.RemoteComputersSheet
+M.RemoteComputersSheet = lambda app, peer, known: types.SimpleNamespace(
+    open=lambda: opened.append([c["n"] for c in known]))
+check("two computers known: alice is asked which",
+      alice.connect_remote(B) is False and
+      opened == [["Office PC", "Home PC"]], opened)
+M.RemoteComputersSheet = real_pick
+alice.connect_remote(B, to=fake, chosen=True)
+settle(lambda: False, 1.5)
+check("one named that is not bob's: bob's computer sets the offer aside",
+      bob.call is None or bob.call.ended)
+alice.end_call()
+settle(lambda: not mail.mail)
+settle(lambda: False, 1.0)
+M.AppLock.turn_on("4321", 0)
+alice.call = None
+alice.connect_remote(B, to=here, chosen=True)
+check("the app lock on: a session from afar finds Ferritext locked",
+      settle(lambda: bob.call is not None and bob.call.lets, 6) and
+      bob.locked, (bob.call and bob.call.lets, bob.locked))
+M.AppLock.turn_off()
+bob.unlocked()
+alice.end_call()
+settle(lambda: bob.call is None or bob.call.ended, 4)
+rows = {key: (ok, words) for key, ok, _t, words in M.remote_checklist()}
+check("Before you leave: what it takes, read from the computer",
+      {"start", "keepup", "signin", "power", "tried", "back"} <= set(rows)
+      and rows["tried"][0] is True and rows["back"][0] is True and
+      "1 min 35 s" in rows["back"][1] and rows["power"][0] is None, rows)
+
+
+class Reg:
+    """winreg's calls the readers make, over a dict of keys."""
+    HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER = "HKLM", "HKCU"
+
+    def __init__(self, keys):
+        self.keys = keys
+
+    def OpenKey(self, root, path):
+        if (root, path) not in self.keys:
+            raise OSError(path)
+        return Key(self.keys[(root, path)])
+
+    @staticmethod
+    def QueryValueEx(key, name):
+        if name not in key:
+            raise OSError(name)
+        return key[name], 1
+
+
+class Key(dict):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+
+WINLOGON = (r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon")
+os.environ["USERNAME"] = "Bob"
+check("Windows signs in by itself: netplwiz's setting for this person, or "
+      "not", M.windows_signs_in_by_itself(Reg({("HKLM", WINLOGON): {
+          "AutoAdminLogon": "1", "DefaultUserName": "bob"}})) is True and
+      M.windows_signs_in_by_itself(Reg({("HKLM", WINLOGON): {
+          "AutoAdminLogon": "1", "DefaultUserName": "someone"}})) is False
+      and M.windows_signs_in_by_itself(Reg({("HKLM", WINLOGON): {
+          "AutoAdminLogon": "0"}})) is False and
+      M.windows_signs_in_by_itself(Reg({})) is False)
+DESK = r"Control Panel\Desktop"
+POLICY = r"Software\Policies\Microsoft\Windows\Control Panel\Desktop"
+check("the screen saver that asks for sign-in, its minutes; a policy's word "
+      "first; Dynamic lock; nothing",
+      M.windows_screen_locks_itself(Reg({("HKCU", DESK): {
+          "ScreenSaveActive": "1", "ScreenSaverIsSecure": "1",
+          "ScreenSaveTimeOut": "600"}})) == 10 and
+      M.windows_screen_locks_itself(Reg({("HKCU", DESK): {
+          "ScreenSaveActive": "1", "ScreenSaverIsSecure": "1",
+          "ScreenSaveTimeOut": "600"}, ("HKCU", POLICY): {
+          "ScreenSaveActive": "0"}})) == 0 and
+      M.windows_screen_locks_itself(Reg({("HKCU", (
+          r"Software\Microsoft\Windows NT\CurrentVersion\Winlogon")): {
+          "EnableGoodbye": 1}})) == -1 and
+      M.windows_screen_locks_itself(Reg({})) == 0)
+
+print("\n19.0.1: reminders before an access ends; what is read off the wire")
+M.save_pref("remote_reminded", None)
+M.remote_computer_seen(A, B, here, "Home PC", until=time.time() + 3 * 86400)
+check("an access ending in three days: said once in the chat",
+      alice.remote_reminders() == 1 and alice.remote_reminders() == 0 and
+      any("ends" in (m.get("body") or "") and "Home PC" in m["body"]
+          for m in alice.store.messages_for(B)))
+check("…and again on its last day",
+      alice.remote_reminders(time.time() + 2.5 * 86400) == 1 and
+      alice.remote_reminders(time.time() + 2.6 * 86400) == 0)
+state = M.sanitize_remote_state({"op": "state", "s": "evil", "n": "x" * 99,
+                                 "dev": "zz", "u": True, "si": "yes"})
+check("a computer's state, every field checked",
+      state == {"s": "ok", "n": "x" * 40, "dev": None, "u": None,
+                "si": None}, state)
+check("a list of programs, every field checked, 30 at the most",
+      len(M.sanitize_programs([{"w": 1, "p": 2, "t": "t", "x": "x"}] * 40))
+      == 30 and M.sanitize_programs([{"w": "1", "p": 2}, None, 3]) == [])
+check("a word too long, not JSON, or without a short op: refused",
+      M.parse_rcmd(b"{}" + b" " * M.RCMD_BYTES) is None and
+      M.parse_rcmd(b"\xff") is None and
+      M.parse_rcmd(b'{"op": "' + b"x" * 20 + b'"}') is None and
+      M.parse_rcmd(b'{"op": "list", "n": 1}') == {"op": "list", "n": 1})
+check("a word only in its own role: a computer not let in does nothing it "
+      "is asked", bob._remote_cmd(types.SimpleNamespace(
+          lets=False, asks=False, engine=None), {"op": "restart", "n": 9})
+      is None and len(M._REMOTE_TEST_RESTARTS) == before + 1)
+
+print("\n19.0.1: one Ferritext at a time, and the watcher (keep running)")
+base = tempfile.mkdtemp(prefix="fext-guard-")
+first = M.hold_lock(Path(base) / "instance.lock")
+check("one Ferritext holds its data folder; a second is refused",
+      first is not None and M.hold_lock(Path(base) / "instance.lock") is None)
+first.close()
+check("…and it is free again once the first has gone",
+      M.hold_lock(Path(base) / "instance.lock") is not None)
+fake_app = Path(base) / "fake_app.py"
+fake_app.write_text(
+    "import json, os, sys, time\n"
+    "base = sys.argv[1]\n"
+    "mode = open(os.path.join(base, 'mode')).read().strip()\n"
+    "open(os.path.join(base, 'starts'), 'a').write(f'{os.getpid()}\\n')\n"
+    "json.dump({'pid': os.getpid(), 'cmd': [sys.executable, __file__, base],"
+    " 'quit': False}, open(os.path.join(base, 'keepup.json'), 'w'))\n"
+    "end = time.time() + 40\n"
+    "while time.time() < end:\n"
+    "    if mode == 'crash':\n"
+    "        sys.exit(3)\n"
+    "    if mode == 'beat':\n"
+    "        open(os.path.join(base, 'keepup.beat'), 'w').write('1')\n"
+    "    time.sleep(0.2)\n")
+GUARD_ENV = dict(os.environ, FEXT_GUARD_QUICK="0.2,1.5,0.6,0.4,0.4,0.4")
+
+
+def guard_dir(mode):
+    folder = Path(tempfile.mkdtemp(prefix="fext-guard-"))
+    (folder / "mode").write_text(mode)
+    return folder
+
+
+def starts(folder):
+    try:
+        return [int(n) for n in (folder / "starts").read_text().split()]
+    except OSError:
+        return []
+
+
+def watcher(folder):
+    return subprocess.Popen([sys.executable, sys.argv[1] if len(sys.argv)
+                               > 1 else "main.py", M.GUARD_FLAG, str(folder)],
+                              env=GUARD_ENV)
+
+
+folder = guard_dir("crash")
+(folder / "keepup.json").write_text(json.dumps({
+    "pid": 999999, "cmd": [sys.executable, str(fake_app), str(folder)],
+    "quit": False}))
+guard = watcher(folder)
+check("Ferritext gone without being closed (a crash): the watcher starts "
+      "it again, and again", wait_until(lambda: len(starts(folder)) >= 2, 15),
+      starts(folder))
+second = watcher(folder)
+check("a second watcher for the same folder ends at once",
+      wait_until(lambda: second.poll() is not None, 10))
+(folder / "keepup.json").write_text(json.dumps({
+    "pid": 999999, "cmd": [sys.executable, str(fake_app), str(folder)],
+    "quit": True}))
+check("closed by its person: the watcher ends, and starts nothing more",
+      wait_until(lambda: guard.poll() is not None, 10))
+folder = guard_dir("hang")
+hung = subprocess.Popen([sys.executable, str(fake_app), str(folder)])
+wait_until(lambda: starts(folder), 5)
+(folder / "keepup.beat").write_text("1")          # its last beat, long ago
+os.utime(folder / "keepup.beat", (time.time() - 100, time.time() - 100))
+guard = watcher(folder)
+check("Ferritext that stops answering (no beat): ended, then started again",
+      wait_until(lambda: len(starts(folder)) >= 2, 20) and
+      wait_until(lambda: hung.poll() is not None, 5), starts(folder))
+(folder / "mode").write_text("beat")
+count = len(starts(folder))
+wait_until(lambda: False, 3)
+check("one that answers is left alone",
+      len(starts(folder)) <= count + 1 and guard.poll() is None,
+      starts(folder))
+data = json.loads((folder / "keepup.json").read_text())
+(folder / "keepup.json").write_text(json.dumps(dict(data, quit=True)))
+wait_until(lambda: guard.poll() is not None, 10)
+for pid in starts(folder):
+    try:
+        os.kill(pid, 9)
+    except OSError:
+        pass
+if os.name == "nt":
+    # A one-file EXE runs an unpacked copy of itself, under the name it was
+    # built with: a download renamed "… (1).exe" is known by that copy.
+    M.guard_tell([r"C:\Downloads\Ferritext-19.0.1-windows (1).exe"], True)
+    told = json.loads((M.DATA_DIR / "keepup.json").read_text("utf-8"))
+    mine = M._process_image(os.getpid()) or ""
+    check("Windows: keepup.json names the program file Ferritext runs, so "
+          "that a renamed download is still known to the watcher",
+          mine and told.get("image", "").lower() == mine.lower() and
+          M._guard_alive(os.getpid(), told["cmd"], told["image"]), told)
 
 # ---- the computer's own injector ------------------------------------------------------
 os.environ.pop("FEXT_REMOTE_TEST", None)

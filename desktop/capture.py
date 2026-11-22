@@ -107,6 +107,12 @@ SCREENS = ("chats", "chats_pressed", "menu", "chat", "call_refused", "chat_info"
            # and a controlled call from each side
            "chat_menu_remote", "remote_access", "control_ask",
            "remote_controller", "remote_computer",
+           # 19.0.1 (REMOTE191): Remote access's "Before you leave";
+           # controlling a computer from afar: its band when it shows a
+           # security screen, Keys, Ctrl+Alt+Del's, its programs, a
+           # restart; and which of two computers
+           "remote_checklist", "remote_note", "remote_keys", "remote_cad",
+           "remote_programs", "remote_restart", "remote_computers",
            # 19.0 (PINS26): a chat's pinned messages: the bar, the list
            "pin_bar", "pins_sheet")
 
@@ -569,6 +575,24 @@ def scroll_sheet_to_end():
             for w in walk(view):
                 if isinstance(w, ScrollView):
                     w.scroll_y = 0
+
+
+def scroll_sheet_to(*titles):
+    """Scroll the open sheet until the first of `titles` it has is near
+    its top (an older version's own title can follow); a sheet with none
+    is left as it is."""
+    labels = [w for view in Window.children
+              if isinstance(view, M.ModalView) for w in walk(view)
+              if isinstance(w, Label)]
+    for title in titles:
+        title = getattr(M, "tr", str)(title).lower()
+        for w in labels:
+            if title in (w.text or "").lower():
+                scroll = next((a for a in ancestors(w)
+                               if isinstance(a, ScrollView)), None)
+                if scroll is not None:
+                    scroll.scroll_to(w, padding=dp(40), animate=False)
+                return
 
 
 def scroll_settings_to(title, page="settings"):
@@ -1052,6 +1076,45 @@ def remote_call(computer: bool, ask: bool = False):
     app.call_view = lambda tiles: None        # the stand-ins stay
     if ask:
         M.ControlAskSheet(app, call).open()
+
+
+def remote_191(what: str):
+    """19.0.1 (REMOTE191): controlling alex's computer from afar ("Office
+    PC", which signs in by itself), with its band ("note": it shows a
+    security screen) or one of the Keys sheets."""
+    if not hasattr(M, "RemoteKeysSheet"):
+        return
+    remote_call(computer=False)
+    app.call.rc_state = {"s": "secure" if what == "note" else "ok",
+                         "n": "Office PC", "si": True,
+                         "u": time.time() + 30 * 86400}
+    app._refresh_call()
+    if what == "keys":
+        M.RemoteKeysSheet(app).open()
+    elif what == "cad":
+        M.RemoteCadSheet(app).open()
+    elif what == "restart":
+        M.RemoteRestartSheet(app).open()
+    elif what == "programs":
+        M.RemoteProgramsSheet.show(app, M.sanitize_programs([
+            {"w": 1, "p": 10, "t": "Quarterly report", "x": "ledger.exe"},
+            {"w": 2, "p": 11, "t": "Invoices", "x": "explorer.exe"},
+            {"w": 3, "p": 12, "t": "Backup tool", "x": "backup.exe",
+             "h": True},
+            {"w": 4, "p": 13, "t": "Device Manager", "x": "mmc.exe",
+             "a": True}]))
+
+
+def remote_computers():
+    """19.0.1: alex's identity on two computers that answered here."""
+    if not hasattr(M, "RemoteComputersSheet"):
+        return
+    close_sheets()
+    for n, (dev, name) in enumerate((("0123456789abcdef", "Office PC"),
+                                     ("fedcba9876543210", "Home laptop"))):
+        M.remote_computer_seen(me, alex, dev, name,
+                               now=time.time() - 3600 * (2 + 46 * n))
+    M.RemoteComputersSheet(app, alex, M.remote_computers(me, alex)).open()
 
 
 def video_call_end():
@@ -2130,6 +2193,23 @@ STEPS = [
     (video_call_end, 0.4, None),
     (lambda: remote_call(computer=True), 1.0, "remote_computer"),
     (video_call_end, 0.4, None),
+    (remote_access, 0.8, None),
+    (lambda: scroll_sheet_to("Before you leave",       # 19.0's: after it
+                             "After a restart or a power cut"), 0.5,
+     "remote_checklist"),
+    (close_sheets, 0.3, None),
+    (lambda: remote_191("note"), 1.0, "remote_note"),
+    (lambda: remote_191("keys"), 0.8, "remote_keys"),
+    (close_sheets, 0.3, None),
+    (lambda: remote_191("cad"), 0.8, "remote_cad"),
+    (close_sheets, 0.3, None),
+    (lambda: remote_191("programs"), 0.8, "remote_programs"),
+    (close_sheets, 0.3, None),
+    (lambda: remote_191("restart"), 0.8, "remote_restart"),
+    (close_sheets, 0.3, None),
+    (video_call_end, 0.4, None),
+    (remote_computers, 0.8, "remote_computers"),
+    (close_sheets, 0.3, None),
     (pins_chat, 1.0, "pin_bar"),
     (lambda: M.PinsSheet(app, alex).open()
      if hasattr(M, "PinsSheet") else None, 0.8, "pins_sheet"),

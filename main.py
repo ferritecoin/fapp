@@ -144,6 +144,201 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, NamedTuple, Optional
 
+
+# ---- 19.0.1 (KEEPUP): Ferritext kept running on a computer reached from afar
+# A small watcher: this same program started with GUARD_FLAG and the data
+# folder. It imports nothing below this point (no window, little memory),
+# and starts Ferritext again when it closed without its person closing it
+# (a crash), or when it stopped answering for GUARD_HANG seconds and a
+# minute more (it is ended first), after GUARD_WAITS. Ferritext starts it,
+# and starts it again, while someone can connect to the computer from afar
+# (FextApp.keep_running). Its files, in the data folder: keepup.json
+# (Ferritext's process, how to start it, whether its person closed it),
+# keepup.beat (touched by Ferritext's UI every GUARD_BEAT seconds) and
+# guard.lock (held by the watcher: one at a time).
+GUARD_FLAG = "--guard"
+GUARD_AGAIN = "--again"          # ...and what it starts Ferritext with
+GUARD_EVERY, GUARD_BEAT, GUARD_HANG = 5.0, 20.0, 300.0
+GUARD_WAITS = (10, 30, 60, 300, 900)
+
+
+def hold_lock(path: Path):
+    """An exclusive lock on `path`, held while the file returned stays
+    open (and let go by the system when the process ends); None while
+    another process holds it."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(path, "a+")
+    except OSError:
+        return None
+    try:
+        if os.name == "nt":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return handle
+    except OSError:
+        handle.close()
+        return None
+
+
+def _process_image(pid: int) -> Optional[str]:
+    """Windows: the program file process `pid` runs ("" when Windows does
+    not say), or None when it runs no more."""
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.GetExitCodeProcess.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        ctypes.c_void_p, wintypes.DWORD, ctypes.c_wchar_p,
+        ctypes.POINTER(wintypes.DWORD)]
+    process = kernel32.OpenProcess(0x1000, False, pid)
+    if not process:
+        return None
+    try:
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(process, ctypes.byref(code)) \
+                or code.value != 259:                      # STILL_ACTIVE
+            return None
+        path = ctypes.create_unicode_buffer(520)
+        size = wintypes.DWORD(520)
+        if not kernel32.QueryFullProcessImageNameW(
+                process, 0, path, ctypes.byref(size)):
+            return ""
+        return path.value
+    finally:
+        kernel32.CloseHandle(process)
+
+
+def _guard_alive(pid, cmd, image: str = "") -> bool:
+    """Ferritext's process `pid` still runs, and is Ferritext (a number
+    the system gave to another program since is not). `image` is the
+    program file it said it runs: a one-file EXE runs a copy of itself,
+    unpacked, under the name it was built with, whatever its download
+    was renamed to."""
+    if not isinstance(pid, int) or pid <= 0 or not cmd:
+        return False
+    if os.name == "nt":
+        path = _process_image(pid)
+        if not path:
+            return path == ""
+        return os.path.basename(path).lower() == \
+            os.path.basename(image or cmd[0]).lower()
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        pass                                 # someone else's: say it runs
+    try:
+        line = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except OSError:
+        return True
+    return os.fsencode(cmd[-1]) in line
+
+
+def _guard_end(pid: int) -> None:
+    """A Ferritext that stopped answering, ended."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.TerminateProcess.argtypes = [ctypes.c_void_p,
+                                                  ctypes.c_uint]
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            process = kernel32.OpenProcess(0x0001, False, pid)
+            if process:
+                kernel32.TerminateProcess(process, 1)
+                kernel32.CloseHandle(process)
+        else:
+            import signal
+            os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def guard_start(cmd: list) -> bool:
+    """Start `cmd` on its own (not a child the watcher waits on), with no
+    window of its own on Windows; True when it started."""
+    try:
+        if os.name == "nt":
+            subprocess.Popen(cmd, close_fds=True, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,
+                             creationflags=0x00000008 | 0x00000200)
+        else:      # DETACHED_PROCESS, CREATE_NEW_PROCESS_GROUP above
+            subprocess.Popen(cmd, close_fds=True, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        return True
+    except OSError:
+        return False
+
+
+def guard_loop(base: Path, every: float = GUARD_EVERY,
+               hang: float = GUARD_HANG, waits: tuple = GUARD_WAITS,
+               confirm: float = 60.0) -> None:
+    """The watcher (GUARD_FLAG). It ends when Ferritext's person closed it
+    (keepup.json says "quit"), or when another watcher runs already."""
+    lock = hold_lock(base / "guard.lock")
+    if lock is None:
+        return
+    tries, started, hung_since, up_since = 0, 0.0, None, None
+    while True:
+        time.sleep(every)
+        try:
+            state = json.loads((base / "keepup.json").read_text("utf-8"))
+        except (OSError, ValueError):
+            state = None
+        if not isinstance(state, dict) or state.get("quit") is not False:
+            return
+        pid, cmd = state.get("pid"), state.get("cmd")
+        if not isinstance(cmd, list) or not all(isinstance(c, str)
+                                                for c in cmd):
+            return
+        image = state.get("image")
+        now = time.time()
+        if _guard_alive(pid, cmd, image if isinstance(image, str) else ""):
+            try:
+                beat = now - (base / "keepup.beat").stat().st_mtime
+            except OSError:
+                beat = 0.0
+            if beat > hang:
+                hung_since = hung_since or now
+                if now - hung_since >= confirm:
+                    _guard_end(pid)
+                    hung_since = None
+            else:
+                hung_since = None
+                up_since = up_since or now
+                if now - up_since > 600:
+                    tries = 0                  # well again: no long wait
+            continue
+        up_since = hung_since = None
+        if now - started >= waits[min(tries, len(waits) - 1)]:
+            started, tries = now, tries + 1
+            guard_start(cmd + ["--startup", GUARD_AGAIN])
+
+
+if __name__ == "__main__" and GUARD_FLAG in sys.argv[1:]:
+    _at = sys.argv.index(GUARD_FLAG)
+    _quick = os.environ.get("FEXT_GUARD_QUICK")      # the tests' timings
+    if _quick:
+        _e, _h, _c, *_w = (float(n) for n in _quick.split(","))
+        guard_loop(Path(sys.argv[_at + 1]), _e, _h, tuple(_w), _c)
+    else:
+        guard_loop(Path(sys.argv[_at + 1]) if len(sys.argv) > _at + 1
+                   else Path.home() / ".fext")
+    raise SystemExit
+
 import qrcode
 import requests
 from cryptography.hazmat.backends import default_backend
@@ -481,6 +676,20 @@ def address_from_pub_bytes(compressed: bytes) -> str:
 
 def address_from_priv(priv: int) -> str:
     return address_from_pub_bytes(pub_to_compressed(priv_to_pub(priv)))
+
+
+def key_matches_address(public_key_hex, address) -> bool:
+    """19.0.1 (SECURITY27): `public_key_hex` (compressed secp256k1, hex) is
+    the key `address` is the hash of. Every address is one key's: a key
+    that is not its address's is someone else's."""
+    if not isinstance(public_key_hex, str) or not isinstance(address, str):
+        return False
+    try:
+        raw = bytes.fromhex(public_key_hex)
+        compressed_to_pub(raw)
+    except ValueError:
+        return False
+    return address_from_pub_bytes(raw) == address
 
 
 def address_meets_pow(address: str) -> bool:
@@ -1019,7 +1228,7 @@ REQUIRE_TLS = _os.environ.get("FEXT_REQUIRE_TLS", "") not in ("", "0", "false")
 
 APP_NAME = "Ferritext"
 #: Must equal `version` in buildozer.spec — CI refuses to build if not.
-APP_VERSION = "19.0.0"
+APP_VERSION = "19.0.1"
 
 # The identity/QR payload keeps carrying the ORIGINAL tag. It is wire data
 # that older clients already produce and consume, so renaming the app must
@@ -1072,6 +1281,74 @@ def replace_file(src, dst) -> None:
         except PermissionError:
             time.sleep(wait)
     os.replace(src, dst)
+
+
+def _json_of(path: Path):
+    """The JSON a file holds, or None (missing, cut short, zeros)."""
+    try:
+        return json.loads(Path(path).read_text("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def write_durably(path: Path, text: str, keep_old: bool = True,
+                  private: bool = False) -> None:
+    """19.0.1 (KEEPUP): `text` put in `path` whole or not at all, and on
+    the disk before it is (written beside it, flushed, then put in its
+    place): a power cut leaves the old file or the new one, never a part
+    of one, nor one of zeros. The file it replaces is kept as `path`.bak
+    when it held good JSON (`keep_old`: a key removed must not live on in
+    it, so then the new is kept there instead). read_durably reads it when
+    the file itself cannot be read. `private`: readable by its owner only
+    (keys)."""
+    path = Path(path)
+    tmp, old = path.with_name(path.name + ".tmp"), \
+        path.with_name(path.name + ".bak")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+    if private:
+        try:
+            os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            pass
+    if keep_old and _json_of(path) is not None:
+        replace_file(path, old)
+    replace_file(tmp, path)
+    if not keep_old:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if private:
+            try:
+                os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+            except OSError:
+                pass
+        replace_file(tmp, old)
+    if os.name != "nt":                    # the renames on the disk too
+        try:
+            folder = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(folder)
+            finally:
+                os.close(folder)
+        except OSError:
+            pass
+
+
+def read_durably(path: Path):
+    """The JSON of `path`, else of its last good copy (write_durably), else
+    None: a file a power cut spoiled is not taken for an empty one."""
+    found = _json_of(path)
+    if found is None:
+        found = _json_of(Path(path).with_name(Path(path).name + ".bak"))
+        if found is not None:
+            log.warning("%s could not be read: its last good copy is used",
+                        Path(path).name)
+    return found
 
 # ---- bundled type and artwork --------------------------------------------------
 # In the source tree and the APK they sit in data/ beside this file. The
@@ -5597,13 +5874,13 @@ _PREFS_LOCK = threading.RLock()
 
 
 def load_prefs() -> dict:
-    """Device-wide preferences shared by the app and its service."""
-    try:
-        with _PREFS_LOCK:
-            data = json.loads((DATA_DIR / "prefs.json").read_text("utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    """Device-wide preferences shared by the app and its service. 19.0.1
+    (KEEPUP): from the last good copy when a power cut spoiled the file
+    (read_durably): it holds Remote access's list, and a computer reached
+    from afar that lost it would answer no one."""
+    with _PREFS_LOCK:
+        data = read_durably(DATA_DIR / "prefs.json")
+    return data if isinstance(data, dict) else {}
 
 
 def save_pref(key: str, value) -> None:
@@ -5611,10 +5888,7 @@ def save_pref(key: str, value) -> None:
         prefs = load_prefs()
         prefs[key] = value
         try:
-            DATA_DIR.mkdir(parents=True, exist_ok=True)
-            tmp = DATA_DIR / "prefs.json.tmp"
-            tmp.write_text(json.dumps(prefs), "utf-8")
-            replace_file(tmp, DATA_DIR / "prefs.json")
+            write_durably(DATA_DIR / "prefs.json", json.dumps(prefs))
         except OSError:
             log.exception("could not save preferences")
 
@@ -9085,6 +9359,12 @@ class CallEngine(threading.Thread):
         self._input_sent = self._input_until = 0.0
         self.input_in: Optional[InputIn] = None
         self._input_refused = False
+        # 19.0.1 (MOBILE191): this side's shared screen's step of
+        # SCREEN_STEPS; the most the side controlling it asks for (Data
+        # saver; 0: no limit); the least delay lately, ms (_delay_grew).
+        self._sstep = 0
+        self.screen_cap = 0
+        self._rtt_floor: Optional[float] = None
         self._vhidden: dict = {}          # track -> its rung before hidden
         self._vclean: dict = {}           # track -> clean periods in a row
         self._vbase: Optional[tuple] = None   # their (whole, lost) before
@@ -9316,6 +9596,17 @@ class CallEngine(threading.Thread):
         threading.Thread(target=send, daemon=True,
                          name="fext-call-react").start()
 
+    def send_rcmd(self, word: dict) -> bool:
+        """19.0.1 (REMOTE191): a word of a controlled screen's (PKT_RCMD)
+        to the other side, sealed; False when it is too long or the call
+        has no keys yet."""
+        data = json.dumps(word, separators=(",", ":"),
+                          ensure_ascii=False).encode("utf-8")
+        if self.keys is None or len(data) > RCMD_BYTES:
+            return False
+        self._send(PKT_RCMD, data)
+        return True
+
     def ask_video_key(self, track: str) -> None:
         keys = self.keys
         if keys is not None:
@@ -9388,9 +9679,12 @@ class CallEngine(threading.Thread):
             if not on:
                 self._vrung.pop(track, None)
                 self._vhidden.pop(track, None)
+                self._vplanned.pop(track, None)
                 continue
-            rungs = VIDEO_LADDER[:VIDEO_LADDER.index(video_ceiling()) + 1] \
-                if track == "v" else (VIDEO_SCREEN,)
+            if track == "s":                          # 19.0.1 (MOBILE191)
+                self._plan_screen(loss, codec, now)
+                continue
+            rungs = VIDEO_LADDER[:VIDEO_LADDER.index(video_ceiling()) + 1]
             top = len(rungs) - 1
             w, h = theirs["shows"].get(track, (0, 0))
             was = self._vrung.get(track, top)
@@ -9432,6 +9726,50 @@ class CallEngine(threading.Thread):
             if track == "v":
                 sound = call_quality_kbps(rung.sound)
         self._pair_sound(sound)
+
+    def _plan_screen(self, loss: float, codec: str, now: float) -> None:
+        """19.0.1 (MOBILE191): this side's shared screen, every two
+        seconds. Its ceiling a step of SCREEN_STEPS lower while the other
+        side loses pictures (5 % or more) or the way's delay has grown (a
+        queue filling: _delay_grew), a step higher after six clean seconds;
+        never above what the way takes, nor what the side controlling it
+        asks (Data saver: screen_cap). Its size VIDEO_SCREEN's."""
+        step, clean = self._sstep, self._vclean.get("s", 0)
+        if loss >= 0.05 or self._delay_grew(now):
+            step, clean = min(len(SCREEN_STEPS) - 1, step + 1), 0
+        elif loss < 0.01:
+            clean += 1
+            if clean >= 3:
+                step, clean = max(0, step - 1), 0
+        self._sstep, self._vclean["s"] = step, clean
+        kbps = video_kbps(SCREEN_STEPS[step], codec)
+        if self.screen_cap:
+            kbps = min(kbps, self.screen_cap)
+        budget = self._video_budget()
+        if budget is not None:
+            kbps = min(kbps, budget)
+        short = VIDEO_SCREEN.short
+        told, size = self._vkbps.get("s", kbps), (short, codec)
+        if self._vplanned.get("s") != size or abs(kbps - told) > told // 10:
+            self._vplanned["s"], self._vkbps["s"] = size, kbps
+            self._on_event("video_plan", ("s", (short, VIDEO_SCREEN.fps,
+                                                kbps), codec))
+
+    def _delay_grew(self, now: float) -> bool:
+        """19.0.1: the way's delay now well over the least it has been (a
+        queue filling, which comes before pictures are lost on a phone's
+        network): twice it, and 80 ms more. The least creeps up towards the
+        delay now (a twentieth a check), so a way that is simply longer is
+        learnt in a minute or so."""
+        rtt = self.rtt_ms
+        if rtt is None:
+            return False
+        floor = self._rtt_floor
+        if floor is None or rtt < floor:
+            self._rtt_floor = rtt
+            return False
+        self._rtt_floor = floor + (rtt - floor) * 0.05
+        return rtt > 2 * floor + 80
 
     def _video_budget(self) -> Optional[int]:
         """kbit/s a picture may take on the way the call goes now: none
@@ -9738,6 +10076,10 @@ class CallEngine(threading.Thread):
                 self._on_event("video_key", ROOM_TRACK_NAME[payload[0]])
         elif ptype == PKT_INPUT:                                  # 19.0
             self._take_input(payload)
+        elif ptype == PKT_RCMD:                                   # 19.0.1
+            word = parse_rcmd(payload)
+            if word is not None:
+                self._on_event("rcmd", word)
         elif ptype == PKT_REACT and len(payload) > 2:            # 17.3
             serial = struct.unpack("!H", payload[:2])[0]
             if serial != self._react_heard:
@@ -10620,6 +10962,29 @@ VIDEO_CODEC_IDS = {"h264": 1, "hevc": 2, "av1": 3}
 VIDEO_PIECE_BYTES = 1000
 VIDEO_MAX_PIECES = 600              # a picture of 600 kB at the most
 VIDEO_KEY_EVERY = 10.0              # seconds: a key frame at least this often
+#: 19.0.1 (MOBILE191, the owner's 22 Nov note: remote work over mobile
+#: data). A shared screen is coded only when it changes (FfmpegVideoCoder:
+#: a still one sends nothing), its key frame comes when asked (a picture
+#: lost) or this often, with a change to code; 19.0 coded every capture and
+#: sent a whole picture every ten seconds, about 50 MB an hour of a screen
+#: nobody touched (bench_remote_191.py, the private package).
+VIDEO_SCREEN_KEY_EVERY = 120.0
+#: ...the most one coded screen may hold beyond its share of the ceiling, in
+#: seconds of the ceiling (x264's VBV buffer). 19.0's was a whole second: a
+#: screen that changed at once (a window opened) could send a second's bits
+#: in one picture, and a link at the ceiling took that second to carry it.
+SCREEN_VBV = 0.25
+#: ...its ceiling, kbit/s, a step lower while the other side loses pictures
+#: or the way's delay grows (a queue filling, as a phone's network does), a
+#: step higher after clean seconds (CallEngine._plan_screen). Its size stays
+#: VIDEO_SCREEN's whatever the other side draws it at: x264 codes a screen
+#: best at its own size (at 720 lines a page scrolled cost five times the
+#: bits, its words resampled each picture: bench_remote_191.py).
+SCREEN_STEPS = (8000, 5000, 3000, 1800, 1000, 600)
+#: ...and coded on for this long once it stops changing, so x264 sharpens
+#: what it sent while it moved (a picture never coded again keeps the
+#: quality of its first: 43 dB where 53 is clean), then not at all.
+SCREEN_SETTLE = 1.0
 #: A piece's flags: a key frame, the picture's first piece; the low two
 #: bits are its layer (0 the smallest of a room's three sizes).
 VIDEO_KEY, VIDEO_START, VIDEO_LAYER = 0x80, 0x40, 0x03
@@ -10790,6 +11155,13 @@ class VideoAssembler:
         """A key frame is due: one was lost, or a picture came that cannot
         be decoded without one (not merely the first still on its way)."""
         return self.need_key and bool(self.lost or self.skipped)
+
+    def follows(self, number: int) -> bool:
+        """19.0.1: `number` is the very next picture after the last one
+        handed on, nothing missing: the stream goes on, however long it
+        was still (a screen that did not change sends nothing)."""
+        return self.done is not None and number == self.done + 1 and \
+            not self._open and not self.need_key
 
     def put(self, number: int, index: int, count: int, codec: int,
             flags: int, data: bytes, now: float) -> Optional[tuple]:
@@ -11225,7 +11597,8 @@ class FfmpegEncoder:
                 options["crf"] = str(SCREEN_CRF)
         if not (screen and name == "libx264"):
             ctx.bit_rate = kbps * 1000
-        ctx.max_bit_rate = ctx.rc_buffer_size = kbps * 1000
+        ctx.max_bit_rate = kbps * 1000
+        ctx.rc_buffer_size = FfmpegEncoder._buffer(kbps, screen)
         # x264 slices a picture between its threads (zerolatency): more of
         # them, less time a picture.
         ctx.thread_count = 1 if width * height <= 640 * 480 else \
@@ -11264,12 +11637,19 @@ class FfmpegEncoder:
         self.cost = took if not self.cost else self.cost * .8 + took * .2
         return out
 
+    @staticmethod
+    def _buffer(kbps: int, screen: bool) -> int:
+        """The coder's VBV buffer, bits: a second of the ceiling, a shared
+        screen's SCREEN_VBV of it (19.0.1)."""
+        return int(kbps * 1000 * (SCREEN_VBV if screen else 1.0))
+
     def set_kbps(self, kbps: int) -> None:
         if kbps != self.kbps:
             self.kbps = kbps
             if not (self.screen and self.name == "libx264"):
                 self.ctx.bit_rate = kbps * 1000
-            self.ctx.max_bit_rate = self.ctx.rc_buffer_size = kbps * 1000
+            self.ctx.max_bit_rate = kbps * 1000
+            self.ctx.rc_buffer_size = self._buffer(kbps, self.screen)
 
     def close(self) -> None:
         self.ctx = None
@@ -11557,6 +11937,17 @@ class VideoCapture(threading.Thread):
 
 
 # ---- this device's pictures, coded at the sizes wanted ----------------------
+def frame_signature(frame) -> int:
+    """19.0.1 (MOBILE191): a captured picture's CRC-32, over every plane's
+    bytes as FFmpeg holds them (no copy): two captures of a screen that did
+    not change have the same. About 1.6 ms for a 1080p screen."""
+    import zlib
+    sig = 0
+    for plane in frame.planes:
+        sig = zlib.crc32(plane, sig)
+    return sig
+
+
 class FfmpegVideoCoder:
     """A computer's camera or screen coded at the sizes a call wants: one
     VideoCapture, an FfmpegEncoder a size. A phone's is
@@ -11614,6 +12005,12 @@ class FfmpegVideoCoder:
         now = time.monotonic()
         with self._lock:
             plan, codec, keys = list(self.plan), self.codec, set(self._keys)
+        # 19.0.1 (MOBILE191): a screen is coded while it changes (by its
+        # signature) and SCREEN_SETTLE after, or when a key frame is owed;
+        # its own key frames every VIDEO_SCREEN_KEY_EVERY at most.
+        screen = self.source.kind == "screen"
+        sig = frame_signature(frame) if screen else None
+        every = VIDEO_SCREEN_KEY_EVERY if screen else VIDEO_KEY_EVERY
         out = []
         for layer, short, fps, kbps in plan:
             size = video_size(frame.width, frame.height, short)
@@ -11626,10 +12023,15 @@ class FfmpegVideoCoder:
             coder, due, key_at = held[:3]
             if now < due - 0.25 / fps:            # this size's own rate
                 continue
+            key = key_at is None or layer in keys
+            if sig is not None:
+                if sig != held[5]:
+                    held[6] = now                 # changed: it settles now
+                elif not key and now - held[6] > SCREEN_SETTLE:
+                    continue                      # still, and sharp: nothing
             held[1] = max(due + 1 / fps, now - 0.5 / fps)
             coder.set_kbps(kbps)
-            key = key_at is None or layer in keys or \
-                now - key_at >= VIDEO_KEY_EVERY
+            key = key or now - key_at >= every
             try:
                 coded = coder.encode(frame, key)
             except Exception as exc:
@@ -11641,6 +12043,7 @@ class FfmpegVideoCoder:
             if key:
                 with self._lock:
                     self._keys.discard(layer)
+            held[5] = sig
             for data, is_key in coded:
                 if is_key:
                     held[2] = now
@@ -11669,9 +12072,11 @@ class FfmpegVideoCoder:
     def _make(self, layer: int, codec: str, size: tuple, fps: int,
               kbps: int, now: float, preset: Optional[int] = None
               ) -> Optional[list]:
-        """A size's coder: [encoder, due, key at, busy since, idle since].
-        19.0: x264 starts at the setting this computer last kept for the
-        same size and rate (X264_PRESETS)."""
+        """A size's coder: [encoder, due, key at, busy since, idle since,
+        the signature of the screen it coded last and when that screen last
+        changed (19.0.1)]. 19.0: x264
+        starts at the setting this computer last kept for the same size and
+        rate (X264_PRESETS)."""
         known = _VIDEO_CAN.setdefault("x264", {})
         if preset is None:
             preset = known.get((size, fps), 0)
@@ -11682,7 +12087,8 @@ class FfmpegVideoCoder:
         except Exception as exc:
             log.warning("video: no coder for %s: %s", size, exc)
             return None
-        held = self._coders[layer] = [encoder, now, None, None, None]
+        held = self._coders[layer] = [encoder, now, None, None, None, None,
+                                      now]
         return held
 
     def _pace(self, layer: int, held: list, now: float) -> None:
@@ -11868,7 +12274,8 @@ class VideoReceiver(threading.Thread):
             return
         layer = flags & VIDEO_LAYER
         stream = self._streams.get((who, track, layer))
-        if stream is None or now - stream.heard > 2.0:
+        if stream is None or (now - stream.heard > 2.0 and
+                              not stream.follows(number)):
             stream = self._streams[(who, track, layer)] = VideoAssembler()
         self._current[(who, track)] = layer
         got = stream.put(number, index, count, cid, flags,
@@ -11924,10 +12331,17 @@ class VideoReceiver(threading.Thread):
             except Exception:
                 log.exception("video: asking for a key frame failed")
 
+    #: 19.0.1: a stream heard from no more for this long is let go; one
+    #: quieter than QUIET (a screen that did not change) is kept, as it
+    #: was, for the picture that follows (VideoAssembler.follows).
+    QUIET, GONE = 5.0, 600.0
+
     def _check(self, now: float) -> None:
         for (who, track, layer), stream in list(self._streams.items()):
-            if now - stream.heard > 5.0:             # gone quiet
+            if now - stream.heard > self.GONE:
                 del self._streams[(who, track, layer)]
+                continue
+            if now - stream.heard > self.QUIET:     # still: nothing to ask
                 continue
             stream.expire(now)
             if stream.wants_key and self._current.get((who, track)) == layer \
@@ -13835,6 +14249,9 @@ def sanitize_call_signal(op: str, ctl: dict) -> Optional[dict]:
             return None
         out["v"] = ctl.get("v") is True       # 17.0: a video call
         out["rc"] = ctl.get("rc") is True     # 19.0: a remote session
+        to = _str(ctl.get("to"), 17)          # 19.0.1: for that computer
+        if out["rc"] and to and _DEVICE_ID_RE.fullmatch(to):
+            out["to"] = to
     if op in ("call", "ringing", "answer"):
         quality = _int(ctl.get("q"), 16, 512)
         if quality:
@@ -13857,6 +14274,11 @@ def sanitize_call_signal(op: str, ctl: dict) -> Optional[dict]:
     if op == "answer":
         out["codec"] = ctl.get("codec") if ctl.get("codec") in CALL_CODECS \
             else "ima16"
+        # 19.0.1: a remote session's computer, by its number and name.
+        dev = _str(ctl.get("dev"), 17)
+        if dev and _DEVICE_ID_RE.fullmatch(dev):
+            out["dev"] = dev
+            out["dn"] = clean_device_name(_str(ctl.get("dn"), 80) or "")
     if op == "end":
         why = ctl.get("why")
         out["why"] = why if why in CALL_END_REASONS else "hangup"
@@ -13920,6 +14342,15 @@ class Call:
         self.asks = self.released = self.lets = False
         self.their_asks = self.can_control = False
         self.control_kind, self.control_since = "asked", 0.0
+        # 19.0.1 (REMOTE191): their computer (its number, name) once it
+        # said; what it last told (rc_state); words asked of it and not yet
+        # answered (number -> [word, tries, sent]); restarted from here.
+        self.computer: Optional[tuple] = None
+        self.rc_state: Optional[dict] = None
+        self.rc_waiting: dict = {}
+        self.rc_number = 0
+        self.rc_said: tuple = (None, 0.0)
+        self.restarting = False
 
     @property
     def tag_bytes(self) -> bytes:
@@ -14085,6 +14516,13 @@ def meter_lines(numbers: dict) -> list:
 # if the packet that let it go was lost (InputIn).
 
 PKT_INPUT = 0x09
+#: 19.0.1 (REMOTE191, the owner's 22 Nov note): what the two ends of a
+#: controlled screen say beside the input, sealed as every packet: a small
+#: JSON object, at most RCMD_BYTES (RemoteControlMixin._remote_cmd). The
+#: computer tells its state and its programs; the side controlling it asks
+#: for those, ends a program, restarts it, and says Data saver's limit.
+PKT_RCMD = 0x0A
+RCMD_BYTES = 1100
 INPUT_MOVE, INPUT_BUTTON, INPUT_WHEEL, INPUT_KEY, INPUT_TEXT = range(1, 6)
 #: Each event's fields after its number and kind. Positions are a share of
 #: the shared picture, 0 to 65535 across and down.
@@ -14671,6 +15109,11 @@ REMOTE_GRANTS = ((1, N_("For a day")), (7, N_("For a week")),
 #: controls, this often, for this long: ten minutes, a computer's restart
 #: and sign-in. Its screen is due this soon once it is answered.
 REMOTE_RETRY_EVERY, REMOTE_RETRY_FOR = 5.0, 600.0
+#: 19.0.1: ...and for this long after a restart asked from afar (Windows'
+#: updates can hold one for a while).
+REMOTE_RESTART_WAIT = 1200.0
+#: ...and the side controlling is told its access ends this long before.
+REMOTE_ENDS_SOON = 14 * 86400
 REMOTE_RETRY_REASONS = ("failed", "timeout", "busy", "unavailable")
 REMOTE_SCREEN_WAIT = 30.0
 REMOTE_SESSIONS_KEPT = 20
@@ -14748,15 +15191,19 @@ def remote_session_kept(who: str, kind: str, start: float,
               [:REMOTE_SESSIONS_KEPT])
 
 
-def keep_awake(on: bool) -> bool:
+def keep_awake(on: bool, display: bool = False) -> bool:
     """19.0 (REMOTE): Windows asked not to sleep while this app runs (its
     access list not empty, Keep this computer awake on); its own ways
-    again when off. Only Windows: True when it took it."""
+    again when off. 19.0.1: `display`, the screen kept on too, while
+    someone controls it (a screen off, or its saver, shows them nothing).
+    Only Windows: True when it took it. (Windows keeps it for the thread
+    that asks: the UI thread, always.)"""
     if not IS_WINDOWS:
         return False
     try:
         import ctypes
-        flags = 0x80000000 | (0x00000001 if on else 0)  # CONTINUOUS, SYSTEM
+        flags = 0x80000000 | (0x00000001 if on or display else 0) | \
+            (0x00000002 if display else 0)    # CONTINUOUS, SYSTEM, DISPLAY
         return bool(ctypes.windll.kernel32.SetThreadExecutionState(flags))
     except Exception:
         log.exception("remote: Windows would not stay awake")
@@ -14825,6 +15272,659 @@ def starts_by_itself() -> Optional[bool]:
 def set_starts_by_itself(on: bool) -> bool:
     return set_start_with_windows(on) if IS_WINDOWS else \
         set_start_with_session(on)
+
+
+# ---- 19.0.1 (REMOTE191): remote access for the long term -------------------
+# The owner (22 Nov 2026): people who rely on it cannot reach the other side
+# for a long time, so its setting up matters most; Task Manager, Ctrl+Alt+Del
+# and the other special cases; mobile data; and no one crossing into another
+# machine, or acting as a server or as someone they are not. What each part
+# answers: .private/PLAN_REMOTE.md, "19.0.1".
+
+def parse_rcmd(payload: bytes) -> Optional[dict]:
+    """A PKT_RCMD word: a JSON object whose "op" is a short string; None
+    for anything else."""
+    if len(payload) > RCMD_BYTES:
+        return None
+    try:
+        word = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return None
+    if not isinstance(word, dict) or not isinstance(word.get("op"), str) \
+            or len(word["op"]) > 16:
+        return None
+    return word
+
+
+#: What the screen of a controlled computer can be (windows_screen_state).
+REMOTE_SCREENS = ("ok", "secure", "admin")
+
+
+def sanitize_remote_state(word: dict) -> dict:
+    """A computer's "state" word, field by field (it is sealed by the call's
+    keys, which only the two ends hold, yet read as anything may be)."""
+    if not isinstance(word, dict):
+        word = {}
+    until = word.get("u")
+    dev = _str(word.get("dev"), 17)
+    return {"s": word.get("s") if word.get("s") in REMOTE_SCREENS else "ok",
+            "n": clean_device_name(_str(word.get("n"), 80) or ""),
+            "dev": dev if dev and _DEVICE_ID_RE.fullmatch(dev) else None,
+            "u": until if isinstance(until, (int, float)) and
+            not isinstance(until, bool) and 0 <= until < 4e9 else None,
+            "si": word.get("si") if isinstance(word.get("si"), bool)
+            else None}
+
+
+def sanitize_programs(raw) -> list:
+    """A computer's list of programs (windows_programs), each field
+    checked; 30 at the most."""
+    out = []
+    for p in raw if isinstance(raw, list) else []:
+        if not isinstance(p, dict):
+            continue
+        w, pid = _int(p.get("w"), 1, 2 ** 63), _int(p.get("p"), 1, 2 ** 31)
+        if w is None or pid is None:
+            continue
+        out.append({"w": w, "p": pid,
+                    "t": clean_device_name(_str(p.get("t"), 80) or "")[:60],
+                    "x": clean_device_name(_str(p.get("x"), 60) or ""),
+                    "a": p.get("a") is True, "h": p.get("h") is True})
+    return out[:30]
+
+
+#: A computer's name, as the side controlling it sees it: this long at most.
+REMOTE_NAME_MAX = 40
+_DEVICE_ID_RE = re.compile(r"[0-9a-f]{16}")
+
+
+def _machine_mark() -> str:
+    """What tells this computer from a copy of its data folder on another:
+    Windows' MachineGuid, Linux's machine-id, else its network name."""
+    try:
+        if IS_WINDOWS:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                r"SOFTWARE\Microsoft\Cryptography") as key:
+                return str(winreg.QueryValueEx(key, "MachineGuid")[0])
+        for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+            if os.path.exists(path):
+                return Path(path).read_text().strip()
+    except OSError:
+        pass
+    return platform.node()
+
+
+def device_id() -> str:
+    """This install's number (16 hex digits), made once and kept with a
+    mark of the computer (_machine_mark): a data folder copied to another
+    computer makes a new one there, so no two computers answer as one."""
+    mark = hashlib.sha256(_machine_mark().encode("utf-8")).hexdigest()[:16]
+    with _PREFS_LOCK:
+        known = load_prefs().get("device")
+        if isinstance(known, dict) and known.get("mark") == mark and \
+                isinstance(known.get("id"), str) and \
+                _DEVICE_ID_RE.fullmatch(known["id"]):
+            return known["id"]
+        made = os.urandom(8).hex()
+        save_pref("device", {"id": made, "mark": mark})
+        return made
+
+
+def clean_device_name(raw) -> str:
+    """A computer's name as shown: one line of printable characters,
+    REMOTE_NAME_MAX at most."""
+    if not isinstance(raw, str):
+        return ""
+    text = " ".join("".join(c if c.isprintable() else " "
+                            for c in raw).split())
+    return text[:REMOTE_NAME_MAX]
+
+
+def device_name() -> str:
+    """What this computer is called in remote sessions: the name its
+    person gave it (Remote access), else its own network name."""
+    chosen = clean_device_name(load_prefs().get("device_name"))
+    return chosen or clean_device_name(platform.node()) or \
+        tr("This computer")
+
+
+def remote_computers(me: str, peer: str) -> list:
+    """The computers of `peer` this identity reached in a remote session,
+    the latest first: [{"dev", "n": name, "at": last time, "u": the grant's
+    end as it said then (0: none, None: not said)}]."""
+    raw = ((load_prefs().get("remote_computers") or {}).get(me) or {}) \
+        .get(peer)
+    out = [dict(c) for c in raw if isinstance(c, dict) and
+           isinstance(c.get("dev"), str) and
+           _DEVICE_ID_RE.fullmatch(c["dev"])] if isinstance(raw, list) \
+        else []
+    return sorted(out, key=lambda c: -(c.get("at") or 0))
+
+
+def remote_computer_seen(me: str, peer: str, dev: str, name: str,
+                         until=None, now: Optional[float] = None) -> None:
+    """A computer of `peer` answered (or told its state in) a remote
+    session: kept, eight a person at the most."""
+    if not _DEVICE_ID_RE.fullmatch(dev or ""):
+        return
+    now = time.time() if now is None else now
+    with _PREFS_LOCK:
+        everyone = dict(load_prefs().get("remote_computers") or {})
+        mine = dict(everyone.get(me) or {})
+        known = {c["dev"]: c for c in remote_computers(me, peer)}
+        entry = dict(known.get(dev) or {"dev": dev})
+        entry.update(n=clean_device_name(name) or entry.get("n") or "",
+                     at=now)
+        if until is not None:
+            entry["u"] = until
+        known[dev] = entry
+        mine[peer] = sorted(known.values(),
+                            key=lambda c: -(c.get("at") or 0))[:8]
+        everyone[me] = mine
+        save_pref("remote_computers", everyone)
+
+
+#: A remote session's offer is taken only when the time its sender signed
+#: in it is this close to this computer's clock: the relay stamps the time
+#: it took an offer (relay_at), and a relay that lied about it could
+#: otherwise play an old offer again.
+REMOTE_OFFER_SKEW = 600.0
+_REMOTE_OFFERS_SEEN: "OrderedDict[str, float]" = OrderedDict()
+
+
+def remote_offer_for_here(sig: dict, now: Optional[float] = None,
+                          relay_now: Optional[float] = None) -> bool:
+    """A remote session's offer is for this computer: none named (an older
+    app, or the first session) or this one (its "to"), and signed in time
+    (REMOTE_OFFER_SKEW) by this computer's clock. A computer left alone
+    for months can drift further than that from the relay's clock
+    (`relay_now`), and is then judged by the relay's: an old offer played
+    again opens a session nobody can see or control (its keys are its
+    caller's), where a drifted clock would keep everyone out."""
+    now = time.time() if now is None else now
+    to = sig.get("to")
+    if to and to != device_id():
+        return False
+    signed = sig.get("t")
+    if not isinstance(signed, (int, float)):
+        return False
+    if relay_now is not None and abs(relay_now - now) > REMOTE_OFFER_SKEW:
+        log.warning("remote: this computer's clock is %d s from the "
+                    "relay's: the relay's is used", int(now - relay_now))
+        now = relay_now
+    return abs(now - signed) <= REMOTE_OFFER_SKEW
+
+
+def remote_offer_once(offer_id: str) -> bool:
+    """True the first time a remote session's offer is answered here, False
+    for the same offer played again."""
+    if offer_id in _REMOTE_OFFERS_SEEN:
+        return False
+    _REMOTE_OFFERS_SEEN[offer_id] = time.time()
+    while len(_REMOTE_OFFERS_SEEN) > 200:
+        _REMOTE_OFFERS_SEEN.popitem(last=False)
+    return True
+
+
+#: Data saver (the side controlling a screen): the most the shared screen
+#: is sent at, kbit/s. On by itself on a phone, where mobile data is.
+REMOTE_SAVER_KBPS = 1500
+
+
+def remote_saver() -> bool:
+    chosen = load_prefs().get("remote_saver")
+    return IS_MOBILE if chosen is None else chosen is True
+
+
+# ---- what the controlled computer can tell and do (Windows) ----------------
+def _win32():
+    """(user32, kernel32, advapi32) with the prototypes used here: handles
+    as pointers, so none is cut to 32 bits."""
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    H = ctypes.c_void_p
+    user32.OpenInputDesktop.restype = H
+    user32.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                        wintypes.DWORD]
+    user32.CloseDesktop.argtypes = [H]
+    user32.GetUserObjectInformationW.argtypes = [
+        H, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD)]
+    user32.GetForegroundWindow.restype = H
+    user32.GetWindowThreadProcessId.argtypes = [
+        H, ctypes.POINTER(wintypes.DWORD)]
+    user32.IsWindowVisible.argtypes = user32.IsHungAppWindow.argtypes = [H]
+    user32.GetWindow.restype = H
+    user32.GetWindow.argtypes = [H, ctypes.c_uint]
+    user32.GetWindowTextW.argtypes = [H, ctypes.c_wchar_p, ctypes.c_int]
+    user32.GetWindowLongW.argtypes = [H, ctypes.c_int]
+    user32.PostMessageW.argtypes = [H, ctypes.c_uint, ctypes.c_void_p,
+                                    ctypes.c_void_p]
+    kernel32.OpenProcess.restype = H
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                     wintypes.DWORD]
+    kernel32.CloseHandle.argtypes = [H]
+    kernel32.GetCurrentProcess.restype = H
+    kernel32.TerminateProcess.argtypes = [H, ctypes.c_uint]
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        H, wintypes.DWORD, ctypes.c_wchar_p, ctypes.POINTER(wintypes.DWORD)]
+    advapi32.OpenProcessToken.argtypes = [H, wintypes.DWORD,
+                                          ctypes.POINTER(H)]
+    advapi32.GetTokenInformation.argtypes = [
+        H, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD)]
+    advapi32.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
+    advapi32.GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]
+    advapi32.GetSidSubAuthority.restype = ctypes.POINTER(wintypes.DWORD)
+    advapi32.GetSidSubAuthority.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    return user32, kernel32, advapi32
+
+
+def _process_level(process, kernel32, advapi32) -> Optional[int]:
+    """A process's integrity level (0x2000 a person's own programs, 0x3000
+    one run as administrator, 0x4000 the system's), None when Windows will
+    not say (a process above this one's)."""
+    import ctypes
+    from ctypes import wintypes
+    token = ctypes.c_void_p()
+    if not advapi32.OpenProcessToken(process, 0x0008, ctypes.byref(token)):
+        return None                                           # TOKEN_QUERY
+    try:
+        need = wintypes.DWORD()
+        advapi32.GetTokenInformation(token, 25, None, 0, ctypes.byref(need))
+        buf = ctypes.create_string_buffer(max(need.value, 64))
+        if not advapi32.GetTokenInformation(token, 25, buf, len(buf),
+                                            ctypes.byref(need)):
+            return None                           # 25: TokenIntegrityLevel
+        sid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
+        count = advapi32.GetSidSubAuthorityCount(sid)[0]
+        return int(advapi32.GetSidSubAuthority(sid, count - 1)[0])
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def _window_above_us(hwnd, user32, kernel32, advapi32) -> bool:
+    """A window run above this program (as administrator, or by the
+    system): Windows takes no input from this program into it (UIPI)."""
+    import ctypes
+    from ctypes import wintypes
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if not pid.value or pid.value == os.getpid():
+        return False
+    ours = _process_level(kernel32.GetCurrentProcess(), kernel32, advapi32)
+    process = kernel32.OpenProcess(0x1000, False, pid.value)
+    if not process:                     # PROCESS_QUERY_LIMITED_INFORMATION
+        return True
+    try:
+        level = _process_level(process, kernel32, advapi32)
+    finally:
+        kernel32.CloseHandle(process)
+    return level is None or (ours is not None and level > ours)
+
+
+def windows_screen_state(dlls=None) -> str:
+    """19.0.1 (REMOTE191): what the controlled computer's screen is now:
+    "ok"; "secure", a Windows security screen (locked, a permission
+    prompt, Ctrl+Alt+Del's), which no program can show or use from afar;
+    "admin", a window run as administrator in front (Task Manager, an
+    installer), which takes no input from Ferritext. `dlls` stands in for
+    _win32() in the tests."""
+    import ctypes
+    from ctypes import wintypes
+    user32, kernel32, advapi32 = dlls or _win32()
+    desk = user32.OpenInputDesktop(0, False, 0x0001)   # DESKTOP_READOBJECTS
+    if not desk:
+        return "secure"
+    try:
+        name = ctypes.create_unicode_buffer(64)
+        need = wintypes.DWORD()
+        if not user32.GetUserObjectInformationW(desk, 2, name,
+                                                ctypes.sizeof(name),
+                                                ctypes.byref(need)) or \
+                name.value.lower() != "default":          # 2: UOI_NAME
+            return "secure"
+    finally:
+        user32.CloseDesktop(desk)
+    hwnd = user32.GetForegroundWindow()
+    if hwnd and _window_above_us(hwnd, user32, kernel32, advapi32):
+        return "admin"
+    return "ok"
+
+
+#: Programs Ferritext does not end from afar: Windows' own, and File
+#: Explorer, whose end takes the taskbar with it.
+REMOTE_KEEP_PROGRAMS = ("explorer.exe", "dwm.exe", "csrss.exe",
+                        "winlogon.exe", "lsass.exe", "services.exe",
+                        "smss.exe", "svchost.exe", "sihost.exe")
+
+
+def windows_programs(dlls=None) -> list:
+    """The windows on the controlled computer's screen, as Task Manager's
+    first page lists them: [{"w": window, "p": process, "t": its title,
+    "x": its program, "a": run as administrator, "h": not answering}], 30
+    at the most."""
+    import ctypes
+    from ctypes import wintypes
+    user32, kernel32, advapi32 = dlls or _win32()
+    found = []
+
+    def one(hwnd, _lparam):
+        if len(found) >= 30 or not user32.IsWindowVisible(hwnd) or \
+                user32.GetWindow(hwnd, 4):                 # 4: GW_OWNER
+            return True
+        if user32.GetWindowLongW(hwnd, -20) & 0x00000080:  # WS_EX_TOOLWINDOW
+            return True
+        title = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(hwnd, title, 256)
+        if not title.value.strip():
+            return True
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value == os.getpid():
+            return True
+        found.append({"w": int(hwnd), "p": int(pid.value),
+                      "t": clean_device_name(title.value)[:60],
+                      "x": _process_name(pid.value, kernel32),
+                      "a": _window_above_us(hwnd, user32, kernel32,
+                                            advapi32),
+                      "h": bool(user32.IsHungAppWindow(hwnd))})
+        return True
+    proc = ctypes.WINFUNCTYPE(wintypes.BOOL, ctypes.c_void_p,
+                              ctypes.c_void_p)(one)
+    user32.EnumWindows(proc, 0)
+    return found
+
+
+def _process_name(pid: int, kernel32) -> str:
+    import ctypes
+    from ctypes import wintypes
+    process = kernel32.OpenProcess(0x1000, False, pid)
+    if not process:
+        return ""
+    try:
+        path = ctypes.create_unicode_buffer(520)
+        size = wintypes.DWORD(520)
+        if not kernel32.QueryFullProcessImageNameW(process, 0, path,
+                                                   ctypes.byref(size)):
+            return ""
+        return os.path.basename(path.value)[:40]
+    finally:
+        kernel32.CloseHandle(process)
+
+
+def windows_close_program(hwnd: int, pid: int, dlls=None) -> tuple:
+    """A window's program closed from afar, as Task Manager's End task
+    does: one that answers is asked to close (it may ask to save first,
+    on the screen), one that does not is ended. (done, why not)."""
+    user32, kernel32, advapi32 = dlls or _win32()
+    listed = {(p["w"], p["p"]): p for p in windows_programs(dlls)}
+    program = listed.get((hwnd, pid))
+    if program is None:
+        return False, tr("That window has closed")
+    if program["x"].lower() in REMOTE_KEEP_PROGRAMS:
+        return False, tr("Ferritext does not end {program}: close its "
+                         "windows instead", program=program["x"])
+    if program["a"]:
+        return False, tr("It runs as administrator: Windows does not let "
+                         "Ferritext close it")
+    if not program["h"]:
+        return bool(user32.PostMessageW(hwnd, 0x0010, None, None)), ""
+    process = kernel32.OpenProcess(0x0001, False, pid)     # PROCESS_TERMINATE
+    if not process:
+        return False, tr("Windows did not let Ferritext end it")
+    try:
+        return bool(kernel32.TerminateProcess(process, 1)), ""
+    finally:
+        kernel32.CloseHandle(process)
+
+
+def remote_screen_state() -> str:
+    """The controlled computer's screen (windows_screen_state); "ok"
+    wherever there is nothing to tell (X11 takes input on its lock screen
+    too). FEXT_REMOTE_TEST: what the tests set."""
+    if os.environ.get("FEXT_REMOTE_TEST"):
+        return os.environ.get("FEXT_REMOTE_SCREEN", "ok")
+    if IS_WINDOWS:
+        try:
+            return windows_screen_state()
+        except Exception:
+            log.exception("remote: the screen's state")
+    return "ok"
+
+
+def remote_programs() -> Optional[list]:
+    """windows_programs(), or None where this computer cannot list them."""
+    if os.environ.get("FEXT_REMOTE_TEST"):
+        return [dict(p) for p in _REMOTE_TEST_PROGRAMS]
+    if IS_WINDOWS:
+        try:
+            return windows_programs()
+        except Exception:
+            log.exception("remote: the programs")
+    return None
+
+
+#: The tests' programs (FEXT_REMOTE_TEST), and what was closed.
+_REMOTE_TEST_PROGRAMS: list = []
+
+
+def remote_close_program(hwnd: int, pid: int) -> tuple:
+    if os.environ.get("FEXT_REMOTE_TEST"):
+        for program in _REMOTE_TEST_PROGRAMS:
+            if (program["w"], program["p"]) == (hwnd, pid):
+                if program["a"]:
+                    return False, tr("It runs as administrator: Windows "
+                                     "does not let Ferritext close it")
+                _REMOTE_TEST_PROGRAMS.remove(program)
+                return True, ""
+        return False, tr("That window has closed")
+    if IS_WINDOWS:
+        try:
+            return windows_close_program(hwnd, pid)
+        except Exception:
+            log.exception("remote: closing a program")
+    return False, tr("This computer cannot do that from afar")
+
+
+def computer_restart(note: str) -> tuple:
+    """This computer restarted (in 15 seconds on Windows, with `note` in
+    its notice): (done, why not). FEXT_REMOTE_TEST: only counted."""
+    if os.environ.get("FEXT_REMOTE_TEST"):
+        _REMOTE_TEST_RESTARTS.append(note)
+        return True, ""
+    if IS_WINDOWS:
+        command = ["shutdown", "/r", "/t", "15", "/d", "p:0:0", "/c",
+                   note[:200]]
+    elif sys.platform.startswith("linux"):
+        command = ["systemctl", "reboot"]
+    else:
+        return False, tr("This computer cannot restart from afar")
+    try:
+        done = subprocess.run(command, capture_output=True, timeout=15,
+                              creationflags=0x08000000 if IS_WINDOWS
+                              else 0)                    # CREATE_NO_WINDOW
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+    if done.returncode:
+        return False, (done.stderr or done.stdout).decode(
+            "utf-8", "replace").strip()[:200] or tr("It would not restart")
+    return True, ""
+
+
+_REMOTE_TEST_RESTARTS: list = []
+
+
+def windows_signs_in_by_itself(reg=None) -> Optional[bool]:
+    """Whether Windows signs this person in by itself after a restart
+    (netplwiz's automatic sign-in: Winlogon's AutoAdminLogon, for their
+    name); None where there is no Windows to ask. `reg` stands in for
+    winreg in the tests."""
+    if reg is None:
+        if not IS_WINDOWS:
+            return None
+        import winreg as reg
+    try:
+        with reg.OpenKey(reg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft"
+                         r"\Windows NT\CurrentVersion\Winlogon") as key:
+            auto = str(reg.QueryValueEx(key, "AutoAdminLogon")[0]).strip()
+            try:
+                user = str(reg.QueryValueEx(key, "DefaultUserName")[0])
+            except OSError:
+                user = ""
+    except OSError:
+        return False
+    me = os.environ.get("USERNAME", "")
+    return auto == "1" and (not user.strip() or not me or
+                            user.strip().lower() == me.lower())
+
+
+def windows_screen_locks_itself(reg=None) -> Optional[int]:
+    """Minutes after which this computer's screen locks by itself with
+    nobody at it — its screen saver set to ask for sign-in, a policy's
+    inactivity limit — 0 when it does not; -1 for Dynamic lock (locked
+    when a paired phone goes); None where there is no Windows to ask."""
+    if reg is None:
+        if not IS_WINDOWS:
+            return None
+        import winreg as reg
+
+    def read(root, path: str, name: str):
+        try:
+            with reg.OpenKey(root, path) as key:
+                return reg.QueryValueEx(key, name)[0]
+        except OSError:
+            return None
+    desk = r"Control Panel\Desktop"
+    policy = r"Software\Policies\Microsoft\Windows\Control Panel\Desktop"
+    found = []
+    for path in (policy, desk):
+        active = read(reg.HKEY_CURRENT_USER, path, "ScreenSaveActive")
+        secure = read(reg.HKEY_CURRENT_USER, path, "ScreenSaverIsSecure")
+        wait = read(reg.HKEY_CURRENT_USER, path, "ScreenSaveTimeOut")
+        if active is not None or secure is not None:
+            if str(active) == "1" and str(secure) == "1":
+                try:
+                    seconds = int(str(wait).strip())
+                except ValueError:
+                    seconds = 900               # Windows' own when unset
+                found.append(max(1, seconds // 60))
+            break                       # the policy's word, if any, wins
+    limit = read(reg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows"
+                 r"\CurrentVersion\Policies\System", "InactivityTimeoutSecs")
+    if isinstance(limit, int) and limit > 0:
+        found.append(max(1, limit // 60))
+    if read(reg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows NT"
+            r"\CurrentVersion\Winlogon", "EnableGoodbye") == 1:
+        return -1
+    return min(found) if found else 0
+
+
+def remote_restart_asked(by: str, now: Optional[float] = None) -> None:
+    """A restart from afar is under way: when, and who asked (the next
+    start says how long it took to be back: remote_restart_back)."""
+    save_pref("remote_restart", {"at": time.time() if now is None else now,
+                                 "by": by})
+
+
+def remote_restart_back(now: Optional[float] = None) -> Optional[float]:
+    """At start: seconds since a restart from afar was asked, when it was
+    asked within the hour before (kept as "remote_back" for Remote access's
+    checklist); None otherwise."""
+    now = time.time() if now is None else now
+    asked = load_prefs().get("remote_restart")
+    if not isinstance(asked, dict) or \
+            not isinstance(asked.get("at"), (int, float)):
+        return None
+    save_pref("remote_restart", None)
+    took = now - asked["at"]
+    if not 0 < took < 3600:
+        return None
+    save_pref("remote_back", {"at": now, "took": took})
+    return took
+
+
+# ---- 19.0.1 (KEEPUP): the watcher, from Ferritext's side (guard_loop) ------
+def remote_access_anyone(now: Optional[float] = None) -> bool:
+    """Someone can connect to this computer from afar, for any of its
+    identities."""
+    raw = load_prefs().get("remote_access")
+    return isinstance(raw, dict) and any(
+        remote_access_list(me, now) for me in raw if isinstance(me, str))
+
+
+def keep_running_on() -> bool:
+    """Remote access's "Keep Ferritext running" (on unless turned off)."""
+    return load_prefs().get("remote_keepup", True) is not False
+
+
+def guard_command() -> Optional[list]:
+    """What starts this Ferritext again: the Windows EXE, or this Python
+    with its file; None on a phone, or where neither is known."""
+    if IS_MOBILE:
+        return None
+    exe = built_exe()
+    if exe:
+        return [exe]
+    script = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] \
+        else ""
+    if script.endswith(".py") and os.path.isfile(script):
+        return [sys.executable, script]
+    return None
+
+
+def guard_tell(cmd: list, quit_: bool) -> None:
+    """keepup.json: this process and its program file, how to start it,
+    and whether its person closed it (the watcher then ends)."""
+    image = (_process_image(os.getpid()) or "") if IS_WINDOWS else ""
+    data = json.dumps({"pid": os.getpid(), "cmd": cmd, "quit": quit_,
+                       "image": image})
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = DATA_DIR / "keepup.json.tmp"
+        tmp.write_text(data, "utf-8")
+        replace_file(tmp, DATA_DIR / "keepup.json")
+    except OSError:
+        log.exception("keep running: keepup.json")
+
+
+def guard_beat() -> None:
+    """This app's UI answers: keepup.beat touched (on the UI thread)."""
+    try:
+        (DATA_DIR / "keepup.beat").write_text(str(int(time.time())))
+    except OSError:
+        pass
+
+
+def guard_running() -> bool:
+    """A watcher holds guard.lock."""
+    handle = hold_lock(DATA_DIR / "guard.lock")
+    if handle is None:
+        return True
+    handle.close()
+    return False
+
+
+def show_running_window() -> None:
+    """Another Ferritext was opened while this one runs: this one's window
+    is brought to the front instead (Windows; elsewhere it says so)."""
+    if not IS_WINDOWS:
+        print(f"{APP_NAME} is open already.", file=sys.stderr)
+        return
+    try:
+        import ctypes
+        user32 = ctypes.WinDLL("user32")
+        user32.FindWindowW.restype = ctypes.c_void_p
+        hwnd = user32.FindWindowW(None, APP_NAME)
+        if hwnd:
+            user32.ShowWindow(ctypes.c_void_p(hwnd), 9)        # SW_RESTORE
+            user32.SetForegroundWindow(ctypes.c_void_p(hwnd))
+    except Exception:
+        log.exception("could not show the open Ferritext")
 
 
 # ---- 16.1: calls as sessions (1-to-1 and conferences) ----------------------
@@ -14943,6 +16043,7 @@ class CallSession:
         self.id = session_id or uuid.uuid4().hex
         self.chat, self.group, self.video, self.host = chat, group, video, host
         self.remote = False         # 19.0: a remote session (connect_remote)
+        self.remote_to: Optional[str] = None    # 19.0.1: for that computer
         self.stage = "initiated"
         self.started_at = time.time() if started_at is None else started_at
         self.ended_at: Optional[float] = None
@@ -16431,18 +17532,18 @@ class IdentityManager:
 
     # ---- persistence ---------------------------------------------------------
     def _load(self) -> None:
-        if IDENTITIES_PATH.exists():
-            try:
-                self._data = json.loads(IDENTITIES_PATH.read_text("utf-8"))
-            except (json.JSONDecodeError, OSError):
-                pass
+        """19.0.1 (KEEPUP): read_durably, so a file a power cut spoiled is
+        read from its last good copy, not taken for no identities (the
+        next save then wrote that over the keys)."""
+        found = read_durably(IDENTITIES_PATH)
+        if isinstance(found, dict):
+            self._data = found
 
-    def _save(self) -> None:
-        IDENTITIES_PATH.write_text(json.dumps(self._data, indent=2), "utf-8")
-        try:      # best effort: private keys readable by owner only
-            os.chmod(IDENTITIES_PATH, stat.S_IRUSR | stat.S_IWUSR)
-        except OSError:
-            pass
+    def _save(self, forget: bool = False) -> None:
+        """Written whole or not at all (write_durably), owner-readable only.
+        `forget`: an identity was removed: its key is kept in no copy."""
+        write_durably(IDENTITIES_PATH, json.dumps(self._data, indent=2),
+                      keep_old=not forget, private=True)
 
     # ---- collection ----------------------------------------------------------
     @property
@@ -16534,7 +17635,7 @@ class IdentityManager:
         if self._data.get("active") == address:
             self._data["active"] = (remaining[0]["address"] if remaining
                                     else None)
-        self._save()
+        self._save(forget=True)          # 19.0.1: its key in no copy
         # Its pictures go too: its own, and those it was sent (listed in its
         # database, which is about to be deleted).
         discard_picture_file(own_picture_path(address))
@@ -17201,9 +18302,25 @@ class ApiClient:
 
     def lookup(self, *, username: Optional[str] = None,
                address: Optional[str] = None) -> dict:
+        """Someone in the relay's directory: {"address", "username",
+        "public_key"}. 19.0.1 (SECURITY27): what the relay says is checked
+        before anything uses it — the address must be the hash of the key
+        given for it (as every address is), and the one asked for — so a
+        relay that acted as someone could not put a key of its own under
+        their address and read what is sealed to them. Refused, it is an
+        ApiError ("bad_key"), as the relay's own refusals are."""
         params = ({"username": username} if username is not None
                   else {"address": address})
-        return self._get("/api/users/lookup", params)
+        found = self._get("/api/users/lookup", params)
+        if not key_matches_address(found.get("public_key"),
+                                   found.get("address")) or \
+                (address is not None and found.get("address") != address):
+            log.warning("the relay gave a key that is not %s's",
+                        short_addr(str(found.get("address")), 10))
+            raise self.ApiError(502, "bad_key", tr(
+                "The relay gave a key that does not belong to that "
+                "address: nothing was saved"))
+        return found
 
     def send_message(self, recipient: str, envelope: dict,
                      client_msg_id: str) -> dict:
@@ -17804,7 +18921,21 @@ class LocalStore:
         `accepted=False` (v14) is for someone met because they wrote — first
         to you, or in a group: until you accept them, write to them or add
         them yourself, what they send you directly is a message request.
-        Like `listed`, it only ever goes up."""
+        Like `listed`, it only ever goes up.
+
+        19.0.1 (SECURITY27): a contact's key is never replaced by one its
+        address is not the hash of, whoever passes it (ValueError): what
+        comes from outside is checked before it gets here (the relay's
+        directory: ApiClient.lookup; a group's state: sanitize_group_state;
+        a message: open_envelope), and this keeps a contact's key from
+        being swapped by any path that did not."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT public_key FROM contacts WHERE address = ?",
+                (address,)).fetchone()
+        if row is not None and row["public_key"] != public_key and \
+                not key_matches_address(public_key, address):
+            raise ValueError(f"not the key of {short_addr(address, 10)}")
         with self._lock:
             self._db.execute(
                 """INSERT INTO contacts (address, username, public_key, added_at,
@@ -21872,6 +23003,28 @@ class ButtonRow(BoxLayout):
 
 def button_row(*buttons, spacing=None) -> BoxLayout:
     return ButtonRow(buttons, spacing=spacing)
+
+
+class FitGrid(GridLayout):
+    """19.0.1: buttons in as many columns as their widest label fits, at
+    most `most`, so that none is cut short on a narrow phone or in a
+    longer language (ButtonRow's rule, for a grid)."""
+
+    def __init__(self, buttons, most: int = 3, **kw):
+        kw.setdefault("size_hint_y", None)
+        super().__init__(cols=most, spacing=dp(6), **kw)
+        self.most, self.buttons = most, list(buttons)
+        for b in self.buttons:
+            self.add_widget(b)
+        self.bind(minimum_height=self.setter("height"), width=self._reflow)
+
+    def _reflow(self, *_a) -> None:
+        widest = max((b.natural_width() for b in self.buttons), default=0)
+        cols = self.most
+        while cols > 1 and widest > \
+                (self.width - self.spacing[0] * (cols - 1)) / cols:
+            cols -= 1
+        self.cols = cols
 
 
 #: Icons are geometry, rendered once offscreen at ICON_SUPERSAMPLE times
@@ -27524,6 +28677,300 @@ class ControlAskSheet(Sheet):
             self.app.allow_control(self.call)
 
 
+def remote_note_words(state: Optional[dict], name: str,
+                      now: Optional[float] = None) -> str:
+    """19.0.1: what the side controlling a computer is told of it, from
+    what it last said (sanitize_remote_state): '' while nothing matters."""
+    if not state:
+        return ""
+    if state.get("s") == "secure":
+        return tr("{name}'s computer shows a Windows security screen (it is "
+                  "locked, or asks for permission, or shows Ctrl+Alt+Del's "
+                  "screen): it cannot be seen or used from afar. Wait for "
+                  "someone there, or restart it from Keys.", name=name)
+    if state.get("s") == "admin":
+        return tr("A window run as administrator is in front: Windows lets "
+                  "Ferritext neither use it nor type into it. Click another "
+                  "window, or close it from Keys › Programs.")
+    until = state.get("u")
+    now = time.time() if now is None else now
+    if until and until - now < REMOTE_ENDS_SOON:
+        return tr("Your access to {name}'s computer ends {when}: extend it "
+                  "there, in Settings › Remote access, before it does.",
+                  name=name, when=when_text(until))
+    return ""
+
+
+def _minutes_seconds(seconds: float) -> str:
+    whole = max(1, int(round(seconds)))
+    return tr("{m} min {s} s", m=whole // 60, s=whole % 60) \
+        if whole >= 60 else tr("{s} s", s=whole)
+
+
+def remote_checklist(now: Optional[float] = None) -> list:
+    """19.0.1 (REMOTE191): Remote access's "Before you leave", read from
+    the computer itself each time: [(key, done, title, words)], `done`
+    None where Ferritext cannot tell. What it takes for someone far away
+    to reach this computer for months: Ferritext starting with the
+    session, started again if it closes (the watcher), the computer awake,
+    signing in by itself after a restart, a screen that does not lock by
+    itself, power back after a cut; and that it was tried, from afar and
+    through a restart, while its person is still at it."""
+    now = time.time() if now is None else now
+    out = []
+    starts = starts_by_itself()
+    out.append(("start", starts, tr("Start when you sign in"), tr(
+        "Ferritext opens, minimised, when you sign in, and waits for a "
+        "session") if starts is not None else tr(
+        "Only the Windows EXE can start by itself")))
+    if guard_command() is not None:
+        out.append(("keepup", keep_running_on(), tr("Keep Ferritext running"),
+                    tr("Started again if it closes or stops answering, "
+                       "while someone is listed")))
+    if IS_WINDOWS:
+        out.append(("awake", load_prefs().get("remote_awake", True) is not
+                    False, tr("Keep this computer awake"), tr(
+                        "While someone is listed and Ferritext runs, Windows "
+                        "does not go to sleep")))
+    signs = windows_signs_in_by_itself()
+    out.append(("signin", signs, tr("Signs in by itself"), tr(
+        "After a restart Windows signs in by itself, and Ferritext starts")
+        if signs else tr(
+        "After a restart Windows waits for someone to sign in, and Ferritext "
+        "cannot start: turn on automatic sign-in (netplwiz), which lets in "
+        "anyone at the computer too") if signs is False else tr(
+        "Ferritext starts only once someone signs in: after a restart the "
+        "computer must sign in by itself")))
+    locks = windows_screen_locks_itself()
+    if locks is not None:
+        out.append(("lock", locks == 0, tr("The screen does not lock by "
+                                           "itself"), tr(
+            "Nothing locks it while nobody is at it") if locks == 0 else tr(
+            "Dynamic lock locks it when your phone goes: a locked screen "
+            "cannot be used from afar") if locks < 0 else tr(
+            "Its screen saver locks it after {n} minutes with nobody at it: "
+            "a locked screen cannot be used from afar", n=locks)))
+    out.append(("power", None, tr("On again after a power cut"), tr(
+        "A setting of the computer's firmware (BIOS or UEFI): power on when "
+        "the power returns. Ferritext cannot see it: check it before you "
+        "leave")))
+    away = [s for s in remote_sessions() if s.get("kind") == "away"]
+    out.append(("tried", bool(away), tr("Tried from afar"), tr(
+        "Last used from afar {when}", when=when_text(away[0].get("start")
+                                                     or 0)) if away else tr(
+        "Try it while you are here: connect from your phone on its mobile "
+        "data")))
+    back = load_prefs().get("remote_back")
+    took = back.get("took") if isinstance(back, dict) else None
+    out.append(("back", isinstance(took, (int, float)), tr(
+        "Back after a restart"), tr(
+        "It came back by itself {took} after a restart from afar, {when}",
+        took=_minutes_seconds(took), when=when_text(back.get("at") or 0))
+        if isinstance(took, (int, float)) else tr(
+        "Try it while you are here: from your phone, Keys › Restart it, "
+        "and see it come back")))
+    return out
+
+
+class DeviceNameSheet(Sheet):
+    """19.0.1: this computer's name in remote sessions."""
+
+    def __init__(self, saved: Callable[[str], None]) -> None:
+        super().__init__(tr("This computer's name"))
+        self.saved = saved
+        self.field = TextInput(text=device_name(), multiline=False,
+                               size_hint_y=None, height=dp(52),
+                               font_size=fs(18), write_tab=False)
+        self.add(self.field)
+        self.add(button_row(
+            Btn(tr("Cancel"), kind="quiet", on_release=lambda _w:
+                self.dismiss()),
+            Btn(tr("Save"), on_release=lambda _w: self._save())))
+
+    def _save(self) -> None:
+        name = clean_device_name(self.field.text)
+        self.dismiss()
+        self.saved(name)
+
+
+class RemoteComputersSheet(Sheet):
+    """19.0.1 (REMOTE191): someone whose identity is on several computers
+    that answered here before: which one to connect to (the offer names
+    it, and only it answers), or any (the first that lists you)."""
+
+    def __init__(self, app: "FextApp", peer: str, known: list) -> None:
+        name = person_name(app.store.get_contact(peer) or {}, peer, 14)
+        super().__init__(tr("Which of {name}'s computers?", name=name))
+        self.app, self.peer = app, peer
+        rows = [ListRow("screen", c.get("n") or tr("A computer"),
+                        tr("Last connected {when}", when=when_text(
+                            c.get("at") or 0)), chevron=True,
+                        on_tap=lambda d=c["dev"]: self._go(d))
+                for c in known]
+        rows.append(ListRow("link", tr("Any of their computers"),
+                            tr("The first that lists you answers"),
+                            chevron=True, on_tap=lambda: self._go(None)))
+        self.add(rows_card(rows, inset=0))
+
+    def _go(self, dev: Optional[str]) -> None:
+        self.dismiss()
+        self.app.connect_remote(self.peer, to=dev, chosen=True)
+
+
+class RemoteKeysSheet(Sheet):
+    """19.0.1 (REMOTE191): keys this side cannot press on their computer
+    itself (its own system takes them, or a phone has none) and what their
+    computer can do for it: Ctrl+Alt+Del's place, its programs, a restart,
+    and Data saver for their screen."""
+
+    KEYS = ((N_("Task Manager"), ("ctrl", "shift", "escape")),
+            (N_("Start menu"), ("meta",)),
+            (N_("Switch window"), ("alt", "tab")),
+            (N_("Show desktop"), ("meta", "d")),
+            (N_("Close window"), ("alt", "f4")),
+            (N_("Copy"), ("ctrl", "c")), (N_("Paste"), ("ctrl", "v")),
+            (N_("Undo"), ("ctrl", "z")), (N_("Select all"), ("ctrl", "a")),
+            (N_("Esc"), ("escape",)), (N_("Delete"), ("delete",)))
+
+    def __init__(self, app: "FextApp") -> None:
+        call = app.call
+        super().__init__(tr("Keys for {name}'s computer", name=app.call_name(
+            call.peer) if call else ""))
+        self.app = app
+        buttons = [Btn("Ctrl+Alt+Del", kind="quiet", on_release=lambda _w:
+                       self._then(lambda: RemoteCadSheet(app).open()))]
+        buttons += [Btn(tr(label), kind="quiet", on_release=lambda _w, k=combo:
+                        app.remote_keys(k)) for label, combo in self.KEYS]
+        self.add(FitGrid(buttons))
+        self.add(SectionHead(tr("Their computer")))
+        mbit = f"{REMOTE_SAVER_KBPS / 1000:g}"
+        self.add(rows_card([
+            ListRow("menu", tr("Programs…"), tr(
+                "What is open on it; close one that does not answer"),
+                chevron=True, on_tap=lambda: self._then(app.remote_programs)),
+            ListRow("retry", tr("Restart it…"), tr(
+                "For when it is stuck: a locked screen, a permission prompt"),
+                chevron=True, on_tap=lambda: self._then(
+                    lambda: RemoteRestartSheet(app).open())),
+            ListRow("download", tr("Data saver"), tr(
+                "Their screen at {mbit} Mbit/s at most, for mobile data",
+                mbit=mbit), control=ToggleSwitch(
+                    remote_saver(), lambda on: app.set_remote_saver(on)))],
+            inset=0))
+
+    def _then(self, then: Callable) -> None:
+        self.dismiss()
+        Clock.schedule_once(lambda _dt: then(), 0.15)
+
+
+class RemoteCadSheet(Sheet):
+    """19.0.1: Ctrl+Alt+Del from afar, which no program can press: what
+    each of its uses becomes."""
+
+    def __init__(self, app: "FextApp") -> None:
+        super().__init__("Ctrl+Alt+Del", subtitle=tr(
+            "Windows keeps these keys for itself: no program can press them "
+            "for you from afar, and the screen they open (lock, sign out, "
+            "Task Manager) cannot be seen or used from afar either."))
+        self.app = app
+        self.add(rows_card([
+            ListRow("screen", tr("Task Manager"), tr(
+                "Opened as Ctrl+Shift+Esc opens it. When it runs as "
+                "administrator you see it but cannot use it: Programs "
+                "closes what does not answer."), chevron=True,
+                on_tap=lambda: self._then(lambda: app.remote_keys(
+                    ("ctrl", "shift", "escape")))),
+            ListRow("menu", tr("Programs…"), tr(
+                "Close a program from here"), chevron=True,
+                on_tap=lambda: self._then(app.remote_programs)),
+            ListRow("retry", tr("Restart their computer…"), tr(
+                "When it is stuck"), chevron=True, on_tap=lambda: self._then(
+                    lambda: RemoteRestartSheet(app).open()))], inset=0))
+        self.add(hint(tr("Locking it or signing out from afar leaves it "
+                         "waiting for someone at it: Ferritext cannot sign "
+                         "in for you.")))
+
+    def _then(self, then: Callable) -> None:
+        self.dismiss()
+        Clock.schedule_once(lambda _dt: then(), 0.15)
+
+
+class RemoteRestartSheet(Sheet):
+    """19.0.1: restart their computer from afar, saying first whether it
+    will be back by itself (it signs in by itself, as it told)."""
+
+    def __init__(self, app: "FextApp") -> None:
+        call = app.call
+        signs_in = (call.rc_state or {}).get("si") if call else None
+        super().__init__(tr("Restart {name}'s computer?", name=app.call_name(
+            call.peer) if call else ""), subtitle=tr(
+            "It signs in by itself: Ferritext should be back within a few "
+            "minutes, and connects again by itself.") if signs_in is True
+            else tr("It does not sign in by itself: after the restart it "
+                    "waits at the sign-in screen, and cannot be reached "
+                    "until someone signs in.") if signs_in is False
+            else tr("Ferritext connects again once it is back, if it signs "
+                    "in by itself."))
+        self.app = app
+        self.add(button_row(
+            Btn(tr("Cancel"), kind="quiet", on_release=lambda _w:
+                self.dismiss()),
+            Btn(tr("Restart"), kind="solid_danger", on_release=lambda _w:
+                self._go())))
+
+    def _go(self) -> None:
+        self.dismiss()
+        self.app.remote_ask({"op": "restart"})
+
+
+class RemoteProgramsSheet(Sheet):
+    """19.0.1: the windows open on their computer, as Task Manager's first
+    page lists them: each closed from here (asked to close, as Task
+    Manager's End task does; ended when it does not answer); one run as
+    administrator only shown."""
+
+    _open: Optional["RemoteProgramsSheet"] = None
+
+    @classmethod
+    def show(cls, app: "FextApp", programs: Optional[list]) -> None:
+        sheet = cls._open
+        if sheet is None or sheet.parent is None:
+            sheet = cls._open = cls(app)
+            sheet.open()
+        sheet.fill(programs)
+
+    def __init__(self, app: "FextApp") -> None:
+        call = app.call
+        super().__init__(tr("Programs on {name}'s computer",
+                            name=app.call_name(call.peer) if call else ""))
+        self.app = app
+
+    def fill(self, programs: Optional[list]) -> None:
+        self.body.clear_widgets()
+        if programs is None:
+            self.add(hint(tr("That computer cannot list its programs from "
+                             "afar.")))
+            return
+        rows = []
+        for p in programs:
+            words = p["x"] + (" · " + tr("runs as administrator")
+                              if p["a"] else "") + (
+                " · " + tr("not answering") if p["h"] else "")
+            close = None
+            if not p["a"]:
+                close = Btn(tr("End task") if p["h"] else tr("Close"),
+                            kind="text", size_hint_x=None,
+                            pos_hint={"center_y": .5},
+                            on_release=lambda _w, q=p: self.app.remote_ask(
+                                {"op": "end", "w": q["w"], "p": q["p"]}))
+                close.width = close.natural_width() + dp(8)
+            rows.append(ListRow("screen", p["t"], words, control=close))
+        self.add(rows_card(rows, inset=0) if rows else
+                 hint(tr("No windows are open on it.")))
+        self.add(Btn(tr("Refresh"), kind="quiet", on_release=lambda _w:
+                     self.app.remote_programs()))
+
+
 class PinsSheet(Sheet):
     """19.0 (PINS26): every pinned message of a chat, newest pin first,
     with who wrote it and when: a tap shows it; Unpin each, Unpin all,
@@ -27612,15 +29059,34 @@ class RemoteAccessSheet(Sheet):
                 control=remove))
         self.add(rows_card(rows, inset=0) if rows else hint(tr(
             "No one is listed: this computer answers no remote session.")))
+        soon = [e for e in remote_access_list(self.app.keys.address)
+                if e["until"] and e["until"] - time.time() < 30 * 86400]
+        if soon:                                         # 19.0.1
+            self.add(hint(tr(
+                "Away for longer? A grant that ends while you are away "
+                "cannot be made longer from afar except by someone "
+                "connected: choose Until I remove them, or a year.")))
         self.status = self.status_label()
         self.add(Btn(tr("Add someone…"), kind="quiet",
                      on_release=lambda _w: self._pick()))
-        self.add(SectionHead(tr("After a restart or a power cut")))
+        # 19.0.1 (REMOTE191): this computer's name, as the people listed
+        # see it when they choose among an identity's computers.
+        rename = Btn(tr("Rename"), kind="text", size_hint_x=None,
+                     pos_hint={"center_y": .5},
+                     on_release=lambda _w: self._rename())
+        rename.width = rename.natural_width() + dp(8)
+        self.add(SectionHead(tr("This computer")))
+        self.add(rows_card([ListRow("screen", device_name(), tr(
+            "What the people listed see it as"), control=rename)], inset=0))
+        self.add(SectionHead(tr("Before you leave")))
         self.add(rows_card(self._checklist(), inset=0))
         self.add(hint(tr(
-            "Windows lets no one control its sign-in or lock screen, or a "
-            "program run as administrator. Whoever holds a listed person's "
-            "keys can reach this computer: list only people you trust.")))
+            "Whoever is listed uses this computer as you would: its files, "
+            "and Ferritext with every identity in it, unless the app lock is "
+            "on (it then asks for its code when a session starts). Windows "
+            "lets no one control its sign-in or lock screen, or a program "
+            "run as administrator. Whoever holds a listed person's keys can "
+            "reach this computer: list only people you trust.")))
         sessions = remote_sessions()[:5]
         if sessions:
             self.add(SectionHead(tr("Last sessions")))
@@ -27639,29 +29105,26 @@ class RemoteAccessSheet(Sheet):
                            address, 14)
 
     def _checklist(self) -> list:
-        starts = starts_by_itself()
-        rows = [ListRow(
-            "external", tr("Start when you sign in"),
-            tr("Ferritext opens, minimised, when you sign in, and waits "
-               "for a session") if starts is not None else
-            tr("Only the Windows EXE can start by itself"),
-            control=ToggleSwitch(starts, self._on_start)
-            if starts is not None else None)]
-        if IS_WINDOWS:
-            rows.append(ListRow(
-                "battery", tr("Keep this computer awake"),
-                tr("While someone is listed and Ferritext runs, Windows "
-                   "does not go to sleep"),
-                control=ToggleSwitch(load_prefs().get("remote_awake", True)
-                                     is not False, self._on_awake)))
-        rows.append(ListRow("lock", tr("Sign in by itself"), tr(
-            "Ferritext starts only once someone signs in: after a restart "
-            "the computer must sign in by itself (on Windows, netplwiz), "
-            "which lets in anyone at it too")))
-        rows.append(ListRow("info", tr("On again after a power cut"), tr(
-            "A setting of the computer's firmware (BIOS or UEFI): power "
-            "on when the power returns")))
+        """19.0.1: remote_checklist, a row each: done (a tick) or to do;
+        the ones Ferritext sets, with their switch."""
+        switches = {"start": self._on_start, "keepup": self._on_keepup,
+                    "awake": self._on_awake}
+        rows = []
+        for key, ok, title, words in remote_checklist():
+            control = None
+            if key in switches and ok is not None:
+                control = ToggleSwitch(bool(ok), switches[key])
+            rows.append(ListRow("check" if ok else "info", title, words,
+                                control=control))
         return rows
+
+    def _on_keepup(self, on: bool) -> None:
+        save_pref("remote_keepup", bool(on))
+        self.app.apply_keep_awake()
+
+    def _rename(self) -> None:
+        DeviceNameSheet(lambda name: (save_pref("device_name", name),
+                                      self._fill())).open()
 
     def _on_start(self, on: bool) -> None:
         if not set_starts_by_itself(on):
@@ -27852,6 +29315,19 @@ class CallOverlay(ModalView):
                                  on_release=lambda _w: self._remote_end())
         self.remote_band.add_widget(self.remote_button)
         stack.add_widget(self.remote_band)
+        # 19.0.1 (REMOTE191): under it, for the side controlling, what
+        # their computer says that matters (a security screen, a window run
+        # as administrator in front, the access's end soon).
+        self.remote_note = BoxLayout(size_hint=(1, None), height=0,
+                                     padding=[dp(14), dp(8)], opacity=0,
+                                     pos_hint={"x": 0, "top": 1})
+        paint_round(self.remote_note, T.accent, radius=0)
+        self.remote_note_words = InfoLabel("", font_size=fs(14),
+                                           color=T.on_accent)
+        self.remote_note.add_widget(self.remote_note_words)
+        self.remote_note_words.bind(height=lambda *_a: self._place_note())
+        stack.add_widget(self.remote_note)
+        stack.bind(size=lambda *_a: self._place_note())
         if call_is_wide():                      # 17.2: your chats beside
             beside = BoxLayout()
             beside.add_widget(app.call_chats_sidebar())
@@ -27879,6 +29355,9 @@ class CallOverlay(ModalView):
                                         lambda: RemoteTypeSheet(
                                             app.send_remote_input).open(),
                                         **kw)
+        # 19.0.1: the keys and the computer's own help (RemoteKeysSheet).
+        self.keys_button = CallButton("key", tr("Keys"), lambda:
+                                      RemoteKeysSheet(app).open(), **kw)
         self.decline = CallButton("phone_end", tr("Decline"),
                                   lambda: app.decline_call(), kind="end")
         self.accept = CallButton("phone", tr("Answer"),
@@ -27966,6 +29445,8 @@ class CallOverlay(ModalView):
                 parts += [Widget(), self.control]
             if "keys" in layout:
                 parts += [Widget(), self.typing_button]
+            if "+rk" in layout:                      # 19.0.1
+                parts += [Widget(), self.keys_button]
             parts += [Widget(), self.end, Widget()]
         for part in parts:
             self.controls.add_widget(part)
@@ -27983,9 +29464,11 @@ class CallOverlay(ModalView):
             # 19.0 (REMOTE): Control to ask; a phone controlling has
             # Keyboard in its place (Release is in the band at the top).
             controls = self.app.can_ask_control(call) or call.asks
-            typing = controls and IS_MOBILE and self.app.controlling(call)
+            controlling = self.app.controlling(call)
+            typing = controls and IS_MOBILE and controlling
             self._arrange("call" + ("+keys" if typing else "+control"
-                                    if controls else ""))
+                                    if controls else "") +
+                          ("+rk" if controlling else ""))
         self.mute.set_on(call.muted, "mic_off" if call.muted else "mic",
                          tr("Unmute" if call.muted else "Mute"))
         route = getattr(call, "route", "") or (
@@ -28095,6 +29578,22 @@ class CallOverlay(ModalView):
         on = bool(words) and not call.ended
         self.remote_band.opacity, self.remote_band.disabled = \
             (1, False) if on else (0, True)
+        note = remote_note_words(call.rc_state, name) \
+            if controlling and not call.ended else ""
+        if note != self.remote_note_words.text:
+            self.remote_note_words.text = note
+        self._place_note()
+
+    def _place_note(self) -> None:
+        """19.0.1: the note under the red band, as tall as its words."""
+        note, words = self.remote_note, self.remote_note_words
+        note.height = words.height + dp(16) if words.text else 0
+        note.opacity = 1 if words.text else 0
+        stack = note.parent
+        if stack is not None and stack.height:
+            below = self.remote_band.height if self.remote_band.opacity \
+                else 0
+            note.pos_hint = {"x": 0, "top": 1 - below / stack.height}
 
     def _remote_end(self) -> None:
         """The band's Stop (this computer) or Release (the other side)."""
@@ -39309,6 +40808,7 @@ class RemoteControlMixin:
         """This side began, or stopped, controlling theirs. Stopped there
         (Stop, their screen), it asks no more: a new ask is a new yes."""
         name = self.call_name(call.peer)
+        self._remote_ticks(call, on)                         # 19.0.1
         if on:
             self._set_status(tr("You are controlling {name}'s computer",
                                 name=name), T.text_2)
@@ -39362,7 +40862,16 @@ class RemoteControlMixin:
             call.control_since = time.time()
             self._say_control(call)
             self._refresh_call()
+            # 19.0.1 (REMOTE191): the screen kept on; what the computer is
+            # told to the side controlling it, from now on (_remote_tick).
+            self.apply_keep_awake()
+            self._remote_ticks(call, True)
             if kind == "away":
+                # Whoever is let in uses this computer as its person would:
+                # Ferritext too, every identity in it. With the app lock on,
+                # its chats wait behind the code.
+                if AppLock.on():
+                    self.lock_now()
                 desktop_notify(tr("Remote access"), tr(
                     "{name} is using this computer remotely. Stop it from "
                     "Ferritext's call screen.", name=self.call_name(
@@ -39381,6 +40890,8 @@ class RemoteControlMixin:
             self._say_control(call)
             remote_session_kept(call.peer, call.control_kind,
                                 call.control_since, time.time())
+            self._remote_ticks(call, False)
+            self.apply_keep_awake()                   # 19.0.1: as it was
             self._refresh_call()
         if by_hand and call.remote and not call.ended:
             self.end_call()
@@ -39404,8 +40915,16 @@ class RemoteControlMixin:
         """A remote session's offer is taken only by a computer whose
         access list lets `sender` in. Anywhere else it is set aside without
         a word back (another device of this identity may be that computer);
-        a computer that could be controlled keeps a line of the try."""
+        a computer that could be controlled keeps a line of the try.
+        19.0.1: and only by the computer it names, signed in time
+        (remote_offer_for_here): another computer of this identity, or an
+        old offer played again, is set aside without a line."""
         if not remote_control_possible():
+            return False
+        if not remote_offer_for_here(sig, relay_now=self.api.relay_now()
+                                     if self.api is not None else None):
+            log.info("remote: an offer for another computer, or signed "
+                     "out of time, set aside")
             return False
         if remote_access_allows(self.keys.address, sender):
             return True
@@ -39427,7 +40946,9 @@ class RemoteControlMixin:
         set aside without a ring, as nobody may be at the computer."""
         address = link.keys.address
         if not remote_control_possible() or \
-                call_offer_age(sig, link.api) > CALL_OFFER_MAX_AGE:
+                call_offer_age(sig, link.api) > CALL_OFFER_MAX_AGE or \
+                not remote_offer_for_here(sig, relay_now=link.api.relay_now()
+                                          if link.api else None):  # 19.0.1
             return
         if not remote_access_allows(address, sender):
             link.store.add_event(sender, tr(
@@ -39446,22 +40967,35 @@ class RemoteControlMixin:
             self._activate_identity(address)    # takes the offer up, answers
 
     def connect_remote(self, peer: Optional[str] = None,
-                       again: bool = False) -> bool:
+                       again: bool = False, to: Optional[str] = None,
+                       chosen: bool = False) -> bool:
         """Connect to their computer (the chat's menu): a call marked as a
         remote session ("rc"), without sound, through the relay only. Their
         computer answers by itself if its access list lets this identity
         in, shares its screen, and this side asks to control it at once.
-        True when the call was placed."""
+        True when the call was placed.
+
+        19.0.1: for one computer. The one reached before, named in the
+        offer (`to`: its number), and only it answers; with several known,
+        a sheet asks which first (RemoteComputersSheet: `chosen`); none
+        known, the first of theirs that lists this identity answers, and
+        says which it is."""
         peer = peer or self.current_peer
         why = self.call_blocker(peer, remote=True)
         if why:
             self._set_status(why, T.accent)
             return False
+        if not again and not chosen:
+            known = remote_computers(self.keys.address, peer)
+            if len(known) > 1:
+                RemoteComputersSheet(self, peer, known).open()
+                return False
+            to = known[0]["dev"] if known else None
         if not again:
             self.__dict__.pop("_remote_retry", None)
         me = self.my_call_address()
         session = CallSession(peer, me, group=False, video=False, host=me)
-        session.remote = True
+        session.remote, session.remote_to = True, to
         session.preview()
         session.confirm_join()
         self._call_sessions()[session.id] = session
@@ -39476,12 +41010,18 @@ class RemoteControlMixin:
         self._answer_now()
         self._share_screen_then(call, lambda: None)
 
-    def _remote_answered(self, call: "Call") -> None:
+    def _remote_answered(self, call: "Call", sig: dict) -> None:
         """Their computer answered a remote session placed here: no more
-        placing it again; its screen is due within REMOTE_SCREEN_WAIT."""
+        placing it again; its screen is due within REMOTE_SCREEN_WAIT.
+        19.0.1: which computer it is (its number and name) is kept, and
+        named in the next offers."""
         if not (call.remote and call.outgoing):
             return
         self.__dict__.pop("_remote_retry", None)
+        if sig.get("dev"):
+            call.computer = (sig["dev"], sig.get("dn") or "")
+            remote_computer_seen(self.keys.address, call.peer, sig["dev"],
+                                 sig.get("dn") or "")
         Clock.schedule_once(lambda _dt: self._remote_screen_due(call),
                             REMOTE_SCREEN_WAIT)
 
@@ -39503,11 +41043,19 @@ class RemoteControlMixin:
         if not (call.remote and call.outgoing):
             return
         retry = self.__dict__.get("_remote_retry")
-        if retry is None and why == "failed" and \
+        # 19.0.1: restarted from here, the computer is waited for longer
+        # (REMOTE_RESTART_WAIT: Windows' updates can take a while), and it
+        # may end the call on its way down.
+        restarting = getattr(call, "restarting", False)
+        if retry is None and (restarting or why == "failed") and \
                 call.connected_at is not None:
             retry = self.__dict__["_remote_retry"] = {
-                "peer": call.peer,
-                "until": time.monotonic() + REMOTE_RETRY_FOR}
+                "peer": call.peer, "restart": restarting,
+                "to": (getattr(call, "computer", None) or (None,))[0] or
+                getattr(call.session, "remote_to", None),
+                "until": time.monotonic() + (REMOTE_RESTART_WAIT if
+                                             restarting else
+                                             REMOTE_RETRY_FOR)}
         elif retry is None or why not in REMOTE_RETRY_REASONS:
             self.__dict__.pop("_remote_retry", None)
             if why == "timeout":
@@ -39525,8 +41073,10 @@ class RemoteControlMixin:
                                 "again later", name=self.call_name(
                                     retry["peer"])), T.alert)
             return
-        self._set_status(tr("The connection dropped. Connecting again…"),
-                         T.text_2)
+        self._set_status(tr(
+            "Waiting for {name}'s computer to restart and sign in…",
+            name=self.call_name(retry["peer"])) if retry.get("restart")
+            else tr("The connection dropped. Connecting again…"), T.text_2)
         Clock.schedule_once(lambda _dt: self._remote_again(retry),
                             REMOTE_RETRY_EVERY)
 
@@ -39536,14 +41086,312 @@ class RemoteControlMixin:
         if self.call is not None and not self.call.ended:
             self.__dict__.pop("_remote_retry", None)   # another call came
             return
-        if not self.connect_remote(retry["peer"], again=True):
+        if not self.connect_remote(retry["peer"], again=True,
+                                   to=retry.get("to")):
             self._remote_later(retry)
+
+    # -- 19.0.1 (REMOTE191): the computer's state, its programs, a restart --
+    def _remote_ticks(self, call: "Call", on: bool) -> None:
+        """Once a second while this computer is controlled, or this side
+        controls theirs (_remote_tick); stopped with it."""
+        tick = self.__dict__.pop("_remote_tick_ev", None)
+        if tick is not None:
+            tick.cancel()
+        if on and not call.ended:
+            call.rc_said = (None, 0.0)          # (state told, when)
+            self.__dict__["_remote_tick_ev"] = Clock.schedule_interval(
+                lambda _dt: self._remote_tick(call), 1.0)
+            self._remote_tick(call)
+
+    def _remote_tick(self, call: "Call") -> None:
+        """The computer: its state to the side controlling it when it
+        changes, and every five seconds (a lost packet is told again). The
+        side controlling: Data saver's limit, every five seconds; a word
+        not answered, sent again (three times at the most)."""
+        engine = call.engine
+        if call.ended or engine is None or self.call is not call:
+            self._remote_ticks(call, False)
+            return
+        now = time.monotonic()
+        if call.lets:
+            state = self._remote_state_word(call, now)
+            said, at = call.rc_said
+            if state != said or now - at >= 5.0:
+                call.rc_said = (state, now)
+                engine.send_rcmd(state)
+        if self.controlling(call):
+            if now - call.__dict__.get("rc_limit_at", 0.0) >= 5.0:
+                call.rc_limit_at = now
+                engine.send_rcmd({"op": "limit", "kbps": REMOTE_SAVER_KBPS
+                                  if remote_saver() else 0})
+            for number, waiting in list(call.rc_waiting.items()):
+                word, tries, sent = waiting
+                if now - sent < 1.5:
+                    continue
+                if tries >= 3:
+                    del call.rc_waiting[number]
+                    self._set_status(tr("{name}'s computer did not answer",
+                                        name=self.call_name(call.peer)),
+                                     T.alert)
+                    continue
+                call.rc_waiting[number] = [word, tries + 1, now]
+                engine.send_rcmd(word)
+
+    def _remote_state_word(self, call: "Call", now: float) -> dict:
+        """What this computer tells the side controlling it: its screen
+        (remote_screen_state, each second), and, read again every half
+        minute, its name and number, when their grant ends (a remote
+        session's; 0: when removed), whether it signs in by itself after a
+        restart (None: not known)."""
+        known = call.__dict__.get("rc_mine")
+        if known is None or now - known[0] >= 30.0:
+            until = None
+            if call.control_kind == "away":
+                until = next((e["until"] for e in remote_access_list(
+                    self.keys.address) if e["a"] == call.peer), None)
+            known = call.rc_mine = (now, {
+                "n": device_name(), "dev": device_id(), "u": until,
+                "si": windows_signs_in_by_itself() if IS_WINDOWS
+                else None})
+        return dict(known[1], op="state", s=remote_screen_state())
+
+    def remote_ask(self, word: dict) -> None:
+        """The side controlling: a word for their computer (programs, end,
+        restart), numbered, sent again until it is answered."""
+        call = self.call
+        if call is None or call.engine is None or not self.controlling(call):
+            return
+        call.rc_number = getattr(call, "rc_number", 0) + 1
+        word = dict(word, n=call.rc_number)
+        call.rc_waiting[call.rc_number] = [word, 1, time.monotonic()]
+        call.engine.send_rcmd(word)
+
+    def remote_reminders(self, now: Optional[float] = None) -> int:
+        """19.0.1: each computer this identity reaches from afar whose
+        access ends within a week, then within a day (as it said in its
+        last session), is said so in the chat with its person, once each:
+        it can be made longer only by someone at it, or connected to it.
+        How many were said."""
+        if self.store is None or not self.keys.has_identity:
+            return 0
+        now = time.time() if now is None else now
+        me = self.keys.address
+        told = dict(load_prefs().get("remote_reminded") or {})
+        said = 0
+        for peer in (load_prefs().get("remote_computers") or {}).get(me) or {}:
+            for c in remote_computers(me, peer):
+                until = c.get("u")
+                if not isinstance(until, (int, float)) or not until or \
+                        until < now:
+                    continue
+                left = until - now
+                step = 1 if left < 86400 else 7 if left < 7 * 86400 else 0
+                key = f"{me}|{peer}|{c['dev']}|{int(until)}"
+                if not step or step in (told.get(key) or []):
+                    continue
+                told[key] = (told.get(key) or []) + [step]
+                self.store.add_event(peer, tr(
+                    "Your access to {computer} ends {when}. Connect and "
+                    "extend it there, in Settings › Remote access, before "
+                    "it does.", computer=c.get("n") or tr("their computer"),
+                    when=when_text(until)))
+                self.ui_queue.put(("message_stored", peer))
+                said += 1
+        if said:
+            save_pref("remote_reminded", told)
+        return said
+
+    def remote_programs(self) -> None:
+        """Their computer's programs (RemoteProgramsSheet once they come)."""
+        self._set_status(tr("Asking for its programs…"), T.text_2)
+        self.remote_ask({"op": "list"})
+
+    def remote_keys(self, names: tuple) -> None:
+        """Keys pressed together on their computer (Ctrl+Shift+Esc, Alt+Tab,
+        the Windows key): each down in order, then up in reverse."""
+        numbers = [REMOTE_KEYS.index(n) for n in names if n in REMOTE_KEYS]
+        for number in numbers:
+            self.send_remote_input(INPUT_KEY, (number, 1))
+        for number in reversed(numbers):
+            self.send_remote_input(INPUT_KEY, (number, 0))
+
+    def set_remote_saver(self, on: bool) -> None:
+        save_pref("remote_saver", bool(on))
+        call = self.call
+        if call is not None and call.engine is not None and \
+                self.controlling(call):
+            call.engine.send_rcmd({"op": "limit", "kbps": REMOTE_SAVER_KBPS
+                                   if on else 0})
+
+    def _remote_cmd(self, call: "Call", word: dict) -> None:
+        """A word of a controlled screen's (PKT_RCMD, sealed with the
+        call's keys): the computer's when this side controls it, the
+        controller's when this computer is controlled. Each is taken only
+        in its own role: nothing is done here for a side not let in."""
+        op = word.get("op")
+        if op in ("limit", "list", "end", "restart") and call.lets:
+            self._remote_here(call, op, word)
+        elif op in ("state", "programs", "done") and (
+                self.controlling(call) or call.asks):
+            self._remote_there(call, op, word)
+
+    def _remote_here(self, call: "Call", op: str, word: dict) -> None:
+        """This computer, controlled: what the side controlling it asks."""
+        engine = call.engine
+        if op == "limit":
+            engine.screen_cap = _int(word.get("kbps"), 0, 100000) or 0
+            return
+        number = _int(word.get("n"), 1, 2 ** 31)
+        if number is None or engine is None:
+            return
+        if op == "list":
+            programs = remote_programs()
+            if programs is None:
+                engine.send_rcmd({"op": "programs", "n": number, "none": True})
+                return
+            parts = [programs[i:i + 6] for i in range(0, len(programs), 6)] \
+                or [[]]
+            for i, part in enumerate(parts):
+                engine.send_rcmd({"op": "programs", "n": number, "part": i,
+                                  "of": len(parts), "list": part})
+            return
+        done = call.__dict__.setdefault("rc_done", {})
+        if number in done:                      # asked again: told again
+            engine.send_rcmd(done[number])
+            return
+        name = self.call_name(call.peer)
+        if op == "end":
+            ok, why = remote_close_program(_int(word.get("w"), 0, 2 ** 63) or 0,
+                                           _int(word.get("p"), 0, 2 ** 31) or 0)
+        else:                                   # restart
+            ok, why = computer_restart(tr(
+                "Ferritext: {name} restarts this computer from afar.",
+                name=name))
+            if ok:
+                remote_restart_asked(call.peer)
+                self.store.add_event(call.peer, tr(
+                    "{name} restarted this computer from afar", name=name))
+        done[number] = {"op": "done", "n": number, "of": op, "ok": ok,
+                        "why": str(why)[:200]}
+        engine.send_rcmd(done[number])
+
+    def _remote_there(self, call: "Call", op: str, word: dict) -> None:
+        """The side controlling: what their computer says."""
+        if op == "state":
+            state = sanitize_remote_state(word)
+            call.rc_state = state
+            if state.get("dev"):
+                call.computer = (state["dev"], state.get("n") or "")
+                remote_computer_seen(self.keys.address, call.peer,
+                                     state["dev"], state.get("n") or "",
+                                     until=state.get("u"))
+            self._refresh_call()
+            return
+        number = _int(word.get("n"), 1, 2 ** 31)
+        waiting = call.rc_waiting.get(number) if number else None
+        if waiting is None:
+            return
+        if op == "programs":
+            got = call.__dict__.setdefault("rc_parts", {})
+            if word.get("none") is True:
+                call.rc_waiting.pop(number, None)
+                RemoteProgramsSheet.show(self, None)
+                return
+            count = _int(word.get("of"), 1, 50) or 1
+            part = _int(word.get("part"), 0, count - 1)
+            if part is not None:
+                got.setdefault(number, {})[part] = word.get("list")
+            if len(got.get(number, {})) == count:
+                call.rc_waiting.pop(number, None)
+                parts = got.pop(number)
+                RemoteProgramsSheet.show(self, sanitize_programs(
+                    [p for i in range(count) for p in (parts[i] or [])]))
+            return
+        call.rc_waiting.pop(number, None)
+        what, ok = word.get("of"), word.get("ok") is True
+        why = _str(word.get("why"), 200) or ""
+        name = self.call_name(call.peer)
+        if what == "restart" and ok:
+            call.restarting = True
+            self._set_status(tr("{name}'s computer is restarting. Ferritext "
+                                "connects again once it is back.",
+                                name=name), T.text_2)
+        elif what == "restart":
+            self._set_status(tr("{name}'s computer did not restart: {why}",
+                                name=name, why=why), T.alert)
+        elif what == "end":
+            self._set_status(tr("Asked it to close") if ok else why or tr(
+                "It could not be closed"), T.text_2 if ok else T.alert)
+            if ok:
+                Clock.schedule_once(lambda _dt: self.remote_ask(
+                    {"op": "list"}), 1.5)
 
     def apply_keep_awake(self) -> None:
         """Windows kept awake while this identity's access list is not
-        empty and Keep this computer awake is on."""
+        empty and Keep this computer awake is on (19.0.1: the screen too
+        while someone controls it); and Ferritext kept running
+        (keep_running)."""
         if self.keys.has_identity:
-            keep_awake(keep_awake_wanted(self.keys.address))
+            call = self.call
+            keep_awake(keep_awake_wanted(self.keys.address),
+                       display=bool(call and call.lets and not call.ended))
+        self.keep_running()
+
+    def keep_running(self) -> None:
+        """19.0.1 (KEEPUP): while someone can connect to this computer from
+        afar and Keep Ferritext running is on, the watcher runs (guard_loop:
+        started now if it is not) and knows this process; otherwise it is
+        told to end. Not in the tests (FEXT_REMOTE_TEST), whose apps come
+        and go."""
+        cmd = guard_command()
+        if cmd is None or os.environ.get("FEXT_REMOTE_TEST"):
+            return
+        if not (keep_running_on() and remote_access_anyone()):
+            if self.__dict__.pop("_guarded", False):
+                guard_tell(cmd, True)
+            return
+        guard_tell(cmd, False)
+        guard_beat()
+        self.__dict__["_guarded"] = True
+        if not guard_running():
+            guard_start(cmd + [GUARD_FLAG, str(DATA_DIR)])
+
+    def _guard_beat(self) -> None:
+        """Every GUARD_BEAT seconds: the connection to the relay looked
+        after (a sync worker that ended by itself, not stopped here, is
+        started again: a computer whose window answers but whose
+        connection is gone cannot be reached either), and the watcher told
+        this UI answers."""
+        worker = self.worker
+        if worker is not None and not worker.is_alive() and \
+                not worker.stop_event.is_set() and self.keys.has_identity \
+                and self.keys.username:
+            log.warning("the sync worker had stopped by itself: started "
+                        "again")
+            self._start_worker()
+        if self.__dict__.get("_guarded"):
+            guard_beat()
+
+    def guard_closed(self) -> None:
+        """This app is being closed (on_stop). By its person, normally: the
+        watcher ends. 19.0.1 (the owner: "if the overseas computer loses
+        Ferritext, it is over"): while someone can connect to this computer
+        from afar and Keep Ferritext running is on, it comes back (minimised,
+        with a notice that says why: --again), and is closed for good only
+        once that switch is off. A restart of the computer ends the watcher
+        with it; the sign-in starts Ferritext again."""
+        cmd = guard_command()
+        if cmd is None or not self.__dict__.pop("_guarded", False):
+            return
+        guard_tell(cmd, not (keep_running_on() and remote_access_anyone()))
+
+    def _told_again(self) -> None:
+        """Started again by the watcher (--again): the person at the
+        computer is told why, once."""
+        desktop_notify(tr("Ferritext is running again"), tr(
+            "Someone can connect to this computer from afar, so Ferritext "
+            "keeps running. To close it for good, turn off Keep Ferritext "
+            "running in Settings › Remote access first."))
 
 
 class FextApp(RemoteControlMixin, MessagingMixin, App):
@@ -40015,6 +41863,7 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
             NewIdentityModal(self, first_run=True).open()
 
     def on_stop(self) -> None:
+        self.guard_closed()                       # 19.0.1 (KEEPUP)
         call = self.__dict__.get("_room_call")
         if call is not None:              # 16.1: out of a group's call
             leaving = threading.Thread(target=call.leave, daemon=True)
@@ -43170,11 +45019,16 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
             return
         op = {"op": "call", "id": call.id, "tag": call.tag, "k": call.pub,
               "codecs": call_codecs(), "q": call_quality_kbps(),
-              "c": engine.candidates(), "t": int(time.time()),
+              "c": engine.candidates(), "t": int(
+                  self.api.relay_now() if self.api is not None
+                  else time.time()),       # 19.0.1: the clock both ends share
               "v": bool(call.session and (call.session.video or
                                           call.session.me.camera))}
         if call.remote:                                   # 19.0 (REMOTE)
             op["rc"] = True
+            to = getattr(call.session, "remote_to", None)   # 19.0.1
+            if to:
+                op["to"] = to
         call.signalled = True
         if not self._send_control_to(call.peer, op, "Voice call"):
             self.ui_queue.put(("call_engine", call.id, "failed",
@@ -43247,6 +45101,8 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
             return
         if sig["id"] in self._declined_calls:
             return                     # declined from its notification
+        if remote and not remote_offer_once(sig["id"]):    # 19.0.1
+            return                     # answered once: not played again
         call = Call(sender, outgoing=False, call_id=sig["id"],
                     tag=sig["tag"])
         call.their_key, call.remote_cands = sig["k"], sig["c"]
@@ -43352,7 +45208,7 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
                 engine.start_audio()
             self._call_audio_started()
             self._tell_taken(sender, call.id, sig["k"])
-            self._remote_answered(call)                      # 19.0
+            self._remote_answered(call, sig)                 # 19.0
         elif op == "end":
             if call.outgoing and unanswered and sig["why"] == "declined":
                 self._tell_taken(sender, call.id, None)
@@ -43418,6 +45274,8 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
             self._their_call_media(call, value)
         elif kind == "control":                                # 19.0
             self._control_changed(call, bool(value))
+        elif kind == "rcmd":                                   # 19.0.1
+            self._remote_cmd(call, value)
         elif kind == "react":                                  # 17.3
             self._heard_reaction(call, str(value))
         elif kind == "video_plan":
@@ -43478,6 +45336,8 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
                   "c": engine.candidates() if engine else [],
                   "codec": pick_send_codec(call.their_codecs),
                   "codecs": call_codecs(), "q": call_quality_kbps()}
+            if call.remote:            # 19.0.1: which computer answered
+                op.update(dev=device_id(), dn=device_name())
             threading.Thread(target=self._send_control_to,
                              args=(call.peer, op, "Voice call"),
                              daemon=True).start()
@@ -44631,6 +46491,14 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
         if self.worker is not None:
             self.worker.stop_event.set()
             self.worker = None
+        # 19.0.1 (KEEPUP): a computer someone reaches from afar has nobody
+        # at it to choose a name: it registers again by itself, under the
+        # name it had (its keys are intact), and asks a person only if that
+        # cannot be done.
+        old = self.keys.username
+        if old and not IS_MOBILE and remote_access_anyone():
+            self._register_again(old)
+            return
         self.keys.clear_username()
         self.chats_screen.refresh_header()
         self._set_status(tr("This relay doesn't recognise your identity — "
@@ -44639,6 +46507,64 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
                     "(its database may have been reset). Your keys are "
                     "safe — choose a name to register again.")
         self._register_modal = RegisterModal(self, reason=reason)
+        self._register_modal.bind(
+            on_dismiss=lambda *_a: setattr(self, "_register_modal", None))
+        self._register_modal.open()
+
+    #: 19.0.1: tries a computer makes to register again by itself, each
+    #: this many seconds after the last failed (the relay down meanwhile).
+    REREGISTER_TRIES, REREGISTER_EVERY = 60, 60.0
+
+    def _register_again(self, name: str, tries: int = 0) -> None:
+        """19.0.1 (KEEPUP): the relay no longer knows this identity (its
+        records reset) and someone can reach this computer from afar: it
+        registers again under `name`; that name taken, under it and a few
+        digits; the relay knowing the address under another name, that
+        name. The relay down, again a minute later, for an hour; then, or
+        if the relay refuses, the form for a person, as before."""
+        def work() -> None:
+            names = [name, (name[:27] + "_" + "".join(
+                random.choice("0123456789") for _ in range(4)))]
+            for each in names:
+                try:
+                    self.api.register(each)
+                except ApiClient.ApiError as exc:
+                    if exc.code == "username_taken":
+                        continue
+                    if exc.code == "address_registered" and \
+                            valid_username(exc.detail.get("username") or ""):
+                        run_on_ui(self._registered_again,
+                                  exc.detail["username"])
+                    else:
+                        run_on_ui(self._ask_to_register, exc.message)
+                    return
+                except requests.RequestException:
+                    if tries + 1 < self.REREGISTER_TRIES:
+                        Clock.schedule_once(
+                            lambda _dt: self._register_again(name, tries + 1),
+                            self.REREGISTER_EVERY)
+                    else:
+                        run_on_ui(self._ask_to_register, "")
+                    return
+                run_on_ui(self._registered_again, each)
+                return
+            run_on_ui(self._ask_to_register, "")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _registered_again(self, name: str) -> None:
+        self.keys.set_username(name)
+        self.chats_screen.refresh_header()
+        log.info("registered again by itself, as %s", name)
+        self._start_worker()
+
+    def _ask_to_register(self, message: str) -> None:
+        """It could not register again by itself: a person is asked."""
+        self.keys.clear_username()
+        self.chats_screen.refresh_header()
+        self._register_modal = RegisterModal(self, reason=message or tr(
+            "The relay no longer has a record of this identity (its "
+            "database may have been reset). Your keys are safe — choose a "
+            "name to register again."))
         self._register_modal.bind(
             on_dismiss=lambda *_a: setattr(self, "_register_modal", None))
         self._register_modal.open()
@@ -44671,6 +46597,10 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
         Clock.schedule_once(lambda _dt: self.auto_backup(), 8)
         Clock.schedule_interval(lambda _dt: self.auto_backup(), 3600)
         Clock.schedule_once(lambda _dt: self.offer_app_lock(), 2)
+        # 19.0.1 (REMOTE191): an access to someone's computer that ends
+        # soon, said in the chat a week before, and a day before.
+        Clock.schedule_once(lambda _dt: self.remote_reminders(), 20)
+        Clock.schedule_interval(lambda _dt: self.remote_reminders(), 6 * 3600)
         # 18.2: the menu made before it is first asked for (a fifth of
         # a second of making it, on a computer, was the wait for it).
         Clock.schedule_once(lambda _dt: self._make_drawer(), 1.5)
@@ -44683,6 +46613,14 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
             if STARTUP_FLAG in sys.argv[1:]:    # 18.2: opened by Windows
                 Clock.schedule_once(lambda _dt: Window.minimize(), 0.5)
             Clock.schedule_once(lambda _dt: self.apply_keep_awake(), 3)
+            # 19.0.1 (KEEPUP): the watcher looked after once a minute, told
+            # this UI answers; a restart asked from afar timed as it ends.
+            Clock.schedule_interval(lambda _dt: self.keep_running(), 60)
+            Clock.schedule_interval(lambda _dt: self._guard_beat(),
+                                    GUARD_BEAT)
+            remote_restart_back()
+            if GUARD_AGAIN in sys.argv[1:]:
+                Clock.schedule_once(lambda _dt: self._told_again(), 5)
 
     def offer_app_lock(self) -> None:
         """The app lock, offered once on a phone (16.2, I1) — when there is
@@ -45678,6 +47616,17 @@ def run_background_service(max_cycles: Optional[int] = None,
 #  Entrypoint
 # =============================================================================
 def main() -> None:
+    """19.0.1 (KEEPUP): one Ferritext at a time on a computer (its data
+    folder's instance.lock, held while it runs). One opened again brings
+    the open one's window to the front; one the system or the watcher
+    started (STARTUP_FLAG) ends without a word."""
+    instance = None
+    if not IS_MOBILE:
+        instance = hold_lock(DATA_DIR / "instance.lock")
+        if instance is None:
+            if STARTUP_FLAG not in sys.argv[1:]:
+                show_running_window()
+            return
     FextApp().run()
 
 

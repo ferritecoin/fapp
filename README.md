@@ -22,13 +22,13 @@ same key (see [Release signing](#release-signing)).
 
 Every push to the default branch is tested and built, and each new version is
 published to a GitHub Release, whose files never change afterwards. Open the
-**Releases** page (or the **`v19.0.0`** tag) and take:
+**Releases** page (or the **`v19.0.1`** tag) and take:
 
 | Asset | For |
 | --- | --- |
-| `Ferritext-19.0.0.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r`. Calls need Android 6 or later |
-| `Ferritext-19.0.0-windows.exe` | Windows 10 and 11 (64-bit) — the same app in one file, with nothing to install. Windows may say that it does not know the publisher: choose *More info*, then *Run anyway*. |
-| `Ferritext-19.0.0-desktop.py` | Windows / macOS / Linux — one file with its fonts and icons inside. Run it with Python 3.11+ after `pip install kivy requests websocket-client cryptography qrcode pillow`. |
+| `Ferritext-19.0.1.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r`. Calls need Android 6 or later |
+| `Ferritext-19.0.1-windows.exe` | Windows 10 and 11 (64-bit) — the same app in one file, with nothing to install. Windows may say that it does not know the publisher: choose *More info*, then *Run anyway*. |
+| `Ferritext-19.0.1-desktop.py` | Windows / macOS / Linux — one file with its fonts and icons inside. Run it with Python 3.11+ after `pip install kivy requests websocket-client cryptography qrcode pillow`. |
 
 Each Actions run keeps them for a week too: the APK and the desktop file as
 the **`ferritext-release`** artifact, the executable as
@@ -57,12 +57,70 @@ QR code of the page's address, and the steps to install the app and keep
 it running.
 
 ```bash
-python3 tools/download_page.py Ferritext-19.0.0.apk site/ \
+python3 tools/download_page.py Ferritext-19.0.1.apk site/ \
     --url https://your.host/ferritext/        # then serve site/ there
 ```
 
 Relay 12.2.1 and later can serve the page too, at `/download/` on the
 relay's own address: whoever can reach the relay can reach it.
+
+## What's in 19.0.1
+
+For a computer reached from afar for months, whose person cannot go back
+to it: what is set up before leaving has to hold.
+
+- **Before you leave**, in *Settings › Remote access*: each thing that
+  lets the computer be reached for a long time, read from the computer
+  and said with how to put it right. Ferritext starts when you sign in,
+  keeps running and keeps the computer awake; Windows signs in by itself
+  after a restart and its screen does not lock by itself; the firmware
+  turns it on after a power cut (Ferritext cannot see that one); and two
+  things to try while you are still there, from your phone on its mobile
+  data: a session, and a restart from afar that comes back.
+- **Ferritext keeps running.** While someone is listed, a small watcher
+  starts Ferritext again if it closes, or stops answering for six
+  minutes; closing its window brings it back, saying how to close it for
+  good. One Ferritext runs at a time. Settings and identities are written
+  so that a power cut halfway leaves the last good copy, and after a
+  relay is reset the computer registers its name again by itself.
+- **Keys** in a session from afar: Task Manager, the Start menu,
+  switching windows, the desktop, closing a window, copy, paste, undo,
+  select all, Esc and Delete. *Ctrl+Alt+Del* says what Windows keeps for
+  itself and offers what can be done instead. *Programs* lists the
+  windows open on the computer and closes one, or ends one that does not
+  answer (not one run as administrator, nor Windows' own). *Restart it…*
+  restarts the computer; Ferritext waits up to 20 minutes for it and
+  connects again by itself.
+- **A band under the call** says when their computer shows a Windows
+  security screen (locked, a permission prompt, Ctrl+Alt+Del's) or an
+  administrator's window, neither of which can be used from afar, and
+  when your access ends within two weeks. The chat says so too, a week
+  and a day before it does.
+- **Two computers on one identity** are told apart: each has a name
+  (*Remote access › This computer*), and *Connect to their computer*
+  asks which.
+- **Over mobile data** a shared screen sends nothing while it does not
+  change: a picture when it changes, a sharper one a second later, and a
+  key frame every two minutes, only if it changed. A picture waits behind
+  a quarter of a second of bits, not a whole second's, and the rate steps
+  down when pictures are lost or the delay grows. *Data saver* (in Keys;
+  on by default on a phone) holds their screen to 1.5 Mbit/s. On a
+  1080p desktop, an hour of a still screen cost 30 MB and now nothing;
+  typing 33 MB, now 23; switching windows 142 MB, now 79 (64 with Data
+  saver), and a new window arrives over a 2 Mbit/s link within 0.23 s
+  (0.1 s with Data saver) where it took up to half a second.
+- **Security.** What a relay answers is checked: a key that is not the
+  address's own is refused, and a saved contact's key is never replaced
+  by one that is not its address's. An offer from afar names the
+  computer it is for and is signed with its time, so one the relay plays
+  again, or sends to another computer, is set aside. With the app lock
+  on, Ferritext locks itself as a session from afar starts: whoever
+  connects needs its code to read your chats.
+- For developers: `desktop/test_security.py` plays attacks on this
+  client (a relay acting as the server, someone acting as someone else,
+  crossing into another computer or identity, a power cut), each expected
+  refused; `test_remote.py` and `test_video.py` have 19.0.1's sections,
+  and `capture.py` the new screens.
 
 ## What's in 19.0.0
 
@@ -1363,6 +1421,15 @@ verified contacts can be added. Windows lets no program control its
 sign-in or lock screen, or a program run as administrator. Whoever
 holds a listed person's keys can reach the computer: list only people
 you trust.
+
+**For the long term (19.0.1).** *Before you leave* in Remote access
+lists what lets the computer come back on its own, and while someone is
+listed a watcher keeps Ferritext running. In a session, *Keys* sends
+what a phone cannot type and what the controlling computer would keep
+for itself, says what Ctrl+Alt+Del cannot do from afar, lists the
+computer's programs and restarts it. A computer says what its screen
+shows, so the other side knows when Windows has put up a screen nobody
+can use from afar. A still screen costs no data.
 
 ## Sending, and the outbox
 

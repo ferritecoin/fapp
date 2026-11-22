@@ -148,6 +148,9 @@ jobs:
           xvfb-run -a python desktop/test_pictures.py main.py
           xvfb-run -a python desktop/test_calls.py main.py
           xvfb-run -a python desktop/test_remote.py main.py
+          # 19.0.1: attacks on this client (a relay acting as the server,
+          # someone acting as someone else), each expected refused.
+          xvfb-run -a python desktop/test_security.py main.py
           xvfb-run -a python desktop/test_conference.py main.py
           xvfb-run -a python desktop/test_notify.py main.py
           xvfb-run -a python desktop/test_gestures.py main.py
