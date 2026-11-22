@@ -514,11 +514,18 @@ if OLD is not None:
             "blob": "b" * 32, "sha": "0" * 64, "key": M.b64e(bytes(32)),
             "dur": 42000, "w": 480, "h": 640}})
     row = old_app.store.message_by_cid(sender.address, cvid)
-    check("the release before shows a video message as its words: a "
-          "text message, with nothing to download",
-          acked and row and row["kind"] == "text" and
-          row["body"] == "Video message (0:42)" and
-          not row.get("media_state"), row and dict(row))
+    if hasattr(OLD, "FEATURE_VIDEO"):       # 18.1 and later play them
+        check("the release before takes a video message as one, to be "
+              "downloaded",
+              acked and row and row["kind"] == "video" and
+              row["body"] == "Video message (0:42)" and
+              row.get("media_state") == "pending", row and dict(row))
+    else:
+        check("the release before shows a video message as its words: a "
+              "text message, with nothing to download",
+              acked and row and row["kind"] == "text" and
+              row["body"] == "Video message (0:42)" and
+              not row.get("media_state"), row and dict(row))
     acked, cre = deliver_old("nice one", {"k": "text", "ft": M.FEATURES,
                                           "reply": {"cid": cvid,
                                                     "kind": "video"}})
@@ -1160,6 +1167,38 @@ restored.activate(restored.restore_identity(dict(alice.keys.active)))
 check("...while a backup brings the key back with it",
       restored.pq_kid == alice.keys.pq_kid and
       M.IdentityManager().pq_public == alice.keys.pq_public)
+
+# 18.2 (MULTIDEV): the two keys as one text, for another device.
+both = alice.keys.device_key()
+priv_a = int(alice.keys.active["private_key_hex"], 16)
+check("the key for another device carries both keys, in a text no WIF or "
+      "hex begins as, and is in what Settings reveals",
+      both.startswith(M.DEVICE_KEY_PREFIX) and
+      M.parse_identity_key("  " + both + "\n") ==
+      (priv_a, bytes.fromhex(seed)) and
+      M.json.loads(alice.keys.private_export())["key_for_another_device"]
+      == both)
+M.DATA_DIR = Path(tempfile.mkdtemp(prefix="fext-device-"))
+M.IDENTITIES_PATH = M.DATA_DIR / "identities.json"
+second = M.IdentityManager()
+second.activate(second.add_identity(*M.parse_identity_key(both)[:1], "two",
+                                    M.parse_identity_key(both)[1]))
+check("...a device set up from it has the same post-quantum key, and "
+      "keeps it", second.pq_kid == alice.keys.pq_kid and
+      M.IdentityManager().pq_public == alice.keys.pq_public)
+check("a private key alone still imports, with no post-quantum key in it",
+      M.parse_identity_key(M.priv_to_wif(priv_a)) == (priv_a, None) and
+      M.parse_identity_key("%064x" % priv_a) == (priv_a, None))
+wrong = both[:-3] + ("111" if not both.endswith("111") else "222")
+for name, text in (("mistyped", wrong), ("cut short", both[:-20]),
+                   ("of another kind", M.DEVICE_KEY_PREFIX +
+                    M.b58check_encode(0xD2, bytes(96)))):
+    ok, why = expect_reject(lambda t=text: M.parse_identity_key(t),
+                            "key for another device")
+    check(f"a key for another device that is {name} is refused", ok, why)
+ok, why = expect_reject(lambda: M.device_key_text(priv_a, b"short"),
+                        "64 bytes")
+check("...and none is made of a seed of the wrong size", ok, why)
 M.DATA_DIR, M.IDENTITIES_PATH = saved
 
 if OLD is not None:

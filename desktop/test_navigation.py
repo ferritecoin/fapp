@@ -14,7 +14,9 @@
     pin, mark unread and read, block (what they send is held, then
     arrives on unblocking),
     delete (a group is left first);
-  * a tap on a message raises its reactions; a second tap puts them away.
+  * a tap on a message raises its reactions; a second tap puts them away;
+  * an error while a screen is drawn is logged and said, and the app
+    carries on; a second shows the chat list; a storm ends it (18.2).
 """
 import importlib.util
 import os
@@ -496,6 +498,198 @@ check("a tap raises the reactions over it",
 screen.on_bubble_tap(mid)
 check("...a second tap puts them away",
       screen._strip_for is None and screen.strip.concealed)
+
+print("\nA tapped message's menu (18.2)")
+
+
+def menu_names():
+    return [row.label.text for row in screen.menu.rows]
+
+
+def press(name):
+    next(r for r in screen.menu.rows
+         if r.label.text == name).dispatch("on_release")
+    tick(0.2)
+
+
+def inside(part):
+    return (screen.stack.x <= part.x and part.right <= screen.stack.right
+            and screen.stack.y <= part.y and part.top <= screen.stack.top)
+
+
+screen.on_bubble_tap(mid)
+tick(0.2)
+names = menu_names()
+check("a tap also says what can be done with it, in words",
+      not screen.menu.concealed and names[0] == "Reply" and
+      names[-1] == "Delete" and {"Copy", "Forward", "Star", "Select"}
+      <= set(names), str(names))
+check("...Edit only where the message can still be edited",
+      ("Edit" in names) == alice.can_edit(screen._bubbles[mid].msg),
+      str(names))
+menu, strip = screen.menu, screen.strip
+check("...the menu inside the view, clear of the reactions",
+      inside(menu) and inside(strip) and
+      (menu.top <= strip.y or menu.y >= strip.top),
+      (menu.pos, menu.size, strip.pos, strip.size, tuple(screen.stack.pos),
+       tuple(screen.stack.size)))
+# 19.0: where the menu fits neither under the message nor over it and its
+# reactions (Windows' runner: it covered them), laid out for real.
+
+
+def apart(a, b):
+    return a.right <= b.x or b.right <= a.x or a.top <= b.y or b.top <= a.y
+
+
+def tapped_at(width, height):
+    screen.on_bubble_tap(mid)                   # the menu put away
+    M.Window.size = (M.dp(width), M.dp(height))
+    if top.parent is None:
+        M.Window.add_widget(top)
+    tick(0.5)
+    screen.on_bubble_tap(mid)
+    tick(0.2)
+    return (menu.pos, menu.size, strip.pos, strip.size,
+            tuple(screen.stack.pos), tuple(screen.stack.size))
+
+
+shape = tapped_at(400, 560)
+check("...a short window: the reactions at the view's top, the menu just "
+      "under them, both whole", inside(menu) and inside(strip) and
+      apart(menu, strip) and strip.top >= screen.stack.top - M.dp(8), shape)
+shape = tapped_at(840, 392)
+check("...a phone on its side (a menu taller than the view): the reactions "
+      "beside it, whole", inside(strip) and apart(menu, strip), shape)
+M.Window.size = (M.dp(400), M.dp(720))
+tick(0.5)                       # laid out again at the test's own size
+M.Window.remove_widget(top)
+screen.on_bubble_tap(mid)
+check("...and a second tap puts both away",
+      screen.menu.concealed and screen.strip.concealed)
+copied = []
+alice.copy_text = copied.append
+screen.on_bubble_tap(mid)
+press("Copy")
+check("Copy takes its words, and the menu goes",
+      copied == [screen._bubbles[mid].msg["body"]] and
+      screen.menu.concealed and not screen.selected, str(copied))
+screen.on_bubble_tap(mid)
+press("Reply")
+check("Reply begins a reply to it",
+      screen.reply_to is not None and
+      screen.reply_to.get("cid") ==
+      screen._bubbles[mid].msg["client_msg_id"] and not screen.selected)
+
+print("\nThe reply bar's options (18.2)")
+
+
+def rows_of(sheet):
+    """Its rows' words, from the top one down."""
+    found, queue = [], [sheet]
+    while queue:
+        w = queue.pop()
+        if isinstance(w, M.ListRow):
+            found.append(w)
+        queue.extend(w.children)
+    return [w.title.text for w in
+            sorted(found, key=lambda w: -w.to_window(0, w.y)[1])]
+
+
+def top_sheet():
+    return next((w for w in M.Window.children if isinstance(w, M.Sheet)),
+                None)
+
+
+words = screen._bubbles[mid].msg["body"]            # "message number 128"
+screen.reply_options()
+tick(0.3)
+check("a tap on what is replied to offers: a part of it, another chat, "
+      "the message, or to give it up",
+      rows_of(top_sheet()) == ["Quote a part of it", "Reply in another chat",
+                               "Show the message", "Cancel the reply"],
+      str(rows_of(top_sheet())))
+top_sheet().dismiss(animation=False)
+tick(0.2)
+quoted = []
+sheet = M.QuoteSheet(words, quoted.append)
+sheet.open(animation=False)
+tick(0.2)
+check("the part to quote is marked in the message's own words; nothing "
+      "marked, nothing to quote",
+      sheet.field.text == words and sheet.button.disabled)
+sheet.field.select_text(8, 14)
+tick(0.2)
+sheet.button.dispatch("on_release")
+tick(0.2)
+check("...the marked words are what is quoted", quoted == ["number"],
+      str(quoted))
+screen._quote_part("  number \n 128 ")
+check("the reply then quotes that part alone, of the same message",
+      screen.reply_to["snip"] == "number 128" and
+      screen.reply_to["cid"] == screen._bubbles[mid].msg["client_msg_id"]
+      and "number 128" in screen.reply_snip.text, str(screen.reply_to))
+screen._reply_elsewhere()
+tick(0.3)
+sheet = top_sheet()
+check("another chat is chosen from yours, this one left out",
+      isinstance(sheet, M.ChatPickSheet) and B not in sheet.peers and
+      A in sheet.peers, str(getattr(sheet, "peers", None)))
+sheet.take(A)
+tick(0.6)
+carried = screen.take_reply()
+check("...and the reply goes there with its quote",
+      alice.current_peer == A and carried is not None and
+      carried["snip"] == "number 128" and carried["from"] == A and
+      carried["cid"] == alice.store.message(mid)["client_msg_id"],
+      (alice.current_peer == A, carried))
+alice.go_back_to_chats()
+tick(0.3)
+alice.open_conversation(B)
+tick(0.4)
+wait_for(lambda: mid in screen._bubbles, 5)
+screen.start_edit(screen._bubbles[mid].msg)
+before = top_sheet()
+screen.reply_options()
+tick(0.2)
+check("a message being edited is not a reply: the bar offers nothing",
+      top_sheet() is before)
+screen.cancel_reply()
+screen.entry.text = ""
+screen.on_bubble_tap(mid)
+press("Select")
+check("Select holds it, for more to be chosen",
+      list(screen.selected) == [mid] and screen.menu.concealed and
+      screen.select_bar.parent is not None)
+screen.clear_selection()
+screen.on_bubble_tap(mid)
+press("Delete")
+sheet = M.Window.children[0]
+check("Delete asks first: for me, or for everyone",
+      isinstance(sheet, M.DeleteModal) and
+      alice.store.message(mid) is not None)
+sheet.dismiss(animation=False)
+screen.clear_selection()
+tick(0.2)
+alice.store.add_in(
+    B, "see https://example.org/a and the rest",
+    (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(), 9001,
+    uuid.uuid4().hex, unread=False)
+linked = alice.store.messages_for(B)[-1]["id"]
+alice.refresh_chat(B)
+wait_for(lambda: linked in screen._bubbles, 5)
+screen.on_bubble_tap(linked)
+check("a message with a link offers the link alone",
+      "Copy the link" in menu_names(), str(menu_names()))
+press("Copy the link")
+check("...and copies it", copied[-1] == "https://example.org/a",
+      str(copied[-1:]))
+screen.on_bubble_tap(linked)
+tick(0.2)
+check("the newest message, with nothing under it: the menu sits over it "
+      "and its reactions, still inside the view",
+      inside(screen.menu) and screen.menu.y >= screen.strip.top,
+      (screen.menu.pos, screen.strip.pos))
+screen.close_strip()
 alice.go_back_to_chats()
 tick(0.3)
 
@@ -645,6 +839,311 @@ check("...and a list whose chats are as they were is left as it is: its "
       all(a is b for a, b in zip(kept, chats.list.children)),
       f"{len(moved)} moved")
 
+print("\nA lone arrival is shown on the next frame (18.2)")
+shown, real_status = [], alice._set_status
+alice._set_status = lambda text, *a, **k: shown.append(text)
+tick(M.UI_TICK + 0.1)
+alice.ui_queue.put(("status", "one", M.T.ok))
+Clock.tick()
+check("a worker's event is taken on the next frame, not at the next tick",
+      shown == ["one"], shown)
+# "Taken a moment ago" is held there, however slow the machine: with four
+# suites at once more than a tick went by between two lines here, the
+# frame took the two, rightly, and this failed (round 25's last run). The
+# wake is called as the next frame calls it, but alone: on a loaded
+# machine a frame came after a whole tick, and the tick's own drain took
+# them, rightly again (19.0, VERIFY26).
+alice._drained_at = time.monotonic() + 60
+alice.ui_queue.put(("status", "two", M.T.ok))
+alice.ui_queue.put(("status", "three", M.T.ok))
+alice._drain_soon(0)
+check("...those that follow within a tick wait for it, and are taken "
+      "together (a backlog is one repaint a tick, as before)",
+      shown == ["one"], shown)
+alice._drain_ui_queue(0)
+check("...by the tick", shown == ["one", "two", "three"], shown)
+alice._set_status = real_status
+
+print("\nThe collector's long look waits for a quiet moment (18.2)")
+import gc                                                     # noqa: E402
+import weakref                                                # noqa: E402
+before = gc.get_threshold()
+# What Python itself set aside as it started: none, or a few hundred
+# (Ubuntu 24.04's Python 3.12: Devices run 32).
+aside = gc.get_freeze_count()
+sounding = [False]
+quiet = M.QuietCollector(lambda: sounding[0])
+check("Python no longer takes the long look when it chooses; the short "
+      "ones stay its own", gc.get_freeze_count() == aside and
+      gc.get_threshold() == (before[0], before[1], M.QuietCollector.NEVER),
+      (aside, gc.get_freeze_count(), gc.get_threshold()))
+check("the first quiet moment looks through what start-up made, and sets "
+      "it aside: later looks go through what has been made since",
+      quiet.check(now=quiet.touched + 1) == "" and
+      quiet.check(now=quiet.touched + quiet.QUIET + 1) == "deep" and
+      gc.get_freeze_count() > 10000, gc.get_freeze_count())
+
+
+def churn(looks=3):
+    """Objects made and dropped, in rings, until `looks` short looks
+    have gone by since the last long one."""
+    kept = []
+    while gc.get_count()[2] < looks:
+        ring = []
+        ring.append(ring)
+        kept.append(ring)
+        if len(kept) > 2000:
+            kept.clear()
+
+
+churn()
+at = quiet.touched
+check("a hand at work is not interrupted: no long look while it touches",
+      quiet.check(now=at + quiet.QUIET - 0.5) == "" and
+      quiet.check(now=at + quiet.EVERY + 60) == "long" and
+      gc.get_count()[2] == 0)
+churn()
+sounding[0] = True
+check("...nor while something sounds (a call, a message playing or "
+      "being recorded), however quiet the hand",
+      quiet.check(now=time.monotonic() + quiet.EVERY + 60) == "")
+sounding[0] = False
+M.Window.dispatch("on_key_down", 97, 0, "a", [])
+check("...and a key is a hand too",
+      quiet.check(now=time.monotonic() + quiet.QUIET - 1) == "" and
+      quiet.check(now=time.monotonic() + quiet.EVERY + 60) == "long")
+churn()
+quiet.touched -= 60
+M.Window.dispatch("on_textinput", "a")
+check("...as is a letter from a phone's keyboard, which sends no key",
+      quiet.check(now=time.monotonic() + quiet.QUIET - 1) == "")
+quiet.look(deep=False)
+churn()
+real_pending, quiet.PENDING = quiet.PENDING, 3
+quiet.touched = time.monotonic()
+check("a hand that never rests gets one all the same once enough short "
+      "looks have gone by: memory cannot grow without end",
+      quiet.check(now=quiet.touched + 0.1) == "long")
+quiet.PENDING = real_pending
+quiet.owes_deep = True
+frozen = gc.get_freeze_count()
+check("a deep look, through start-up's objects too, when one is owed (a "
+      "theme built every page again), at a quiet moment; then they are "
+      "set aside again",
+      quiet.check(now=time.monotonic() + 1) == "" and
+      quiet.check(now=time.monotonic() + quiet.QUIET + 1) == "deep" and
+      not quiet.owes_deep and gc.get_freeze_count() > 10000, frozen)
+alice.collector = quiet
+gc.disable()
+
+
+class Made:
+    """Something a rebuild made and dropped: it holds itself."""
+
+
+made = Made()
+made.me = made
+dropped = weakref.ref(made)
+del made
+alice._collect_after_rebuild(0)
+check("a theme's rebuild no longer takes the long look a moment after it "
+      "shows: it owes a deep one to the next quiet moment",
+      gc.isenabled() and quiet.owes_deep)
+check("...but what the rebuild itself made is looked through there and "
+      "then, while the screen is still, not at the next touch",
+      dropped() is None and gc.get_count()[1] == 0, gc.get_count())
+sounding[0] = True
+real_sounding, alice.sounding = alice.sounding, lambda: sounding[0]
+alice._went_away()
+owed = quiet.owes_deep
+sounding[0] = False
+alice._went_away()
+check("the app leaving the screen is a quiet moment, unless a call goes "
+      "on behind it", owed and not quiet.owes_deep)
+alice.sounding, alice.collector = real_sounding, None
+quiet.stop()
+check("stopped, the collector is Python's own again",
+      gc.get_threshold() == before and gc.get_freeze_count() == 0)
+
+print("\nAn error while a screen is drawn (18.2): the app carries on")
+net = next(h for h in M.ExceptionManager.handlers
+           if isinstance(h, M.CrashNet))
+M.CrashNet.install()
+check("the net is put up when an app is built, once however many are",
+      sum(isinstance(h, M.CrashNet)
+          for h in M.ExceptionManager.handlers) == 1)
+M.App._running_app = alice               # the app this window is
+alice.open_conversation(B)
+tick(0.3)
+alice.open_contact_settings()
+tick(0.3)
+
+
+def raised(_dt):
+    raise ValueError("a screen's own fault")
+
+
+Clock.schedule_once(raised, 0)
+escaped = None
+try:
+    Clock.tick()                # a frame: Kivy's clock asks the net itself
+except ValueError as exc:
+    escaped = exc
+said = M.Toast.current.text if M.Toast.current else ""
+check("an error in a frame is passed over, and said",
+      escaped is None and len(net._recent) == 1 and "went wrong" in said,
+      (escaped, said))
+check("...the page and its sheet left as they were: one error is not a "
+      "broken screen", alice.manager.current == "conversation" and
+      any(isinstance(w, M.Sheet) for w in M.Window.children))
+verdict = M.ExceptionManager.handle_exception(ValueError("and again"))
+tick(0.4)
+check("a second within seconds closes the sheets and shows the chat list",
+      verdict == M.ExceptionManager.PASS and
+      alice.manager.current == "chats" and
+      not any(isinstance(w, M.Sheet) for w in M.Window.children),
+      alice.manager.current)
+verdicts = [M.ExceptionManager.handle_exception(ValueError(str(n)))
+            for n in range(M.CrashNet.STORM)]
+check("an error every frame is not a working app: it ends, as before",
+      verdicts[-1] == M.ExceptionManager.RAISE and
+      verdicts[0] == M.ExceptionManager.PASS, str(verdicts))
+net._recent.clear()
+check("Ctrl+C and a wanted exit are never passed over",
+      M.ExceptionManager.handle_exception(KeyboardInterrupt()) ==
+      M.ExceptionManager.RAISE and
+      M.ExceptionManager.handle_exception(SystemExit()) ==
+      M.ExceptionManager.RAISE)
+net._recent.clear()
+tick(0.3)
+
+print("\nPinned messages: the bar and the list (19.0)")
+while alice.manager.current != "chats":
+    alice._on_keyboard(None, 27)
+    settled()
+dora = [m for m in alice.store.messages_for(D) if m.get("kind") != "event"]
+picked = [dora[2], dora[10], dora[20]]
+for n, msg in enumerate(picked):
+    alice.store.set_pin(D, msg["client_msg_id"], D,
+                        f"2026-11-20T10:00:0{n}+00:00", True)
+alice.open_conversation(D)
+settled()
+pbar = alice.conversation_screen.pin_bar
+check("a chat with pins shows the bar: the newest first, 3 of 3",
+      pbar.opacity == 1 and pbar.title.text == "Pinned · 3 of 3" and
+      pbar.line.text == M.pin_line(picked[-1]), (pbar.opacity,
+                                                pbar.title.text))
+shown = []
+real_jump = alice.conversation_screen.jump_to_cid
+alice.conversation_screen.pin_bar.on_show = shown.append
+for _ in range(3):
+    pbar.step()
+check("each tap shows its message and walks back; after the oldest, the "
+      "newest again", shown == [m["client_msg_id"] for m in
+                               reversed(picked)] and
+      pbar.title.text == "Pinned · 3 of 3", (shown, pbar.title.text))
+pbar.on_show = real_jump
+menu = [text for _i, text, *_r in alice.conversation_screen.message_actions(
+    dict(picked[0], reactions=[]))]
+check("a pinned message's menu offers Unpin; another's offers Pin",
+      "Unpin" in menu and "Pin" in [text for _i, text, *_r in
+                                    alice.conversation_screen.message_actions(
+                                        dict(dora[5], reactions=[]))])
+sheet = M.PinsSheet(alice, D)
+rows = [w for w in sheet.walk() if isinstance(w, M.ListRow)]
+check("the list: every pin, newest first", len(rows) == 3)
+sheet._unpin(picked[-1]["client_msg_id"])
+tick(0.2)
+rows = [w for w in sheet.walk() if isinstance(w, M.ListRow)]
+check("Unpin in the list: two left, the bar says so",
+      len(rows) == 2 and pbar.title.text == "Pinned · 2 of 2",
+      (len(rows), pbar.title.text))
+sheet._unpin_all()
+tick(0.3)
+check("Unpin all: the bar goes with the last pin",
+      pbar.opacity == 0 and alice.store.pins(D) == [])
+alice.go_back_to_chats()
+settled()
+
+print("\nTwo panes on a wide window (19.0)")
+
+
+def window_at(width, height):
+    """The window at this size, and the panes laid out for it. On Windows
+    Kivy takes a size the app sets over the next frames (the window, then
+    its root), so this waits for the panes rather than a fixed time."""
+    M.Window.size = (M.dp(width), M.dp(height))
+    wait_for(lambda: alice.chats_screen.docked ==
+             (width >= M.TWO_PANES_FROM), 3)
+    tick(0.1)
+
+
+while alice.manager.current != "chats":
+    alice._on_keyboard(None, 27)
+    settled()
+chats = alice.chats_screen
+if top.parent is None:                  # laid out for real, as above
+    M.Window.add_widget(top)
+check("narrow: one column as before, the list in its own screen",
+      not chats.docked and chats._root.parent is chats and
+      alice.side.width == 0)
+window_at(1180, 760)
+check("wide: the list docked at the left, the right side says Choose a chat",
+      chats.docked and chats._root.parent is alice.side and
+      alice.side.width == M.dp(M.SIDE_WIDTH) and
+      alice.manager.current == "chats" and
+      chats._choose_page.parent is chats,
+      (chats.docked, alice.side.width, tuple(M.Window.size), M.dp(1)))
+alice.open_conversation(B)
+settled()
+check("a chat opened: the list and the chat both show, its row marked",
+      alice.manager.current == "conversation" and
+      chats._root.get_root_window() is not None and
+      chats._rows[B][1]._open)
+alice.open_conversation(D)
+settled()
+check("another chat: the right side changes, the list stays, the mark moves",
+      alice.current_peer == D and chats._rows[D][1]._open and
+      not chats._rows[B][1]._open and chats._root.parent is alice.side)
+before = chats._rows[B][1]
+alice.store.add_in(B, "while two panes show", datetime.now(timezone.utc)
+                   .isoformat(), 9900, uuid.uuid4().hex)
+alice.refresh_sidebar()
+tick(0.2)
+check("a message for another chat while one is open: the list repaints at "
+      "once (not left stale)", not getattr(alice, "_list_stale", False) and
+      chats._rows[B][1] is not before)
+alice.open_settings()
+settled()
+check("Settings opens on the right, the list stays",
+      alice.manager.current == "settings" and
+      chats._root.parent is alice.side)
+alice._on_keyboard(None, 27)
+settled()
+alice.open_conversation(D)
+settled()
+alice._on_keyboard(None, 27)
+settled()
+check("Esc closes what is on the right, down to Choose a chat",
+      alice.manager.current == "chats" and alice.current_peer is None and
+      not chats._rows[D][1]._open)
+alice.open_conversation(D)
+settled()
+window_at(400, 720)
+check("narrowed with a chat open: one column, the chat still open",
+      not chats.docked and alice.manager.current == "conversation" and
+      alice.current_peer == D and chats._root.parent is chats)
+window_at(1180, 760)
+check("widened again: docked again, the chat still open beside it",
+      chats.docked and alice.manager.current == "conversation" and
+      chats._rows[D][1]._open)
+tick(1.2)                               # kept once it settles
+kept = M.load_prefs().get("window") or {}
+check("the window's size is kept for the next start",
+      kept.get("w") == int(M.Window.size[0]))
+alice.go_back_to_chats()
+window_at(400, 720)
+
 print("\nA theme changed in Settings (last: it builds every screen again)")
 alice.open_settings()
 tick(0.3)
@@ -663,6 +1162,13 @@ check("the theme's disc moves to the new choice, though Settings is built "
                           for v in seen)
       and done == {"light": 0.0, "dark": 1.0}[other] and
       alice.manager.current == "settings", (start, seen[:8], done))
+window_at(1180, 760)
+alice.set_appearance(theme=was if was in M.THEMES else "light")
+tick(0.5)
+check("a theme changed with two panes: the new list docked in the old "
+      "one's place, alone", alice.chats_screen.docked and
+      alice.chats_screen._root.parent is alice.side and
+      len(alice.side.children) == 1 and alice.manager.current == "settings")
 
 for app in (alice, bob):
     app.store.close()

@@ -22,13 +22,13 @@ same key (see [Release signing](#release-signing)).
 
 Every push to the default branch is tested and built, and each new version is
 published to a GitHub Release, whose files never change afterwards. Open the
-**Releases** page (or the **`v18.1.0`** tag) and take:
+**Releases** page (or the **`v19.0.0`** tag) and take:
 
 | Asset | For |
 | --- | --- |
-| `Ferritext-18.1.0.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r`. Calls need Android 6 or later |
-| `Ferritext-18.1.0-windows.exe` | Windows 10 and 11 (64-bit) — the same app in one file, with nothing to install. Windows may say that it does not know the publisher: choose *More info*, then *Run anyway*. |
-| `Ferritext-18.1.0-desktop.py` | Windows / macOS / Linux — one file with its fonts and icons inside. Run it with Python 3.11+ after `pip install kivy requests websocket-client cryptography qrcode pillow`. |
+| `Ferritext-19.0.0.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r`. Calls need Android 6 or later |
+| `Ferritext-19.0.0-windows.exe` | Windows 10 and 11 (64-bit) — the same app in one file, with nothing to install. Windows may say that it does not know the publisher: choose *More info*, then *Run anyway*. |
+| `Ferritext-19.0.0-desktop.py` | Windows / macOS / Linux — one file with its fonts and icons inside. Run it with Python 3.11+ after `pip install kivy requests websocket-client cryptography qrcode pillow`. |
 
 Each Actions run keeps them for a week too: the APK and the desktop file as
 the **`ferritext-release`** artifact, the executable as
@@ -57,12 +57,100 @@ QR code of the page's address, and the steps to install the app and keep
 it running.
 
 ```bash
-python3 tools/download_page.py Ferritext-18.1.0.apk site/ \
+python3 tools/download_page.py Ferritext-19.0.0.apk site/ \
     --url https://your.host/ferritext/        # then serve site/ there
 ```
 
 Relay 12.2.1 and later can serve the page too, at `/download/` on the
 relay's own address: whoever can reach the relay can reach it.
+
+## What's in 19.0.0
+
+- **Control a computer from a call, or reach your own while away.** In
+  a one-to-one call where a computer (Windows, or Linux on X11) shares
+  its screen, the other side has *Control*; once the computer's person
+  allows it, the pointer, a tap and the keys move it. A red bar on the
+  computer says who is in control, with *Stop*.
+- **Remote access** (*Settings › Remote access*, on a computer): the
+  people listed there, each until a date and verified first, can choose
+  *Connect to their computer* in your chat's menu. The computer answers
+  by itself, without sound, through the relay only, shares its whole
+  screen and lets them in; it says so on the screen and in a notice,
+  and keeps a list of sessions. A session that drops is placed again
+  by itself for ten minutes. To come back after a restart: *Start when
+  you sign in* (Windows and Linux) and *Keep this computer awake*
+  (Windows), with what the app cannot do for you said beside them.
+- **Two panes on a computer.** A window 900 dp wide or wider shows your
+  chats on the left and the chat, or any other page, on the right; the
+  window opens where and as large as you left it.
+- **Pinned messages.** *Pin* in a message's menu pins it for both of
+  you (or the whole group). A bar under the chat's name walks through
+  the pins, newest first; its list shows them all. In a group, its
+  admins pin, and every member too once *What members can do › Pin
+  messages* is on.
+- **Video calls look better.** A camera is opened at the size and rate
+  the call asks for (up to 1080 lines at 60 frames), a computer's
+  graphics chip codes the picture where it can, and each step of the
+  quality ladder has more bits (720p 2.5, 1080p 4.5, 1080p60 8 Mbit/s;
+  two thirds of that in HEVC or AV1). A shared screen is read 30 times
+  a second and coded for sharp text. The meter says what is really
+  sent.
+- 1080p60 is now sent in one-to-one calls when the other side shows
+  your picture full size (it stopped at 30 frames before).
+- For developers: `desktop/test_remote.py` (remote control, with X11's
+  injector tried for real under Xvfb and Windows' on the Devices
+  workflow); `playthrough.py --wide` walks the two panes; the walk now
+  fails on an error the app carried on from.
+- **Also in this release: 18.2.0**, which was not published on its own:
+  everything a message can do on a tap, quoting part of a message, one
+  text or code that carries both of an identity's keys to another
+  device, much faster video on phones, *Start when Windows starts*, and
+  an error in one screen that no longer closes the app (the README's
+  *What's in 18.2.0*).
+
+## What's in 18.2.0
+
+- **Tap a message** for everything you can do with it. The quick
+  reactions float over it as before, and beside it now a menu in
+  words: *Reply*, *Copy*, *Copy the link*, *Forward*, *Edit*, *Star*,
+  *Who has it*, *Select*, *Delete* (which asks: for you, or for
+  everyone), and *Reactions* where it has any.
+- **A reply's options**: tap what you are replying to, above the
+  message field, to quote only a part of it or to send the reply, with
+  its quote, in another chat.
+- **A key for another device** (*My profile › Copy the key for another
+  device*, or its code to scan): both of the identity's keys in one
+  text, so a second device reads what is sealed to the post-quantum
+  key too. *A new identity* takes it by paste or by its code. A
+  private key alone (WIF or hex) imports as before, and the app says
+  what it leaves behind.
+- **Video calls on a phone draw much faster.** A picture now goes from
+  the phone's decoder to the screen as the decoder's own rows, and the
+  graphics chip makes the colours: on the test devices 4 to 8 ms a
+  picture instead of 47 to 112. *Settings › Calls › Picture size on
+  this phone* then offers 360, 480 or 720 lines of another's camera.
+- **A call's meter says more**: the sound waiting to be played, a
+  phone's speaker in its own account, and pictures that came too late
+  to draw.
+- **Start when Windows starts** (the EXE; *Settings › Notifications*):
+  opens minimised when you sign in. Off until you turn it on; nothing
+  runs before sign-in, and no administrator is asked.
+- **An error in one screen no longer closes the app.** The app says so
+  and carries on; if it happens again at once, it goes back to the
+  chat list. The error is in the log in full.
+- **Quicker to the touch.** The menu opens in a third of the time; a
+  chat and the *New conversation* sheet open about a third sooner. A
+  change of theme no longer stalls for a moment afterwards: memory is
+  tidied when you are not touching the app and nothing is playing. A
+  message that arrives alone is shown on the next frame instead of up
+  to 150 ms later.
+- A call that could not ring, because the other person has not accepted
+  your chat request, leaves a line in your own chat saying so.
+- On Windows, *Restore from a backup* also offers Windows' own dialog.
+- The chat list's status line takes a second line instead of cutting
+  its words on a narrow phone.
+- For developers: `desktop/playthrough.py` walks through the app by
+  touch, timing and picturing each step; CI runs it. See *Testing*.
 
 ## What's in 18.1.0
 
@@ -811,6 +899,14 @@ upgraded in place delivers what was waiting for phones that were off, and
 phones reconnect by themselves. The one difference found is the lost tick
 that 15.1.1 fixes, which releases before it still show.
 
+**Remote control and pinned messages (19.0).** An app before 19.0
+ignores what it does not know: a remote session's offer rings there as
+an ordinary voice call (its caller hangs up after 30 seconds without a
+shared screen), control is not offered with it, and a pin changes
+nothing on it. 19.0 says it shows pins in the features it sends (bit
+64). Its local database is schema 14 (one new table); 18.x opens it as
+before. Nothing needs a newer relay.
+
 **Video messages (18.1).** An app before 18.1 shows one as a text
 message with its words ("Video message (0:42)"), acknowledges it as
 any message, and takes a reply to one as a reply. Its file needs
@@ -1207,8 +1303,9 @@ whenever it is loaded.
 **One identity on several devices (18.1).** Every device connected as you
 rings. The one you answer on has the call; the others stop and say
 *Answered on another device* (or *Declined call*). Messages are not shared
-between devices: each gets what arrives while it is connected, and set a
-second device up from a backup, not from the private key alone (see
+between devices: each gets what arrives while it is connected. Set a
+second device up from a backup or with the key for another device
+(18.2, *My profile*), not from the private key alone (see
 *Post-quantum encryption*).
 
 Calls need **relay v10**, which advertises them in `/api/health` and opens a
@@ -1229,7 +1326,7 @@ for (no piece is sent again: a key frame costs less than the wait).
 
 A 1-to-1 call's picture goes the way its sound does (straight, else the
 relay, else the WebSocket), at the rung of the ladder (360p24 at 0.5 Mbit/s
-to 1080p60 at 5) that Settings allows, the way can take, and the other side
+to 1080p60 at 8; 19.0) that Settings allows, the way can take, and the other side
 shows it at; it steps down while pictures are lost and back up after six
 clean seconds, and the sound steps down with it (each rung's pair). A
 group's call sends each camera in three sizes (a quarter, half and the
@@ -1239,6 +1336,33 @@ sender codes only the sizes someone shows. On a computer the camera is read
 by FFmpeg (`v4l2`, `dshow`, `avfoundation`) and the screen too (`x11grab`,
 `gdigrab`, `avfoundation`); on a phone Camera2 draws, upright, into each size's coder.
 
+
+### Remote control (19.0)
+
+In a one-to-one call, a computer that shares its screen and can be
+controlled (Windows through `SendInput`; Linux on X11 through XTEST, with
+libXtst; not Wayland, not macOS yet) says so with its media state. The
+other side's *Control* asks; the computer's person answers *Allow* or
+*Not now*. While allowed, the pointer, the buttons, the wheel and the
+keys go as small sealed packets: each event is numbered, and each packet
+carries the newest pointer position and the last twelve other events
+with the buttons and keys held, so a lost packet is made good by the
+next and nothing stays held when control ends. Typed text is sent as
+text, so the two keyboards' layouts need not match. *Stop* on the
+computer, *Release* on the other side, the screen no longer shared or
+the call's end each end control.
+
+A **remote session** is a call marked as one: no sound on either side
+(no microphone or speaker is needed), and only through the relay, as
+with *Hide my location in calls*. Only a computer whose *Settings ›
+Remote access* lists the caller answers it, by itself; any other device
+of yours sets the offer aside without a word. A computer with several
+identities answers for the one that was called, by that identity's own
+list, and is switched to it. Every entry has an end date, and only
+verified contacts can be added. Windows lets no program control its
+sign-in or lock screen, or a program run as administrator. Whoever
+holds a listed person's keys can reach the computer: list only people
+you trust.
 
 ## Sending, and the outbox
 
@@ -1346,7 +1470,9 @@ two secrets together, so reading it takes breaking both.
 - **A new install from the private key alone** (WIF) has a new ML-KEM key.
   A message sealed to the old one is asked for again, with the new key;
   the sender's app sends that message again once, if it is under a week
-  old. A backup carries the key, so an identity restored from one keeps it.
+  old. A backup carries the key, so an identity restored from one keeps it,
+  and so does the key for another device (18.2: *My profile › Copy the
+  key for another device*, which holds both keys).
 - **Not changed:** signatures are still ECDSA, since forging one takes a
   quantum computer at the time, not later. The relay connection is TLS as
   before, so what the relay sees (who writes to whom, and when) is not
@@ -1525,9 +1651,19 @@ git worktree remove ../before
   message, each the median of five runs. Compare the two files. A
   difference under a tenth is noise, and timings differ between machines,
   so compare only runs from the same one.
+- **`playthrough.py`** (18.2) walks through the app as a person does, by
+  the touches a finger makes: opens a chat, types, sends, taps a message,
+  reacts, replies, flicks through history, opens the menu and Settings,
+  changes the theme. `xvfb-run -a python3 desktop/playthrough.py main.py
+  walk/` saves a picture after each step and a table of how long each
+  took to answer, the longest frame while the page moved, and how much of
+  it was Python's garbage collector. It is how the app's "feel" is
+  compared between versions, and a test of whole flows (CI runs it): a
+  step that is never answered fails it. `--profile STEP` prints where
+  that step's time went.
 - In the change's description, say which screens changed and which
   numbers moved. The pictures and numbers that go to review come from
-  these two tools, so anyone can make them again.
+  these tools, so anyone can make them again.
 
 ## Building it yourself
 

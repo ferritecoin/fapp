@@ -97,7 +97,18 @@ SCREENS = ("chats", "chats_pressed", "menu", "chat", "call_refused", "chat_info"
            # 18.1: lists fade at their edges where there is more (the
            # owner's note on BUILT23): the chat list and a chat in their
            # middles, and the switch in Settings
-           "chats_middle", "chat_middle", "settings_fade")
+           "chats_middle", "chat_middle", "settings_fade",
+           # 18.2: a message tapped (its reactions over it, what can be
+           # done with it by it): one of theirs in a group, one of yours
+           "message_menu", "message_menu_mine", "reply_options",
+           "quote_part", "profile_keys",
+           # 19.0 (REMOTE): the chat's menu with Connect to their computer,
+           # Remote access in Settings, a computer asked to be controlled,
+           # and a controlled call from each side
+           "chat_menu_remote", "remote_access", "control_ask",
+           "remote_controller", "remote_computer",
+           # 19.0 (PINS26): a chat's pinned messages: the bar, the list
+           "pin_bar", "pins_sheet")
 
 parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
 parser.add_argument("client", help="the main.py to capture")
@@ -560,10 +571,11 @@ def scroll_sheet_to_end():
                     w.scroll_y = 0
 
 
-def scroll_settings_to(title):
-    """Scroll Settings until the row titled `title` is in view."""
+def scroll_settings_to(title, page="settings"):
+    """Scroll Settings (or another `page`) until the row titled `title`
+    is in view."""
     title = getattr(M, "tr", str)(title)      # in the app's language (15.1)
-    page = app.manager.get_screen("settings")
+    page = app.manager.get_screen(page)
     for w in walk(page):
         if isinstance(w, Label) and title.lower() in (w.text or "").lower():
             view = next((a for a in ancestors(w)
@@ -908,6 +920,49 @@ def chat_editing():
     app.conversation_screen.start_edit(app.store.message(second))
 
 
+# ---- 18.2 ---------------------------------------------------------------------
+def message_menu(direction):
+    """A tap on the open chat's newest message of plain words that came
+    `in` or went `out`: the quick reactions over it and, from 18.2, its
+    menu."""
+    screen = app.conversation_screen
+    screen.close_strip()
+    for msg_id in sorted(screen._bubbles, reverse=True):
+        msg = screen._bubbles[msg_id].msg
+        if msg["direction"] == direction and msg.get("body") and \
+                (msg.get("kind") or "text") == "text" and \
+                not M.message_ext(msg).get("call"):
+            screen.on_bubble_tap(msg_id)
+            return
+
+
+def reply_options(quote=False):
+    """18.2: a reply begun to the open chat's newest words that came in,
+    and a tap on the reply bar: its options; with `quote`, the sheet
+    that marks a part of it, its first words marked."""
+    screen = app.conversation_screen
+    if not hasattr(screen, "reply_options"):
+        return
+    close_sheets()
+    for msg_id in sorted(screen._bubbles, reverse=True):
+        msg = screen._bubbles[msg_id].msg
+        if msg["direction"] == "in" and len((msg.get("body") or "").split()) > 3 \
+                and (msg.get("kind") or "text") == "text" and \
+                not M.message_ext(msg).get("call"):
+            screen.set_reply(msg)
+            break
+    else:
+        return
+    if not quote:
+        screen.reply_options()
+        return
+    sheet = M.QuoteSheet(screen._reply_full, screen._quote_part)
+    sheet.open()
+    words = screen._reply_full.split()
+    Clock.schedule_once(lambda _dt: sheet.field.select_text(
+        0, len(" ".join(words[:4]))), 0.3)
+
+
 # ---- 17.0 ---------------------------------------------------------------------
 def video_call(mine=False):
     """A 1-to-1 video call, 4 minutes in: alex's camera over the screen;
@@ -938,10 +993,72 @@ def video_call(mine=False):
     app.call_view = lambda tiles: None        # the stand-ins stay
 
 
+def pins_chat():
+    """19.0: alex's chat with three messages pinned, the bar under its
+    head."""
+    if hasattr(app.store, "set_pin"):
+        held = [m for m in app.store.messages_for(alex)
+                if m.get("kind") != "event" and m.get("client_msg_id")]
+        for n, msg in enumerate(held[-3:]):
+            app.store.set_pin(alex, msg["client_msg_id"], alex,
+                              f"2026-11-20T10:00:0{n}+00:00", True)
+    app.open_conversation(alex)
+
+
+def remote_access():
+    """19.0: Remote access with one person listed and a session kept."""
+    if not hasattr(M, "RemoteAccessSheet"):
+        return
+    M.remote_control_possible = lambda: True
+    M.remote_access_grant(me, alex, 30)
+    M.remote_session_kept(alex, "away", time.time() - 3600 * 5,
+                          time.time() - 3600 * 5 + 1500)
+    M.RemoteAccessSheet(app).open()
+
+
+def remote_call(computer: bool, ask: bool = False):
+    """19.0: a remote session 12 minutes in. `computer`: this side is the
+    one controlled (its own screen shared, the red bar; `ask`: alex asks
+    in an ordinary call instead); otherwise this side controls alex's
+    shared screen."""
+    if not hasattr(M, "RemoteControlMixin"):
+        return
+    M.remote_control_possible = lambda: True
+    close_sheets()
+    frames = app.__dict__.setdefault("_call_frames", {})
+    frames[(alex, "s")] = screen_frame()
+    s = M.CallSession(alex, me, group=False, video=False,
+                      host=alex if computer else me,
+                      started_at=time.time() - 731)
+    s.preview()
+    s.confirm_join()
+    call = M.Call(alex, outgoing=not computer, call_id=s.id)
+    call.session, call.state = s, "active"
+    call.connected_at = time.monotonic() - 731
+    call.path = "relay"
+    call.remote = not ask
+    app.call = call
+    call_people(s, [(alex, {"micEnabled": False, "cameraEnabled": False,
+                            "screenShareEnabled": not computer})])
+    if computer:
+        s.me.screen = True
+        call.their_asks = True
+        call.lets = not ask
+    else:
+        s.members[alex].screen = True
+        call.can_control = call.asks = True
+        app.controlling = lambda _call=None: True
+    app.show_call()
+    app.call_view = lambda tiles: None        # the stand-ins stay
+    if ask:
+        M.ControlAskSheet(app, call).open()
+
+
 def video_call_end():
     if app.call is not None:
         app._close_call_screen(app.call)
     app.__dict__.pop("call_view", None)
+    app.__dict__.pop("controlling", None)
 
 
 def call_recording():
@@ -1084,6 +1201,10 @@ def video_call_present():
 class StandInEngine:
     """A call's numbers, as its engine tells the meter (17.2): a good way."""
     way, rtt_ms, quiet = "fine", 38.0, False
+    controlling = False                          # 19.0: remote control
+
+    def set_control(self, *_a):
+        pass
 
     def meter(self):
         return {"way": self.way, "rtt": self.rtt_ms, "packet_ms": 5,
@@ -1982,6 +2103,38 @@ STEPS = [
     (lambda: scroll_settings_to("Fade the edges of lists"), 0.5,
      "settings_fade"),
     (app.close_settings, 0.4, None),
+    # 18.2
+    (lambda: app.open_conversation(group), 1.0, None),
+    (lambda: message_menu("in"), 0.6, "message_menu"),
+    (lambda: message_menu("out"), 0.6, "message_menu_mine"),
+    (lambda: if_present(app.conversation_screen, "close_strip"), 0.2, None),
+    (reply_options, 0.8, "reply_options"),
+    (lambda: reply_options(quote=True), 1.0, "quote_part"),
+    (close_sheets, 0.3, None),
+    (lambda: if_present(app.conversation_screen, "cancel_reply"), 0.2, None),
+    (app.go_back_to_chats, 0.4, None),
+    (lambda: if_present(app, "open_profile"), 1.0, None),
+    (lambda: scroll_settings_to("Copy the key for another device",
+                                app.manager.current), 0.5, "profile_keys"),
+    (app.go_back_to_chats, 0.4, None),
+    (lambda: app.open_conversation(alex), 1.0, None),
+    (lambda: app.conversation_screen.open_menu(), 0.8, "chat_menu_remote"),
+    (close_sheets, 0.3, None),
+    (app.go_back_to_chats, 0.4, None),
+    (remote_access, 0.8, "remote_access"),
+    (close_sheets, 0.3, None),
+    (lambda: remote_call(computer=True, ask=True), 1.0, "control_ask"),
+    (close_sheets, 0.3, None),
+    (video_call_end, 0.4, None),
+    (lambda: remote_call(computer=False), 1.0, "remote_controller"),
+    (video_call_end, 0.4, None),
+    (lambda: remote_call(computer=True), 1.0, "remote_computer"),
+    (video_call_end, 0.4, None),
+    (pins_chat, 1.0, "pin_bar"),
+    (lambda: M.PinsSheet(app, alex).open()
+     if hasattr(M, "PinsSheet") else None, 0.8, "pins_sheet"),
+    (close_sheets, 0.3, None),
+    (app.go_back_to_chats, 0.4, None),
 ]
 assert [s for *_, s in STEPS if s] == list(SCREENS)
 

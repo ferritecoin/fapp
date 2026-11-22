@@ -1098,6 +1098,30 @@ check("...a wrong passphrase is said, and the app carries on as it was",
 check("...its own worker beating again, the stand-in stopped",
       alice._pause_beat is None and alice.worker is not None)
 restore.dismiss(animation=False)
+# 18.2: on Windows, its own Open dialog beside the list (a stand-in here).
+asked = []
+M.IS_WINDOWS, M.windows_open_dialog, real_dialog = True, \
+    lambda *a, **k: asked.append(a) or target, M.windows_open_dialog
+restore = M.RestoreSheet(alice)
+restore.open(animation=False)
+tick(0.3)
+row = next(w for w in restore.walk() if isinstance(w, M.ListRow)
+           and "Windows" in w.title.text)
+row.dispatch("on_release")
+check("on Windows, a backup can be chosen in Windows' own dialog, which "
+      "lists backups; the list stays beside it",
+      wait_for(lambda: restore.path == target, 5) and
+      asked[0][1] == ["*" + M.BACKUP_SUFFIX] and
+      restore.chooser is not None and
+      restore.status.text == "Chosen: " + os.path.basename(target) and
+      restore.made.text.startswith("Made "), (asked, restore.status.text))
+M.windows_open_dialog = lambda *a, **k: 1 / 0
+row.dispatch("on_release")
+check("...and where it will not open, that is said and the list is there",
+      wait_for(lambda: "would not open" in restore.status.text, 5),
+      restore.status.text)
+M.IS_WINDOWS, M.windows_open_dialog = False, real_dialog
+restore.dismiss(animation=False)
 alice.close_settings()
 tick(0.3)
 
@@ -1451,6 +1475,120 @@ finally:
     M.SERVER_URL_OVERRIDE = override
     os.environ.pop("REQUESTS_CA_BUNDLE", None)
     plain.shutdown()
+
+print("\nA key for another device (18.2, MULTIDEV)")
+M.App._running_app = alice
+alice.open_profile()
+tick(0.4)
+page = alice.profile_screen
+rows = {w.title.text: w for w in page.walk() if isinstance(w, M.ListRow)}
+copied = []
+real_copy = M.Clipboard.copy
+M.Clipboard.copy = copied.append
+rows["Copy the key for another device"].dispatch("on_release")
+M.Clipboard.copy = real_copy
+check("My profile copies the key for another device, beside the WIF",
+      "Copy WIF" in rows and copied == [alice.keys.device_key()], copied)
+check("...and says, without being asked, what each is for",
+      any("WIF is the private key alone" in w.text for w in page.walk()
+          if isinstance(w, M.InfoLabel)))
+check("...its code is not shown while the key is hidden",
+      page.device_code.height == 0 and not page.device_code.children)
+page._toggle_private()
+tick(0.2)
+check("...and is while it is revealed, with the key's own text",
+      page.device_code.height > M.dp(200) and
+      alice.keys.device_key() in page.private_label.text)
+page._toggle_private()
+check("...and goes when it is hidden again",
+      page.device_code.height == 0 and not page.device_code.children)
+alice.close_profile()
+tick(0.3)
+dialog = M.NewIdentityModal(bob)
+dialog.open(animation=False)
+tick(0.3)
+check("the import dialog says what a private key alone brings",
+      any("new post-quantum key" in w.text for w in dialog.walk()
+          if isinstance(w, M.InfoLabel)))
+made = []
+bob.on_identity_created = made.append
+dialog.key_entry.text = alice.keys.device_key()[:-2] + "zz"
+dialog._import_key()
+check("a mistyped key for another device is refused, and said",
+      not made and "Cannot read that key" in dialog.status.text,
+      dialog.status.text)
+priv, _p, elsewhere, _n = M.mine_identity()   # an identity of another device
+seed = os.urandom(64)
+dialog.key_entry.text = M.device_key_text(priv, seed)
+dialog._import_key()
+tick(0.3)
+second = bob.keys.find(elsewhere) or {}
+check("the key for another device imports with its post-quantum key",
+      made == [elsewhere] and second.get("pq_seed_hex") == seed.hex(),
+      (made, dialog.status.text))
+
+print("\nStart when Windows starts (18.2): the EXE, its own Run key")
+
+
+class Registry:
+    """Stands in for winreg: one key, its values."""
+    HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ = "HKCU", 2, 1
+
+    def __init__(self):
+        self.values, self.opened, self.refuse = {}, [], False
+
+    def OpenKey(self, root, path, _reserved=0, access=0):
+        if self.refuse:
+            raise PermissionError("no")
+        self.opened.append((root, path, access))
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+    def QueryValueEx(self, _key, name):
+        if name not in self.values:
+            raise FileNotFoundError(name)
+        return self.values[name], self.REG_SZ
+
+    def SetValueEx(self, _key, name, _r, _kind, value):
+        self.values[name] = value
+
+    def DeleteValue(self, _key, name):
+        del self.values[name]              # KeyError is not Windows' error
+
+
+reg = Registry()
+check("a main.py run by Python is not a program Windows can start: the "
+      "setting is not offered, and nothing is written",
+      M.built_exe() is None and not M.start_with_windows(reg) and
+      not M.set_start_with_windows(True, reg) and not reg.opened)
+real_exe, M.built_exe = M.built_exe, lambda: r"C:\Apps\Ferritext.exe"
+check("the EXE: off until turned on", not M.start_with_windows(reg))
+check("...on: the person's own Run key names the EXE, told to open "
+      "minimised", M.set_start_with_windows(True, reg) and
+      reg.values == {M.APP_NAME: '"C:\\Apps\\Ferritext.exe" --startup'}
+      and reg.opened[-1][:2] == ("HKCU", M.STARTUP_RUN_KEY) and
+      M.start_with_windows(reg), reg.values)
+M.built_exe = lambda: r"D:\Moved\Ferritext.exe"
+check("...an EXE since moved is not the one named: off, until turned on "
+      "again", not M.start_with_windows(reg) and
+      M.set_start_with_windows(True, reg) and M.start_with_windows(reg))
+reg.DeleteValue = lambda _k, name: (_ for _ in ()).throw(
+    FileNotFoundError(name)) if name not in reg.values else \
+    reg.values.pop(name)
+check("...off: its name is gone, and off twice is no fault",
+      M.set_start_with_windows(False, reg) and not reg.values and
+      M.set_start_with_windows(False, reg) and
+      not M.start_with_windows(reg))
+reg.refuse = True
+check("...and where Windows refuses, that is the answer",
+      not M.set_start_with_windows(True, reg) and
+      not M.start_with_windows(reg))
+M.built_exe = real_exe
 
 passed = sum(1 for _n, ok in RESULTS if ok)
 print(f"\n  {passed}/{len(RESULTS)} passed")

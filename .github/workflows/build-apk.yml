@@ -147,12 +147,15 @@ jobs:
           xvfb-run -a python desktop/test_navigation.py main.py
           xvfb-run -a python desktop/test_pictures.py main.py
           xvfb-run -a python desktop/test_calls.py main.py
+          xvfb-run -a python desktop/test_remote.py main.py
           xvfb-run -a python desktop/test_conference.py main.py
           xvfb-run -a python desktop/test_notify.py main.py
           xvfb-run -a python desktop/test_gestures.py main.py
           xvfb-run -a python desktop/test_touch.py main.py
           xvfb-run -a python desktop/test_privacy.py main.py
           xvfb-run -a python desktop/test_screen.py main.py
+          # 18.2: a walk through the app by touch, each step answered.
+          xvfb-run -a python desktop/playthrough.py main.py
           # Video messages (18.1): the file and the recorder as a phone's
           # Python 3.11 runs them; then with PyAV, recorded and played.
           xvfb-run -a python desktop/test_videomsg.py main.py

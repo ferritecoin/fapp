@@ -2,6 +2,7 @@ package org.fext.call;
 
 import android.app.Activity;
 import android.content.Context;
+import android.graphics.Rect;
 import android.graphics.SurfaceTexture;
 import android.hardware.camera2.CameraCaptureSession;
 import android.hardware.camera2.CameraCharacteristics;
@@ -106,6 +107,9 @@ public class VideoCall {
     private String plan = "";         // what setPlan asked for last
     private String planCodec = "";
     private Size captureSize = new Size(1280, 720);
+    /** 19.0 (VIDEO26, V1): the camera is opened at the call's top size and
+     * rate (Settings' video quality), not always near 1280 x 720 at 30. */
+    private int wantShort = 720, wantFps = 30;
     private CameraDevice camera;
     private CameraCaptureSession session;
     private SurfaceTexture texture;
@@ -205,6 +209,14 @@ public class VideoCall {
 
     // ---- the camera ---------------------------------------------------------------
     public VideoCall(Activity activity) {
+        this(activity, 720, 30);
+    }
+
+    /** 19.0: the camera opened for a picture `shortSide` lines on its
+     * shorter side at `fps` frames a second, as near as it gives. */
+    public VideoCall(Activity activity, int shortSide, int fps) {
+        wantShort = Math.max(240, Math.min(1080, shortSide));
+        wantFps = Math.max(15, Math.min(60, fps));
         context = activity.getApplicationContext();
         int turned = 0;
         try {
@@ -377,9 +389,10 @@ public class VideoCall {
         StreamConfigurationMap map = traits.get(
                 CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
         captureSize = pickSize(map == null ? null
-                : map.getOutputSizes(SurfaceTexture.class));
+                : map.getOutputSizes(SurfaceTexture.class), wantShort);
         Range<Integer> fps = pickFps(traits.get(
-                CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES));
+                CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES),
+                wantFps);
         texture.setDefaultBufferSize(captureSize.getWidth(),
                 captureSize.getHeight());
         final Range<Integer> rate = fps;
@@ -440,10 +453,12 @@ public class VideoCall {
         }
     }
 
-    /** A 16:9 size near 1280 × 720 (4:3 when none), as the sensor gives
-     * it (wider than tall). */
-    private static Size pickSize(Size[] sizes) {
-        Size best = new Size(1280, 720);
+    /** A 16:9 size near `shortSide` lines (720: 1280 x 720; 1080: 1920 x
+     * 1080), 4:3 when none, never wider than 1920, as the sensor gives it
+     * (wider than tall). */
+    static Size pickSize(Size[] sizes, int shortSide) {
+        int tw = shortSide * 16 / 9, th = shortSide;
+        Size best = new Size(tw, th);
         if (sizes == null) {
             return best;
         }
@@ -451,7 +466,7 @@ public class VideoCall {
         for (Size size : sizes) {
             int w = size.getWidth(), h = size.getHeight();
             boolean wide = w * 9 == h * 16;
-            int score = Math.abs(w - 1280) + Math.abs(h - 720)
+            int score = Math.abs(w - tw) + Math.abs(h - th)
                     + (wide ? 0 : 400) + (w > 1920 ? 4000 : 0);
             if (score < bestScore) {
                 bestScore = score;
@@ -461,11 +476,25 @@ public class VideoCall {
         return best;
     }
 
-    /** The steadiest rate up to 30 frames a second. */
-    private static Range<Integer> pickFps(Range<Integer>[] ranges) {
-        Range<Integer> best = null;
+    /** The steadiest rate that reaches `fps` frames a second (19.0: 60
+     * for 1080p60), else the steadiest up to 30. */
+    static Range<Integer> pickFps(Range<Integer>[] ranges, int fps) {
         if (ranges == null) {
             return null;
+        }
+        Range<Integer> best = null;
+        if (fps > 30) {
+            for (Range<Integer> range : ranges) {
+                if (range.getUpper() != fps) {
+                    continue;
+                }
+                if (best == null || range.getLower() > best.getLower()) {
+                    best = range;
+                }
+            }
+            if (best != null) {
+                return best;
+            }
         }
         for (Range<Integer> range : ranges) {
             if (range.getUpper() > 30) {
@@ -620,8 +649,19 @@ public class VideoCall {
                 format.setInteger(MediaFormat.KEY_PRIORITY, 0);  // real time
             }
             layer.encoder = MediaCodec.createEncoderByType(mime);
-            layer.encoder.configure(format, null, null,
-                    MediaCodec.CONFIGURE_FLAG_ENCODE);
+            MediaFormat better = betterFormat(format, layer.encoder, mime,
+                    layer.width, layer.height, fps);
+            try {
+                layer.encoder.configure(better, null, null,
+                        MediaCodec.CONFIGURE_FLAG_ENCODE);
+            } catch (Exception refused) {
+                // 19.0: a coder that will not take the high profile or a
+                // constant rate is set up as 18.2 did, with its defaults.
+                layer.encoder.release();
+                layer.encoder = MediaCodec.createEncoderByType(mime);
+                layer.encoder.configure(format, null, null,
+                        MediaCodec.CONFIGURE_FLAG_ENCODE);
+            }
             Surface input = layer.encoder.createInputSurface();
             layer.encoder.start();
             layer.surface = EGL14.eglCreateWindowSurface(display, eglConfig,
@@ -633,6 +673,69 @@ public class VideoCall {
             release(layer);
             return null;
         }
+    }
+
+    /** 19.0 (VIDEO26, V2): `format` with H.264's high profile (CABAC, the
+     * 8x8 transform: the same picture in fewer bits) where this coder
+     * lists it, at the level the size and rate need, and a constant
+     * bitrate where the coder offers one (a call's packets keep an even
+     * pace). Left as it was where the coder lists neither. */
+    static MediaFormat betterFormat(MediaFormat format, MediaCodec coder,
+                                    String mime, int width, int height,
+                                    int fps) {
+        MediaFormat out = MediaFormat.createVideoFormat(mime, width, height);
+        for (String key : new String[]{MediaFormat.KEY_COLOR_FORMAT,
+                MediaFormat.KEY_BIT_RATE, MediaFormat.KEY_FRAME_RATE,
+                MediaFormat.KEY_I_FRAME_INTERVAL}) {
+            out.setInteger(key, format.getInteger(key));
+        }
+        if (Build.VERSION.SDK_INT >= 23) {
+            out.setInteger(MediaFormat.KEY_PRIORITY, 0);
+        }
+        try {
+            MediaCodecInfo.CodecCapabilities caps =
+                    coder.getCodecInfo().getCapabilitiesForType(mime);
+            if (Build.VERSION.SDK_INT >= 23 && "video/avc".equals(mime)) {
+                for (MediaCodecInfo.CodecProfileLevel pl : caps.profileLevels) {
+                    if (pl.profile == MediaCodecInfo.CodecProfileLevel
+                            .AVCProfileHigh) {
+                        out.setInteger(MediaFormat.KEY_PROFILE, pl.profile);
+                        out.setInteger(MediaFormat.KEY_LEVEL,
+                                avcLevel(width, height, fps));
+                        break;
+                    }
+                }
+            }
+            MediaCodecInfo.EncoderCapabilities enc =
+                    caps.getEncoderCapabilities();
+            if (enc != null && enc.isBitrateModeSupported(
+                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)) {
+                out.setInteger(MediaFormat.KEY_BITRATE_MODE,
+                        MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR);
+            }
+        } catch (Exception unknown) {
+            return format;
+        }
+        return out;
+    }
+
+    /** The H.264 level a picture of this size and rate needs (macroblocks
+     * a second, as the standard's table has them). */
+    static int avcLevel(int width, int height, int fps) {
+        long rate = (long) ((width + 15) / 16) * ((height + 15) / 16) * fps;
+        if (rate <= 108000) {
+            return MediaCodecInfo.CodecProfileLevel.AVCLevel31;
+        }
+        if (rate <= 216000) {
+            return MediaCodecInfo.CodecProfileLevel.AVCLevel32;
+        }
+        if (rate <= 245760) {
+            return MediaCodecInfo.CodecProfileLevel.AVCLevel4;
+        }
+        if (rate <= 522240) {
+            return MediaCodecInfo.CodecProfileLevel.AVCLevel42;
+        }
+        return MediaCodecInfo.CodecProfileLevel.AVCLevel51;
     }
 
     private void release(Layer layer) {
@@ -1054,18 +1157,8 @@ public class VideoCall {
         public String decode(String b64, int w, int h, boolean fill) {
             try {
                 byte[] data = Base64.decode(b64, Base64.NO_WRAP);
-                if (data.length > 0) {
-                    int in = codec.dequeueInputBuffer(
-                            at == 0 ? 100000 : 2000);
-                    if (in < 0) {
-                        refused = "no room in the decoder";
-                        return "!";
-                    }
-                    ByteBuffer buffer = codec.getInputBuffer(in);
-                    buffer.clear();
-                    buffer.put(data);
-                    codec.queueInputBuffer(in, 0, data.length, at, 0);
-                    at += 33333;
+                if (data.length > 0 && !feed(data)) {
+                    return "!";
                 }
                 String out = "";
                 MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
@@ -1093,6 +1186,64 @@ public class VideoCall {
             }
         }
 
+        /** A coded picture handed to the decoder; false (and why, in
+         * refused) when it has no room for it. */
+        private boolean feed(byte[] data) {
+            int in = codec.dequeueInputBuffer(at == 0 ? 100000 : 2000);
+            if (in < 0) {
+                refused = "no room in the decoder";
+                return false;
+            }
+            ByteBuffer buffer = codec.getInputBuffer(in);
+            buffer.clear();
+            buffer.put(data);
+            codec.queueInputBuffer(in, 0, data.length, at, 0);
+            at += 33333;
+            return true;
+        }
+
+        /** 18.2: decode's work without its sums and without text. The
+         * newest picture decoded comes back as the decoder made it, its
+         * rows of Y, U and V copied and nothing worked out for any
+         * pixel (i420, below); the screen's graphics chip makes the
+         * colours and the size (main.py, YuvPicture). Bytes go in and
+         * come out: before, each picture was made RGBA pixel by pixel
+         * here, written out as base64 text, and read back in Python.
+         * draw false: decoded, not copied. most: the shorter side
+         * wanted; a picture more than half as large again is thinned by
+         * whole steps. No bytes: none yet (or not drawn); one byte: as
+         * decode's "!" (refused says why). */
+        public byte[] planes(byte[] data, boolean draw, int most) {
+            try {
+                if (data.length > 0 && !feed(data)) {
+                    return new byte[1];
+                }
+                byte[] out = new byte[0];
+                MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+                while (true) {
+                    int index = codec.dequeueOutputBuffer(info, 0);
+                    if (index == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                        return out;
+                    }
+                    if (index < 0) {
+                        continue;
+                    }
+                    if (draw) {
+                        Image image = codec.getOutputImage(index);
+                        if (image != null) {
+                            out = i420(image, most);
+                            image.close();
+                        }
+                    }
+                    codec.releaseOutputBuffer(index, false);
+                    pictures++;
+                }
+            } catch (Exception error) {
+                refused = error.toString();
+                return new byte[1];
+            }
+        }
+
         /** Why decode last gave "!", for the log and the self-test. */
         public String refused() {
             return refused;
@@ -1111,6 +1262,60 @@ public class VideoCall {
                 // released below either way
             }
             codec.release();
+        }
+    }
+
+    /** 18.2: a decoded picture's rows as they are, for a texture half as
+     * tall again as the picture: its width and height (two bytes each,
+     * the larger first), every row of Y, then for each two rows one row
+     * of U beside one of V. Only the part of the image that is picture
+     * (its crop: a decoder's buffer is often a few rows larger). A
+     * picture whose shorter side is more than half as large again as
+     * `most` gives every 2nd, 4th or 8th sample of every such row. */
+    static byte[] i420(Image image, int most) {
+        Rect crop = image.getCropRect();
+        int sw = crop.width() & ~1, sh = crop.height() & ~1;
+        int step = 1;
+        while (step < 8 && Math.min(sw, sh) / step > most * 3 / 2) {
+            step *= 2;
+        }
+        int w = (sw / step) & ~1, h = (sh / step) & ~1;
+        byte[] out = new byte[4 + w * h * 3 / 2];
+        out[0] = (byte) (w >> 8);
+        out[1] = (byte) w;
+        out[2] = (byte) (h >> 8);
+        out[3] = (byte) h;
+        Image.Plane[] planes = image.getPlanes();
+        rows(planes[0], crop.left, crop.top, out, 4, w, h, step, w);
+        int under = 4 + w * h;
+        rows(planes[1], crop.left / 2, crop.top / 2, out, under,
+                w / 2, h / 2, step, w);
+        rows(planes[2], crop.left / 2, crop.top / 2, out, under + w / 2,
+                w / 2, h / 2, step, w);
+        return out;
+    }
+
+    /** `count` samples from each of `lines` rows of a plane, from its
+     * sample (left, top) on, every step-th of both, into out: the first
+     * row at `at`, each next `stride` bytes on. A plane whose samples
+     * lie side by side is copied a row at a time. */
+    private static void rows(Image.Plane plane, int left, int top,
+                             byte[] out, int at, int count, int lines,
+                             int step, int stride) {
+        ByteBuffer from = plane.getBuffer();
+        int rowStride = plane.getRowStride();
+        int pixel = plane.getPixelStride();
+        for (int r = 0; r < lines; r++) {
+            int start = (top + r * step) * rowStride + left * pixel;
+            int to = at + r * stride;
+            if (pixel == 1 && step == 1) {
+                from.position(start);
+                from.get(out, to, count);
+            } else {
+                for (int c = 0; c < count; c++) {
+                    out[to + c] = from.get(start + c * step * pixel);
+                }
+            }
         }
     }
 

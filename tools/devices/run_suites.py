@@ -7,7 +7,8 @@ runs once more, and its line says so ("ok on a second run"): the call
 suites' real-time checks can miss on a busy runner, and a fault of the
 system fails both runs. Under a failed suite's line come its failed checks,
 or the end of its log if it stopped before them, so that the job's own log
-says what failed when its logs cannot be kept.
+says what failed when its logs cannot be kept; then the lines before
+its first few failures.
 
     python tools/devices/run_suites.py main.py OUT_DIR [suite ...]
 """
@@ -21,12 +22,17 @@ from pathlib import Path
 
 SUITES = ("test_service", "test_core", "test_flows", "test_design",
           "test_composer", "test_bundle", "smoke_desktop", "smoke_chat",
-          "test_navigation", "test_pictures", "test_calls", "test_conference",
-          "test_notify", "test_gestures", "test_touch", "test_privacy",
-          "test_screen", "test_backup", "test_video", "test_videomsg")
+          "test_navigation", "test_pictures", "test_calls", "test_remote",
+          "test_conference", "test_notify", "test_gestures", "test_touch",
+          "test_privacy", "test_screen", "test_backup", "test_video",
+          "test_videomsg", "playthrough")
 #: Suites that open no window (as build-apk.yml runs them).
 NO_WINDOW = {"test_service", "test_backup"}
 PASSED = re.compile(r"(\d+)/(\d+) passed")
+#: Under a failed suite's line, the log lines before its first few failed
+#: checks too: the job's log is all a run leaves where its files cannot be
+#: fetched.
+CONTEXT, CONTEXT_FAILS = 8, 3
 
 
 def run(suite: str, main_py: str, out: Path, attempt: int = 1) -> tuple:
@@ -54,6 +60,11 @@ def run(suite: str, main_py: str, out: Path, attempt: int = 1) -> tuple:
     what = [line.strip() for line in lines if "[FAIL]" in line]
     if not found or not what:      # it stopped early: how, from its end
         what += lines[-15:]
+    else:                          # what led to the first failures
+        fails = [n for n, line in enumerate(lines) if "[FAIL]" in line]
+        for n in fails[:CONTEXT_FAILS]:
+            what += ["  before: " + line.strip()[:240]
+                     for line in lines[max(0, n - CONTEXT):n]]
     return passed, checks, round(time.monotonic() - start), status, what
 
 

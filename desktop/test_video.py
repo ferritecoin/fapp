@@ -32,6 +32,7 @@ M = importlib.util.module_from_spec(_spec)
 sys.modules["fext_video"] = M
 _spec.loader.exec_module(M)
 from kivy.base import EventLoop                                # noqa: E402
+M_SOURCE = open(_spec.origin, encoding="utf-8").read()
 
 RESULTS = []
 
@@ -60,21 +61,79 @@ def pump(seconds=0.05):
 
 print("\nThe ladder and a room's sizes")
 ladder = [(r.name, r.short, r.fps, r.kbps, r.sound) for r in M.VIDEO_LADDER]
-check("the ladder as decided: 360p24 at 0.5 Mbit/s to 1080p60 at 5, "
-      "each with its sound",
+check("the ladder as decided (19.0, V3): 360p24 at 0.5 Mbit/s, 720p30 "
+      "at 2.5, 1080p30 at 4.5, 1080p60 at 8, each with its sound",
       ladder == [("360p", 360, 24, 500, "standard"),
                  ("480p", 480, 24, 1000, "standard"),
-                 ("720p", 720, 30, 2000, "high"),
-                 ("1080p", 1080, 30, 3000, "high"),
-                 ("1080p60", 1080, 60, 5000, "ultra")], ladder)
+                 ("720p", 720, 30, 2500, "high"),
+                 ("1080p", 1080, 30, 4500, "high"),
+                 ("1080p60", 1080, 60, 8000, "ultra")], ladder)
+check("a shared screen: 1080 lines at 30 frames a second (was 15), 8 "
+      "Mbit/s its ceiling",
+      (M.VIDEO_SCREEN.short, M.VIDEO_SCREEN.fps, M.VIDEO_SCREEN.kbps) ==
+      (1080, 30, 8000))
+check("HEVC and AV1 take two thirds of H.264's bits for the same rung",
+      (M.video_kbps(8000, "h264"), M.video_kbps(8000, "hevc"),
+       M.video_kbps(4500, "av1")) == (8000, 5333, 3000))
 check("720p unless chosen otherwise", M.video_ceiling().name == "720p")
 M.save_pref("video_quality", "1080p60")
 check("...and as chosen", M.video_ceiling().name == "1080p60")
 M.save_pref("video_quality", "720p")
 layers = M.video_layers(M.VIDEO_LADDER[2])
 check("a room's three sizes of 720p30: 180p15, 360p30, 720p30 at "
-      "166, 500, 2000 kbit/s",
-      layers == ((180, 15, 166), (360, 30, 500), (720, 30, 2000)), layers)
+      "208, 625, 2500 kbit/s",
+      layers == ((180, 15, 208), (360, 30, 625), (720, 30, 2500)), layers)
+print("\nA computer's camera asked for what the call wants (19.0, V1)")
+top = M.camera_tries("dshow", M.VIDEO_LADDER[4])
+check("1080p60: the camera asked for 1920x1080 at 60, then at 30, then "
+      "1280x720 at 30, each compressed (MJPEG) first; then as it comes",
+      [(t.get("video_size"), t.get("framerate"), t.get("vcodec"))
+       for t in top] ==
+      [("1920x1080", "60", "mjpeg"), ("1920x1080", "60", None),
+       ("1920x1080", "30", "mjpeg"), ("1920x1080", "30", None),
+       ("1280x720", "30", "mjpeg"), ("1280x720", "30", None),
+       (None, None, None)] and all(t["rtbufsize"] == "128M" for t in top),
+      top)
+low = M.camera_tries("v4l2", M.VIDEO_LADDER[2])
+check("720p (Linux): 1280x720 at 30, compressed first, then as it comes; "
+      "no 1080 asked",
+      [(t.get("video_size"), t.get("input_format")) for t in low] ==
+      [("1280x720", "mjpeg"), ("1280x720", None), (None, None)], low)
+mac = M.camera_tries("avfoundation", M.VIDEO_LADDER[3])
+check("a Mac: its own pixel format, no MJPEG to ask for",
+      [t.get("video_size") for t in mac] == ["1920x1080", "1280x720", None]
+      and all(t["pixel_format"] == "uyvy422" for t in mac), mac)
+M.save_pref("camera_gave", {"Desk camera": [1280, 720, 30]})
+M.save_pref("video_camera", "Desk camera")
+check("Settings says what the camera gave, beside a quality it cannot "
+      "give; nothing beside one it can",
+      M.camera_gave("Desk camera") == (1280, 720, 30) and
+      "1280x720" in M.camera_note(M.VIDEO_LADDER[3]) and
+      M.camera_note(M.VIDEO_LADDER[2]) == "",
+      M.camera_note(M.VIDEO_LADDER[3]))
+M.save_pref("camera_gave", {})
+M.save_pref("video_camera", None)
+java = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                        "android", "VideoCall.java"), encoding="utf-8").read()
+check("a phone's camera opens at the call's size and rate (VideoCall.java, "
+      "read here, compiled by CI): the size nearest it, never wider than "
+      "1920; a rate range that reaches 60 for 1080p60",
+      "public VideoCall(Activity activity, int shortSide, int fps)" in java
+      and "this(activity, 720, 30);" in java and
+      "pickSize(map == null ? null" in java and
+      "int tw = shortSide * 16 / 9, th = shortSide;" in java and
+      "if (range.getUpper() != fps)" in java)
+check("...and its coder is asked for the high profile, at the level the size "
+      "needs, and a constant bitrate where it offers them, else set up as "
+      "before",
+      "CodecProfileLevel\n                            .AVCProfileHigh" in java
+      and "BITRATE_MODE_CBR" in java and
+      "layer.encoder.configure(format, null, null," in java and
+      "catch (Exception refused)" in java)
+check("...which a call asks for with Settings' quality; a video message's "
+      "camera opens as before",
+      "AndroidVideoCoder(video_ceiling())" in M_SOURCE and
+      "_video_call_java()(activity, want.short, want.fps)" in M_SOURCE)
 check("a screen's thumbnail moves at 5 frames a second",
       M.video_layers(M.VIDEO_SCREEN)[0][1] == 5)
 check("a picture's size: its shape kept, both sides even, never larger",
@@ -140,6 +199,40 @@ check("through a relay that takes 150 packets a second (13.0), what the "
       (old_relay, new_relay, eng._video_budget()) == (240, 6240, None),
       (old_relay, new_relay))
 eng.sock.close()
+M.save_pref("video_quality", "1080p60")
+
+
+def relayed(decoders):
+    """A 1080p60 camera's first plan through relay 13.2, drawn at 1080."""
+    plans = []
+    eng = M.CallEngine(os.urandom(16).hex(), os.urandom(8), 0, None, "",
+                       on_event=lambda kind, value: plans.append(value)
+                       if kind == "video_plan" else None,
+                       relay_pps=1000, relay_kbps=8000)
+    eng.path, eng.packet_ms = "relay", 5
+    eng.media = {"flags": 2, "shows": {}}
+    eng.their_media = {"shows": {"v": (1920, 1080), "s": (0, 0)},
+                       "whole": 0, "lost": 0, "decoders": decoders}
+    eng._adapt_video(100.0)
+    eng.sock.close()
+    return plans[-1] if plans else None
+
+
+h264 = relayed(["h264"])
+had = M._VIDEO_CAN.get("hw")
+M._VIDEO_CAN["hw"] = ("hevc",)          # as on a computer with the chip
+hevc = relayed(["hevc", "h264"])
+if had is None:
+    M._VIDEO_CAN.pop("hw", None)
+else:
+    M._VIDEO_CAN["hw"] = had
+check("through relay 13.2 (6,240 kbit/s for a picture): 1080p60's 8 Mbit/s "
+      "does not fit in H.264, 1080p30's 4.5 does; in HEVC 1080p60 does, "
+      "at two thirds (5,333; where PyAV is, which codes it)",
+      h264 == ("v", (1080, 30, 4500), "h264") and (
+          hevc == ("v", (1080, 60, 5333), "hevc") or M._pyav() is None),
+      (h264, hevc))
+M.save_pref("video_quality", "720p")
 
 print("\nA 1-to-1 camera the other side does not draw (17.2, NEXTCALLS)")
 plans = []
@@ -218,6 +311,9 @@ M._video_call_java = saved[2]
 M._VIDEO_CAN.pop("dec", None)
 
 print("\nA phone's decoder, and the self-test's camera check (17.2.1)")
+# These are of the decoder's pictures as text, RGBA made in Java: what a
+# video message's player asks for, and from 18.2 what a call falls back
+# to where the phone's chip cannot draw I420 rows.
 PICTURE = "4:2:" + M.b64e(bytes(32))        # 4 × 2 RGBA, as Java gives it
 
 
@@ -277,9 +373,9 @@ class StandInCoder:
         pass
 
 
-def phone_decoder(java):
+def phone_decoder(java, rows=False):
     dec = object.__new__(M.AndroidVideoDecoder)   # no Java to make one
-    dec._java, dec.codec = java, "h264"
+    dec._java, dec.codec, dec.rows = java, "h264", rows
     return dec
 
 
@@ -343,6 +439,229 @@ check("a decoder that makes two pictures between asks lost none: the "
       verdict == "PASS" and said[-1][2] ==
       "24 coded, 24 decoded, 0 refused, 12 drawn", said)
 
+
+
+print("\nA phone's pictures as the decoder's own rows (18.2)")
+import re                                                     # noqa: E402
+from pathlib import Path                                      # noqa: E402
+W, H = 64, 48
+RED, BLUE = (81, 90, 240), (41, 240, 110)           # Y, U, V (BT.601)
+
+
+def i420(top, foot):
+    """A W × H picture of two halves as VideoCall.i420 packs it: its
+    size, the rows of Y, then for each two rows U beside V."""
+    y = bytes([top[0]]) * (W * H // 2) + bytes([foot[0]]) * (W * H // 2)
+    under = b"".join(
+        bytes([c[1]]) * (W // 2) + bytes([c[2]]) * (W // 2)
+        for c in [top] * (H // 4) + [foot] * (H // 4))
+    return M.struct.pack("!HH", W, H) + y + under
+
+
+class RowsDecoder:
+    """VideoCall.Decoder's planes, in Python: bytes in, the last
+    picture's rows out (none where it is not drawn; one byte: refused)."""
+
+    def __init__(self):
+        self.calls, self.busy = [], False
+
+    def planes(self, data, draw, most):
+        self.calls.append((data, draw, most))
+        if self.busy:
+            return bytes(1)
+        return i420(RED, BLUE) if draw else b""
+
+    @staticmethod
+    def refused():
+        return "no room in the decoder"
+
+    def decode(self, *_a):
+        raise AssertionError("the text path, though rows can be drawn")
+
+
+java = RowsDecoder()
+dec = phone_decoder(java, rows=True)
+got = dec.decode(b"coded", (360, 640), True)
+check("a call's decoder on a phone is handed bytes and gives its rows back as "
+      "bytes: no text, and the shorter side wanted said",
+      java.calls == [(b"coded", True, 360)] and got is not None and
+      got[1:] == (W, H, "i420") and len(got[0]) == W * H * 3 // 2,
+      (java.calls, got and got[1:]))
+check("...a picture decoded and not drawn copies nothing",
+      dec.decode(b"late", None, True) is None and
+      java.calls[-1] == (b"late", False, 0))
+java.busy = True
+try:
+    dec.decode(b"next", (360, 640), True)
+    refused = ""
+except ValueError as exc:
+    refused = str(exc)
+check("...and one refused is refused as before, saying why",
+      refused == "no room in the decoder", refused)
+check("rows that are not the size their header says are no picture",
+      M.unpack_planes(i420(RED, BLUE)[:-1]) is None and
+      M.unpack_planes(b"") is None and
+      M.unpack_planes(bytes(4)) is None)
+rows = M.unpack_planes(i420(RED, BLUE))[0]
+picture = M.YuvPicture(W, H)
+picture.draw(rows)
+pixels = picture.texture.pixels
+
+
+def pixel(col, row):                   # row 0: the texture's lowest row
+    at = (row * W + col) * 4
+    return tuple(pixels[at:at + 3])
+
+
+def near(colour, wanted):
+    return all(abs(a - b) <= 6 for a, b in zip(colour, wanted))
+
+
+check("the graphics chip makes the colours of them (BT.601): red is red, "
+      "blue is blue, at the size of the picture",
+      tuple(picture.texture.size) == (W, H) and
+      near(pixel(5, H - 2), (255, 0, 0)) and
+      near(pixel(W - 5, 2), (0, 0, 255)),
+      (pixel(5, H - 2), pixel(W - 5, 2)))
+check("...the right way up for a tile to show as it is: the picture's "
+      "top half above its lower half, and no flip asked for",
+      near(pixel(W // 2, H - 4), (255, 0, 0)) and
+      near(pixel(W // 2, 3), (0, 0, 255)) and
+      tuple(picture.texture.tex_coords) ==
+      (0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0))
+check("...and no plane bleeds into its neighbour at the picture's edges",
+      all(near(pixel(c, H - 1), (255, 0, 0)) and
+          near(pixel(c, 0), (0, 0, 255)) for c in (0, W // 2 - 1,
+                                                  W // 2, W - 1)),
+      [pixel(c, r) for r in (H - 1, 0) for c in (0, W // 2, W - 1)])
+
+
+class RowsReceiver:
+    """A VideoReceiver's latest, for a CallVideo's tick."""
+    serial = 1
+
+    def latest(self, _who, _track):
+        return (self.serial, rows, W, H, "i420")
+
+    def show(self, *_a):
+        pass
+
+    def stop(self):
+        pass
+
+
+class Tile:
+    size = (W, H)
+    refreshed = asked = 0
+
+    def refresh(self):
+        self.refreshed += 1
+
+    class canvas:                                   # noqa: N801
+        @staticmethod
+        def ask_update():
+            Tile.asked += 1
+
+
+textures = {}
+layer = M.CallVideo("me", textures, on_key=lambda *a: None,
+                    on_failed=lambda *a: None)
+layer.receiver.stop()
+layer.receiver = RowsReceiver()
+tile = Tile()
+layer.view = {("ann", "v"): tile}
+layer.tick()
+first = textures.get(("ann", "v"))
+layer.receiver.serial = 2
+layer.tick()
+check("a call shows them in the tile's own texture: made at the first "
+      "picture, drawn into at the next",
+      first is not None and tuple(first.size) == (W, H) and
+      textures[("ann", "v")] is first and tile.refreshed == 1 and
+      Tile.asked == 1, (first, tile.refreshed, Tile.asked))
+real_picture = M.YuvPicture.__init__
+
+
+def no_shader(self, *_a):
+    raise RuntimeError("the picture's shader did not compile")
+
+
+M.YuvPicture.__init__ = no_shader
+layer.view = {("bea", "v"): tile}
+layer.tick()                                        # must not raise
+M.YuvPicture.__init__ = real_picture
+check("a chip that refuses the shader is said once, and the phone's "
+      "decoders are asked for RGBA as before from then on",
+      ("bea", "v") not in textures and M.YuvPicture.usable is False)
+text_java = StandInDecoder()
+text_java.ready = [PICTURE]
+check("...as text, the way 18.1 did it",
+      phone_decoder(text_java, rows=True).decode(b"", (4, 2), False) ==
+      (bytes(32), 4, 2, "rgba"))
+M.YuvPicture.usable = True
+layer.close()
+said.clear()
+drawer = threading.Thread(target=lambda: M._selftest_draw(
+    lambda *a: said.append(a) or a[1]))
+drawer.start()                # the check waits; the UI thread draws
+while drawer.is_alive():
+    M.Clock.tick()
+    time.sleep(0.01)
+check("the self-test has the device's own chip draw red over blue and "
+      "reads it back (the emulators run it)",
+      len(said) == 1 and said[0][:2] == ("video-draw", "PASS") and
+      "red drawn (25" in said[0][2], said)
+said.clear()
+M.YuvPicture.__init__ = no_shader
+drawer = threading.Thread(target=lambda: M._selftest_draw(
+    lambda *a: said.append(a) or a[1]))
+drawer.start()
+while drawer.is_alive():
+    M.Clock.tick()
+    time.sleep(0.01)
+M.YuvPicture.__init__ = real_picture
+check("...and fails, saying why, on one that refuses",
+      said[0][:2] == ("video-draw", "FAIL") and "shader" in said[0][2],
+      said)
+
+
+class BothWays(RowsDecoder):
+    """A phone's decoder asked either way, as the self-test compares
+    them: rows, or text."""
+    asked = []
+
+    def planes(self, data, draw, most):
+        BothWays.asked.append("rows")
+        return super().planes(data, draw, most)
+
+    def decode(self, b64, w, h, fill):
+        BothWays.asked.append("text")
+        return PICTURE
+
+    def close(self):
+        pass
+
+
+real_maker = M.android_video_decoder
+M.android_video_decoder = lambda codec, rows=False: phone_decoder(
+    BothWays(), rows)
+told = M._selftest_paths([(0, "h264", True, b"k"), (0, "h264", False, b"p")],
+                         pace=0)
+M.android_video_decoder = real_maker
+check("...and it times a picture both ways on the device, for the log: "
+      "the rows' way and 18.1's text, each with a decoder of its own",
+      re.fullmatch(r"a picture for a phone's tile: \d+\.\d ms as rows, "
+                   r"\d+\.\d ms as text", told) and
+      BothWays.asked == ["rows", "rows", "text", "text"] and
+      M.YuvPicture.usable is True, (told, BothWays.asked))
+java_source = (Path(sys.argv[1]).resolve().parent / "android" /
+               "VideoCall.java").read_text(encoding="utf-8")
+check("VideoCall.java (compiled by CI alone) has the rows' side of it: "
+      "bytes in and out, the picture's crop, and no sum for any pixel",
+      "public byte[] planes(byte[] data, boolean draw, int most)"
+      in java_source and "static byte[] i420(Image image, int most)"
+      in java_source and "image.getCropRect()" in java_source and
+      "out = i420(image, most);" in java_source)
 
 print("\nA phone's camera, which way up (18.1)")
 # VideoCall.java is compiled by CI alone; its turns are read here.
@@ -452,6 +771,8 @@ check("...one that waited longer than a picture may is decoded, as the "
 behind._piece("ann", "v", whole_picture(2), now, 0.01)
 check("...and the next in time is shown again",
       behind.latest("ann", "v")[0] == first[0] + 1)
+check("...the one too late is counted, for the call's meter (18.2)",
+      behind.late == 1, behind.late)
 slow = CountingDecoder(after=2)
 asking = M.VideoReceiver(on_key=lambda *a: None, decoder=lambda codec: slow)
 asking.show("ann", "v", (360, 640))
@@ -477,8 +798,25 @@ try:
           M.video_box((300, 500), "v") == (300, 500) and
           M.video_layer_for(1000) == 1 and M.video_layer_for(150) == 0,
           box)
+    # 18.2: the phone's owner may raise it (Settings › Calls).
+    M.save_pref("phone_picture", 480)
+    check("...or what its owner chose: 480 lines of a camera, a shared "
+          "screen as before, a room's picture still the middle size",
+          M.phone_picture() == 480 and
+          M.video_box((1080, 2200), "v")[0] == 480 and
+          M.video_box((1080, 2200), "s")[0] == 720 and
+          M.video_layer_for(1000) == 1)
+    M.save_pref("phone_picture", 720)
+    check("...at 720 a room's largest picture too",
+          M.video_box((1080, 2200), "v")[0] == 720 and
+          M.video_layer_for(1000) == 2 and M.video_layer_for(150) == 0)
+    M.save_pref("phone_picture", 1080)
+    check("...and a size it does not offer is not taken: 360",
+          M.phone_picture() == 360 and
+          M.video_box((1080, 2200), "v")[0] == 360)
 finally:
     M.IS_ANDROID = real_android
+    M.save_pref("phone_picture", None)
 check("...a computer, which turns pictures over in time, as large as "
       "its tile", M.video_box((1080, 2200), "v") == (1080, 2200) and
       M.video_layer_for(1000) == 2)
@@ -491,8 +829,9 @@ decoder = java.split("class Decoder")[1]
 check("...and its first picture, the key frame, waits for a decoder just "
       "started (Devices run 25: refused after 2 ms, and no picture after "
       "it could be decoded)",
-      "dequeueInputBuffer(\n                            at == 0 ? 100000 "
-      ": 2000)" in decoder and "public String refused()" in decoder)
+      "codec.dequeueInputBuffer(at == 0 ? 100000 : 2000)" in decoder and
+      "public String refused()" in decoder and
+      decoder.count("!feed(data)") == 2)     # the text's way and the rows'
 check("...asked only where the decoder says it can, and made again "
       "without if it still refuses: one asked for what it cannot do "
       "decoded nothing at all (Devices run 24, Android 11)",
@@ -557,13 +896,61 @@ check("a size whose rows FFmpeg pads comes out unpadded",
       got is not None and len(got[0]) == got[1] * got[2] * 3, got and got[1:])
 kbits = {n: sum(len(p[3]) for p in v) * 8 / 2000 for n, v in by_layer.items()}
 check("each size near its bitrate (kbit/s, the first second's key frame "
-      "included)", kbits[2] < 2000 * 1.6 and kbits[1] < 500 * 1.6 and
-      kbits[0] < 166 * 2.2, {n: round(k) for n, k in kbits.items()})
+      "included)", kbits[2] < 2500 * 1.6 and kbits[1] < 625 * 1.6 and
+      kbits[0] < 208 * 2.2, {n: round(k) for n, k in kbits.items()})
 preview = coder.preview((160, 120))
 check("this device's own picture, small, for its tile",
       preview is not None and preview[2:4] == (212, 120), preview and
       preview[2:4])
+
+print("\nThe coder (19.0, V2)")
+check("what is really sent, for the call's meter: the largest size, at the "
+      "rate the camera gives",
+      coder.sent() == (1280, 720, 30) and coder.capture.gave ==
+      (1280, 720, 30), (coder.sent(), coder.capture.gave))
+used = coder._coders[2][0]
+check("a graphics chip's H.264 coders tried first; here (no chip) each "
+      "failed and is not tried again; x264 codes",
+      used.name == "libx264" and {"h264_nvenc", "h264_qsv", "h264_amf",
+                                  "h264_videotoolbox"} <=
+      M._VIDEO_CAN.get("bad", set()), (used.name, M._VIDEO_CAN.get("bad")))
+sps = next((nal for _l, _c, key, data in by_layer[2] if key
+            for nal in M.annexb_nals(data) if nal[0] & 0x1F == 7), b"")
+check("x264's high profile (18.2: baseline) and its best setting first",
+      sps[1:2] == bytes([100]) and used.preset == 0 and
+      M.X264_PRESETS[0] == "veryfast", sps[1:2])
+held, now = coder._coders[2], time.monotonic()
+held[0].cost = 0.9 / held[0].fps
+coder._pace(2, held, now)
+waited = coder._coders[2] is held
+coder._pace(2, held, now + 1.1)
+faster = coder._coders[2][0]
+check("a computer too slow for it (a picture in more than half its frame's "
+      "time, for a second) steps to the next faster setting, remembered "
+      "for that size",
+      waited and faster is not used and faster.preset == 1 and
+      M._VIDEO_CAN["x264"][((1280, 720), 30)] == 1)
+quick = coder._coders[2]
+quick[0].cost = 0.1 / quick[0].fps
+coder._pace(2, quick, now + 2.0)
+coder._pace(2, quick, now + 2.0 + M.X264_PATIENCE + 0.1)
+check("...and back to the better one after a while with time to spare",
+      coder._coders[2][0].preset == 0)
 coder.close()
+frame = M.VideoCapture(M.video_sources("screen")[0])
+frame.start()
+still = frame.next_frame(0, 3.0)[1]
+frame.stop()
+spent = {}
+for screen in (True, False):
+    enc = M.FfmpegEncoder("h264", 1920, 1080, 30, 8000, screen=screen)
+    sizes = [len(d) for n in range(30)
+             for d, _k in enc.encode(still, n == 0)]
+    spent[screen] = sum(sizes[1:])
+check("a shared screen is coded for its quality under its ceiling: a still "
+      "screen costs a few kilobytes a second, where a fixed bitrate spends "
+      "its whole budget on it",
+      spent[True] * 5 < spent[False] and spent[True] < 60000, spent)
 
 print("\nSent, received, decoded (threads)")
 received = M.VideoReceiver(on_key=lambda *a: asked.append(a))

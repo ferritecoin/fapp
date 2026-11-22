@@ -127,10 +127,25 @@ suites rely on.
 | Video (`VideoSender`, `VideoReceiver`; a video message's `VideoNoteRecorder` and `VideoNotePictures`) | Coding and decoding pictures, so the UI only draws the newest one |
 
 Workers reach the UI only through `ui_queue` (drained by
-`FextApp._drain_ui_queue`) or `run_on_ui`. `LocalStore` is
+`FextApp._drain_ui_queue`) or `run_on_ui`. The queue is a `WakingQueue`
+(18.2): an event put on it asks for the next frame, so a message that
+arrives alone is shown at once; events that follow within `UI_TICK` are
+taken together, so a backlog stays one repaint a tick. `LocalStore` is
 lock-protected and safe from any thread. On Android a thread that used
 Java ends with `leave_jvm()`, and the app's own Java classes are found
 on the UI thread first (`android_find_call_classes`).
+
+**The garbage collector (18.2).** Python's long look at every object the
+app holds took 80 to 400 ms and fell where a person had just asked for
+something. `QuietCollector` sets start-up's objects aside (`gc.freeze`),
+stops the automatic long look, and takes it itself at a quiet moment:
+three seconds without a touch or a key, nothing sounding
+(`FextApp.sounding`), at most every 30 s; a deeper one when owed (after a
+theme's rebuild, every ten minutes of use, when the app leaves the
+screen). What a theme's rebuild itself made is looked through a tenth
+of a second after the theme shows, while the screen is still
+(`_collect_after_rebuild`). `desktop/playthrough.py` shows the
+collector's share of each step.
 
 ## 6. Identity and keys
 
@@ -146,6 +161,12 @@ on the UI thread first (`android_find_call_classes`).
   own database, and only the active one syncs; 17.2 lets the others ring.
 - Keys live in `identities.json` in the data folder; backups
   (`make_backup`, `restore_backup`) carry them, sealed by a passphrase.
+- **The key for another device (18.2).** `device_key_text` is both keys
+  as one text (`fextkey1` and a Base58Check of the private key and the
+  ML-KEM seed), copied or shown as a code in My profile;
+  `parse_identity_key` reads it, a WIF or hex, and
+  `IdentityManager.add_identity` keeps the seed. A WIF alone still
+  brings a new ML-KEM key (§15).
 
 ## 7. A message, end to end
 
@@ -404,15 +425,32 @@ message keeps the way up it began with (`follow(false)`).
 **Delay on a phone (18.1).** Sound: the speaker (`CallAudio.speaker`)
 is asked for Android's low-latency path and holds 40 ms of sound, not
 all it can; `tune` gives it 10 ms more when it runs dry twice in a
-second. Pictures: each one shown crosses from Android's decoder to the
-screen as bytes, so a phone asks for and draws a camera at 360 lines at
-the most (`video_box`, `VIDEO_PHONE_SHORT`), and a picture that is
+second. Pictures: a phone asks for and draws a camera at 360 lines
+unless Settings › Calls › Picture size on this phone says 480 or 720
+(`video_box`, `phone_picture`, `PHONE_PICTURES`), and a picture that is
 `VIDEO_LATE` behind when its turn comes is decoded and not drawn
 (`VideoReceiver._decode`): a device that falls behind shows fewer
 pictures, never older ones. The decoder is asked not to hold pictures
 back where it says it can (`VideoCall.Decoder.started`: one asked for
 what it cannot do refuses to start, so it is made again without), and
 is asked again at once for the one it was just given.
+
+**A call's pictures on a phone (18.2).** A call's decoder
+(`android_call_decoder`) hands each picture over as its own rows, I420
+(`VideoCall.Decoder.planes`, `i420`: the crop alone, thinned by whole
+steps when the tile is much smaller), not as RGBA text. `YuvPicture`
+keeps them in one texture, Y over U beside V, and the graphics chip
+makes the colours and the size (`YUV_SHADER`, BT.601, in an `Fbo`); a
+tile shows that texture as any other (`CallVideo._draw_rows`). A chip
+that refuses the shader is logged once and the call goes back to text
+(`YuvPicture.usable`). A video message's player keeps the text path. The
+emulators' self-test draws red over blue this way and reads it back
+(`video-draw`), and times a picture both ways.
+
+**The meter (18.2)** also says what this device did with what arrived:
+sound waiting to be played (`JitterBuffer.held_ms`), a phone's speaker
+in its own account (`CallAudio.facts`), pictures too late to draw
+(`VideoReceiver.late`); `meter_lines` puts them in words.
 
 **Where a device is (18.1).** A straight way shows each device the
 other's network address, which says roughly where it is.
@@ -492,6 +530,32 @@ members (a selective forwarding unit) but cannot read them.
   up, so the share waits up to 20 s for it (18.0.2: a slow phone overran
   6).
 
+**Control of a shared screen, and remote sessions (19.0).** In a 1-to-1
+call, a computer that can be controlled (Windows; Linux on X11) and
+shares its screen says so in its media state (flag `controllable`); the
+other side then has *Control*. Its ask (flag `control`) is answered on
+the computer by *Allow* (`ControlAskSheet`), which sets `lets`; from then
+the controller's pointer, taps and keys go as `PKT_INPUT` packets
+(`RemoteSurface` → `CallEngine.send_input`): numbered events, each packet
+repeating the newest move and the last twelve others with what is held,
+so a lost packet is made good by the next and a stuck key is let go
+(`InputOut`, `InputIn`). The computer does them through `WindowsInjector`
+(SendInput) or `X11Injector` (XTEST). A **remote session** is a call
+whose offer says `rc`: no sound on either side (`CallAudio` opens no
+device, so a computer without a microphone can be reached), the relay
+only (`CallEngine(hidden=True)`). Only a computer whose Settings › Remote
+access lists the caller (`remote_access_list`, per identity, each grant
+until a date) answers it, by itself: it shares its whole screen and lets
+them in (`RemoteControlMixin._remote_answer`, `_lets_in`). An offer for
+another identity on the computer (its `IdentityLink`) is decided by that
+identity's list; listed, the app switches to it and answers, as Answer in
+the waiting bar does (`_remote_elsewhere`). Every other device sets the
+offer aside without a word, since another device of the same identity may
+be that computer. A session that drops is placed again
+(`REMOTE_RETRY_EVERY`, `REMOTE_RETRY_FOR`). The plan, its security and
+what is not built (a service before sign-in) are in
+`.private/PLAN_REMOTE.md`.
+
 The design notes for calls are in `CallSession`'s, `RoomCall`'s and
 `CallEngine`'s docstrings.
 
@@ -501,21 +565,25 @@ One SQLite database per identity (`store_<address>.db` in the data
 folder), opened by `LocalStore`. Its main tables: `contacts`, `messages`
 (every kind, with `ext` holding the x-block's kept fields), `groups`,
 `group_sends`, `reactions`, `reactions_more`, `chat_flags` (drafts,
-timers), `pictures`, `held` (a blocked sender's frames), `call_chat`, and
-`tombstones`.
+timers), `pictures`, `held` (a blocked sender's frames), `call_chat`,
+`pins` (19.0) and `tombstones`.
 
 - **Migrations** are additive only (`LocalStore._MIGRATIONS`): a column
   is added if it is missing, decided by inspection, and every column has a
   default. `SCHEMA_VERSION` counts them (12 in 18.0: `groups.admins`,
   holding the other admins, the log and who made the change held, and the
   tables of links for anyone, `join_links`, `join_asks`, `join_asked`; 13
-  in 18.1: `contacts.away_at`, when a chat last got an away reply).
+  in 18.1: `contacts.away_at`, when a chat last got an away reply; 14 in
+  19.0: `pins`, a chat's pinned messages, an unpin kept so an older pin
+  cannot win over it).
 - An older release opens a newer database and ignores what it does not
   know; `desktop/test_core.py` checks both ways against the previous
   release's real code.
 - Beside the database: `identities.json`, `prefs.json` (device settings,
   read and written under one lock in a process, `_PREFS_LOCK`: Windows
-  refuses to replace a file any thread has open), `media/`, `pictures/`,
+  refuses to replace a file any thread has open; 19.0 keeps there each
+  identity's Remote access list, the sessions kept and the window's place),
+  `media/`, `pictures/`,
   `commands/` (notification actions on Android), `cache/`.
 
 ## 12. The relay, as the app sees it
@@ -562,6 +630,45 @@ outbox waits.
   chats are as they were is left as it is. Runs of messages are joined
   only where rows came: at the foot for an arrival (`_join_rows(tail=)`),
   at the top for a page of older ones (`head=`).
+- **A tapped message (18.2).** The quick reactions float over it, and
+  beside it a menu in words (`MessageMenu`, placed by `_place_menu`):
+  each row is the held messages' own action taken on that one message
+  (`ConversationScreen.message_actions`). Where the menu fits neither
+  under the message nor over it (a short window, a phone on its side),
+  the reactions move clear of it (19.0): to the view's top with the menu
+  under them, else beside it. A tap on the reply bar offers
+  to quote a part (`QuoteSheet`), to reply in another chat
+  (`ChatPickSheet`), to show the message or to give the reply up
+  (`reply_options`).
+- **Two panes on a computer (19.0).** From `TWO_PANES_FROM` (900 dp) of
+  width the chat list is docked at the window's left, `SIDE_WIDTH` wide:
+  the root holds a row of `FextApp.side` and the `ScreenManager`, and
+  `_apply_panes` moves `ChatsScreen._root` into `side`
+  (`ChatsScreen.dock`), the screen showing "Choose a chat" in its place;
+  narrower, `undock` puts it back. It runs when the root's width changes,
+  not `Window.width`: on Windows Kivy reads that from the drawn window,
+  so a size the app sets changes no binding on it. Nothing is rebuilt,
+  and the screens' names do not change ("chats" showing still means no
+  chat is open), so every `manager.current` test and `back_target`
+  stand. Docked, the list repaints while a chat is open
+  (`refresh_sidebar`), the open chat's row is marked (`mark_open`, one
+  row), and pages change without a slide. The window's size and place
+  are kept in prefs.json (`window`), its place only where it is still on
+  a screen (`desktop_area`, `window_place_ok`).
+- **Pinned messages (19.0).** A pin is a control (`{"op": "pin", "cid",
+  "on"}`, or `"all"` to let every pin go), sealed like every message; the
+  newest word on a message wins, by when its author's app signed it, and
+  an unpinned row is kept so a late pin cannot bring it back (`pins`
+  table, `LocalStore.set_pin`, `unpin_all`, `pins`: those whose message
+  is on this device, at most `PINS_MAX`). In a chat of two either may
+  pin; in a group its owner and the admins who may change its name and
+  photo, and every member where its rules say `"pin"`
+  (`group_may_pin`; `GroupRightsSheet`'s Pin messages). `PinBar` under
+  the chat's head walks back through them; `PinsSheet` lists them.
+- **An error in a screen (18.2).** `CrashNet`, a Kivy `ExceptionHandler`
+  put up in `FextApp.build`, logs it, says so once and carries on; a
+  second within ten seconds closes the sheets and shows the chat list;
+  more than eight in that time end the app with the error, as before.
 - **Fading edges (18.1).** A `ScrollView` given `fade`, the colour of the
   page behind it, fades its top and bottom into the page where there is
   more to scroll to (two tinted strips, `place_fades`); Settings ›
@@ -613,7 +720,11 @@ outbox waits.
   Windows a photo or a chat export is chosen in Windows' own Open dialog
   (18.1, `windows_open_dialog` through ctypes, on a thread of its own so
   a call goes on behind it); elsewhere, and where that will not open, in
-  the app's list (`ImageChooserModal`).
+  the app's list (`ImageChooserModal`). The EXE can start when Windows
+  starts (18.2, Settings › Notifications): the Run key of the person's
+  own account names it with `--startup`, which opens it minimised
+  (`set_start_with_windows`, `built_exe`); no administrator, nothing
+  before sign-in.
 - **Device tests**: `tools/devices/` starts the app on Android emulators
   (old, current, newest) and on Windows and Ubuntu, and runs its
   self-test (the `devices` workflow): a call's classes and sound, the
@@ -671,6 +782,7 @@ Every suite runs headless (`xvfb-run`) against a given `main.py`:
 | `test_core.py` | Crypto, envelopes, sanitisers, storage; the previous release's real code both ways |
 | `test_flows.py` | Two and three real apps through an in-memory relay: messages, groups, group rules, media, the outbox, receipts |
 | `test_calls.py`, `test_conference.py`, `test_video.py` | 1-to-1 calls between two engines, rooms, video, several calls in one chat |
+| `test_remote.py` | Remote control: the input packets, where a touch lands, the access list, two apps in a remote session and an ordinary call's control; X11's injector against Xvfb, Windows' on the Devices workflow |
 | `test_videomsg.py` | Video messages: the MP4 written and read in plain Python, files that are not what they say, the recorder against stand-ins for a phone, the bubble and the sheet; with PyAV, recorded, opened by FFmpeg and played |
 | `test_design.py`, `test_composer.py`, `test_navigation.py`, `test_touch.py`, `test_gestures.py` | Themes, contrast, phrases; the composer; navigation; touch |
 | `test_backup.py`, `test_privacy.py`, `test_notify.py`, `test_pictures.py`, `test_service.py`, `test_bundle.py` | Backups, privacy, notifications, pictures, the Android service, the desktop bundle |
@@ -678,7 +790,10 @@ Every suite runs headless (`xvfb-run`) against a given `main.py`:
 
 `desktop/capture.py` takes every screen from the same chats, before and
 after a change, and lists layout problems. `desktop/bench.py` times the
-app's own work.
+app's own work. `desktop/playthrough.py` (18.2) walks through the app by
+the touches a finger makes and times each step from the finger lifting
+to the frame that answers it: the app's "feel", compared between
+versions, and a test of whole flows that CI runs.
 
 ## 17. Releases
 
@@ -708,11 +823,20 @@ the fact.
 | change how lists fade at their edges | `ScrollView` (`fade`, `FADE`, `place_fades`), `fade_ramp`; `APPEARANCE.edge_fade`; Settings' Appearance rows |
 | change how much of the chat list is made before it shows | `LIST_FIRST_PAINT`, `LIST_CHUNK`; `ChatsScreen.refresh_list`, `_fill`; `ChatColumn` |
 | change how quickly a call gives back delay | `JitterBuffer` (`SKIP_EVERY`, `SKIP_QUIET`, its aim and floor), `CALL_QUIET_LEVEL`; the packet length: `CallEngine._adapt` |
-| change what a phone draws of a call's pictures, or when one is too late to draw | `VIDEO_PHONE_SHORT`, `video_box`, `video_layer_for`; `VIDEO_LATE`, `VideoReceiver._decode` |
+| change when a call's picture is too late to draw | `VIDEO_LATE`, `VideoReceiver._decode`; what a phone asks for: `video_box`, `video_layer_for` |
 | change how much sound a phone's speaker holds | `CallAudio.java`: `speaker` (40 ms to begin with), `tune`; its numbers in the log: `facts` |
 | change which way up a phone's camera is sent | `VideoCall.java`: `sentTurn`, `shownTurn`, `lying`, `hold`, `draw`; `desktop/test_video.py` holds the rule |
 | change what several devices of one identity do in a call | `FextApp._tell_taken`, `_call_taken`, `CALL_UNANSWERED_REASONS`; the `taken` signal in `sanitize_call_signal` |
 | change what a call to someone not yet accepted does | `FextApp._call_as_request`, `CALL_ASK_EVERY`; `SyncWorker._called` |
+| change remote control | asking and letting: `RemoteControlMixin`, `ControlAskSheet`, the flags in `CALL_MEDIA_FLAGS`; input: `RemoteSurface`, `pack_input`, `InputOut`, `InputIn`, `REMOTE_KEYS` (new keys at the end); the computer's side: `WindowsInjector`, `X11Injector`, `remote_injector` |
+| change remote sessions | who: `remote_access_*`, `RemoteAccessSheet`, `REMOTE_GRANTS`; answering: `_lets_in`, `_remote_answer`; placing again: `_remote_call_over`, `REMOTE_RETRY_*`; coming back: `starts_by_itself`, `keep_awake` |
+| change a tapped message's menu, or the reply's options | `ConversationScreen.message_actions`, `MessageMenu`, `_place_menu`; `reply_options`, `QuoteSheet`, `ChatPickSheet` |
+| change what happens when a screen raises | `CrashNet` (`AGAIN`, `STORM`) |
+| change pinned messages | the control in `SyncWorker._handle_control` (`op == "pin"`); `LocalStore.set_pin`, `unpin_all`, `pins`, `PINS_MAX`; who may: `group_may_pin`, `FextApp.can_pin`; `pin_message`, `unpin_all`; `PinBar`, `PinsSheet`; the menu's row in `message_actions` |
+| change a computer's two panes | `two_panes`, `TWO_PANES_FROM`, `SIDE_WIDTH`; `FextApp._apply_panes`, `side`; `ChatsScreen.dock`, `undock`, `_choose`, `mark_open`; the window kept: `_restore_window`, `_keep_window` |
+| change when the garbage collector runs | `QuietCollector` (`QUIET`, `EVERY`, `DEEP`, `PENDING`), `FextApp.sounding` |
+| change the key for another device | `device_key_text`, `parse_identity_key`, `DEVICE_KEY_PREFIX`; `IdentityManager.add_identity` |
+| change how a phone draws a call's pictures | `android_call_decoder`, `YuvPicture`, `YUV_SHADER`, `CallVideo._draw_rows`; `VideoCall.java`: `planes`, `i420`; its size: `PHONE_PICTURES`, `phone_picture` |
 | change a computer's file choosers | `ImageChooserModal`, `ImportChooserModal`; Windows' own: `windows_chooses`, `windows_open_dialog` |
 | add a label that shows markup | say `markup=True` and pass what people wrote through `escape_markup`; `desktop/test_design.py` draws the hostile cases |
 | change away replies | `MessagingMixin.away_reply` (who gets one, how often), `away_since`, `away_words`; Settings' `away_card`; the chat list's reminder in `ChatsScreen` |

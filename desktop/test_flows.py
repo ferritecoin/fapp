@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -1572,7 +1573,7 @@ with bob.store._lock:
     bob.store._db.commit()
 check("rules left behind by an older release's newer state are not used",
       bob.store.group(rgid)["rules"] == {} and
-      M.LocalStore.SCHEMA_VERSION == 13)
+      M.LocalStore.SCHEMA_VERSION == 14)
 
 print("\n17.4: a group's topics")
 check("topics keep good ids and names, once each; none without a list",
@@ -2513,6 +2514,126 @@ check("off again: the reminder goes, and so do the replies",
       M.away_since() == 0 and away_row(ivy) is None
       and written(jon, I, "Welcome back") is None)
 M.save_pref("away_text", "")
+
+print("\n19.0: pinned messages (PINS26)")
+
+
+def pin_cids(app, peer):
+    return [m["client_msg_id"] for m in app.store.pins(peer)]
+
+
+def said(app, peer, words):
+    return any(m.get("kind") == "event" and words in (m.get("body") or "")
+               for m in app.store.messages_for(peer))
+
+
+def sent_and_delivered(action):
+    relay.mail.clear()
+    action()
+    wait_for(lambda: relay.mail)
+    deliver(relay, parties)
+    for party in parties.values():
+        pump(party)
+
+
+sent_and_delivered(lambda: alice.send_text(B, "the plan for Saturday"))
+sent_and_delivered(lambda: alice.send_text(B, "the address"))
+plan, address = [m["client_msg_id"] for m in alice.store.messages_for(B)
+                 if m.get("body") in ("the plan for Saturday",
+                                      "the address")]
+sent_and_delivered(lambda: alice.pin_message(B, plan, True))
+check("pinned in a chat of two: both sides hold it, a line in each chat",
+      pin_cids(alice, B) == [plan] and pin_cids(bob, A) == [plan] and
+      said(alice, B, "You pinned a message") and
+      said(bob, A, "alice pinned a message"))
+time.sleep(0.01)
+sent_and_delivered(lambda: bob.pin_message(A, address, True))
+check("either of the two may pin; the newest pin first",
+      pin_cids(alice, B) == [address, plan] and
+      pin_cids(bob, A) == [address, plan])
+sent_and_delivered(lambda: bob.pin_message(A, plan, False))
+check("unpinned by either: gone on both sides, nothing said",
+      pin_cids(alice, B) == [address] and pin_cids(bob, A) == [address])
+check("a pin older than the unpin held changes nothing (newest wins)",
+      not alice.store.set_pin(B, plan, B, "2000-01-01T00:00:00+00:00",
+                              True) and pin_cids(alice, B) == [address])
+time.sleep(0.01)
+sent_and_delivered(lambda: alice.pin_message(B, plan, True))
+sent_and_delivered(lambda: alice.unpin_all(B))
+check("Unpin all: nothing pinned on either side",
+      pin_cids(alice, B) == [] and pin_cids(bob, A) == [])
+for n in range(M.PINS_MAX + 3):
+    alice.store.set_pin(A, f"{n:032x}", A, f"2026-01-01T00:00:{n:02d}",
+                        True)
+held = alice.store._db.execute(
+    "SELECT COUNT(*) FROM pins WHERE peer = ? AND on_ = 1", (A,)
+).fetchone()[0]
+check("a chat keeps at most fifty pins: the oldest go", held == M.PINS_MAX)
+
+relay.mail.clear()
+ppeer = alice.create_group("Pinboard", [B, K])
+pgid = M.gid_of(ppeer)
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+for party in parties.values():
+    pump(party)
+sent_and_delivered(lambda: alice.send_text(ppeer, "rota for March"))
+rota = next(m["client_msg_id"] for m in alice.store.messages_for(ppeer)
+            if m.get("body") == "rota for March")
+check("a member who is not an admin may not pin (by default)",
+      not cara.can_pin(ppeer) and alice.can_pin(ppeer))
+relay.mail.clear()
+threading.Thread(target=lambda: cara._send_control(
+    ppeer, {"op": "pin", "cid": rota, "on": True}, "x"), daemon=True).start()
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+check("...and a pin sent all the same is not taken by the others",
+      pin_cids(alice, ppeer) == [] and pin_cids(bob, ppeer) == [])
+sent_and_delivered(lambda: alice.pin_message(ppeer, rota, True))
+check("the group's owner pins: every member holds it",
+      pin_cids(bob, ppeer) == [rota] and pin_cids(cara, ppeer) == [rota])
+sent_and_delivered(lambda: alice.set_group_permissions(pgid, [],
+                                                       members_pin=True))
+check("the group's rule: members may pin, said in the chat",
+      bob.can_pin(ppeer) and cara.can_pin(ppeer) and
+      said(alice, ppeer, "You let members pin messages"))
+sent_and_delivered(lambda: cara.send_text(ppeer, "who brings the urn?"))
+urn = next(m["client_msg_id"] for m in cara.store.messages_for(ppeer)
+           if m.get("body") == "who brings the urn?")
+time.sleep(0.01)
+sent_and_delivered(lambda: cara.pin_message(ppeer, urn, True))
+check("...and a member's pin is taken by everyone",
+      pin_cids(alice, ppeer) == [urn, rota] and
+      pin_cids(bob, ppeer) == [urn, rota])
+relay.mail.clear()
+threading.Thread(target=lambda: alice._send_control(
+    ppeer, {"op": "pin", "cid": "f" * 32, "on": True}, "x"),
+    daemon=True).start()
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+check("a pin of a message this device does not hold is kept, not shown",
+      bob.store.pinned(ppeer, "f" * 32) and "f" * 32 not in
+      pin_cids(bob, ppeer))
+sent_and_delivered(lambda: alice.set_group_permissions(pgid, [],
+                                                       members_pin=False))
+check("the rule turned off: only admins again",
+      not cara.can_pin(ppeer) and alice.can_pin(ppeer) and
+      said(alice, ppeer, "Only admins can pin messages now"))
+check("an older app's reading of the state keeps nothing new: the rule "
+      "rides in the rules, and only 19.0 reads it",
+      "pin" not in M.sanitize_group_rules({"pin": "yes"}, {B, K}) and
+      M.sanitize_group_rules({"pin": True}, {B, K}) == {"pin": True})
+probe_db = os.path.join(os.environ["HOME"], "pins_migration.db")
+store13 = M.LocalStore(Path(probe_db))
+store13._db.execute("DROP TABLE pins")
+store13._db.execute("PRAGMA user_version = 13")
+store13._db.commit()
+store13.close()
+store14 = M.LocalStore(Path(probe_db))
+check("a store from 18.x opens with the pins table, as schema 14",
+      store14._db.execute("PRAGMA user_version").fetchone()[0] == 14 and
+      store14.pins("x") == [])
+store14.close()
 
 print("\nIdentity rename")
 old_user = alice.keys.username

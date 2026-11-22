@@ -1676,7 +1676,16 @@ def record_sheet():
 
 
 def record_send():
-    if PLAY["sheet"].recorder.elapsed_ms < 2000:
+    rec = PLAY["sheet"].recorder
+    coders = [(h[0].name, h[0].preset) for h in
+              getattr(rec.coder, "_coders", {}).values()]
+    if coders and coders != PLAY.get("coders"):     # which coder, how fast
+        PLAY["coders"] = coders
+        print(f"  (recording: {coders}, "
+              f"{[round(h[0].cost * 1000, 1) for h in rec.coder._coders.values()]}"
+              f" ms a picture, {rec.elapsed_ms} ms in; set aside: "
+              f"{sorted(M._VIDEO_CAN.get('bad', ()))})", flush=True)
+    if rec.elapsed_ms < 2000:
         return False
     PLAY["sheet"]._send()
 

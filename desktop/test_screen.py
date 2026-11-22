@@ -563,7 +563,8 @@ check("on Android 5 every check is skipped, the coders' and the camera's "
       "too: they are a call's (the Devices run's API 21 failed them)",
       said == [[c, "SKIP"] for c in (
           "call-classes", "call-audio", "codecs-encoders", "codecs-decoders",
-          "camera", "screen", "video-message", "service-notice")]
+          "camera", "screen", "video-message", "video-draw",
+          "service-notice")]
       + [["done", "0/0"]], said)
 
 check("\"done\" is the UI thread's to say, once the sheet that Back closes "

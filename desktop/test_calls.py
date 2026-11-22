@@ -23,6 +23,7 @@ import re
 import socket
 import struct
 import sys
+from pathlib import Path
 import tempfile
 import threading
 import time
@@ -352,6 +353,8 @@ class StandInRelay(threading.Thread):
                 data, src = self.sock.recvfrom(2048)
             except socket.timeout:
                 continue
+            except ConnectionResetError:    # Windows: an ICMP refusal from
+                continue                    # an end that has gone
             except OSError:
                 return
             tag = data[1:9]
@@ -1094,6 +1097,24 @@ check("beside the way, its bars: four while it is fine; a tap tells the "
       alice._call_overlay.meter.bars.lit == 4 and lines[0] == "Direct" and
       any(line.startswith("Delay: ") for line in lines) and
       any(line.startswith("Sound: packets of ") for line in lines), lines)
+check("...and what this device did with what arrived (18.2): the sound "
+      "waiting to be played; no line for a speaker or pictures it has not",
+      any(line.startswith("Sound waiting to be played: ") for line in lines)
+      and not any(line.startswith(("Speaker:", "Their pictures:"))
+                  for line in lines), lines)
+more = M.meter_lines({
+    "rtt": 40, "held_ms": 60, "late": 3, "pictures": (240, 7),
+    "speaker": "speaker holds 40 of 160 ms, ran dry 2 times, "
+               "low-latency path"})
+java = (Path(sys.argv[1]).resolve().parent / "android" /
+        "CallAudio.java").read_text(encoding="utf-8")
+check("...a phone's speaker in its own account (CallAudio.facts), and the "
+      "pictures too late to draw",
+      "Sound waiting to be played: 60 ms; 3 packets came too late" in more
+      and "Speaker: 40 of 160 ms held, ran dry 2 times, on Android's "
+      "low-latency path" in more and
+      "Their pictures: 240 arrived, 7 too late to draw" in more and
+      '"speaker holds "' in java and '" ms, ran dry "' in java, more)
 check("...bars: fine 4; ok 3, or 2 past 300 ms there and back; poor 1; "
       "none before the way is judged",
       [M.meter_bars(w, r) for w, r in (("fine", 50), ("ok", 50),
@@ -1636,13 +1657,15 @@ M.set_identity_rings(B2, True)
 bob._update_links()
 
 saved = M.CALL_RING_SECONDS
-M.CALL_RING_SECONDS = 1
+M.CALL_RING_SECONDS = 3                  # time to reach bob on a slow runner
 place_call(alice, B)
-settle(parties, lambda: bob.call is not None)
+rang = settle(parties, lambda: bob.call is not None)
 check("unanswered, it gives up: no answer for alice, missed for bob",
-      settle(parties, lambda: alice.call is None and bob.call is None, 8) and
-      events_of(alice, B)[-1] == "No answer" and
-      events_of(bob, A)[-1] == "Missed call")
+      settle(parties, lambda: alice.call is None and bob.call is None and
+             events_of(alice, B)[-1:] == ["No answer"] and
+             events_of(bob, A)[-1:] == ["Missed call"], 12),
+      [rang] + [c.state if c else None for c in (alice.call, bob.call)] +
+      [events_of(alice, B)[-2:], events_of(bob, A)[-2:]])
 M.CALL_RING_SECONDS = saved
 
 told = []
@@ -1731,10 +1754,21 @@ check("calling them all the same tells them of it: a missed video call's "
       cards)
 check("...the caller is told that they will see it",
       len(words) == 1 and "will see that you called" in words[0], words)
+
+
+def tries(app, peer):
+    return [m["body"] for m in app.store.messages_for(peer)
+            if m["kind"] == "event" and "You tried" in m["body"]]
+
+
+check("...and the caller's own chat keeps a line of the try (18.2)",
+      len(tries(dave, B)) == 1 and "video call" in tries(dave, B)[0] and
+      "once they accept" in tries(dave, B)[0], tries(dave, B))
 dave.start_call(B)
 settle(parties, lambda: not mail.mail)
 check("...and pressed again within the minute, it is said again and sent "
-      "once", len(words) == 2 and len(call_cards(bob, D)) == 1)
+      "once", len(words) == 2 and len(call_cards(bob, D)) == 1 and
+      len(tries(dave, B)) == 1)
 dave._set_status = real_words
 offer = {"op": "call", "id": "ab" * 16, "tag": "cd" * 8, "k": "ef" * 32,
          "c": [], "codecs": ["opus"], "t": int(time.time()), "v": False}

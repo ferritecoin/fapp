@@ -3,8 +3,9 @@
 # started with the self-test (main.py: android_selftest, debug builds only),
 # its verdicts read from logcat, a screenshot and the logs kept in OUT_DIR.
 # The self-test's checks: call-classes, call-audio, codecs-encoders,
-# codecs-decoders, camera, (18.0) screen, (18.1) video-message, and
-# (18.1) back: Android's Back key, pressed here, as the app took it.
+# codecs-decoders, camera, (18.0) screen, (18.1) video-message, (18.2)
+# video-draw (a decoder's rows drawn by the graphics chip), and (18.1)
+# back: Android's Back key, pressed here, as the app took it.
 #
 #   tools/devices/android_check.sh APP_DEBUG.apk OUT_DIR
 #
@@ -193,4 +194,7 @@ if grep -B 2 -A 12 "Traceback (most recent call last)" "$OUT/logcat.txt" \
   # copy on one line: the lines are cut for the log, whole in the file.)
   head -25 "$OUT/tracebacks.txt" | cut -c1-300
 fi
+# The verdicts once more, last: the end of a job's log is the part read
+# first (and the part its reader can ask for by itself).
+echo "The self-test said:"; cat "$OUT/selftest.txt"
 exit $failed
