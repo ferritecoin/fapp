@@ -39,15 +39,29 @@ python3 -m venv env && . env/bin/activate
 pip install nuitka zstandard kivy requests urllib3 charset-normalizer idna \
             certifi websocket-client cryptography qrcode pillow
 pip install sounddevice numpy av pyzbar pyogg   # optional: what they add
-./build_desktop.sh              # -> desktop/dist/ferritext.dist/
-ONEFILE=1 ./build_desktop.sh    # -> desktop/dist/fext   (single file)
-python3 smoke_exe.py dist/fext  # start it twice in an empty home, as a person would
+python3 build_desktop.py            # -> desktop/dist/ferritext.dist/
+python3 build_desktop.py --onefile  # -> desktop/dist/fext   (single file)
+python3 smoke_exe.py dist/fext      # start it as a person would; hold it against Python
 ```
 
-Linux also needs `gcc` and `patchelf`; Windows, Git Bash and Visual
-Studio's C++ build tools (CI: `build-windows` in `build-apk.yml`, with
-`ONEFILE=1 NAME=Ferritext-<version>-windows.exe`). Overrides: `PY=`,
-`OUT=`, `NAME=`, `SRC=`.
+On Windows, from a Command Prompt, `desktop\build_exe.bat` does all of it
+(an environment, the pinned packages, the build): it needs Python 3.13
+and Visual Studio's C++ build tools. CI builds the release with the same
+file (`build-windows` in `build-apk.yml`). Linux also needs `gcc` and
+`patchelf`. Options: `--name`, `--out`, `--source`.
+
+Running Nuitka by hand on a release's `Ferritext-<version>-desktop.py`
+fails on Windows ("A shared library should have exactly one target with
+the suffix: .dll"): its one-file build makes a DLL named after the
+source, and its build tool refuses a name with dots. `build_desktop.py`
+builds from a copy named without them.
+
+`<the executable> --check report.json` writes what the build can do on
+this computer, each part tried for real (a picture coded and decoded, the
+screen read once, the input injector made). `smoke_exe.py` runs it, and
+the same check under plain Python: a build that can do less fails. (Until
+20.0 the EXE lacked PyAV, so video, screen sharing and remote control,
+and nothing said so.)
 
 A one-file build unpacks itself once per version into the user's cache
 folder (`%LOCALAPPDATA%\Ferritext\<version>` on Windows) and starts from

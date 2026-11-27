@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 
 os.environ.setdefault("KIVY_NO_ARGS", "1")
 os.environ["KIVY_NO_CONSOLELOG"] = "1"
@@ -625,6 +626,60 @@ check("...and fails, saying why, on one that refuses",
       said)
 
 
+print("\n21.0 (NEXT29): each picture drawn as it comes")
+
+
+class RgbaReceiver(RowsReceiver):
+    def latest(self, _who, _track):
+        return (self.serial, bytes(W * H * 4), W, H, "rgba")
+
+
+layer = M.CallVideo("me", {}, on_key=lambda *a: None,
+                    on_failed=lambda *a: None)
+layer._clock.cancel()             # its 30 ticks a second: the push alone
+layer.DRAW_MOST = 10              # a slow cap, to see it hold: each of the
+#                                   clock's ticks here waits a 60th itself
+layer.receiver.stop()
+layer.receiver = RgbaReceiver()
+layer.view = {("ann", "v"): Tile()}
+layer.receiver.serial = 5
+layer._soon()                     # (the receiver's thread) one is ready
+M.Clock.tick()
+first = layer._drawn.get(("ann", "v"))
+M.Clock.tick()                    # the clock's time is its last tick's
+layer._ticked = time.monotonic()  # as if one were drawn just now
+layer.receiver.serial = 6
+layer._soon()                     # and the next at once
+M.Clock.tick()
+soon = layer._drawn.get(("ann", "v"))
+time.sleep(1.2 / layer.DRAW_MOST)
+M.Clock.tick()
+check("a picture ready is drawn at the UI thread's next frame (it waited "
+      "for the next of 30 ticks a second), the one after it no sooner "
+      "than DRAW_MOST a second allows",
+      first == 5 and soon == 5 and layer._drawn.get(("ann", "v")) == 6,
+      (first, soon, layer._drawn))
+check("...a computer draws 60 a second at most, a phone 30",
+      M.CallVideo.DRAW_MOST == (30 if M.IS_MOBILE else 60))
+layer.close()
+
+
+class OnePicture:
+    codec = "h264"
+
+    def decode(self, _data, box, _fill):
+        return (bytes(W * H * 4), W, H, "rgba")
+
+
+pings = []
+receiver = M.VideoReceiver(lambda *a: None, decoder=lambda _c: OnePicture(),
+                           on_picture=lambda: pings.append(1))
+receiver.show("ann", "v", (W, H))
+receiver._decode("ann", "v", "h264", b"a picture")
+check("...the receiver says so as each one is decoded",
+      pings == [1] and receiver.latest("ann", "v")[0] == 1, pings)
+
+
 class BothWays(RowsDecoder):
     """A phone's decoder asked either way, as the self-test compares
     them: rows, or text."""
@@ -773,6 +828,45 @@ check("...and the next in time is shown again",
       behind.latest("ann", "v")[0] == first[0] + 1)
 check("...the one too late is counted, for the call's meter (18.2)",
       behind.late == 1, behind.late)
+# 20.0: a device on which even decoding alone is too slow (an older
+# phone): every picture was late, none was drawn, the picture stood still.
+asked, strained = [], []
+old_phone = M.VideoReceiver(on_key=lambda *a: asked.append(a),
+                            decoder=lambda codec: CountingDecoder(),
+                            on_strain=lambda: strained.append(1))
+old_phone.show("ann", "v", (360, 640))
+old_phone._piece("ann", "v", whole_picture(0, key=True), now, 0.0)
+shown = old_phone.latest("ann", "v")
+for n in range(5):                      # five more wait behind this one
+    old_phone.put("ann", "v", whole_picture(2 + n))
+old_phone.put("bob", "v", whole_picture(0, key=True))    # another's
+old_phone._piece("ann", "v", whole_picture(1), now, old_phone.SKIP + 0.1)
+check("a second behind, what waits of that picture is let go (another "
+      "person's is kept) and a key frame asked for at once",
+      old_phone._inbox.qsize() == 1 and asked == [("ann", "v", 0)] and
+      old_phone.skips == 1 and old_phone.latest("ann", "v") == shown,
+      (old_phone._inbox.qsize(), asked, old_phone.skips))
+old_phone._piece("ann", "v", whole_picture(8), now + 0.1, 0.0)
+check("...the pictures that follow wait for the key frame",
+      old_phone.latest("ann", "v") == shown)
+old_phone._piece("ann", "v", whole_picture(9, key=True), now + 0.2, 0.0)
+check("...which is shown as it comes: the picture moves again, from now",
+      old_phone.latest("ann", "v")[0] == shown[0] + 1 and
+      old_phone.ease == 1 and not strained)
+old_phone._piece("ann", "v", whole_picture(10), now + 5,
+                 old_phone.SKIP + 0.1)
+check("let go twice within half a minute: a picture half the size is "
+      "asked for, and whoever says what this device shows is told",
+      old_phone.ease == 2 and strained == [1] and old_phone.skips == 2,
+      (old_phone.ease, strained))
+old_phone._piece("ann", "v", whole_picture(11, key=True), now + 6, 0.0)
+for at in (40, 45, 80, 85, 120, 125):
+    old_phone._piece("ann", "v", whole_picture(at), now + at,
+                     old_phone.SKIP + 0.1)
+    old_phone._piece("ann", "v", whole_picture(at + 1, key=True),
+                     now + at + 1, 0.0)
+check("...a quarter at the least, however often after that",
+      old_phone.ease == 4 and len(strained) == 2, (old_phone.ease, strained))
 slow = CountingDecoder(after=2)
 asking = M.VideoReceiver(on_key=lambda *a: None, decoder=lambda codec: slow)
 asking.show("ann", "v", (360, 640))
@@ -1063,6 +1157,195 @@ check("…but after a gap where pictures are missing, a key frame first",
 recv._check(now + 240 + M.VideoReceiver.GONE + 1)
 check("a stream silent for ten minutes is let go",
       ("ann", "s", 0) not in recv._streams)
+
+print("\n21.1: a key frame a viewer can start from (the owner's phone saw no "
+      "picture of a PC)")
+
+
+def ffmpeg_option(coder, option):
+    """Whether FFmpeg's `coder` has `option` (None: its libraries not found
+    beside PyAV's): an option FFmpeg does not know is ignored unsaid."""
+    import ctypes
+    import glob
+    import av
+    base = os.path.dirname(av.__file__)
+    found = glob.glob(os.path.join(base, "..", "av.libs", "*")) + \
+        glob.glob(os.path.join(base, "*.so*")) + \
+        glob.glob(os.path.join(base, "*.dll"))
+    util = [p for p in found if "avutil" in os.path.basename(p)]
+    codec = [p for p in found if "avcodec" in os.path.basename(p)]
+    if not util or not codec:
+        return None
+    util = ctypes.CDLL(util[0], mode=getattr(ctypes, "RTLD_GLOBAL", 0))
+    lib = ctypes.CDLL(codec[0])
+    lib.avcodec_find_encoder_by_name.restype = ctypes.c_void_p
+    lib.avcodec_find_encoder_by_name.argtypes = [ctypes.c_char_p]
+    lib.avcodec_alloc_context3.restype = ctypes.c_void_p
+    lib.avcodec_alloc_context3.argtypes = [ctypes.c_void_p]
+    util.av_opt_find.restype = ctypes.c_void_p
+    util.av_opt_find.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                 ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+    found_coder = lib.avcodec_find_encoder_by_name(coder.encode())
+    if not found_coder:
+        return None
+    ctx = lib.avcodec_alloc_context3(found_coder)
+    return bool(util.av_opt_find(ctx, option.encode(), None, 0, 1))
+
+
+known = {}
+for family, coder in (("nvenc", "h264_nvenc"), ("qsv", "h264_qsv"),
+                      ("amf", "h264_amf")):
+    for option in M._FFMPEG_OPTIONS[family]:
+        known[(coder, option)] = ffmpeg_option(coder, option)
+asked_idr = {c: M._FFMPEG_OPTIONS[f].get(o) for f, c, o in (
+    ("nvenc", "h264_nvenc", "forced-idr"), ("qsv", "h264_qsv", "forced_idr"),
+    ("amf", "h264_amf", "forced_idr"))}
+if None in known.values():
+    print("  (FFmpeg's libraries not found beside PyAV here: its options not "
+          "looked up)")
+check("a graphics chip's coder (NVIDIA, Intel, AMD) is told to make an IDR "
+      "when a key frame is asked for, each option one FFmpeg knows by that "
+      "name (FFmpeg ignores, unsaid, one it does not)",
+      set(asked_idr.values()) == {"1"} and
+      all(v is not False for v in known.values()), (asked_idr, known))
+
+
+class Packet:
+    def __init__(self, key):
+        self.is_keyframe = key
+
+
+class ChipContext:
+    """A chip's coder as FFmpeg's context: `keys` says, for each picture
+    handed in, the packets that come out (and at the end, the rest)."""
+
+    def __init__(self, *keys):
+        self.keys = list(keys)
+
+    def encode(self, frame):
+        return [Packet(k) for k in self.keys.pop(0)]
+
+
+import av                                                  # noqa: E402
+
+M.FfmpegEncoder._prove(av, ChipContext([True], [True], []), 64, 48)
+check("a chip's coder is used once it makes a key frame when asked (its "
+      "second picture, asked, a key frame like its first)", True)
+try:
+    M.FfmpegEncoder._prove(av, ChipContext([True], [False], []), 64, 48)
+    refused = False
+except RuntimeError:
+    refused = True
+late_ok = True
+try:
+    M.FfmpegEncoder._prove(av, ChipContext([], [True], [True]), 64, 48)
+except RuntimeError:
+    late_ok = False
+check("...one whose picture asked to be a key frame is not one is not used "
+      "(x264 is), and one a picture behind is used", refused and late_ok)
+
+
+class NoKeys:
+    """A chip's coder that makes no key frame when asked (21.0's nvenc)."""
+    name, codec, fps, preset = "h264_nvenc", "h264", 30, 0
+
+    def __init__(self, size):
+        self.size, self.kbps, self.cost, self.closed = size, 8000, 0.0, False
+
+    def set_kbps(self, kbps):
+        self.kbps = kbps
+
+    def encode(self, frame, key):
+        return [(b"\x00\x00\x00\x01\x41" + bytes(16), False)]
+
+    def close(self):
+        self.closed = True
+
+
+coder = still_coder("screen", first)
+began = coder.poll(0.5)
+fake = NoKeys(coder._coders[0][0].size)
+coder._coders[0][0] = fake
+given = []
+for _ in range(M.FfmpegVideoCoder.KEY_OWED_MOST):  # the viewer asks again
+    coder.ask_key(0)
+    given += coder.poll(0.5)
+bad = M._VIDEO_CAN.get("bad", set())
+coder.ask_key(0)
+after = coder.poll(0.5)
+check(f"in a session, a coder asked for a key frame that hands out "
+      f"{M.FfmpegVideoCoder.KEY_OWED_MOST} pictures, none a key frame, is "
+      f"put aside (and a chip's not used again this run); the next picture "
+      f"is a key frame from another",
+      began and began[0][2] and not any(p[2] for p in given) and
+      fake.closed and "h264_nvenc" in bad and after and after[0][2] and
+      coder._coders[0][0].name == "libx264",
+      ([p[2] for p in given], fake.closed, sorted(bad), after[:1]))
+bad.discard("h264_nvenc")
+x264 = [p for _ in range(4) for p in (coder.ask_key(0) or coder.poll(0.5))]
+check("...x264, asked, gives a key frame each time and is kept",
+      len(x264) == 4 and all(p[2] for p in x264) and
+      coder._coders[0][0].name == "libx264")
+coder.close()
+
+class Shows(Quiet):
+    """A decoder that shows each picture it takes."""
+
+    def decode(self, data, box, fill):
+        return (b"\0" * 12, 2, 2, "rgb")
+
+
+asks = []
+waiting = M.VideoReceiver(on_key=lambda *a: asks.append(a),
+                          decoder=lambda codec: Shows())
+waiting.show("bob", "s", (800, 600), False)
+since = waiting._shown[("bob", "s")]
+for later in (1.0, 1.6, 2.0, 3.2, 4.7, 7.0, 10.7):
+    waiting._check(since + later)
+asked_then = len(asks)
+waiting._piece("bob", "s", whole_picture(0, key=True), since + 10.8, 0.0)
+for later in (23.0, 35.0):
+    waiting._check(since + later)
+check("a picture shown and none come yet is asked for after 1.5 s, then "
+      "twice as long between asks (3, 6, … 12 s: a still screen whose "
+      "first picture was lost sent nothing more); no more once one is "
+      "decoded", asked_then == 3 and len(asks) == 3 and
+      asks[0] == ("bob", "s", 0), asks)
+blind = M.VideoReceiver(on_key=lambda *a: asks.append(a),
+                        decoder=lambda codec: Quiet())
+blind.show("ann", "s", (800, 600), False)
+since = blind._shown[("ann", "s")]
+blind._piece("ann", "s", whole_picture(0, key=True), since + 0.1, 0.0)
+before = len(asks)
+blind._check(since + 1.6)
+check("...a picture taken in that showed nothing does not count: still "
+      "asked for (a decoder waiting for a key frame of its own)",
+      len(asks) == before + 1, asks[before:])
+blind.show("ann", "s", None)
+check("...and hidden, then shown again, it is watched again",
+      ("ann", "s") not in blind._decoded and ("ann", "s") not in
+      blind._shown)
+
+big = M.VideoAssembler()
+now = time.monotonic()
+taken = big.put(0, 0, M.VIDEO_MAX_PIECES + 1, 1, M.VIDEO_KEY, b"x", now)
+check("a picture of more pieces than a stream carries is lost, and a key "
+      "frame wanted (it was dropped unsaid: nothing was asked for)",
+      taken is None and big.lost == 1 and big.wants_key and
+      big.put(1, 0, 1, 1, M.VIDEO_KEY | M.VIDEO_START, b"k", now) ==
+      (1, True, b"k"))
+check("a shared screen is at most 3840 across (a phone's decoder takes "
+      "4K): three screens side by side are scaled down whole",
+      M.video_size(5760, 1080, 1080, M.SCREEN_LONGEST) == (3840, 720) and
+      M.video_size(1920, 1080, 1080, M.SCREEN_LONGEST) == (1920, 1080))
+java = (Path(sys.argv[1] if len(sys.argv) > 1 else "main.py").resolve()
+        .parent / "android" / "VideoCall.java").read_text("utf-8")
+check("a phone's decoder is given room for the largest picture a stream "
+      "carries, and says so when a picture is larger still",
+      "KEY_MAX_INPUT_SIZE, MOST_IN" in java and
+      "MOST_IN = 1 << 20" in java and
+      1 << 20 >= M.VIDEO_MAX_PIECES * M.VIDEO_PIECE_BYTES and
+      "the decoder's room" in java)
 plans = []
 eng = M.CallEngine(os.urandom(16).hex(), os.urandom(8), 0, None, "",
                    on_event=lambda kind, value: plans.append(value)
@@ -1240,6 +1523,72 @@ for role in (0, 1):
     pair[role].stop()
     seen[role].stop()
 
+print("\n21.1: a still screen whose first picture is lost, engine to engine")
+call_id, call_tag = os.urandom(16).hex(), os.urandom(8)
+ev = {0: [], 1: []}
+pair = {}
+for role in (0, 1):
+    pair[role] = M.CallEngine(call_id, call_tag, role, None, "",
+                              on_event=lambda k, v, r=role: ev[r].append((k, v)),
+                              audio_factory=M.CallAudio)
+    pair[role].set_keys(M.CallKeys(secret, call_id, call_tag,
+                                   caller=role == 0))
+pair[0].add_candidates(pair[1].candidates())
+pair[1].add_candidates(pair[0].candidates())
+viewer = M.VideoReceiver(on_key=lambda *a: pair[1].ask_video_key(a[1]))
+lost_pieces = []
+taken = viewer.put
+
+
+first_seen = []
+
+
+def lossy(who, track, payload):
+    """The way loses every piece of the screen's first picture, and of the
+    pictures that sharpen it for a second after (SCREEN_SETTLE): after
+    them a still screen (a locked one) sends nothing at all."""
+    if track == "s":
+        first_seen[:] = first_seen or [time.monotonic()]
+        if time.monotonic() - first_seen[0] < M.SCREEN_SETTLE + 0.3:
+            lost_pieces.append(1)
+            return
+    taken(who, track, payload)
+
+
+viewer.put = lossy
+viewer.start()
+pair[1].video, pair[1].video_who = viewer, "other"
+for role in (0, 1):
+    pair[role].start()
+for _ in range(100):
+    if pair[0].path == "direct" and pair[1].path == "direct":
+        break
+    time.sleep(0.03)
+pair[0].set_media(True, False, True)                # 0 shares its screen
+viewer.show("other", "s", (960, 540), False)
+screen_coder = still_coder("screen", first)
+screen_sender = M.VideoSender("s", screen_coder, pair[0].video_emit("s"))
+screen_sender.start()
+answered, until = 0, time.monotonic() + 8.0
+while time.monotonic() < until and viewer.latest("other", "s") is None:
+    asked = [1 for k, v in ev[0] if k == "video_key" and v == "s"]
+    for _ in asked[answered:]:
+        screen_coder.ask_key()                  # as CallVideo.ask_key does
+    answered = len(asked)
+    time.sleep(0.05)
+check("its first pictures lost on the way (the first and its second of "
+      "sharpening), a still screen sends nothing more, and the viewer asks "
+      "for one after 1.5 s: the picture comes (it waited for good: the "
+      "owner's phone, a locked PC)",
+      lost_pieces and answered >= 1 and
+      viewer.latest("other", "s") is not None,
+      (len(lost_pieces), answered, viewer.pictures))
+screen_sender.stop()
+screen_coder.close()
+for role in (0, 1):
+    pair[role].stop()
+viewer.stop()
+
 print("\nRecording a call (F13)")
 keys = M.IdentityManager()
 priv, *_ = M.mine_identity()
@@ -1302,5 +1651,50 @@ session.update_member(them.state())
 check("one who records says so in their state; the others are told once",
       them.state().get("rec") is True and session.recording() and
       session.recording_news == [other.address])
+
+print("\n21.1 (SCREEN60, CURSOR30): the screen's rate, and its pointer left out")
+M.save_pref("remote_smooth", None)
+was = M.screen_fps()
+M.save_pref("remote_smooth", True)
+check("a shared screen is read 30 times a second; 60 with Settings › "
+      "Remote access › Smoother screen", was == 30 and M.screen_fps() == 60)
+os.environ.pop("FEXT_VIDEO_TEST")
+found = M.video_sources("screen")          # this X display's (xvfb)
+os.environ["FEXT_VIDEO_TEST"] = "1"
+check("...FFmpeg's grab asked for 60 first, then 30 and 15 where it will "
+      "not open", found and found[0].options == (
+          {"framerate": "60"}, {"framerate": "30"}, {"framerate": "15"}),
+      found and found[0].options)
+check("...the service's helper reads it as often (not started here)",
+      M.DeskCapture(found[0]).fps == 60)
+plans = []
+planner = M.CallEngine(os.urandom(16).hex(), os.urandom(8), 0, None, "",
+                       on_event=lambda k, v: plans.append((k, v)),
+                       audio_factory=M.CallAudio)
+planner._plan_screen(0.0, "h264", time.monotonic())
+check("...and a 1-to-1 call's plan for it says 60 a second",
+      plans and plans[-1][0] == "video_plan" and plans[-1][1][1][1] == 60,
+      plans)
+M.save_pref("remote_smooth", False)
+grab = M.FfmpegVideoCoder(found[0])
+grab.set_pointer(False)                  # any thread asks; poll applies it
+opened = grab.capture
+grab._apply_pointer()
+check("CURSOR30: the screen read without its pointer (the side controlling "
+      "draws its own): FFmpeg's grab opened again without it",
+      grab.pointer is False and grab.capture is not opened and
+      all(o.get("draw_mouse") == "0" for o in grab.source.options),
+      grab.source.options)
+grab.set_pointer(True)
+grab._apply_pointer()
+check("...and with it again once that ends",
+      all(o.get("draw_mouse") == "1" for o in grab.source.options))
+grab.close()
+desk = M.DeskCapture(found[0])
+grab = types.SimpleNamespace(capture=desk, source=found[0], pointer=True,
+                             _pointer_wanted=False)
+M.FfmpegVideoCoder._apply_pointer(grab)
+check("...the service's helper is told, without opening anything again",
+      desk.pointer is False and grab.capture is desk)
 
 finish()

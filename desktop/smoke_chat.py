@@ -58,7 +58,7 @@ class StubApp:
     current_peer = PEER
     keys = type("Keys", (), {"address": "FecMe1111111111111111111111111111",
                              "has_identity": True, "username": "me",
-                             "label": "Personal"})
+                             "label": "Personal", "identities": [{}]})
     store = None
 
     def conversation_kind(self, peer):

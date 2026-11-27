@@ -775,6 +775,36 @@ if M.opus_library() is not None:
            [i for i in range(len(played) - 48000, len(played) - 480, 480)
             if not any(played[i:i + 480])][:8]))
 
+
+
+def ws_waits(engine, packets=20) -> list:
+    """21.0: how long each of `packets` from the WebSocket waits for the
+    engine to take it, given out of step with its loop (seconds)."""
+    taken, waits = [], []
+    engine._packet = lambda *_a: taken.append(time.monotonic())
+    engine.start()
+    for n in range(packets):
+        time.sleep(0.013)
+        taken.clear()
+        given = time.monotonic()
+        engine.ws_packet(bytes([n]))
+        end = given + 0.5
+        while not taken and time.monotonic() < end:
+            time.sleep(0.0005)
+        if taken:
+            waits.append(taken[0] - given)
+    engine.stop()
+    return sorted(waits)
+
+
+waits = ws_waits(M.RoomEngine("0123456789abcdef", 0, None, "", os.urandom(32),
+                              lambda *_a: None,
+                              audio_factory=lambda: Tone(0)))
+check("21.0: a packet the WebSocket hands a group call's engine is taken at "
+      "once (it waited for the loop's select, up to 10 ms)",
+      len(waits) == 20 and waits[10] < 0.004,
+      [round(w * 1000, 1) for w in waits])
+
 passed = sum(1 for _n, ok in RESULTS if ok)
 print(f"\n  {passed}/{len(RESULTS)} passed")
 sys.exit(0 if passed == len(RESULTS) else 1)

@@ -14,11 +14,16 @@ workflow's emulators do (main.py's self-test shares the screen there).
 """
 import contextlib
 import importlib.util
+import inspect
 import io
+import json
 import os
+import re
 import sys
 import tempfile
 import threading
+import time
+import types
 from pathlib import Path
 
 os.environ.setdefault("KIVY_NO_ARGS", "1")
@@ -265,6 +270,27 @@ class Stop:
         self.then = then
 
 
+class JString(str):
+    """java.lang.String, as pyjnius makes one."""
+
+
+class ExtraIntent:
+    """android.content.Intent's string extras as pyjnius fills them (run
+    61): a Python str goes in as a char[], which getStringExtra reads as
+    null."""
+
+    def __init__(self):
+        self.extras = {}
+
+    def putExtra(self, key, value):
+        self.extras[key] = value if isinstance(value, JString) else \
+            list(value)
+
+    def getStringExtra(self, key):
+        value = self.extras.get(key)
+        return value if isinstance(value, str) else None
+
+
 CLASSES = {
     "android.content.Context": Context,
     "android.os.Handler": lambda looper: ("handler", looper),
@@ -279,6 +305,8 @@ CLASSES = {
     "android.media.MediaCodec$BufferInfo": Info,
     "java.nio.ByteBuffer": Heap,
     "android.os.Bundle": lambda: Bundle(),
+    "android.content.Intent": ExtraIntent,
+    "java.lang.String": JString,
 }
 FACTORIES = set()
 
@@ -308,6 +336,22 @@ class ShareJava:
 
 
 CLASSES["org.fext.fext.ServiceFextshare"] = ShareJava
+
+
+class CameraJava(ShareJava):
+    """p4a's ServiceFextcam (20.0), likewise."""
+    started = stopped = 0
+
+
+CLASSES["org.fext.fext.ServiceFextcam"] = CameraJava
+
+
+class LocationJava(ShareJava):
+    """p4a's ServiceFextloc (21.0), likewise."""
+    started = stopped = 0
+
+
+CLASSES["org.fext.fext.ServiceFextloc"] = LocationJava
 # The call's other classes, which android_find_call_classes finds as well.
 CLASSES.update(dict.fromkeys((
     "org.fext.call.CallAudio", "org.fext.call.VideoCall",
@@ -560,17 +604,20 @@ finally:
 said = [line.split(" ")[1:3] for line in printed.getvalue().splitlines()
         if line.startswith("FEXT-SELFTEST ")]
 check("on Android 5 every check is skipped, the coders' and the camera's "
-      "too: they are a call's (the Devices run's API 21 failed them)",
+      "too: they are a call's (the Devices run's API 21 failed them); a "
+      "string on an Intent is read back there too (21.1)",
       said == [[c, "SKIP"] for c in (
           "call-classes", "call-audio", "codecs-encoders", "codecs-decoders",
           "camera", "screen", "video-message", "video-draw",
-          "service-notice")]
-      + [["done", "0/0"]], said)
+          "camera-service", "service-notice", "call-notice", "location",
+          "location-service")] + [["string-extra", "PASS"]] +
+      [["live-notice", "SKIP"], ["call-lobby", "SKIP"], ["done", "1/1"]],
+      said)
 
 check("\"done\" is the UI thread's to say, once the sheet that Back closes "
       "is open: the emulators' check presses Back on reading it (18.1)",
       "done" not in before_ui and printed.getvalue().splitlines()[-2:] ==
-      ["the Back sheet opens", "FEXT-SELFTEST done 0/0"],
+      ["the Back sheet opens", "FEXT-SELFTEST done 1/1"],
       printed.getvalue().splitlines()[-3:])
 check("the sync service's class and the notifier are found on the UI "
       "thread first, as the app finds them: the check's own thread could "
@@ -594,7 +641,9 @@ H = importlib.util.module_from_spec(hook)
 hook.loader.exec_module(H)
 manifest = ('<service android:name="org.x.ServiceFextsync" />'
             '<service android:name="org.x.ServiceFextcall" />'
-            '<service android:name="org.x.ServiceFextshare" />')
+            '<service android:name="org.x.ServiceFextshare" />'
+            '<service android:name="org.x.ServiceFextcam" />'
+            '<service android:name="org.x.ServiceFextloc" />')
 typed = H.declare_service_types(manifest)
 spec = (ROOT / "buildozer.spec").read_text("utf-8")
 check("the share service is declared, of type mediaProjection, with its "
@@ -602,6 +651,410 @@ check("the share service is declared, of type mediaProjection, with its "
       '"mediaProjection"' in typed and
       "Fextshare:main.py:foreground" in spec and
       "FOREGROUND_SERVICE_MEDIA_PROJECTION" in spec)
+
+java = """    public boolean deleteSurroundingText(int beforeLength, int afterLength) {
+        if (Build.VERSION.SDK_INT <= 29 /* Android 10.0 (Q) */) {
+            if (beforeLength > 0 && afterLength == 0) {
+                while (beforeLength-- > 0) {
+                    nativeGenerateScancodeForUnichar('\\b');
+                }
+                return true;
+           }
+        }
+
+        if (!super.deleteSurroundingText(beforeLength, afterLength)) {
+            return false;
+        }
+        updateText();
+        return true;
+    }
+"""
+kept = H.keep_backspace(java)
+check("20.0: SDL's Java is given the keyboard's backspace past its own "
+      "text (Android 11 and later deleted nothing of what the app had put "
+      "in the field), once, before SDL's own deleting",
+      kept.count("nativeGenerateScancodeForUnichar('\\b');") == 2 and
+      kept.index("fextBefore") < kept.index("if (!super.deleteSurr") and
+      H.keep_backspace(kept) == kept)
+try:
+    H.keep_backspace(java.replace("super.delete", "other.delete"))
+    refused = False
+except RuntimeError as exc:
+    refused = "backspace" in str(exc)
+check("...and a build with another SDL stops, saying so", refused)
+
+print("\n20.0: a call's camera kept on when the app leaves the screen")
+check("the camera service is declared, of type camera, with its "
+      "permission; the call service stays the microphone's alone (Android "
+      "14 would refuse it to someone who never gave the camera)",
+      'ServiceFextcam" android:foregroundServiceType="camera"' in typed and
+      'ServiceFextcall" android:foregroundServiceType="microphone"' in typed
+      and "Fextcam:main.py:foreground" in spec and
+      "FOREGROUND_SERVICE_CAMERA" in spec)
+check("21.0: the location service is declared, of type location, with "
+      "its permission and the place's",
+      'ServiceFextloc" android:foregroundServiceType="location"' in typed
+      and "Fextloc:main.py:foreground" in spec and
+      "FOREGROUND_SERVICE_LOCATION" in spec and
+      "ACCESS_FINE_LOCATION" in spec and "ACCESS_COARSE_LOCATION" in spec)
+
+
+class Video:
+    """A call's video with the camera's coder in it, or not."""
+    def __init__(self):
+        self.coders, self.stopped = {}, []
+
+    def start(self, track):
+        self.coders[track] = object()
+        return ""
+
+    def stop(self, track):
+        self.coders.pop(track, None)
+        self.stopped.append(track)
+
+    def close(self):
+        self.coders.clear()
+
+
+class Shell:
+    """FextApp's camera parts, on a stand-in for the rest of the app."""
+    _camera_service = M.FextApp._camera_service
+    _pause_call_camera = M.FextApp._pause_call_camera
+    stop_call_video = M.FextApp.stop_call_video
+    close_call_video = M.FextApp.close_call_video
+
+    def __init__(self):
+        self.video, self.toggled = Video(), []
+        self.call = types.SimpleNamespace(ended=False, state="active")
+
+    def call_video(self, create=True):
+        return self.video
+
+    def _toggle_call_video(self, track):
+        self.toggled.append(track)
+
+
+phone, shell = Android(34), Shell()
+service = M.CameraService()
+shell.video.start("v")
+as_phone(phone, lambda: shell._camera_service(True))
+check("a call's camera turned on starts the camera service, in sight "
+      "(Android gives a service started out of sight no camera)",
+      CameraJava.started == 1 and service.on)
+as_phone(phone, lambda: shell._camera_service(True))
+check("...once", CameraJava.started == 1)
+as_phone(phone, shell._pause_call_camera)
+check("the app left with it on, in a call: the camera stays on (it went "
+      "off, and the other side lost the picture)",
+      shell.toggled == [] and "_camera_paused" not in shell.__dict__)
+shell.call.state = "incoming"
+as_phone(phone, shell._pause_call_camera)
+check("...the lobby's, before the call is answered, still goes off",
+      shell.toggled == ["v"] and shell.__dict__.pop("_camera_paused"))
+shell.call.state = "active"
+as_phone(phone, lambda: shell.stop_call_video("v"))
+check("the camera turned off stops the service",
+      CameraJava.stopped == 1 and not service.on and
+      shell.video.stopped == ["v"])
+shell.video.start("v")
+del shell.toggled[:]
+as_phone(phone, shell._pause_call_camera)
+check("...and without the service (it could not start), the camera goes "
+      "off out of sight, as before", shell.toggled == ["v"])
+as_phone(phone, lambda: shell._camera_service(True))
+as_phone(phone, shell.close_call_video)
+check("the call over: the service stopped with the camera",
+      CameraJava.stopped == 2 and not service.on)
+before = CameraJava.started
+shell._camera_service(True)
+check("a computer has no such service", CameraJava.started == before)
+said = []
+verdict = as_phone(phone, lambda: M._selftest_camera_service(
+    lambda *a: said.append(a) or a[1], M.CameraService(), 2.0))
+check("the device self-test starts it, sees it up, and stops it",
+      verdict == "PASS" and said == [("camera-service", "PASS", "up")] and
+      not service.on, said)
+CameraJava.delay = 5.0
+check("...and fails where it does not come up",
+      as_phone(phone, lambda: M._selftest_camera_service(
+          lambda *a: a[1], M.CameraService(), 0.3)) == "FAIL")
+CameraJava.delay = 0.0
+
+print("\nThe location self-test (21.0)")
+
+
+class StandInPlace:
+    """AndroidLocation's part the self-test uses: a provider on or off,
+    and the points it hands a follower."""
+
+    PROVIDERS, enabled, points = ("gps", "network"), {"gps"}, []
+
+    class _Manager:
+        @staticmethod
+        def isProviderEnabled(name):
+            return name in StandInPlace.enabled
+
+    @classmethod
+    def _manager(cls):
+        return cls._Manager()
+
+    def follow(self, on_point):
+        for point in StandInPlace.points:
+            on_point(point)
+
+    def unfollow(self, on_point):
+        pass
+
+
+def location_selftest(wait=1.0, up_wait=1.0):
+    """Its verdicts, run on a thread of its own as the self-test's are,
+    the UI thread's clock turning meanwhile, on a stand-in phone that has
+    found none of the app's classes yet (as a device, it finds them from
+    the UI thread alone)."""
+    said = []
+    worker = threading.Thread(target=lambda: M._selftest_location(
+        lambda *a: said.append(a) or a[1], wait, up_wait))
+
+    def run():
+        worker.start()
+        while worker.is_alive():
+            M.Clock.tick()
+            worker.join(0.01)
+    as_phone(Android(34), run)
+    return said
+
+
+real_location = M.AndroidLocation, M.LOCATION_SOURCE, M.android_has_permission
+M.AndroidLocation = StandInPlace
+M.android_has_permission = lambda _p: True
+StandInPlace.points = [{"lat": 51.5007, "lon": -0.1246, "acc": 5, "at": 1}]
+said = location_selftest()
+check("the device self-test finds where the phone is as a live share "
+      "does, and launches the location service as a live share does, "
+      "from the UI thread (from a thread of its own its class was not "
+      "found: Devices run 52, Android 5); up, then stopped",
+      said == [("location", "PASS", "51.500700, -0.124600 (±5 m)"),
+               ("location-service", "PASS", "up")] and
+      (LocationJava.started, LocationJava.stopped) == (1, 1), said)
+StandInPlace.points, LocationJava.delay = [], 5.0
+said = location_selftest()
+check("...and fails, saying why, where no point comes or the service does "
+      "not come up",
+      said == [("location", "FAIL", "no point in 1 s from gps"),
+               ("location-service", "FAIL", "not up in 1 s")], said)
+LocationJava.delay = 0.0
+StandInPlace.enabled = set()
+check("...with location off, the first is skipped",
+      location_selftest()[0] == ("location", "SKIP", "location is off"))
+M.android_has_permission = lambda _p: False
+check("...without the permission, both are",
+      location_selftest() == [
+          ("location", "SKIP", "no location permission"),
+          ("location-service", "SKIP", "no location permission")])
+
+print("\nThe live location's notice self-test (21.1, LIVENOTICE30)")
+
+
+def live_notice_selftest(shows=True, stops=True, sdk=34):
+    """Its verdict on a stand-in phone: the notice shows the words the flag
+    file holds while the service runs (as Notifier.liveNotice does), and
+    Stop does what NotifyReceiver does (the mark left, the flag taken)."""
+    said = []
+
+    def shown():
+        if not (shows and service.flag.exists()):
+            return None
+        return json.loads(service.flag.read_text())["text"]
+
+    def press_stop(svc):
+        if stops:
+            Path(str(svc.flag) + ".stopped").touch()
+            svc.flag.unlink()
+
+    service = M.LocationService()
+
+    def run():
+        worker = threading.Thread(target=lambda: M._selftest_live_notice(
+            lambda *a: said.append(a) or a[1], 1.0, service, shown,
+            press_stop))
+        worker.start()
+        while worker.is_alive():
+            M.Clock.tick()
+            worker.join(0.01)
+    as_phone(Android(sdk), run)
+    return said, service
+
+
+M.android_has_permission = lambda _p: True
+said, service = live_notice_selftest()
+check("the location service's notice says with whom and until when, and "
+      "its Stop ends the service and tells the app",
+      said == [("live-notice", "PASS", "'With the self-test until 12:00'; "
+                "Stop: the service ended, the app told")] and
+      not service.flag.exists() and not service.stopped_mark.exists(), said)
+check("...and fails, saying why, where the notice is not the app's own",
+      live_notice_selftest(shows=False)[0] == [
+          ("live-notice", "FAIL", "shown: None")])
+check("...or Stop leaves the service running",
+      live_notice_selftest(stops=False)[0][0][1] == "FAIL")
+check("...skipped before Android 6, which cannot say what is shown",
+      live_notice_selftest(sdk=21)[0] == [
+          ("live-notice", "SKIP", "needs Android 6")])
+
+
+class Shown:
+    """A notice Android shows (StatusBarNotification), as pyjnius gives
+    it: its words a Python str when they are a String."""
+
+    def __init__(self, nid, text):
+        self.nid, self.text = nid, text
+
+    def getId(self):
+        return self.nid
+
+    def getNotification(self):
+        return types.SimpleNamespace(extras=types.SimpleNamespace(
+            getCharSequence=lambda key: self.text
+            if key == "android.text" else None))
+
+
+class Styled:
+    """Words that are not a String: a Java object to pyjnius."""
+
+    @staticmethod
+    def toString():
+        return "With Ann until 12:00"
+
+
+def notice_words(shown, nid=8):
+    saved = M.android_context
+    manager = types.SimpleNamespace(getActiveNotifications=lambda: shown)
+    M.android_context = lambda: types.SimpleNamespace(
+        getSystemService=lambda _name: manager)
+    try:
+        return M.android_notice_words(nid)
+    finally:
+        M.android_context = saved
+
+
+def press_stop_sent():
+    """What android_press_live_stop hands to Java, on a stand-in phone."""
+    pressed = []
+    ctx = types.SimpleNamespace(getPackageName=lambda: "org.fext.fext")
+    saved = M.android_context, M._notifier
+    M.android_context = lambda: ctx
+    M._notifier = lambda: types.SimpleNamespace(
+        pressStopLive=lambda *given: pressed.append(given))
+    try:
+        M.android_press_live_stop(types.SimpleNamespace(flag=Path("/f/.x")))
+    finally:
+        M.android_context, M._notifier = saved
+    return pressed, ctx
+
+
+def java_body(java, head):
+    """One method of a Java file, from its head to its closing brace."""
+    body = java[java.index(head):]
+    return body[:body.index("\n    }\n")]
+
+
+pressed, phone = press_stop_sent()
+notifier = (ROOT / "android" / "Notifier.java").read_text("utf-8")
+live, built, press = (java_body(notifier, head) for head in (
+    "public static void liveNotice(", "static Intent stopLiveIntent(",
+    "public static void pressStopLive("))
+check("...its Stop, as the self-test presses it, is what the notice's own "
+      "Stop sends, built in Java (pyjnius gave the activity to setClassName "
+      "as a name, run 60, and the flag to putExtra as a char[], run 61): to "
+      "the app's own receiver, with the flag as a string",
+      pressed == [(phone, str(Path("/f/.x")))] and
+      type(pressed[0][1]) is str and
+      "stopLiveIntent(service, flag)" in live and
+      "sendBroadcast(stopLiveIntent(ctx, flag))" in press and
+      "setClass(ctx, NotifyReceiver.class)" in built and
+      'putExtra("flag", flag)' in built, (pressed, built))
+# Every other extra: the self-test's bare str (below) is on purpose.
+source = Path(_spec.origin).read_text("utf-8").replace(
+    inspect.getsource(M._selftest_string_extra), "")
+values = re.findall(r"\.putExtra\([^,]+,\s*([^\s(]+)", source)
+check("each extra the app puts on an Intent is a Java object (_jstring, "
+      "_charseq, cast): a Python str would go in as a char[], which "
+      "Android reads back as none (run 61)",
+      len(values) == source.count(".putExtra(") and
+      set(values) <= {"_jstring", "_charseq", "cast"}, values)
+
+
+def string_extra(jstring=None):
+    """The self-test's string-extra check on a stand-in phone."""
+    said = []
+    saved = M._jni, M._jstring
+    M._jni = lambda: (CLASSES.get, None)
+    M._jstring = jstring or M._jstring
+    try:
+        verdict = M._selftest_string_extra(
+            lambda *words: said.append(words) or words[1])
+    finally:
+        M._jni, M._jstring = saved
+    return verdict, said[-1][2]
+
+
+passed, detail = string_extra()
+failed, _ = string_extra(jstring=lambda text: text)
+check("the emulators' self-test reads a Java String back from an Intent "
+      "(string-extra), says what a Python str gives, and fails where "
+      "the app's String would not read back",
+      passed == "PASS" and failed == "FAIL" and detail ==
+      "a Java String read back as 'fext', a Python str as None", detail)
+check("a notice's words read back, a String as Python's str (run 59, "
+      "Android 16) or styled words as a Java object; none shown is None",
+      notice_words([Shown(8, "With Ann until 12:00")]) ==
+      notice_words([Shown(3, "x"), Shown(8, Styled())]) ==
+      "With Ann until 12:00" and notice_words([Shown(8, None)]) == "" and
+      notice_words([Shown(3, "x")]) is None)
+
+
+class LiveShell:
+    """FextApp's live-share parts, on a stand-in for the rest."""
+    _follow_live = M.FextApp._follow_live
+    _live_service = M.FextApp._live_service
+    _live_check_stop = M.FextApp._live_check_stop
+
+    def __init__(self):
+        self._live, self._live_clock, self.stops = {}, None, []
+
+    def live_notice_words(self):
+        return "With Ann until 12:00"
+
+    def stop_live(self, peer, cid):
+        self.stops.append(cid)
+        self._live.pop(cid, None)
+
+    def _on_live_point(self, point):
+        pass
+
+    def _live_tick(self, _dt):
+        pass
+
+
+M.LOCATION_SOURCE, live, before = StandInPlace(), LiveShell(), \
+    LocationJava.started
+as_phone(Android(34), lambda: live._follow_live(
+    "peer", "cid", int(time.time()) + 900, None))
+check("a live share launches the location service in sight, from the UI "
+      "thread, as the camera's (on a thread of its own, its class was not "
+      "found and the share was not kept up out of sight)",
+      LocationJava.started == before + 1 and "cid" in live._live)
+check("21.1: ...its notice's words given to the service with its flag",
+      json.loads(M.LocationService().flag.read_text()) == {
+          "title": "Sharing your location", "text": "With Ann until 12:00"})
+M.LocationService().stopped_mark.touch()         # Stop tapped on the notice
+as_phone(Android(34), lambda: live._live_check_stop())
+check("...and once its Stop was tapped, every share this phone keeps up "
+      "ends, the app told once", live.stops == ["cid"] and not live._live
+      and not M.LocationService().stopped_mark.exists(), live.stops)
+live._live_clock.cancel()
+M.AndroidLocation, M.LOCATION_SOURCE, M.android_has_permission = \
+    real_location
 
 passed = sum(RESULTS)
 print(f"\n  {passed}/{len(RESULTS)} passed")

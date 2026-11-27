@@ -234,6 +234,33 @@ sequenceDiagram
   every `AWAY_EVERY` (`contacts.away_at`), and none to a message that
   carries `auto`, so two away devices stop after one each. The relay has
   no part in it.
+- **Polls** (21.0): a message carrying `x.poll` (`sanitize_poll`: a
+  question, 2 to `POLL_MAX` choices, one answer or several, an end),
+  drawn as a `PollCard`. A vote is a control (`vote`: the places of the
+  choices picked, `[]` to take it back) that every device counts for
+  itself, the newest of each member's counting (`poll_votes`); its asker,
+  or in a group an admin who may delete members' messages, ends it
+  (`pollend`, `may_end_poll`). None counts after its end.
+- **Places** (21.0): a message carrying `x.loc` (`sanitize_location`:
+  degrees to a millionth, accuracy, time; a live share's `until`, within
+  a day), drawn as a `LocationCard`. A live share's later points are
+  controls (`loc`) from its sharer alone, while it runs, sent as the
+  phone moves (`live_due`); its end (`loc` with `stop`, or its time)
+  leaves no point on any side (`live_points`). The phone's place comes
+  from Android's LocationManager (`AndroidLocation`, `location_source`);
+  off screen only while `LocationService` (a foreground service of type
+  location) runs, launched on the UI thread as a share starts (a thread
+  Python started cannot find the service's Java class: Devices run 52,
+  Android 5). A share this app no longer follows goes on when it
+  opens again, or ends (`_resume_live`). 21.1: the service's notice is
+  the app's own (`Notifier.liveNotice`, from words the app writes into
+  the service's flag file), with whom and until when, and its Stop
+  (`NotifyReceiver`) takes the flag away and leaves a mark the app reads
+  (`_live_check_stop`). No map is drawn: a phone's maps
+  app is handed a geo: link (`show_in_maps`), a computer copies the
+  coordinates.
+- Both keep words for apps before 21.0 in `body` (`poll_body`,
+  `location_body`), which show those instead.
 
 ## 8. Groups
 
@@ -315,6 +342,25 @@ envelope per member, carrying `x.grp = {id, v}`.
     their `tp`, and *All* names their topics. On again, each topic is back.
   - Stored with the state's version (`groups.topics`), as the rules are.
     Older apps ignore `tp`: one chat, writing to General.
+- **Slow mode, about, @everyone (20.0)**: three more rules in `r`, so an
+  app before 20.0 passes over them (`sanitize_group_rules`).
+  - `slow` (seconds, one of `GROUP_SLOW`): `slow_wait` is the one rule.
+    The sender's app keeps the pace (`FextApp.slow_stop`, asked before
+    the composer is cleared, before a recording starts and in
+    `_queue_message`). The others hold a message only at more than twice
+    the pace (`SyncWorker._too_soon`), counted from the sender's own
+    stamps, or the relay's where those are ahead. Not by the relay's
+    stamps alone: two messages written a minute apart while offline
+    reach the relay together. `_slow_seen` is in memory; admins are
+    never held.
+  - `about` (text, `MAX_GROUP_ABOUT`): `set_group_about`; the first row
+    of the group's page; said in the chat when it changes
+    (`_rules_events`) and to a member who joins (`_apply_group_state`).
+  - `mention_all`: an admin's message that says "@everyone" carries
+    `x.ev`. The receiver, having checked the sender is an admin, adds
+    its own address to the stored `mn`, so everything a mention does (the
+    badge, the notice through a mute, the bubble's mark) follows. Anyone
+    else's `ev` is dropped.
 - **Limits**: `MAX_GROUP_MEMBERS` (32), because each message is sealed
   once per member; `MAX_TOPICS` (32).
 
@@ -372,6 +418,17 @@ flowchart LR
 - An app before 18.1 drops a media reference of a kind it does not know
   and shows `body` ("Video message (0:42)"); `FEATURE_VIDEO` /
   `CAP_VIDEO` tell the sender who can play one.
+
+**Documents (20.0)** are a fourth kind (`kind: "file"`, any type, sent
+as `application/octet-stream`): the same sealed blob, with a `name`
+(`file_name`: a file's name alone, no path, at most `FILE_NAME_MAX`).
+`FextApp.send_file` sends one, `FileContent` is its bubble, and
+`save_document` hands a fetched one to Android's Save dialog, or copies
+it to the Downloads folder on a computer. Ferritext opens none itself.
+An older app shows `body` ("Document: name"). **A contact handed on** is
+no media: a text message with `x.card = {a, u}`, drawn as a card
+(`ConversationScreen.on_contact_card` looks the address up before a chat
+opens). The paperclip's choices are `AttachSheet`'s tiles.
 
 ## 10. Calls
 
@@ -582,9 +639,14 @@ computer) and a name (`device_name`). The answer carries both; the
 controller keeps them (`remote_computer_seen`) and, with two or more,
 asks which (`RemoteComputersSheet`); the offer then names it (`to`) and
 every other computer sets it aside. An offer is also refused when its
-signed time is more than `REMOTE_OFFER_SKEW` away, or seen before
-(`remote_offer_for_here`, `remote_offer_once`): a relay that replays an
-old offer, or sends it to another computer, starts nothing.
+signed time is more than `REMOTE_OFFER_SKEW` from this computer's
+clock, or seen before (`remote_offer_for_here`, `remote_offer_once`):
+a relay that replays an old offer, or sends it to another computer,
+starts nothing. A computer whose clock drifted further than that from
+the relay's (`relay_now`) judges by the relay's, or it would refuse
+every offer; a relay lying about its clock could then replay one,
+which opens a session nobody can see or control (its keys are the
+caller's), shown on the computer as any session is.
 **Before you leave.** `remote_checklist` reads what can be read
 (`windows_signs_in_by_itself`, `windows_screen_locks_itself`, the
 watcher, the last sessions, a restart that came back:
@@ -603,6 +665,71 @@ quiet (`VideoAssembler.follows`, `VideoReceiver` `QUIET`, `GONE`). The
 sender's ceiling steps through `SCREEN_STEPS` on loss or a delay that
 grows (`_plan_screen`, `_delay_grew`: the round trip against its
 lowest), and back up when the link is clean; Data saver caps it.
+
+**20.0.** *A call that hears nothing* is kept `CALL_DROP_SECONDS` (two
+minutes): while quiet the engine registers with the relay every
+`REG_QUIET` and asks the app for a new pass every `RENEW_EVERY`
+(`"renew"` → `_renew_call_pass` → `CallEngine.renew`). A remote session
+drops after `REMOTE_DROP_SECONDS` (`CallEngine(drop_after=…)`), since a
+restarted computer is a new program. *An offer kept by the service* is
+judged by its age when kept (`call_offer_age`, `sig["aged"]`), not by a
+clock the app has not yet set against the relay's. *On the call screen*:
+`MicMarks` (who is muted), `CallOverlay.swap` (your picture as the large
+one), a button for the other camera. *A decoder that falls behind* lets
+go of what it holds and eases back (`VideoReceiver`).
+**The end-to-end test** (`desktop/e2e_remote.py`) runs the program itself
+as the away computer and found three of the above. On Windows input is
+also refused while a window that does not answer is in front: its
+stand-in belongs to the system.
+
+**21.0: the lock screen, from afar (SERVICE29).** Windows lets no program
+of a person's see or use its lock and sign-in screens, Ctrl+Alt+Del or
+an administrator's window. A Windows service can: `--service` runs as
+the system in session 0 and keeps one helper, `--desk`, on the screen's
+session, also as the system. The helper follows the desktop in front
+(`_desk_follow`), reads it into memory only the person's Ferritext may
+open (`DeskCapture`), puts in the pointer and keys (`_DeskInput`;
+characters as the layout's keys off the person's desktop, where Unicode
+was refused) and draws a red bar on the lock screen while a session is
+on; the service presses Ctrl+Alt+Del for it (SendSAS). Their pipes take
+only the system and the person signed in, and the person's side checks
+the system owns them (`DeskClient`, `HelperInjector`). It is set up from
+*Settings › Remote access › The lock screen, from afar*
+(`DeskServiceSheet`), by the program itself only, run again as
+administrator (`service_ask` → `service_run`): copied to Program Files,
+which only administrators change (`service_install`, `SERVICE_MARK`),
+and removed with its copy (`service_remove`). Permission prompts are
+looked at only, unless *Answer permission prompts from afar*.
+`remote_screen_state` gains `locked`, `prompt`, `prompt-view` and `hung`:
+a program that does not answer in front (`windows_hung_front`), with
+*End it* in the band. The helper logs to `desk.log`. Checked on GitHub's
+Windows (`desktop/test_winservice.py`, the Devices workflow; the
+program's own setting up and removal, `desktop/smoke_service.py`), all
+but the unlock itself: that machine's sign-in screen draws nothing.
+**NEXT29.** The clipboard either way (`clip`, in parts; `clipget`), the
+computer's log of its sessions (`remote.log`: never what was typed or
+shown), read from afar or at home.
+**A picture sooner (21.0).** The others' pictures are drawn as they come
+(`CallVideo._soon`, at most `DRAW_MOST` a second): they waited for the
+next of 30 ticks a second, 16 ms on average, and a call sent at 60 was
+drawn at 30. A packet the WebSocket hands an engine wakes its loop
+(`LoopWaker`; it waited up to 20 ms for the loop's select). The pointer's
+moves of one frame go as one packet (`RemoteSurface.send`): a mouse that
+tells its place 500 times a second sent each as one.
+**21.1: a picture to start from, and a phone's trackpad.** A graphics
+chip's H.264 coder (nvenc, QSV, AMF) is told to make a real key frame
+when asked (`forced_idr`; FFmpeg's default made an intra picture no
+viewer could start from) and is proved to before use
+(`FfmpegEncoder._prove`), and put aside if it owes one
+(`FfmpegVideoCoder._owes_key`). A viewer that shows a track and has
+decoded nothing asks again every `NOTHING_YET` seconds. The picture can
+be zoomed and moved (`CallPicture.zoom`, `focus`, `rect`); a phone
+controls as a touchpad (`RemoteSurface.mode`, `remote_touch_mode`).
+The side controlling says it draws the pointer (`"pt"` in `limit`); a
+Windows computer then reads its screen without it
+(`FfmpegVideoCoder.set_pointer`) and tells its shape and a local move
+(`op: cursor`, `_pointer_tick`, `remote_pointer_now`). The screen is
+read at `screen_fps()`: 60 with *Smoother screen*.
 
 The design notes for calls are in `CallSession`'s, `RoomCall`'s and
 `CallEngine`'s docstrings.
@@ -751,7 +878,9 @@ outbox waits.
   outermost page it leaves for the home screen, the app kept. The
   keyboard takes Back first, to hide itself; a Back that then finds a
   field still focused is not spent on the field (18.1,
-  `_back_past_a_field`).
+  `_back_past_a_field`). 21.1: a Back no view takes reaches the
+  activity's `onBackPressed`, which closed the app; the build makes SDL's
+  hand it to the app as the key (`tools/p4a_hook.py`, `BACK_TO_APP`).
 - **Themes**: `THEMES` holds each palette's colour tokens (light and
   dark); `THEME_SETS` holds the looks (palettes, faces, corners).
   `desktop/test_design.py` measures every pair's contrast. The app
@@ -778,14 +907,28 @@ outbox waits.
   Android wants a running service to show a notification: the sync
   service puts its own in the place of python-for-android's (18.1,
   `Notifier.serviceNotice`): silent, without a badge, and secret, so a
-  locked phone does not show it.
+  locked phone does not show it; 20.0: of the least importance, so it
+  has no icon in the status bar. 20.0 adds a fourth service, of the
+  camera type (`CameraService`, "Fextcam"), which holds the camera in a
+  video call while the app is out of sight; it is its own service
+  because Android 14 refuses to start one whose type's permission is not
+  granted. The build hook also patches SDL's Java (`keep_backspace`):
+  on Android 11 and later its `deleteSurroundingText` deleted only what
+  the keyboard itself had typed, so Backspace did nothing to text the
+  app had put in a field. The hook fails the build if SDL's code is not
+  as it expects.
 - **Computers** (Linux, macOS, Windows): the same `main.py` with
   `data/` appended as comment lines (`tools/bundle_desktop.py`), unpacked
   at start. The Windows EXE is that file compiled by Nuitka in CI. On
   Windows a photo or a chat export is chosen in Windows' own Open dialog
   (18.1, `windows_open_dialog` through ctypes, on a thread of its own so
   a call goes on behind it); elsewhere, and where that will not open, in
-  the app's list (`ImageChooserModal`). The EXE can start when Windows
+  the app's list (`ImageChooserModal`). 20.0: one script builds every
+  desktop program (`desktop/build_desktop.py`; `build_exe.bat` on
+  Windows), with every package the Python file can use;
+  `--check` (`build_check`) prints what a program can do on this
+  computer, each part tried for real, and `smoke_exe.py` fails a build
+  that can do less than plain Python. The EXE can start when Windows
   starts (18.2, Settings › Notifications): the Run key of the person's
   own account names it with `--startup`, which opens it minimised
   (`set_start_with_windows`, `built_exe`); no administrator, nothing
@@ -863,6 +1006,7 @@ Every suite runs headless (`xvfb-run`) against a given `main.py`:
 | `test_flows.py` | Two and three real apps through an in-memory relay: messages, groups, group rules, media, the outbox, receipts |
 | `test_calls.py`, `test_conference.py`, `test_video.py` | 1-to-1 calls between two engines, rooms, video, several calls in one chat |
 | `test_remote.py` | Remote control: the input packets, where a touch lands, the access list, two apps in a remote session and an ordinary call's control; 19.0.1's computer state, keys, programs, restart, two computers, checklist and watcher; X11's injector against Xvfb, Windows' on the Devices workflow |
+| `e2e_remote.py` | 20.0: a remote session with real programs: the away computer is `main.py` or a built executable, the relay a stand-in, the target a window that writes down what it is given. Pointer, buttons, wheel, drag, typing, shortcuts, a crash, a restart from afar |
 | `test_security.py` | Attacks on this client, each expected refused: a relay acting as the server, someone acting as someone else, crossing into another computer or identity, a power cut (19.0.1) |
 | `test_videomsg.py` | Video messages: the MP4 written and read in plain Python, files that are not what they say, the recorder against stand-ins for a phone, the bubble and the sheet; with PyAV, recorded, opened by FFmpeg and played |
 | `test_design.py`, `test_composer.py`, `test_navigation.py`, `test_touch.py`, `test_gestures.py` | Themes, contrast, phrases; the composer; navigation; touch |
@@ -897,6 +1041,10 @@ the fact.
 | add a control | `MessagingMixin._send_control` / `_send_control_to`; `SyncWorker._handle_control` (always acknowledge; authorise by author, membership or admin) |
 | change a group's state | `sanitize_group_state`, `_group_state`, `_publish_group_state`, `_apply_group_state` |
 | change what members may do | `GROUP_RIGHTS`, `sanitize_group_rules`, `group_denied`, `message_rights`; the sheets `GroupRightsSheet`, `RestrictSheet` |
+| change slow mode, About this group or @everyone (20.0) | `GROUP_SLOW`, `slow_wait`, `FextApp.slow_stop`, `SyncWorker._too_soon`; `MAX_GROUP_ABOUT`, `set_group_about`; `MENTION_ALL`, `mention_all`; all three in `sanitize_group_rules` / `sanitize_ext` |
+| change what the paperclip offers (20.0) | `ConversationScreen.attach_menu`, `AttachSheet`, `ATTACH_TINTS`, the icon in `icon_geometry` |
+| change how long a silent call is kept (20.0) | `CALL_DROP_SECONDS`, `REMOTE_DROP_SECONDS`; `CallEngine.REG_QUIET`, `RENEW_EVERY` |
+| change what a desktop build holds, or what it must be able to do | `desktop/build_desktop.py` (`EXTRAS`), `requirements-exe.txt`; `build_check` in `main.py`; `desktop/smoke_exe.py`, `desktop/e2e_remote.py` (`NEEDED`) |
 | change topics | `sanitize_group_topics`, `topics_events`, `FextApp.change_topics`, `MessagingMixin.compose_topic`; `TopicStrip`, `TopicsSheet`; `ConversationScreen.in_topic` |
 | add a column or table | `LocalStore._MIGRATIONS` and `SCHEMA_VERSION` (additive, with a default) |
 | change video messages | the file: `mp4_write`, `mp4_read`; recording: `VideoNoteRecorder`, `VIDEO_NOTE`, `MAX_VIDEO_SECONDS`, `media_limit`; the sheet `VideoNoteSheet` (`stop_here`: when it stops by itself); the bubble `VideoContent`; playing: `ConversationScreen.play_video`, `VideoNotePictures` |

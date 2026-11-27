@@ -37,12 +37,17 @@ import android.os.Build;
 public final class Notifier {
     public static final String CHANNEL_MESSAGES = "messages";
     public static final String CHANNEL_CALLS = "calls";
-    public static final String CHANNEL_SERVICE = "service";
+    public static final String CHANNEL_SERVICE = "quiet";
+    private static final String CHANNEL_SERVICE_19 = "service";
     /** The sync service's notice: below the chats' ids (1000 and up). */
     public static final int SERVICE_NOTICE = 7;
     public static final String ACTION_REPLY = "org.fext.notify.REPLY";
     public static final String ACTION_READ = "org.fext.notify.READ";
     public static final String ACTION_DECLINE = "org.fext.notify.DECLINE";
+    /** 21.1 (LIVENOTICE30): a live location's notice, and its Stop. */
+    public static final String CHANNEL_LIVE = "live";
+    public static final int LIVE_NOTICE = 8;
+    public static final String ACTION_STOP_LIVE = "org.fext.notify.STOP_LIVE";
     public static final String KEY_REPLY = "fext_reply";
     private static final long[] RING_VIBRATION = {0, 900, 700, 900, 700};
     private static final String WORDS = "fext_notify_words";
@@ -132,13 +137,24 @@ public final class Notifier {
      * running service to show one; this one is silent, has no badge, and
      * is SECRET: a locked phone does not show it. Called by the service
      * (main.android_service_notice); the earlier notice goes as this one
-     * takes its place. */
+     * takes its place.
+     *
+     * 20.0: ...and nothing of it in the status bar (the owner: "it should
+     * only show up when there are messages, calls, notifications"). Its
+     * channel's importance is MIN from Android 9: no icon at the top, one
+     * folded line at the foot of the shade. Android 8 answers a service's
+     * MIN notice with a louder one of its own ("is running in the
+     * background"), so there it stays LOW. An app cannot lower a channel
+     * a person may have set: the channel is a new one ("quiet"), and
+     * 19.0's is removed once nothing shows on it. */
     public static void serviceNotice(Service service) {
         if (Build.VERSION.SDK_INT >= 26) {
             NotificationChannel quiet = new NotificationChannel(
                     CHANNEL_SERVICE, word(service, "service",
                     "Receive messages while closed"),
-                    NotificationManager.IMPORTANCE_LOW);
+                    Build.VERSION.SDK_INT >= 28
+                            ? NotificationManager.IMPORTANCE_MIN
+                            : NotificationManager.IMPORTANCE_LOW);
             quiet.setShowBadge(false);
             quiet.setLockscreenVisibility(Notification.VISIBILITY_SECRET);
             manager(service).createNotificationChannel(quiet);
@@ -156,6 +172,68 @@ public final class Notifier {
             b.setPriority(Notification.PRIORITY_MIN);
         }
         service.startForeground(SERVICE_NOTICE, b.build());
+        if (Build.VERSION.SDK_INT >= 26) {
+            try {
+                manager(service).deleteNotificationChannel(
+                        CHANNEL_SERVICE_19);
+            } catch (RuntimeException e) {
+                // Still in use (an earlier notice on it): next time.
+            }
+        }
+    }
+
+    /**
+     * 21.1 (LIVENOTICE30), in the location service's process: its notice
+     * made the app's own, as serviceNotice does the sync service's. It
+     * says with whom and until when (`text`), shows in the shade without a
+     * sound, and has Stop, which works while the app is closed: the
+     * service's flag file goes (NotifyReceiver), and the service ends.
+     */
+    public static void liveNotice(Service service, String title, String text,
+                                  String flag) {
+        if (Build.VERSION.SDK_INT >= 26) {
+            NotificationChannel live = new NotificationChannel(CHANNEL_LIVE,
+                    word(service, "live", "Live location"),
+                    NotificationManager.IMPORTANCE_LOW);
+            live.setShowBadge(false);
+            manager(service).createNotificationChannel(live);
+        }
+        Intent stop = stopLiveIntent(service, flag);
+        Notification.Builder b = builder(service, CHANNEL_LIVE)
+                .setSmallIcon(smallIcon(service))
+                .setContentTitle(title)
+                .setContentText(text)
+                .setOngoing(true)
+                // A locked phone says only that the place is shared.
+                .setVisibility(Notification.VISIBILITY_PRIVATE)
+                .setPublicVersion(publicVersion(service, CHANNEL_LIVE, title))
+                .setContentIntent(PendingIntent.getActivity(service, 0,
+                        launch(service, "fext://live"), immutable()))
+                .addAction(action(service, word(service, "stop", "Stop"),
+                        PendingIntent.getBroadcast(service, LIVE_NOTICE, stop,
+                                PendingIntent.FLAG_UPDATE_CURRENT
+                                        | immutable())).build());
+        if (Build.VERSION.SDK_INT < 26) {
+            b.setPriority(Notification.PRIORITY_LOW);
+        }
+        service.startForeground(LIVE_NOTICE, b.build());
+    }
+
+    /** What the live notice's Stop sends: to NotifyReceiver, with the flag. */
+    static Intent stopLiveIntent(Context ctx, String flag) {
+        Intent stop = new Intent(ACTION_STOP_LIVE, Uri.parse("fext://live"));
+        stop.setClass(ctx, NotifyReceiver.class);
+        stop.putExtra("flag", flag);
+        return stop;
+    }
+
+    /**
+     * The emulators' self-test presses Stop with this, so it sends what the
+     * notice does. Not from Python: pyjnius gives a Python str to putExtra
+     * as a char[] (Devices run 61), which getStringExtra reads as null.
+     */
+    public static void pressStopLive(Context ctx, String flag) {
+        ctx.sendBroadcast(stopLiveIntent(ctx, flag));
     }
 
     /** What a tap on the app's icon sends, so the running app resumes. */
@@ -313,7 +391,8 @@ public final class Notifier {
      * where Android allows it. Gives up by itself after a minute.
      */
     public static void incomingCall(Context ctx, int id, String peer,
-                                    String callId, String name, String me) {
+                                    String callId, String name, String me,
+                                    boolean video) {
         ensureChannels(ctx);
         Intent show = launch(ctx, "fext://call/" + callId + "/show");
         show.putExtra("fext_peer", peer);
@@ -330,7 +409,10 @@ public final class Notifier {
         PendingIntent declineIntent = toReceiver(ctx, id * 8 + 2,
                 ACTION_DECLINE, peer, id, me, callId, false);
 
-        String incoming = word(ctx, "incoming", "Incoming voice call");
+        // 20.0: a video call says so (it rang as a voice call).
+        String incoming = video
+                ? word(ctx, "incoming_video", "Incoming video call")
+                : word(ctx, "incoming", "Incoming voice call");
         Notification.Builder b = builder(ctx, CHANNEL_CALLS);
         if (Build.VERSION.SDK_INT < 26) {
             b.setPriority(Notification.PRIORITY_MAX);
@@ -355,7 +437,7 @@ public final class Notifier {
             Person caller = new Person.Builder().setName(name)
                     .setImportant(true).build();
             b.setStyle(Notification.CallStyle.forIncomingCall(caller,
-                    declineIntent, answerIntent));
+                    declineIntent, answerIntent).setIsVideo(video));
         } else {
             b.addAction(action(ctx, word(ctx, "decline", "Decline"),
                     declineIntent).build());

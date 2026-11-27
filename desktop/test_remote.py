@@ -166,10 +166,10 @@ check("control ended: the computer lets go of all it was told to hold",
 
 # ---- where a finger lands --------------------------------------------------------
 print("\nWhere on their screen: a letterboxed picture")
-tex = types.SimpleNamespace(size=(1920, 1080))
-picture = types.SimpleNamespace(frames=lambda _u, _t: tex, user="x",
-                                track="s", width=1000, height=800,
-                                center_x=500, center_y=400)
+tex = M.Texture.create(size=(1920, 1080))     # a shared 1080p screen
+picture = M.CallPicture(lambda _u, _t: tex, "x", size_hint=(None, None),
+                        size=(1000, 800), pos=(0, 0))
+picture.track = "s"
 sent = []
 surface = M.RemoteSurface(picture, lambda kind, fields: sent.append(
     (kind, tuple(fields))))
@@ -226,7 +226,205 @@ surface.on_touch_up(two)
 surface.on_touch_up(one)
 check("two fingers drawn up scroll: two notches, the page moving with them",
       sent == [(WHEEL, (0, -120)), (WHEEL, (0, -120))], sent)
+sent.clear()
+for x in (100, 200, 300):              # a mouse's places within one frame
+    surface._move((x, 500))
+waiting = list(sent)
+M.Clock.tick_draw()                    # the frame's end, before it is drawn
+check("21.0: the pointer's moves in one frame go as one, its newest, at "
+      "the frame's end (each went as a packet of its own)",
+      waiting == [] and sent == [(MOVE, (300, 500))], (waiting, sent))
+sent.clear()
+surface._move((400, 500))
+surface.send(BUTTON, (1, 1, 400, 500))
+M.Clock.tick_draw()
+check("...any other event goes at once, after the move waiting, which is "
+      "not sent again",
+      sent == [(MOVE, (400, 500)), (BUTTON, (1, 1, 400, 500))], sent)
 surface.active = False
+
+print("\n21.1: a phone's trackpad, its zoom, and the pointer drawn here")
+surface.size = (1000, 800)                 # the call's screen: a pad
+surface.mode, surface.active, surface.at = "trackpad", True, (0.5, 0.5)
+sent.clear()
+slide = Finger(100, 100)                   # off their picture: a pad anywhere
+surface.on_touch_down(slide)
+for x in (100 + surface.SLOP + 1, 100 + surface.SLOP + 41):
+    slide.to(x, 100)
+    surface.on_touch_move(slide)
+surface.on_touch_up(slide)
+M.Clock.tick_draw()
+moves = [f for k, f in sent if k == MOVE]
+check("trackpad: a finger slid moves the pointer on from where it was, "
+      "further when quick, and clicks nothing",
+      moves and moves[-1][0] > 40000 and moves[-1][1] == 32768 and
+      BUTTON not in [k for k, _f in sent], sent)
+at = surface._shares()
+sent.clear()
+tap = Finger(900, 700)                     # far from the pointer
+surface.on_touch_down(tap)
+surface.on_touch_up(tap)
+check("trackpad: a tap clicks where the pointer is, not under the finger",
+      sent == [(BUTTON, (1, 1) + at), (BUTTON, (1, 0) + at)], sent)
+sent.clear()
+hold = Finger(300, 300)
+surface.on_touch_down(hold)
+surface._cancel_hold()
+surface._held()                            # held still for HOLD
+surface.on_touch_up(hold)
+check("trackpad: held still and let go, a right click there",
+      sent == [(BUTTON, (2, 1) + at), (BUTTON, (2, 0) + at)], sent)
+sent.clear()
+drag = Finger(300, 300)
+surface.on_touch_down(drag)
+surface._cancel_hold()
+surface._held()
+drag.to(300 + surface.SLOP + 21, 300)
+surface.on_touch_move(drag)
+surface.on_touch_up(drag)
+check("trackpad: held, then moved: a drag, the left button held as the "
+      "pointer moves",
+      [k for k, _f in sent] == [BUTTON, MOVE, BUTTON] and
+      sent[0][1][:2] == (1, 1) and sent[2][1][:2] == (1, 0) and
+      sent[2][1][2] > sent[0][1][2], sent)
+at = surface._shares()
+sent.clear()
+a, b = Finger(400, 400, 1), Finger(500, 400, 2)
+for finger in (a, b):
+    surface.on_touch_down(finger)
+for finger in (b, a):
+    surface.on_touch_up(finger)
+check("two fingers tapped together: a right click",
+      sent == [(BUTTON, (2, 1) + at), (BUTTON, (2, 0) + at)], sent)
+sent.clear()
+a, b = Finger(400, 400, 1), Finger(500, 400, 2)
+for finger in (a, b):
+    surface.on_touch_down(finger)
+surface.on_touch_up(b)                     # one finger up first
+tapped = list(sent)                        # (two fingers tapped)
+a.to(460, 400)
+surface.on_touch_move(a)                   # the other still moving
+surface.on_touch_up(a)
+check("...one of two fingers up first, the other moved on: nothing "
+      "breaks (it unpacked one finger as two) and nothing more is sent",
+      sent == tapped and surface._two is None and not surface._fingers,
+      (tapped, sent))
+sent.clear()
+a, b = Finger(400, 400, 1), Finger(600, 400, 2)
+for finger in (a, b):
+    surface.on_touch_down(finger)
+b.to(800, 400)                             # twice as far apart
+surface.on_touch_move(b)
+for finger in (b, a):
+    surface.on_touch_up(finger)
+left, bottom, w, h = picture.rect()
+check("a pinch zooms their picture in, never past its own edges, and "
+      "sends nothing",
+      picture.zoom == 2.0 and abs(w - 2000) < 1e-6 and left <= 0 and
+      left + w >= 1000 and not sent, (picture.zoom, picture.rect(), sent))
+check("…zoomed, a place on the picture is the same place on their screen",
+      surface.where(left + w / 4, bottom + h * 3 / 4) == (16384, 16384),
+      surface.where(left + w / 4, bottom + h * 3 / 4))
+zoom = picture.zoom
+picture.zoom_at(10, 500, 400)
+check("…four times at the most", picture.zoom == M.CallPicture.ZOOM_MOST,
+      picture.zoom)
+surface.pointer_said("ibeam", (65535, 0), False)
+check("their computer's pointer: its shape, and where something there "
+      "moved it (the trackpad's pointer goes there)",
+      surface.shape == "ibeam" and surface.at == (1.0, 0.0) and
+      not surface.drawn_there)
+surface.pointer_said("<script>")
+check("…a shape not known is an arrow", surface.shape == "arrow")
+M.IS_MOBILE = True
+surface._draw_pointer()
+drawn = len(surface.canvas.after.children)
+surface.mode = "touch"
+surface.pointer_said("arrow", None, True)  # their picture has it in it
+undrawn = len(surface.canvas.after.children)
+M.IS_MOBILE = False
+check("a phone draws the pointer over their picture at once: the "
+      "trackpad's always, a touch's only where their picture has none",
+      drawn > 0 and undrawn == 0, (drawn, undrawn))
+shapes = []
+real_cursor = M.Window.set_system_cursor
+M.Window.set_system_cursor = lambda name: shapes.append(name) or True
+surface._over = True
+surface.pointer_said("hand", None, False)
+surface.pointer_said("hand", None, True)
+M.Window.set_system_cursor = real_cursor
+check("a computer's own pointer over their picture takes their pointer's "
+      "shape; an arrow where their picture has it in it",
+      shapes == ["hand", "arrow"], shapes)
+surface.stop()
+check("control over: the picture whole again", picture.zoom == 1.0 and
+      picture.focus == (0.5, 0.5))
+surface._over = False
+
+print("\n20.0: a computer's keyboard: signs in shortcuts, AltGr, old computers")
+codes = M.kivy_remote_keys()
+by_name = {}
+for code, name in codes.items():
+    by_name.setdefault(name, code)
+surface._codes, surface.active, surface._over = codes, True, True
+KEY, TEXT = M.INPUT_KEY, M.INPUT_TEXT
+
+
+def press(name, text=None):
+    """A key down, what it types (if anything), and up."""
+    surface._key_down(None, by_name[name])
+    if text is not None:
+        surface._typed(None, text)
+    surface._key_up(None, by_name[name])
+
+
+del sent[:]
+press("slash", "/")
+press("a", "a")
+check("a sign or a letter typed alone goes as text only",
+      sent == [(TEXT, ("/",)), (TEXT, ("a",))], sent)
+del sent[:]
+surface._key_down(None, by_name["ctrl"])
+press("slash")
+press("grave")
+press("minus")
+surface._key_up(None, by_name["ctrl"])
+check("Ctrl+/, Ctrl+` and Ctrl+- go as those keys, Ctrl held about them",
+      sent == [(KEY, (key("ctrl"), 1)),
+               (KEY, (key("slash"), 1)), (KEY, (key("slash"), 0)),
+               (KEY, (key("grave"), 1)), (KEY, (key("grave"), 0)),
+               (KEY, (key("minus"), 1)), (KEY, (key("minus"), 0)),
+               (KEY, (key("ctrl"), 0))], sent)
+check("the new keys are at the table's end: 19.0's numbers are as they "
+      "were", M.REMOTE_KEYS.index("9") == M.REMOTE_KEYS_19 - 1 and
+      M.REMOTE_KEYS.index("minus") == M.REMOTE_KEYS_19 and
+      all(name in M.WindowsInjector._VK and name in M.X11Injector._SYMS
+          for name in M.REMOTE_KEYS[M.REMOTE_KEYS_19:]))
+del sent[:]
+surface._key_down(None, by_name["altgr"])          # X11: AltGr alone
+press("q", "@")
+surface._key_up(None, by_name["altgr"])
+check("AltGr types (@ on a German keyboard): its character goes as text, "
+      "and no Alt", sent == [(TEXT, ("@",))], sent)
+del sent[:]
+surface._key_down(None, by_name["ctrl"])           # Windows: Ctrl, then it
+surface._key_down(None, by_name["altgr"])
+press("7", "{")
+surface._key_up(None, by_name["altgr"])
+surface._key_up(None, by_name["ctrl"])
+check("...and as Windows gives it, after a Ctrl of its own: that Ctrl is "
+      "let go there before the character",
+      sent == [(KEY, (key("ctrl"), 1)), (KEY, (key("ctrl"), 0)),
+               (TEXT, ("{",))], sent)
+del sent[:]
+surface._key_down(None, by_name["ctrl"])
+surface._ctrl_at -= 1.0                            # Ctrl held a while
+surface._key_down(None, by_name["altgr"])
+surface._key_up(None, by_name["altgr"])
+surface._key_up(None, by_name["ctrl"])
+check("a Ctrl held before AltGr was pressed is the person's own: kept",
+      sent == [(KEY, (key("ctrl"), 1)), (KEY, (key("ctrl"), 0))], sent)
+surface.active = surface._over = False
 
 # ---- the access list ---------------------------------------------------------------
 print("\nThe access list: who, until when, per identity")
@@ -561,6 +759,12 @@ check("bob's side: no sound (no device opened), the relay only, muted",
       call_b.session.me.screen and call_b.control_kind == "away")
 check("alice's side: no sound either, and her ask said",
       type(call_a.engine._audio) is M.CallAudio and call_a.asks)
+check("20.0: a session that hears nothing drops after twenty seconds on "
+      "both sides, as before, where a call between people now waits two "
+      "minutes: a computer that crashed comes back as a new program, "
+      "which only a new session reaches",
+      call_a.engine.drop_after == call_b.engine.drop_after ==
+      M.REMOTE_DROP_SECONDS == 20 < M.CALL_DROP_SECONDS)
 check("bob's computer says who is using it, in a notice and the red bar",
       notices and "alice" in notices[-1][1] and bob._call_overlay is not None
       and bob._call_overlay.remote_words.text ==
@@ -597,15 +801,72 @@ check("what alice does is done on bob's computer, in order",
           ("move", 1000, 2000), ("button", 1, True, 1000, 2000),
           ("button", 1, False, 1000, 2000), ("text", "hello"),
           ("key", "shift", True)], bob_done())
+class ShareSeen:
+    """Bob's shared screen, as CURSOR30 asks it: with its pointer in it or
+    not, where this capture can leave it out (`can`)."""
+    can, drawn = True, []
+
+    def set_pointer(self, drawn):
+        self.drawn.append(drawn)
+        return self.can
+
+    def set_plan(self, *_a):
+        pass
+
+    def ask_key(self, *_a):
+        pass
+
+
+share = ShareSeen()
+bob.call_video = lambda create=True: share
+M._REMOTE_TEST_POINTER.update(c="ibeam", x=100, y=200)
+check("21.1 (CURSOR30): alice's side draws the pointer itself; bob's "
+      "computer tells its shape, and where it is once something there "
+      "moved it away from where alice put it",
+      settle(lambda: alice.call.rc_pointer == ("ibeam", (100, 200)) and
+             alice._call_overlay.remote.shape == "ibeam", 4) and
+      bob.call.rc_pointer_here and bob.call.rc_pointer_out,
+      (alice.call.rc_pointer, bob.call.rc_pointer_here))
+check("…and that its picture has no pointer in it, so a computer's own "
+      "pointer takes the shape",
+      settle(lambda: (alice.call.rc_state or {}).get("pt") is True and
+             not alice._call_overlay.remote.drawn_there, 4),
+      alice.call.rc_state)
+check("…its screen read without it", share.drawn and
+      share.drawn[-1] is False, share.drawn[-3:])
+M._REMOTE_TEST_POINTER.clear()             # a pointer it cannot tell
+check("…a computer that cannot tell its pointer keeps it in the picture, "
+      "and says so",
+      settle(lambda: (alice.call.rc_state or {}).get("pt") is False and
+             alice._call_overlay.remote.drawn_there and
+             not bob.call.rc_pointer_out and share.drawn[-1] is True, 4),
+      alice.call.rc_state)
+M._REMOTE_TEST_POINTER.update(c="ibeam", x=100, y=200)
+share.can = False                          # a capture that cannot
+check("…and one whose capture cannot leave it out (a test picture, a "
+      "Mac's) says its picture has it",
+      settle(lambda: False, 1.0) or (
+          not bob.call.rc_pointer_out and
+          (alice.call.rc_state or {}).get("pt") is False and
+          share.drawn[-1] is True), (bob.call.rc_pointer_out,
+                                     share.drawn[-2:]))
+share.can = True
+M._REMOTE_TEST_POINTER.update(c="arrow", x=1000, y=2000)
 held_by = bob.call.engine.input_in.injector
 alice.release_control()
 check("alice releases: bob's computer lets go of Shift, the session kept",
       settle(lambda: not bob.call.lets and not alice.controlling(), 4) and
       ("key", "shift", False) in held_by.done and
       M.remote_sessions() and M.remote_sessions()[0]["kind"] == "away")
+check("…released: bob's computer stops telling its pointer",
+      settle(lambda: not bob.call.rc_pointer_here, 4))
 alice.toggle_control()
 check("asked again: let in again by the list, without a question",
       settle(lambda: alice.controlling() and bob.call.lets, 4))
+check("…asked again: told again", settle(lambda: bob.call.rc_pointer_here
+                                        and bob.call.rc_pointer_out, 4))
+M._REMOTE_TEST_POINTER.clear()
+del bob.call_video
 bob._call_overlay._remote_end()
 check("Stop on bob's computer ends the whole session, and it is not placed "
       "again", settle(lambda: alice.call is None or alice.call.ended, 4) and
@@ -900,10 +1161,18 @@ check("usable again: the note now says the access ends within two weeks "
       alice._call_overlay.remote_note_words.text)
 M.remote_access_grant(B, A, 0)
 bob.call.__dict__.pop("rc_mine", None)    # read again now, not in 30 s
-check("…and once it is until removed, the note goes",
-      settle(lambda: not alice._call_overlay.remote_note_words.text, 10) and
+check("…and once it is until removed, its words go (21.1: what is left "
+      "says no picture of the screen has come, as none does here)",
+      settle(lambda: "ends" not in alice._call_overlay.remote_note_words.text
+             and "screen" in alice._call_overlay.remote_note_words.text, 10),
+      alice._call_overlay.remote_note_words.text)
+alice._call_overlay.picture.frames = lambda _u, _t: tex     # one has come
+alice._call_overlay.refresh_note()
+check("…and with their picture shown, no note at all",
+      not alice._call_overlay.remote_note_words.text and
       alice._call_overlay.remote_note.opacity == 0,
       alice._call_overlay.remote_note_words.text)
+alice._call_overlay.picture.frames = alice.call_frames
 
 print("\n19.0.1: Data saver, the keys, the programs, a restart")
 alice.set_remote_saver(True)
@@ -920,6 +1189,22 @@ check("Task Manager's keys: each down in order, then up in reverse",
           ("key", "ctrl", True), ("key", "shift", True),
           ("key", "escape", True), ("key", "escape", False),
           ("key", "shift", False), ("key", "ctrl", False)],
+      bob_done()[start:])
+check("20.0: bob's computer said how many keys it knows",
+      settle(lambda: (alice.call.rc_state or {}).get("k") ==
+             len(M.REMOTE_KEYS), 4), alice.call.rc_state)
+start = len(bob_done())
+alice.remote_keys(("ctrl", "slash"))
+check("Ctrl+/ reaches it", settle(lambda: ("key", "slash", True) in
+                                  bob_done()[start:], 4), bob_done()[start:])
+alice.call.rc_state = dict(alice.call.rc_state, k=M.REMOTE_KEYS_19)
+start = len(bob_done())
+alice.remote_keys(("ctrl", "slash"))
+alice.remote_keys(("f5",))
+check("a computer that knows only 19.0's keys is sent none beyond them "
+      "(a packet with one would be refused whole), and the others still "
+      "arrive", settle(lambda: ("key", "f5", False) in bob_done()[start:], 4)
+      and not any(e[:2] == ("key", "slash") for e in bob_done()[start:]),
       bob_done()[start:])
 M._REMOTE_TEST_PROGRAMS[:] = [
     {"w": 100 + n, "p": 10 + n, "t": f"Window {n}", "x": f"app{n}.exe",
@@ -944,6 +1229,97 @@ alice.remote_ask({"op": "end", "w": 102, "p": 12})
 check("one run as administrator: not closed, and why",
       settle(lambda: any("administrator" in t for t in said), 4) and
       102 in [p["w"] for p in M._REMOTE_TEST_PROGRAMS], said)
+
+print("\n21.0 (NEXT29): End it, the clipboard either way, their log")
+M._REMOTE_TEST_PROGRAMS.append({"w": 200, "p": 50, "t": "Frozen",
+                                "x": "frozen.exe", "a": False, "h": True})
+M._REMOTE_TEST_HUNG.update(w=200, p=50, x="frozen.exe")
+os.environ["FEXT_REMOTE_SCREEN"] = "hung"
+note = alice._call_overlay
+check("a program that does not answer in front: said by name (not 'run as "
+      "administrator'), with End it beside the words",
+      settle(lambda: "frozen.exe does not answer" in
+             note.remote_note_words.text, 8) and
+      note.remote_note_end.opacity == 1 and not note.remote_note_end.disabled,
+      note.remote_note_words.text)
+band, end, words = note.remote_note, note.remote_note_end, \
+    note.remote_note_words
+words.text = "frozen.exe does not answer."    # one line, as on a computer
+words.texture_update()
+check("…the note's band as tall as End it, however short its words (on a "
+      "computer, one line: End it stood out above and below it)",
+      band.height >= end.height + M.dp(16) - 0.5,
+      (band.height, end.height, words.height))
+note._end_hung()
+check("…End it ends it there, as Keys › Programs does",
+      settle(lambda: 200 not in [p["w"] for p in M._REMOTE_TEST_PROGRAMS], 5),
+      M._REMOTE_TEST_PROGRAMS)
+M._REMOTE_TEST_HUNG.clear()
+os.environ["FEXT_REMOTE_SCREEN"] = "ok"
+check("…and once it is gone, the note and its button go too",
+      settle(lambda: note.remote_note_end.opacity == 0, 8))
+check("bob's computer kept it in its log: the screen's state, and what "
+      "was ended", any("frozen.exe does not answer" in line
+                       for line in M.remote_log_lines()) and
+      any("ended a program" in line for line in M.remote_log_lines()),
+      M.remote_log_lines()[-6:])
+
+
+class FakeClipboard:
+    """One clipboard for both sides (one process): what each side put in
+    it, in order."""
+    held, put = "", []
+
+    @classmethod
+    def copy(cls, text):
+        cls.put.append(text)
+        cls.held = text
+
+    @classmethod
+    def paste(cls):
+        return cls.held
+
+
+real_clipboard, M.Clipboard = M.Clipboard, FakeClipboard
+FakeClipboard.held = "def f():\n    return '中文 ünïcode' * 3\n" + "x" * 2500
+mine = FakeClipboard.held
+alice.remote_clip_send()
+check("Send my clipboard: alice's text, long and not only ASCII, in bob's "
+      "computer's clipboard, whole (in pieces that each fit a word)",
+      settle(lambda: FakeClipboard.put and FakeClipboard.put[-1] == mine and
+             any("clipboard is on" in s for s in said), 6) and
+      len(M.rcmd_text_parts(mine)) > 1, (len(FakeClipboard.put), said[-2:]))
+FakeClipboard.held, FakeClipboard.put = "their words", []
+alice.remote_clip_get()
+check("Get theirs: bob's computer's clipboard, copied on alice's side",
+      settle(lambda: FakeClipboard.put == ["their words"] and
+             any("copied here" in s for s in said), 6),
+      (FakeClipboard.put, said[-2:]))
+M.Clipboard = real_clipboard
+check("…both kept in bob's computer's log, by how long, never the words",
+      any("put text in this computer's clipboard" in line
+          for line in M.remote_log_lines()) and
+      not any("their words" in line or "中文" in line
+              for line in M.remote_log_lines()))
+logs = []
+
+
+class LogSheet:
+    def __init__(self, _app, lines, name=None):
+        logs.append((lines, name))
+
+    def open(self):
+        pass
+
+
+real_log_sheet, M.RemoteLogSheet = M.RemoteLogSheet, LogSheet
+alice.remote_log_ask()
+check("What went wrong there: bob's computer's log, asked from afar, "
+      "shown with its name",
+      settle(lambda: logs, 5) and
+      any("began a session" in line for line in logs[-1][0]) and
+      logs[-1][1], logs[-1:])
+M.RemoteLogSheet = real_log_sheet
 before = len(M._REMOTE_TEST_RESTARTS)
 waiting = alice.call.rc_waiting
 alice.remote_ask({"op": "restart"})
@@ -1073,9 +1449,13 @@ check("…and again on its last day",
       alice.remote_reminders(time.time() + 2.6 * 86400) == 0)
 state = M.sanitize_remote_state({"op": "state", "s": "evil", "n": "x" * 99,
                                  "dev": "zz", "u": True, "si": "yes"})
-check("a computer's state, every field checked",
+check("a computer's state, every field checked (one that does not say "
+      "how many keys it knows knows 19.0's)",
       state == {"s": "ok", "n": "x" * 40, "dev": None, "u": None,
-                "si": None}, state)
+                "si": None, "k": M.REMOTE_KEYS_19, "sv": False,
+                "pt": False, "hp": None} and
+      M.sanitize_remote_state({"k": 81})["k"] == 81 and
+      M.sanitize_remote_state({"k": 5})["k"] == M.REMOTE_KEYS_19, state)
 check("a list of programs, every field checked, 30 at the most",
       len(M.sanitize_programs([{"w": 1, "p": 2, "t": "t", "x": "x"}] * 40))
       == 30 and M.sanitize_programs([{"w": "1", "p": 2}, None, 3]) == [])
@@ -1128,6 +1508,24 @@ def starts(folder):
         return []
 
 
+def keepup_pid(folder):
+    """The process keepup.json names, as the stand-in wrote it."""
+    try:
+        return json.loads((folder / "keepup.json").read_text()).get("pid")
+    except (OSError, ValueError):
+        return None
+
+
+def stop(process):
+    """A process of this test's, ended if it still runs, whatever a check
+    said: a watcher left running starts its stand-in again and again under
+    every suite after this one (Devices run 53: two, left by a failed check,
+    slowed Windows' video messages until the job ended)."""
+    if process.poll() is None:
+        process.kill()
+        process.wait()
+
+
 def watcher(folder):
     return subprocess.Popen([sys.executable, sys.argv[1] if len(sys.argv)
                                > 1 else "main.py", M.GUARD_FLAG, str(folder)],
@@ -1145,11 +1543,32 @@ check("Ferritext gone without being closed (a crash): the watcher starts "
 second = watcher(folder)
 check("a second watcher for the same folder ends at once",
       wait_until(lambda: second.poll() is not None, 10))
-(folder / "keepup.json").write_text(json.dumps({
-    "pid": 999999, "cmd": [sys.executable, str(fake_app), str(folder)],
-    "quit": True}))
+stop(second)
+stop(guard)                     # the crash loop's watcher, done with
+# Its person closes a Ferritext that runs: it says so in keepup.json, then
+# ends. (Said to the crash loop above, a start of it could write keepup.json
+# again just after, and the watcher never read the close: Devices run 53.)
+folder = guard_dir("beat")
+app = subprocess.Popen([sys.executable, str(fake_app), str(folder)])
+wait_until(lambda: starts(folder) and keepup_pid(folder) == starts(folder)[0],
+           10)
+guard = watcher(folder)
+wait_until(lambda: False, 1)                    # it looks, and leaves it be
+before = starts(folder)
+state = json.loads((folder / "keepup.json").read_text())
+(folder / "keepup.json").write_text(json.dumps(dict(state, quit=True)))
+for pid in before:
+    try:
+        os.kill(pid, 9)
+    except OSError:
+        pass
+app.kill()
+app.wait()
+ended = wait_until(lambda: guard.poll() is not None, 10)
+wait_until(lambda: False, 1)            # anything it started would be here
 check("closed by its person: the watcher ends, and starts nothing more",
-      wait_until(lambda: guard.poll() is not None, 10))
+      ended and starts(folder) == before, starts(folder))
+stop(guard)
 folder = guard_dir("hang")
 hung = subprocess.Popen([sys.executable, str(fake_app), str(folder)])
 wait_until(lambda: starts(folder), 5)
@@ -1168,6 +1587,8 @@ check("one that answers is left alone",
 data = json.loads((folder / "keepup.json").read_text())
 (folder / "keepup.json").write_text(json.dumps(dict(data, quit=True)))
 wait_until(lambda: guard.poll() is not None, 10)
+stop(guard)
+stop(hung)
 for pid in starts(folder):
     try:
         os.kill(pid, 9)
@@ -1186,6 +1607,76 @@ if os.name == "nt":
 
 # ---- the computer's own injector ------------------------------------------------------
 os.environ.pop("FEXT_REMOTE_TEST", None)
+print("\n21.1 (CURSOR30): Windows' pointer read (a stand-in user32)")
+
+
+class PointerUser32:
+    """GetCursorInfo, LoadCursorW and GetSystemMetrics for a desktop of
+    two screens side by side (3840x1080 from x = -1920)."""
+
+    def __init__(self):
+        self.LoadCursorW = lambda _inst, number: 0x10000 + number
+        self.shown, self.cursor, self.at = True, 0x10000 + 32513, (0, 539)
+
+    def GetCursorInfo(self, ref):
+        info = ref._obj
+        info.flags = 1 if self.shown else 0
+        info.hCursor = self.cursor
+        info.ptScreenPos.x, info.ptScreenPos.y = self.at
+        return 1
+
+    def GetSystemMetrics(self, index):
+        return {76: -1920, 77: 0, 78: 3840, 79: 1080}[index]
+
+
+fake = PointerUser32()
+M._WIN_POINTER.clear()
+got = M.windows_pointer_now(fake)
+check("an I-beam in the middle of a two-screen desktop: its name, and "
+      "shares of the whole desktop as the injector counts them",
+      got == ("ibeam", 32776, 32737), got)
+fake.cursor, fake.at = 0x777, (1919, 1079)
+got = M.windows_pointer_now(fake)
+check("…a program's own pointer is an arrow; the far corner is 65535",
+      got == ("arrow", 65535, 65535), got)
+fake.shown = False
+check("…hidden: \"none\"", M.windows_pointer_now(fake)[0] == "none")
+M._WIN_POINTER.clear()
+print("\n20.0: Windows' keys carry their scan codes (a stand-in user32)")
+
+class User32:
+    """SendInput and MapVirtualKeyW, kept: (virtual key, scan code,
+    flags) of each key event sent."""
+    SCANS = {0x0D: 0x1C, 0x24: 0x47, 0xA2: 0x1D, 0xBF: 0x35}
+
+    def __init__(self):
+        self.sent = []
+
+    def MapVirtualKeyW(self, vk, kind):
+        return self.SCANS.get(vk, 0) if kind == 0 else 0
+
+    def SendInput(self, count, array, _size):
+        self.sent += [(array[i].u.ki.wVk, array[i].u.ki.wScan,
+                       array[i].u.ki.dwFlags) for i in range(count)]
+        return count
+
+fake = User32()
+windows = M.WindowsInjector(fake)
+windows.key("enter", True)
+windows.key("home", False)
+windows.key("ctrl", True)
+windows.key("slash", True)
+check("a named key goes with its scan code and its virtual key: a "
+      "program reading either takes it (programs on SDL, games and "
+      "virtual machines read the scan code, and took no key)",
+      fake.sent == [(0x0D, 0x1C, 0), (0x24, 0x47, 0x0001 | 0x0002),
+                    (0xA2, 0x1D, 0), (0xBF, 0x35, 0)], fake.sent)
+del fake.sent[:]
+windows.text("a\u20ac")
+check("typed text stays Unicode presses, whatever the two keyboards",
+      fake.sent == [(0, 0x61, 4), (0, 0x61, 6), (0, 0x20AC, 4),
+                    (0, 0x20AC, 6)], fake.sent)
+
 if sys.platform.startswith("linux") and os.environ.get("DISPLAY") and \
         ctypes.util.find_library("Xtst"):
     print("\nX11: the pointer, a button, a key and typed text (Xvfb)")
@@ -1316,6 +1807,12 @@ elif sys.platform == "win32":
           abs(mid.x - (left + wide / 2)) <= 2 and
           abs(mid.y - (top + high / 2)) <= 2,
           ((got.x, got.y), (mid.x, mid.y), (left, top, wide, high)))
+    M._WIN_POINTER.clear()
+    seen = M.windows_pointer_now()             # 21.1 (CURSOR30)
+    check("21.1: the pointer read back where the injector put it, in the "
+          "injector's shares, with a shape it is known by",
+          seen is not None and seen[0] in M.POINTER_SHAPES and
+          abs(seen[1] - 32768) <= 64 and abs(seen[2] - 32768) <= 64, seen)
 else:
     print("\n(no X11 with XTEST, and not Windows: the real injector is not "
           "tried here)")

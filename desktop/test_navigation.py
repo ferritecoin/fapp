@@ -451,6 +451,25 @@ check("...and one that never closes fails, once, saying so",
       "still open" in said[0][2], said)
 close()
 tick(0.6)
+# 21.1: on a phone, then a Back that no view took: the self-test gives the
+# activity's own onBackPressed one, which BACK_TO_APP hands to the app as
+# the key (here: the key, as that patched handler sends it).
+said.clear()
+real_activity = M._back_to_activity
+M._back_to_activity = lambda: M.Window.dispatch("on_keyboard", 27, 41, None,
+                                                [])
+M.IS_ANDROID = True
+try:
+    M._selftest_back(lambda *words: said.append(words))
+    tick(0.5)
+    back_key()
+    tick(2.0)
+finally:
+    M.IS_ANDROID, M._back_to_activity = False, real_activity
+check("21.1: on a phone, then a second sheet, and a Back given to the "
+      "activity itself (back-activity) closes it too, not the app",
+      [w[:2] for w in said] == [("back", "PASS"), ("back-activity", "PASS")]
+      and not any(isinstance(w, M.Sheet) for w in M.Window.children), said)
 
 print("\nSearch")
 alice.open_search()
@@ -560,6 +579,23 @@ check("...a short window: the reactions at the view's top, the menu just "
 shape = tapped_at(840, 392)
 check("...a phone on its side (a menu taller than the view): the reactions "
       "beside it, whole", inside(strip) and apart(menu, strip), shape)
+# 20.0 (FIXES27): ...and the menu itself, whose first rows were cut off.
+first = menu.rows[0]
+check("...and the menu within the view, its first row (Reply) on show, the "
+      "rest reached by scrolling (it was taller than the view: Reply and "
+      "Copy were cut off)",
+      inside(menu) and menu.height < menu.natural and
+      menu.scroll.scroll_y == 1 and
+      first.to_window(0, first.top)[1] <= menu.top + 1 and
+      menu.list.height > menu.scroll.height,
+      (shape, menu.natural, first.to_window(0, first.top)))
+menu.scroll.scroll_y = 0
+tick(0.1)
+last = menu.rows[-1]
+check("...scrolled to its end, its last row (Delete) is on show",
+      last.label.text == "Delete" and
+      last.to_window(0, last.y)[1] >= menu.y - 1,
+      (last.to_window(0, last.y), menu.y))
 M.Window.size = (M.dp(400), M.dp(720))
 tick(0.5)                       # laid out again at the test's own size
 M.Window.remove_widget(top)
@@ -623,6 +659,228 @@ sheet.button.dispatch("on_release")
 tick(0.2)
 check("...the marked words are what is quoted", quoted == ["number"],
       str(quoted))
+actions = screen.message_actions(screen._bubbles[mid].msg)
+names = [text for _i, text, *_r in actions]
+check("21.0 (SELECT29): a message's menu offers Select text, after Copy",
+      "Select text" in names and
+      names.index("Select text") == names.index("Copy") + 1, names)
+marked, real_copy = [], alice.copy_text
+alice.copy_text = marked.append
+next(run for _i, text, run, *_r in actions if text == "Select text")()
+tick(0.3)
+sheet = top_sheet()
+check("…which opens the message's words in the sheet a quote uses, its "
+      "button Copy the marked words, off until words are marked",
+      isinstance(sheet, M.QuoteSheet) and sheet.field.text == words and
+      sheet.button.text.lower() == "copy the marked words" and
+      sheet.button.disabled,
+      (type(sheet).__name__, getattr(getattr(sheet, "button", None),
+                                     "text", None)))
+sheet.field.select_text(8, 14)
+tick(0.2)
+sheet.button.dispatch("on_release")
+tick(0.3)
+check("…and copies exactly the marked words", marked == ["number"], marked)
+alice.copy_text = real_copy
+
+print("\n21.0 (POLL29): a poll in the chat")
+poll = {"q": "Which day?", "o": ["Friday", "Saturday", "Sunday"],
+        "m": False, "u": 0}
+alice.send_poll(B, poll)
+tick(0.6)
+alice.refresh_chat(B)
+tick(0.3)
+row = next(m for m in alice.store.messages_for(B)
+           if (M.message_ext(m).get("poll") or {}).get("q") == "Which day?")
+card = screen._bubbles[row["id"]].card
+check("its bubble is the poll: the question, a row for each choice, no "
+      "votes yet; not its words for older apps",
+      isinstance(card, M.PollCard) and card.question.text == "Which day?"
+      and [c.label.text for c in card.choices] == poll["o"] and
+      card.footer.text.startswith("0 votes") and
+      screen._bubbles[row["id"]].body is None,
+      (type(card).__name__, getattr(card, "footer", None) and
+       card.footer.text))
+
+
+rings = [(c.ring_at[0], c.mark.center_x, c.x) for c in card.choices]
+check("...each choice's ring drawn on its mark, inside its row (it was "
+      "drawn at the screen's edge, before the row had placed its mark)",
+      all(abs(r - mark) < 1 and r > x for r, mark, x in rings), rings)
+card.choices[1].dispatch("on_release")
+tick(0.6)
+cid = row["client_msg_id"]
+card = screen._bubbles[row["id"]].card
+check("a tap on a choice votes: counted, marked, its bar full",
+      alice.store.poll_votes(B, cid) == {A: [1]} and
+      card.choices[1].picked and card.choices[1].share == 1.0 and
+      card.choices[1].number.text == "1" and
+      card.footer.text.startswith("1 vote"),
+      (alice.store.poll_votes(B, cid), card.footer.text))
+card.choices[1].dispatch("on_release")
+tick(0.6)
+check("…a tap on yours again takes the vote back",
+      alice.store.poll_votes(B, cid) == {})
+card = screen._bubbles[row["id"]].card
+card.choices[2].dispatch("on_release")
+tick(0.6)
+names = [text for _i, text, *_r in screen.message_actions(
+    alice.store.message_by_cid(B, cid))]
+check("its menu: who voted, and End the poll for its asker",
+      "Votes" in names and "End the poll" in names, names)
+alice.end_poll(B, cid)
+tick(0.6)
+card = screen._bubbles[row["id"]].card
+check("ended: it says so, a tap on a choice votes no more",
+      not card.live and "Ended" in card.footer.text and
+      (card.choices[0].dispatch("on_release") or True) and
+      alice.store.poll_votes(B, cid) == {A: [2]} and "End the poll" not in [
+          text for _i, text, *_r in screen.message_actions(
+              alice.store.message_by_cid(B, cid))], card.footer.text)
+tick(0.5)
+relay.mail.clear()                # the poll and its votes, sent to no one
+
+print("\n21.0 (MAP29): a place in the chat")
+
+
+class FakePlace:
+    """Where a phone is, as the suites give it (M.LOCATION_SOURCE)."""
+
+    def __init__(self, point=None):
+        self.point, self.followers = point, []
+
+    def last(self):
+        return self.point
+
+    def follow(self, on_point):
+        self.followers.append(on_point)
+
+    def unfollow(self, on_point):
+        self.followers.remove(on_point)
+
+    def move(self, point):
+        self.point = point
+        for on_point in list(self.followers):
+            on_point(point)
+
+
+def texts_in(widget):
+    """Its buttons' words (a button shows them in capitals)."""
+    return [w.text.lower() for w in widget.walk() if isinstance(w, M.Btn)]
+
+
+def newest_place():
+    row = [m for m in alice.store.messages_for(B)
+           if M.message_ext(m).get("loc")][-1]
+    return row, screen._bubbles[row["id"]].card
+
+
+spot = {"lat": 51.5007, "lon": -0.1246, "acc": 12, "at": int(time.time())}
+sheet = M.LocationSheet(alice, B, live=True)
+sheet.open(animation=False)
+tick(0.2)
+check("on a computer, the place is typed: Send this place is off until "
+      "it is a place, and nothing is shared live",
+      sheet.field is not None and sheet.send.disabled and
+      sheet.live is None)
+sheet.field.text = "the lake"
+tick(0.1)
+off = sheet.send.disabled
+sheet.field.text = "51.5007, -0.1246"
+tick(0.1)
+check("…a place's coordinates turn it on", off and not sheet.send.disabled)
+sheet.send.dispatch("on_release")
+tick(0.6)
+alice.refresh_chat(B)
+tick(0.3)
+row, card = newest_place()
+marked, real_copy = [], alice.copy_text
+alice.copy_text = marked.append
+check("sent: its bubble is the place (a pin, Location, its coordinates), "
+      "not its words for older apps; a computer copies its coordinates",
+      isinstance(card, M.LocationCard) and card.title.text == "Location" and
+      "51.50070, -0.12460" in card.words.text and
+      screen._bubbles[row["id"]].body is None and
+      texts_in(card.buttons) == ["copy the coordinates"] and
+      (card.buttons.children[0].dispatch("on_release") or True) and
+      marked == ["51.500700, -0.124600"],
+      (type(card).__name__, getattr(getattr(card, "words", None), "text",
+                                    None), marked))
+names = [text for _i, text, *_r in screen.message_actions(row)]
+check("…its menu: Copy the coordinates, not the words kept for older apps",
+      "Copy the coordinates" in names and "Open in maps" not in names and
+      "Copy" not in names and "Select text" not in names, names)
+M.OPENS_MAPS = True                                 # as on a phone
+opened, real_open = [], alice.open_place
+alice.open_place = opened.append
+card = M.LocationCard(row, spot, screen)
+card.buttons.children[0].dispatch("on_release")
+actions = screen.message_actions(row)
+check("on a phone, Open in maps hands its point to the phone's maps app, "
+      "in the card and the menu",
+      texts_in(card.buttons) == ["open in maps"] and len(opened) == 1 and
+      (opened[0]["lat"], opened[0]["lon"]) == (51.5007, -0.1246) and
+      "Open in maps" in [text for _i, text, *_r in actions], opened)
+alice.copy_text = real_copy
+alice._here = ({"lat": 51.5007, "lon": -0.1246 + 0.03, "acc": 20,
+                "at": int(time.time())}, time.monotonic())
+theirs = M.LocationCard({"peer": B, "client_msg_id": "c" * 32,
+                         "direction": "in"}, spot, screen)
+check("a place sent to you says how far it is and which way, where this "
+      "device knows where it is",
+      theirs.words.text.splitlines()[0] == "2.1 km west of you",
+      theirs.words.text)
+alice._here = (None, -1e9)
+M.LOCATION_SOURCE = FakePlace()
+real_battery, M.battery_percent = M.battery_percent, lambda: 10
+sheet = M.LocationSheet(alice, B, live=True)
+M.battery_percent = real_battery
+sheet.open(animation=False)
+tick(0.2)
+said = [w.text for w in sheet.body.walk() if isinstance(w, M.InfoLabel)]
+check("on a phone with little battery left, the sheet says a long share "
+      "may stop before its time",
+      "Your battery is at 10%: a long share may stop before its time." in
+      said, said)
+finding = (sheet.where.text, sheet.send.disabled, sheet.live.disabled)
+M.LOCATION_SOURCE.move(spot)
+tick(0.1)
+check("on a phone it finds where it is: until then nothing can be sent; "
+      "then it says where",
+      finding == ("Finding where you are…", True, True) and
+      sheet.where.text == "Here: 51.50070, -0.12460 (±12 m)" and
+      not sheet.send.disabled and not sheet.live.disabled,
+      (finding, sheet.where.text))
+spans = [seg.caps.text.lower() for seg in sheet.span.segments.values()]
+check("…it offers a live share for 15 minutes, an hour or 8 hours",
+      spans == ["15 minutes", "1 hour", "8 hours"] and
+      sheet.span.value == "15", spans)
+sheet.live.dispatch("on_release")
+tick(0.6)
+alice.refresh_chat(B)
+tick(0.3)
+row, card = newest_place()
+check("shared live: Live location, until when, Stop sharing on yours; "
+      "the sheet no longer follows the phone",
+      card.title.text == "Live location" and card.running and
+      "Live until " in card.words.text and
+      texts_in(card.buttons) == ["open in maps", "stop sharing"] and
+      M.LOCATION_SOURCE.followers == [alice._on_live_point] and
+      alice._live_redraw is not None,
+      (card.words.text, texts_in(card.buttons)))
+next(b for b in card.buttons.children
+     if b.text.lower() == "stop sharing").dispatch("on_release")
+tick(0.6)
+row, card = newest_place()
+check("…stopped: it says so, keeps no point, offers nothing",
+      not card.running and card.point is None and
+      card.words.text == "Live location ended" and
+      not card.buttons.children and not M.LOCATION_SOURCE.followers,
+      card.words.text)
+alice.open_place = real_open
+M.LOCATION_SOURCE, M.OPENS_MAPS = None, False
+tick(0.5)
+relay.mail.clear()                # the places, sent to no one
 screen._quote_part("  number \n 128 ")
 check("the reply then quotes that part alone, of the same message",
       screen.reply_to["snip"] == "number 128" and

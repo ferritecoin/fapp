@@ -345,6 +345,7 @@ class StandInRelay(threading.Thread):
         self.sock.bind(("127.0.0.1", 0))
         self.addr = self.sock.getsockname()
         self.ends, self.passed, self.stop = {}, 0, False
+        self.down = False         # 20.0: an outage: it hears nothing
 
     def run(self):
         self.sock.settimeout(0.1)
@@ -357,6 +358,8 @@ class StandInRelay(threading.Thread):
                 continue                    # an end that has gone
             except OSError:
                 return
+            if self.down:
+                continue
             tag = data[1:9]
             if data[0] == M.PKT_REG:
                 role = data[9]
@@ -733,6 +736,53 @@ check("given both, the direct way wins",
       wait_until(lambda: engines[0].path == "direct" and
                  engines[1].path == "direct", 3), str(engines[0].path))
 finish(engines)
+
+print("\n20.0: a call that hears nothing keeps trying, and comes back")
+real_quiet, real_renew = M.CallEngine.REG_QUIET, M.CallEngine.RENEW_EVERY
+M.CallEngine.REG_QUIET, M.CallEngine.RENEW_EVERY = 0.2, 1.0
+engines, events = pair(relay_addr=relay.addr, direct=False)
+wait_until(lambda: engines[0].path == "relay" and
+           engines[1].path == "relay", 3)
+talk(engines, 0.6)
+relay.down = True                 # the network goes: nothing passes
+relay.ends.clear()                # ...and the relay forgets where they were
+went = time.time()
+check("nothing heard for three seconds: the call says so (Reconnecting…)",
+      wait_until(lambda: ("quiet", None) in events[0] and
+                 ("quiet", None) in events[1], 6))
+check("...and asks for a new pass to the relay's call port, again and "
+      "again", wait_until(lambda: sum(1 for k, _v in events[0]
+                                      if k == "renew") >= 2, 4))
+engines[0].renew(relay.addr, "ticket2")
+check("...which its engine uses from its next registration",
+      engines[0].ticket == "ticket2" and engines[0]._reg_at == 0.0 or
+      engines[0].ticket == "ticket2")
+time.sleep(max(0.0, 7.0 - (time.time() - went)))
+check("seven seconds on it has not been dropped (it was, at twenty: now "
+      "at two minutes), and both ends still run",
+      M.CALL_DROP_SECONDS >= 120 and
+      not any(k == "lost" for k, _v in events[0] + events[1]) and
+      engines[0].is_alive() and engines[1].is_alive())
+relay.down = False                # the network is back
+check("the network back: each tells the relay where it is within a second "
+      "(it did every ten), and the call is heard again by itself",
+      wait_until(lambda: ("heard", None) in events[0] and
+                 ("heard", None) in events[1], 4) and
+      wait_until(lambda: engines[0].path == "relay", 3),
+      (events[0][-4:], engines[0].path))
+before = len(engines[1]._audio.played)
+time.sleep(0.6)
+check("...speech and all", len(engines[1]._audio.played) > before + 10)
+check("...by the limit calls between people have (a remote session has "
+      "its own, shorter)", engines[0].drop_after == 0)
+real_drop, M.CALL_DROP_SECONDS = M.CALL_DROP_SECONDS, 5
+relay.down = True
+check("gone for good: after the limit it does end, as before",
+      wait_until(lambda: ("lost", None) in events[0], 9))
+M.CALL_DROP_SECONDS = real_drop
+relay.down = False
+finish(engines)
+M.CallEngine.REG_QUIET, M.CallEngine.RENEW_EVERY = real_quiet, real_renew
 relay.stop = True
 
 engines, events = pair(relay_addr=None, direct=False, ws=True)
@@ -1256,6 +1306,93 @@ M.save_pref("presenter_face", True)
 alice._their_call_media(alice.call, {
     "mic": True, "camera": False, "screen": False, "recording": False,
     "decoders": ["h264"]})
+
+print("\n20.0: both microphones marked; the corner's picture swapped with "
+      "the main one; the other camera's own button")
+
+
+def their_media(mic, camera):
+    alice._their_call_media(alice.call, {
+        "mic": mic, "camera": camera, "screen": False, "recording": False,
+        "decoders": ["h264"]})
+
+
+def mark_words():
+    return [w.text for w in mark_labels()]
+
+
+def mark_labels():
+    return [w for w in overlay.mics.walk(restrict=True)
+            if isinstance(w, M.Label)]
+
+
+name = overlay.name_label.text
+their_media(False, True)
+check("each side's microphone is marked on the call's screen: hers as it "
+      "is, his as he says",
+      overlay.mics.marks == [("You", not alice.call.muted), (name, False)]
+      and f"{name} · muted" in mark_words(), overlay.mics.marks)
+for _ in range(3):
+    M.Clock.tick()
+check("...its words whole, not cut short (they read \"… · mut…\")",
+      len(mark_labels()) == 2 and
+      all(not w.is_shortened and w.width >= w.texture_size[0]
+          for w in mark_labels()),
+      [(w.text, w.is_shortened, round(w.width), w.texture_size[0])
+       for w in mark_labels()])
+was = alice.call.muted
+alice.toggle_call_mute()
+their_media(True, True)
+check("...and follows both: she turns hers, he unmutes",
+      overlay.mics.marks == [("You", was), (name, True)] and
+      alice.call.session.me.mic is was and name in mark_words(),
+      overlay.mics.marks)
+alice.toggle_call_mute()
+alice.call.session.me.camera = True          # her camera on, as his is
+alice._refresh_call()
+check("both cameras on: his fills the screen, hers is in its corner",
+      overlay.picture.user == B and overlay.mine.opacity == 1 and
+      overlay.face.opacity == 0 and not overlay.swapped)
+small = tuple(overlay.mine.size)
+big = overlay.shows()["v"]
+flipped = []
+alice.flip_call_camera = lambda: flipped.append(1)
+overlay.mine.dispatch("on_release")
+check("a tap on her corner puts her own camera over the screen and his in "
+      "that corner (it turned a phone to its back camera, and its torch "
+      "went out)",
+      overlay.swapped and overlay.picture.user == A and not flipped and
+      overlay.mine.opacity == 0 and overlay.face.opacity == 1 and
+      overlay.face.pos_hint == overlay.mine.pos_hint,
+      (overlay.swapped, overlay.picture.user))
+check("...his picture is asked for at the corner's size, not the screen's",
+      set(overlay.shows()) == {"v"} and
+      overlay.shows()["v"][0] <= small[0] + 1 < big[0], overlay.shows())
+overlay.face.dispatch("on_release")
+check("...a tap there turns it back", not overlay.swapped and
+      overlay.picture.user == B and overlay.mine.opacity == 1 and
+      overlay.face.opacity == 0 and
+      overlay.face.pos_hint == overlay.FACE_CORNER)
+overlay.swap()
+their_media(True, False)
+check("...and with his camera off there is nothing to swap with",
+      not overlay.swapped and overlay.picture.user == B)
+check("a computer has one camera: no button for the other",
+      overlay.flip.opacity == 0 and overlay.flip.disabled)
+their_media(True, True)
+M.IS_ANDROID = True
+try:
+    overlay._pictures()
+    shown = overlay.flip.opacity == 1 and not overlay.flip.disabled
+    overlay.flip.dispatch("on_release")
+finally:
+    M.IS_ANDROID = False
+check("a phone with its camera on has it, top right: Other camera",
+      shown and flipped == [1] and overlay.flip.label == "Other camera",
+      (shown, flipped))
+del alice.__dict__["flip_call_camera"]
+alice.call.session.me.camera = False
+their_media(True, False)
 alice.end_call()
 settle(parties, lambda: alice.call is None and bob.call is None)
 bob.go_back_to_chats()
@@ -2210,6 +2347,34 @@ check("the same identity cannot be added to one device twice",
       "already exists on this device" in twice, twice)
 
 relay.stop = True
+
+
+def ws_waits(engine, packets=20) -> list:
+    """21.0: how long each of `packets` from the WebSocket waits for the
+    engine to take it, given out of step with its loop (seconds)."""
+    taken, waits = [], []
+    engine._packet = lambda *_a: taken.append(time.monotonic())
+    engine.start()
+    for n in range(packets):
+        time.sleep(0.013)
+        taken.clear()
+        given = time.monotonic()
+        engine.ws_packet(bytes([n]))
+        end = given + 0.5
+        while not taken and time.monotonic() < end:
+            time.sleep(0.0005)
+        if taken:
+            waits.append(taken[0] - given)
+    engine.stop()
+    return sorted(waits)
+
+
+waits = ws_waits(M.CallEngine("0" * 32, b"t" * 8, 0, None, "",
+                              lambda _k, _v: None))
+check("21.0 (NEXT29): a packet the WebSocket hands the call's engine is "
+      "taken at once (it waited for the loop's select, up to 20 ms)",
+      len(waits) == 20 and waits[10] < 0.004,
+      [round(w * 1000, 1) for w in waits])
 
 passed = sum(1 for _n, c in RESULTS if c)
 print(f"\n  {passed}/{len(RESULTS)} passed")

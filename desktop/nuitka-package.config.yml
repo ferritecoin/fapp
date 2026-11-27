@@ -1,4 +1,4 @@
-# What Nuitka cannot see by itself in the desktop build (build_desktop.sh).
+# What Nuitka cannot see by itself in the desktop build (build_desktop.py).
 # The format is Nuitka's own package configuration:
 # https://nuitka.net/user-documentation/nuitka-package-config.html
 # Its own files carry a checksum per entry; this one does not, so Nuitka
@@ -21,7 +21,7 @@
 # sit outside the package, in <prefix>/share/angle/bin, which kivy_deps.angle
 # names in dep_bins; they go beside the executable, where SDL finds them.
 # They hang on kivy, not on kivy_deps.angle: the build leaves kivy_deps out
-# (build_desktop.sh says why), and the DLLs are all it was for.
+# (build_desktop.py says why), and the DLLs are all it was for.
 - module-name: 'kivy'
   dlls:
     - by_code:

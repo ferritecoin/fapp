@@ -27,6 +27,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import types
 import uuid
 
 os.environ.setdefault("KIVY_NO_ARGS", "1")
@@ -89,6 +90,10 @@ class StubApi:
         self.relay, self.keys = relay, keys
         self._features = {"blobs": True}
         self.read_ids = []
+        self.clock_offset = 0.0     # the relay's clock, not known yet
+
+    def relay_now(self):
+        return time.time() + self.clock_offset
 
     def features(self):
         return self._features
@@ -447,8 +452,8 @@ bob.go_back_to_chats()
 print("\nA call while the app is away")
 M.IS_ANDROID = M.IS_MOBILE = False
 rang = []
-M.android_call_notification = lambda app, peer, cid, name: rang.append(
-    (peer, cid, name)) or True
+M.android_call_notification = lambda app, peer, cid, name, video=False: \
+    rang.append((peer, cid, name, video)) or True
 bob.foreground = False
 cid = uuid.uuid4().hex
 sig = {"op": "call", "id": cid, "tag": os.urandom(8).hex(),
@@ -466,8 +471,16 @@ M.IS_ANDROID = True
 offer.unlink()
 bob.call_signal_arrived(A, sig)
 check("...on a phone, the call's own notification, with Answer/Decline",
-      rang and rang[-1] == (A, cid, "alice"))
+      rang and rang[-1] == (A, cid, "alice", False))
+offer.unlink()
+bob.call_signal_arrived(A, dict(sig, v=True))
+check("20.0: a video call rings as one (it rang as a voice call)",
+      rang[-1] == (A, cid, "alice", True), rang[-1])
 M.IS_ANDROID = False
+offer.unlink()
+bob.call_signal_arrived(A, dict(sig, v=True))
+check("...on a computer too", seen[-1] == (
+    "desktop", "alice", "Incoming video call"), seen[-1])
 bob.call_signal_arrived(A, {"op": "end", "id": cid, "why": "cancelled"})
 card = bob.store.call_card(A, cid) or {}
 check("given up on before anyone answered, it is a missed call's card",
@@ -496,6 +509,83 @@ check("Answer on the notification answers the call as soon as it rings",
 bob.call.ended = True
 bob._close_call_screen(bob.call)
 tick(0.2)
+
+
+def kept_offer(relay_age, kept_ago, known_age):
+    """An offer the service kept `kept_ago` seconds ago, `known_age` old
+    then by its count, the relay's clock 90 s behind this phone's: by the
+    phone's clock alone it looks 90 s older than it is."""
+    kept = dict(sig, id=uuid.uuid4().hex,
+                relay_at=time.time() - 90 - relay_age)
+    offer.write_text(json.dumps({
+        "from": A, "sig": kept, "at": time.time() - kept_ago,
+        "age": known_age}), "utf-8")
+    return kept["id"]
+
+
+# 20.0: the app starts for a call's Answer and does not know the relay's
+# clock yet (the first answer from the relay tells it).
+relay.mail.clear()
+del answered[:]
+bob.api.clock_offset = 0.0
+bob.call = None
+late = kept_offer(5, 3, 2)
+bob._call_from_notification("answer", late)
+check("20.0: answered from its notification by an app just started, its "
+      "clock a minute and a half from the relay's: answered (it was "
+      "declared missed, and the caller told so)",
+      answered == [late] and bob.call is not None and bob.call.id == late
+      and not relay.mail and
+      (bob.store.call_card(A, late) or {}).get("outcome") != "missed",
+      (answered, relay.mail))
+bob.call.ended = True
+bob._close_call_screen(bob.call)
+tick(0.2)
+kept = M.sanitize_call_signal("call", dict(sig, id=uuid.uuid4().hex))
+M.keep_call_offer(B, A, dict(kept, relay_at=bob.api.relay_now() - 7),
+                  M.call_offer_age(dict(kept, relay_at=bob.api.relay_now()
+                                        - 7), bob.api))
+taken = M.take_call_offer(B)
+check("...an offer is kept with its age, and counted on from there",
+      taken and 6.5 < M.call_offer_age(taken[1], None) < 8.5 and
+      6.5 < M.call_offer_age(taken[1], bob.api) < 8.5,
+      taken and M.call_offer_age(taken[1], None))
+del answered[:]
+slow = kept_offer(M.CALL_OFFER_MAX_AGE + 2, 30, M.CALL_OFFER_MAX_AGE - 28)
+bob.call = None
+bob._call_from_notification("answer", slow)
+check("...answered while it rang, the app slow to start: still taken, for "
+      "as long as the caller rings", answered == [slow], answered)
+bob.call.ended = True
+bob._close_call_screen(bob.call)
+tick(0.2)
+bob._answer_on_ring = None
+stale = kept_offer(M.CALL_OFFER_MAX_AGE + 2, 30, M.CALL_OFFER_MAX_AGE - 28)
+bob.call = None
+bob._check_pending_offer()
+check("...one nobody answered, as old: a missed call, as before",
+      (bob.call is None or bob.call.ended) and
+      (bob.store.call_card(A, stale) or {}).get("outcome") == "missed")
+bob.call = None
+bob._answer_on_ring = gone = kept_offer(M.CALL_RING_SECONDS + 5, 40,
+                                        M.CALL_RING_SECONDS - 35)
+bob._check_pending_offer()
+check("...and one answered after the caller gave up",
+      (bob.store.call_card(A, gone) or {}).get("outcome") == "missed")
+bob._answer_on_ring = None
+relay.mail.clear()
+# A lobby that cannot be drawn does not stop the answer.
+del bob.__dict__["answer_call"]
+real_preview, real_now = bob.preview_call, bob._answer_now
+bob.preview_call = lambda session: 1 / 0
+bob._answer_now = lambda: answered.append("now")
+bob.call = types.SimpleNamespace(ended=False, outgoing=False,
+                                 state="incoming", session=object())
+bob.answer_call()
+check("...a lobby that fails to open: answered without it, not a crash",
+      answered[-1] == "now")
+bob.call = None
+del bob.__dict__["preview_call"], bob.__dict__["_answer_now"]
 # A call of our own, ringing on with nobody there, while we are away.
 relay.mail.clear()
 alice.foreground = False
@@ -507,10 +597,57 @@ alice._start_call_watchdog()
 check("away from the app, an unanswered call still gives up on time",
       wait_for(lambda: getattr(call, "end_sent", False), 4) and
       wait_for(lambda: relay.mail, 2))
+# Both come from the watchdog's thread, the end's message by a thread of
+# its own: waited for, not read the moment the message lands (a busy
+# runner's thread paused between them: Devices run 54).
 check("...says so to the other side, and ends the call service",
-      relay.mail and relay.mail[-1]["recipient"] == B and
-      not (M.DATA_DIR / ".call_active").exists())
+      wait_for(lambda: relay.mail and relay.mail[-1]["recipient"] == B and
+               not (M.DATA_DIR / ".call_active").exists(), 3))
 relay.mail.clear()
+
+print("\n20.0: Settings says what this device lacks, and has no dead "
+      "switch")
+
+
+def settings_row(app, title):
+    app.open_settings()
+    tick(0.3)
+    row = next((w for w in app.settings_screen.body.walk()
+                if isinstance(w, M.ListRow) and w.title.text == title), None)
+    app.close_settings()
+    return row
+
+
+def switches(row):
+    return [w for w in row.walk(restrict=True)
+            if isinstance(w, M.ToggleSwitch)]
+
+
+real_can, real_why = M.remote_control_possible, M.call_video_why_not
+M.remote_control_possible = lambda: False
+M.call_video_why_not = lambda track="v": "Video needs PyAV on this computer"
+row = settings_row(alice, "Remote access")
+check("a computer that cannot be controlled still has Remote access in "
+      "Settings, saying why (the row was missing without a word: an EXE "
+      "built without its video package)",
+      row is not None and row.hint.text ==
+      "Video needs PyAV on this computer", row and row.hint.text)
+M.remote_control_possible = lambda: True
+row = settings_row(alice, "Remote access")
+check("...one that can has the row that opens its list, as before",
+      row is not None and "PyAV" not in row.hint.text)
+M.remote_control_possible, M.call_video_why_not = real_can, real_why
+real_rec = M.call_recording_why_not
+M.call_recording_why_not = lambda: "Recording a call on a phone comes in " \
+    "a later update"
+row = settings_row(alice, "Let me record calls")
+check("where calls cannot be recorded (a phone), the row says so and has "
+      "no switch (it had one that switched nothing)",
+      row is not None and not switches(row) and "later" in row.hint.text)
+M.call_recording_why_not = lambda: ""
+row = settings_row(alice, "Let me record calls")
+check("...and where they can, the switch", len(switches(row)) == 1)
+M.call_recording_why_not = real_rec
 
 print("\nKept running on phones that stop it (15.1)")
 os.environ["FEXT_SHOW_ANDROID_SETTINGS"] = "1"     # Settings as a phone's

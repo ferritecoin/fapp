@@ -8,7 +8,8 @@ suites' real-time checks can miss on a busy runner, and a fault of the
 system fails both runs. Under a failed suite's line come its failed checks,
 or the end of its log if it stopped before them, so that the job's own log
 says what failed when its logs cannot be kept; then the lines before
-its first few failures.
+its first few failures, and every line the suite marked as its own account
+of a failure (NOTE, "  ! ").
 
     python tools/devices/run_suites.py main.py OUT_DIR [suite ...]
 """
@@ -25,14 +26,18 @@ SUITES = ("test_service", "test_core", "test_flows", "test_design",
           "test_navigation", "test_pictures", "test_calls", "test_remote",
           "test_security", "test_conference", "test_notify",
           "test_gestures", "test_touch", "test_privacy", "test_screen",
-          "test_backup", "test_video", "test_videomsg", "playthrough")
+          "test_backup", "test_video", "test_videomsg", "playthrough",
+          "e2e_remote",
+          # 21.0: last, for on GitHub's Windows it locks the screen.
+          "test_winservice")
 #: Suites that open no window (as build-apk.yml runs them).
-NO_WINDOW = {"test_service", "test_backup"}
+NO_WINDOW = {"test_service", "test_backup", "test_winservice"}
 PASSED = re.compile(r"(\d+)/(\d+) passed")
 #: Under a failed suite's line, the log lines before its first few failed
 #: checks too: the job's log is all a run leaves where its files cannot be
 #: fetched.
 CONTEXT, CONTEXT_FAILS = 8, 3
+NOTE, NOTES = "  ! ", 400
 
 
 def run(suite: str, main_py: str, out: Path, attempt: int = 1) -> tuple:
@@ -64,7 +69,10 @@ def run(suite: str, main_py: str, out: Path, attempt: int = 1) -> tuple:
         fails = [n for n, line in enumerate(lines) if "[FAIL]" in line]
         for n in fails[:CONTEXT_FAILS]:
             what += ["  before: " + line.strip()[:240]
-                     for line in lines[max(0, n - CONTEXT):n]]
+                     for line in lines[max(0, n - CONTEXT):n]
+                     if not line.startswith(NOTE)]
+        what += [line.rstrip()[:300] for line in lines
+                 if line.startswith(NOTE)][:NOTES]
     return passed, checks, round(time.monotonic() - start), status, what
 
 

@@ -303,6 +303,33 @@ Image.new("RGB", (64, 64), (200, 200, 200)).save(plain)
 check("a picture without a code reads as none (and does not fail)",
       M.read_qr_image(plain) is None)
 
+print("\n21.1: scanning a code on a phone, step by step")
+opened, took = [], []
+real_open, real_take = M.ScanStepsSheet.open, M.android_take_photo
+M.ScanStepsSheet.open = lambda sheet: opened.append(sheet)
+M.android_take_photo = lambda done, failed: took.append(done)
+M.IS_ANDROID = True
+try:
+    M.VerifySheet(alice, B)._scan()
+finally:
+    M.IS_ANDROID = False
+steps = opened[0] if opened else None
+words = [w.text for w in steps.walk() if isinstance(w, M.InfoLabel) and
+         w.text[:1].isdigit()] if steps else []
+check("a phone shows what to do before its camera app opens: where their "
+      "code is, the camera's own tick, and what then, numbered (in words: "
+      "the app's typeface has no ✓ or ⋮)",
+      steps is not None and not took and len(words) == 5 and
+      words[0].startswith("1.") and "Verify" in words[0] and
+      "tick" in words[3] and not any("✓" in w or "⋮" in w for w in words),
+      words)
+button = [w for w in steps.walk() if isinstance(w, M.Btn)] if steps else []
+if button:
+    button[0].dispatch("on_release")
+check("...and Open the camera opens it, the code read as before",
+      len(took) == 1 and took[0].__self__.peer == B, took)
+M.ScanStepsSheet.open, M.android_take_photo = real_open, real_take
+
 alice.set_verified(B, True)
 alice.open_conversation(B)
 tick(0.5)
@@ -1573,6 +1600,10 @@ check("...on: the person's own Run key names the EXE, told to open "
       reg.values == {M.APP_NAME: '"C:\\Apps\\Ferritext.exe" --startup'}
       and reg.opened[-1][:2] == ("HKCU", M.STARTUP_RUN_KEY) and
       M.start_with_windows(reg), reg.values)
+M.built_exe = lambda: r"c:\apps\FERRITEXT.EXE"
+check("20.0 (F7): the same EXE reached by a path in other letter case is "
+      "the one named (Windows' paths know no case): still on",
+      M.start_with_windows(reg))
 M.built_exe = lambda: r"D:\Moved\Ferritext.exe"
 check("...an EXE since moved is not the one named: off, until turned on "
       "again", not M.start_with_windows(reg) and

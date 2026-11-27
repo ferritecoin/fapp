@@ -3,7 +3,7 @@
 
     python desktop/collect_licences.py OUT_DIR
 
-Run with the build's Python (build_desktop.sh does, then puts OUT_DIR into
+Run with the build's Python (build_desktop.py does, then puts OUT_DIR into
 the executable as licences/). For each installed distribution, its licence
 files, as its own metadata lists them, go to OUT_DIR/<name>/, and
 OUT_DIR/README.txt lists them all with their versions and licences. What

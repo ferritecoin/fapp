@@ -34,7 +34,7 @@ source.exclude_dirs = tests, bin, venv, .git, .github, .buildozer, __pycache__, 
 # (v15.1) each language's phrases from data/lang/*.json.
 
 # (str) Application versioning (method 1)
-version = 19.0.1
+version = 21.1.0
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy
@@ -91,9 +91,15 @@ fullscreen = 0
 # 15.1: REQUEST_IGNORE_BATTERY_OPTIMIZATIONS lets Settings › Keep Ferritext
 # running ask Android, which asks the user, to leave its battery use alone.
 # 16.2: USE_BIOMETRIC, the app lock's fingerprint or face. 17.0: CAMERA,
-# video calls (asked the first time the camera is turned on in a call; the
-# camera is used only while the call is on screen).
-android.permissions = INTERNET,ACCESS_NETWORK_STATE,POST_NOTIFICATIONS,RECORD_AUDIO,FOREGROUND_SERVICE,FOREGROUND_SERVICE_DATA_SYNC,FOREGROUND_SERVICE_MICROPHONE,FOREGROUND_SERVICE_MEDIA_PROJECTION,MODIFY_AUDIO_SETTINGS,WAKE_LOCK,VIBRATE,USE_FULL_SCREEN_INTENT,REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,USE_BIOMETRIC,CAMERA
+# video calls (asked the first time the camera is turned on in a call).
+# 20.0: FOREGROUND_SERVICE_CAMERA, the service that keeps a call's camera
+# on when the app leaves the screen (its notification says the camera is
+# on); before it the camera went off there. 21.0: ACCESS_FINE_LOCATION and
+# ACCESS_COARSE_LOCATION, a place sent and a live share (asked the first
+# time; Android lets the person allow only an approximate place), and
+# FOREGROUND_SERVICE_LOCATION, the service that keeps a live share going
+# when the app leaves the screen (its notification says so).
+android.permissions = INTERNET,ACCESS_NETWORK_STATE,POST_NOTIFICATIONS,RECORD_AUDIO,FOREGROUND_SERVICE,FOREGROUND_SERVICE_DATA_SYNC,FOREGROUND_SERVICE_MICROPHONE,FOREGROUND_SERVICE_MEDIA_PROJECTION,FOREGROUND_SERVICE_CAMERA,FOREGROUND_SERVICE_LOCATION,MODIFY_AUDIO_SETTINGS,WAKE_LOCK,VIBRATE,USE_FULL_SCREEN_INTENT,REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,USE_BIOMETRIC,CAMERA,ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION
 
 # (list) Put these files or directories in the apk res directory.
 # Ships res/xml/network_security_config.xml, which permits cleartext for the
@@ -181,8 +187,10 @@ p4a.bootstrap = sdl2
 # own (main.py reads which from PYTHON_NAME): the sync service that keeps
 # notifications arriving after Android has closed the app, the call
 # service that keeps a call's microphone on while the app is off screen,
-# and (18.0) the share service Android wants running while a screen is shared.
-services = Fextsync:main.py:foreground:sticky,Fextcall:main.py:foreground,Fextshare:main.py:foreground
+# (18.0) the share service Android wants running while a screen is shared,
+# (20.0) the camera service that keeps a call's camera on off screen, and
+# (21.0) the location service that keeps a live share going off screen.
+services = Fextsync:main.py:foreground:sticky,Fextcall:main.py:foreground,Fextshare:main.py:foreground,Fextcam:main.py:foreground,Fextloc:main.py:foreground
 
 # (str) Hook run during the p4a build: declares the services' types, which
 # Android 14 requires and p4a's manifest template cannot express.

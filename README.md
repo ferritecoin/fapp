@@ -22,13 +22,13 @@ same key (see [Release signing](#release-signing)).
 
 Every push to the default branch is tested and built, and each new version is
 published to a GitHub Release, whose files never change afterwards. Open the
-**Releases** page (or the **`v19.0.1`** tag) and take:
+**Releases** page (or the **`v21.1.0`** tag) and take:
 
 | Asset | For |
 | --- | --- |
-| `Ferritext-19.0.1.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r`. Calls need Android 6 or later |
-| `Ferritext-19.0.1-windows.exe` | Windows 10 and 11 (64-bit) — the same app in one file, with nothing to install. Windows may say that it does not know the publisher: choose *More info*, then *Run anyway*. |
-| `Ferritext-19.0.1-desktop.py` | Windows / macOS / Linux — one file with its fonts and icons inside. Run it with Python 3.11+ after `pip install kivy requests websocket-client cryptography qrcode pillow`. |
+| `Ferritext-21.1.0.apk` | Android 5.0+ — sideload it via *Install unknown apps*, or `adb install -r`. Calls need Android 6 or later |
+| `Ferritext-21.1.0-windows.exe` | Windows 10 and 11 (64-bit) — the same app in one file, with nothing to install. Windows may say that it does not know the publisher: choose *More info*, then *Run anyway*. |
+| `Ferritext-21.1.0-desktop.py` | Windows / macOS / Linux — one file with its fonts and icons inside. Run it with Python 3.11+ after `pip install kivy requests websocket-client cryptography qrcode pillow`. |
 
 Each Actions run keeps them for a week too: the APK and the desktop file as
 the **`ferritext-release`** artifact, the executable as
@@ -57,12 +57,193 @@ QR code of the page's address, and the steps to install the app and keep
 it running.
 
 ```bash
-python3 tools/download_page.py Ferritext-19.0.1.apk site/ \
+python3 tools/download_page.py Ferritext-21.1.0.apk site/ \
     --url https://your.host/ferritext/        # then serve site/ there
 ```
 
 Relay 12.2.1 and later can serve the page too, at `/download/` on the
 relay's own address: whoever can reach the relay can reach it.
+
+## What's in 21.1.0
+
+A remote session now shows the computer's screen on a phone, a phone
+controls it as a touchpad, Back steps back instead of leaving the app,
+and scanning a code says what to do first. It is the first release
+published since 19.0.1, so 21.0.0's and 20.0.0's changes (below) come
+with it.
+
+**Remote access**
+
+- **The screen shows**: a computer whose graphics chip codes its screen
+  (most do) sent a first picture a viewer could miss for good, and none
+  after it while the screen stood still: a phone saw nothing but could
+  type. The chip now makes real key frames when asked (one that will not
+  is set aside), and a viewer that has shown nothing asks again until a
+  picture comes. While none has, the call says it is waiting.
+- **A phone is a touchpad**: slide a finger to move the pointer, tap to
+  click, hold then slide to drag, hold and let go for the right button;
+  two fingers tap for the right button, slide to scroll and pinch to
+  zoom (up to four times; the picture follows the pointer). *Keys ›
+  Trackpad* off taps where you click instead.
+- **The pointer, at once**: the side in control draws the pointer
+  itself; a Windows computer leaves it out of its picture and says its
+  shape (an I-beam over text, a hand over a link), so a computer's own
+  pointer takes that shape and nothing lags behind the mouse.
+- **Smoother screen**: *Settings › Remote access › Smoother screen* reads
+  and sends the screen 60 times a second, not 30.
+
+**Phones**
+
+- **Back** steps back from every page and sheet, and leaves for the home
+  screen only from the chat list; a Back that reached Android itself had
+  closed the app.
+- **Scanning a code**: *Scan their code* (verifying a contact) and *Scan
+  a key's code* (a key for another device) first say, step by step, where
+  the code is, how to hold the phone, and to tap the camera's own tick to
+  bring the picture back.
+- **A live location's notice** says with whom and until when, and has
+  *Stop*, which works while the app is closed. A locked phone shows only
+  that the place is shared.
+- **A call's notice opens its chat**: a tap on a missed or planned call's
+  notice opened the app, not the chat it was about.
+
+## What's in 21.0.0
+
+A Windows service lets a remote session reach the lock and sign-in
+screens; polls and places come to chats; a hold takes half the time; and
+a remote session's picture comes sooner. It was not published on its
+own: it came with 21.1.0, and 20.0.0's changes (below) with it.
+
+**Remote access**
+
+- **The lock screen, from afar** (Windows, the program itself): *Settings
+  › Remote access › The lock screen, from afar* sets up a small Windows
+  service, after Windows asks you. With it a session sees and uses the
+  lock and sign-in screens, Ctrl+Alt+Del, windows run as administrator
+  and, if you allow it, Windows' permission prompts. A red bar on the
+  lock screen says a session is on. The same sheet updates or removes it.
+- **A program that does not answer**, in front on the computer you
+  control, is named in the band, with *End it*.
+- **The clipboard, either way**: *Keys › Clipboard* (*Send my clipboard*,
+  *Get theirs*).
+- **What went wrong**: the computer keeps a short log of its sessions
+  (when they began and ended, what its screen showed, input it refused, a
+  restart; never what was typed or seen), read from afar (*Keys › What
+  went wrong there…*) or at home (*Remote access › What went wrong
+  lately*).
+- **The picture comes sooner**: each picture of the computer you
+  control is drawn as it arrives, 10 ms sooner on average and 22 ms at
+  the slowest twentieth (it waited for the next of 30 a second), and a
+  computer shows a call sent at 60 a second at 60. Over the WebSocket,
+  where UDP is blocked, each packet is taken at once (it waited up to
+  20 ms). The mouse's moves in one frame go as one packet, not hundreds
+  a second.
+
+**Chats**
+
+- **Polls**: *Poll* in the paperclip's sheet: a question, 2 to 10
+  choices, one answer or several, open until you end it or for an hour, a
+  day or a week. A tap votes, another takes the vote back; *Votes* shows
+  who picked what.
+- **Location**: *Location* in the paperclip's sheet. A phone sends where
+  it is, or shares it live for 15 minutes, an hour or 8 hours (Android's
+  notifications say so while it does). Its card says how far it is and
+  which way; *Open in maps* opens the phone's own maps app; *Stop sharing*
+  ends a live share, and an ended one keeps no place. No map is drawn and
+  no map service is asked. A computer sends coordinates typed or pasted.
+- **Select text**, in a message's menu: its words in a sheet, the part you
+  mark copied.
+- **A hold selects in 0.3 s** (it took 0.7). *Settings › Appearance ›
+  Hold to select* makes it shorter or longer.
+- With several identities on a device, the field says which you write as
+  ("Message as @name").
+
+Not in this version: the wallet, which waits for the chain's work, and a
+live share's notice naming who sees it and until when (21.1.0 has it).
+
+## What's in 20.0.0
+
+Not released on its own: it came with 21.0.0.
+
+The Windows program now does everything the Python file does, a remote
+session is tested from end to end with the real program, and a round of
+faults testers met on their phones is put right.
+
+**The Windows program and remote control**
+
+- **The EXE has video, screen sharing and remote control.** It was built
+  without its video package and said nothing: no *Remote access* in its
+  Settings. One build script (`desktop/build_desktop.py`; on Windows,
+  `desktop\build_exe.bat`) makes it, and `Ferritext.exe --check` says what
+  a build can do. A build that can do less than the Python file fails.
+- **A remote session, end to end** (`desktop/e2e_remote.py`): the program
+  itself as the computer left behind, a controller, and a window that
+  writes down what it is given. The pointer, the three buttons, the wheel,
+  a drag, a line of prose and code, the editing keys and shortcuts; the
+  program ended as a crash ends it, and a restart asked from afar: each
+  time the session comes back by itself.
+- Keys reach every Windows program (they were sent without their scan
+  codes, which some programs read). Shortcuts on the signs' keys (Ctrl+/,
+  Ctrl+-, Ctrl+`) arrive; AltGr types.
+- *Settings › Remote access* is there on every computer, and says why
+  where a computer cannot be controlled.
+
+**Calls**
+
+- **A video call rings as one**, and answering it from the notification
+  answers it: on a phone whose clock was a minute off, it ended at once.
+- **Out of sight, the picture goes on.** A phone keeps its camera in a
+  video call while another app is in front.
+- **An older phone's picture no longer freezes**: a decoder that falls
+  behind lets go of what it cannot show and catches up.
+- **Muted is shown** to both sides, beside each picture.
+- **A tap on your own picture swaps it** with the other side's as the
+  large one. *Other camera* (front or back) is a button of its own.
+- **A call that hears nothing keeps trying** for two minutes, saying
+  *Reconnecting…*, in place of ending after twenty seconds. It finds its
+  way again when Wi-Fi gives way to mobile data.
+
+**Writing**
+
+- **The paperclip opens a sheet of icons**: Gallery, Camera, Video
+  message, Document, Contact, Audio.
+- **Documents**: any file, sealed as a photo is, with its name and size;
+  a tap fetches it, another saves it.
+- **A contact handed on**, as a card that opens a chat with them.
+- **Backspace** deletes what the app itself put in the field (a draft,
+  an emoji from its own panel, a message being edited) on Android 11 and
+  later, where it sometimes did nothing.
+- **Emoji, then the keyboard again**, no longer leaves the field under
+  the keyboard.
+- **The identity you write as** is no longer beside the field, where a
+  tap meant for the emoji key switched it. It is in the chat list's menu.
+- **A pressed message shows it at once**, within its own shape.
+- **A message's menu taller than the screen scrolls** (a phone on its
+  side cut off its first rows).
+
+**Groups** (for their admins, in the group's page)
+
+- **Slow mode**: a member writes once in 10 seconds, a minute, 5 minutes
+  or an hour. What they had written stays in the field.
+- **About this group**: a few lines every member sees, and each new
+  member is told.
+- **@everyone**, from an admin, reaches every member, even one who muted
+  the group.
+
+**And**
+
+- **An away reply of their own** for a contact (their chat's page).
+- **Back** steps out one screen at a time on every phone.
+- *Ready for new messages* is no longer in the status bar: it shows only
+  in the list of notifications, as Android requires of an app that keeps
+  running.
+- A key for another device pasted with line breaks in it is read. *Start
+  when Windows starts* knows its program by a path in other letter case.
+- *Let me record calls* has no switch on a phone, where it switched
+  nothing.
+
+Not in this version: a Windows service for the lock and sign-in screens,
+Location, Poll and the wallet. Each has a plan.
 
 ## What's in 19.0.1
 
@@ -1106,6 +1287,14 @@ member's restriction with its end. Each app keeps to the rules for its own
 messages, and holds back a member's message that broke them, judged by
 the time the relay took it, so an older app cannot get round them.
 
+**Slow mode, about, @everyone (20.0).** Three more rules ride in the
+state. *Slow mode* sets how often a member may write. The sender's app
+keeps the pace; the others hold back only what comes at more than twice
+the pace, counted by the sender's own times, so that messages written
+offline and sent together are not lost. *About this group* is a few lines
+from its admins. *@everyone* in an admin's message is a mention of every
+member; a member's is plain words, whatever their app sends.
+
 **Topics (17.4).** The state can also list the group's topics. A message
 names its topic inside its signed extension block; the relay still sees
 ordinary one-to-one traffic. Turned off, the list stays in the state and
@@ -1246,6 +1435,15 @@ arrives downloads by itself, except:
 Its small preview shows at once. A tap on mobile data asks first, unless
 *Ask before using mobile data* is off. Computers count as on Wi-Fi.
 
+**Documents and contacts (20.0).** The paperclip's sheet also sends a
+*Document*: any file up to the relay's size for media, sealed and fetched
+as a photo is, with its name (cleaned of anything but a file's name) and
+its size in the bubble. A document never downloads by itself on mobile
+data. A tap fetches it; a tap on one fetched saves it (Android's own Save
+dialog; on a computer, the Downloads folder). Nothing is opened by
+Ferritext itself. *Contact* hands someone on as a card: their name and
+address, which the receiver's app looks up before it opens a chat.
+
 ### Video messages (18.1)
 
 The camera key beside the message field offers *Take a photo* or *Record
@@ -1358,6 +1556,20 @@ Echo is cancelled by the system: a headset or a speakerphone that cancels
 it, or on Linux PulseAudio's or PipeWire's echo-cancel module, which is used
 whenever it is loaded.
 
+**A call that hears nothing (20.0)** says *Reconnecting…* after three
+seconds and keeps the call for two minutes (it was twenty seconds). All
+that time it tries every way it has, tells the relay where it now is
+every second (an address changes when Wi-Fi gives way to mobile data),
+and asks for a new pass to the relay's call port every twenty seconds.
+Either side can still hang up. A remote session keeps the twenty
+seconds: a computer that restarted is a new program, which only a new
+session reaches.
+
+On a phone, a video call's camera is held by a service of the *camera*
+type while the app is out of sight (20.0), as the microphone is by its
+own: without it Android stops the camera the moment another app is in
+front. Each side's picture says when its microphone is off.
+
 **One identity on several devices (18.1).** Every device connected as you
 rings. The one you answer on has the call; the others stop and say
 *Answered on another device* (or *Declined call*). Messages are not shared
@@ -1418,9 +1630,11 @@ of yours sets the offer aside without a word. A computer with several
 identities answers for the one that was called, by that identity's own
 list, and is switched to it. Every entry has an end date, and only
 verified contacts can be added. Windows lets no program control its
-sign-in or lock screen, or a program run as administrator. Whoever
-holds a listed person's keys can reach the computer: list only people
-you trust.
+sign-in or lock screen, or a program run as administrator. Nor, as
+20.0's end-to-end test found, while a window that has stopped answering
+is in front (Windows puts its own stand-in window there): *Keys ›
+Programs* ends that program. Whoever holds a
+listed person's keys can reach the computer: list only people you trust.
 
 **For the long term (19.0.1).** *Before you leave* in Remote access
 lists what lets the computer come back on its own, and while someone is
@@ -1430,6 +1644,59 @@ for itself, says what Ctrl+Alt+Del cannot do from afar, lists the
 computer's programs and restarts it. A computer says what its screen
 shows, so the other side knows when Windows has put up a screen nobody
 can use from afar. A still screen costs no data.
+
+**The lock screen, from afar (21.0).** On Windows, *Settings › Remote
+access › The lock screen, from afar* sets up a small service (the
+program itself only, copied to Program Files, which only administrators
+can change; Windows asks you first). It runs as the system, which
+Windows does let see and use its lock and sign-in screens, Ctrl+Alt+Del
+and windows run as administrator; a person's program never can. A red
+bar on the lock screen says a session is on. Windows' permission prompts
+are looked at only, unless you turn on *Answer permission prompts from
+afar* (a program that took Ferritext over could then make itself
+administrator). *Lock when it signs in by itself* locks a computer that
+signed itself in after a restart, to be unlocked from afar. The same
+sheet updates the service to a new version or removes it.
+
+**From a phone, and from another computer (21.1).** A phone controls
+as a laptop's touchpad does: slide one finger to move the pointer, tap
+to click where it is, hold still then slide to drag, hold and let go for
+the right button; two fingers tapped together are the right button,
+moved together they scroll, and a pinch zooms the picture up to four
+times (it follows the pointer). *Keys › Trackpad* off taps where you
+click instead. The side controlling draws the pointer itself, at once:
+a Windows computer leaves it out of its picture and says its shape (an
+I-beam over text, a hand over a link) and where it is when something
+there moves it; a computer's own pointer takes that shape. While no
+picture of the screen has come, the call says so. *Settings › Remote
+access › Smoother screen* reads and sends the screen 60 times a second,
+not 30 (smoother, and up to 8 ms sooner, for twice the work and more
+data while things move).
+
+## Polls and places (21.0)
+
+*Poll* and *Location* are in the paperclip's sheet. A **poll** has a
+question and 2 to 10 choices, one answer or several, and stays open until
+its asker ends it, or for an hour, a day or a week. Each vote is a sealed
+message that every device counts for itself; in a group an admin who may
+delete members' messages can end one too. *Votes* in its menu shows who
+picked what.
+
+A **place** is where a phone is, from Android's own location (GPS and the
+network; no other company's service), or coordinates typed on a computer.
+Its card says how far it is from you and which way (where your phone
+knows where it is), and *Open in maps* hands it to the phone's own maps
+app; a computer copies its coordinates. No map is drawn in the app, so
+no map server learns where anyone looks. A **live** place goes on for 15
+minutes, an hour or 8 hours: each new point is a sealed message to the
+chat, sent when the phone has moved 25 m or a minute has passed (at most
+once a minute in a group of more than ten). Android shows a notification
+while one runs, saying with whom and until when (21.1), with *Stop*,
+which works while the app is closed: the chats are told the share ended
+as soon as the app runs. *Stop sharing* on its card ends it too, and an
+ended share keeps no place on any device. Deleting it, the chat or the group, or blocking the
+person, stops it too. The relay sees that sealed messages pass, never
+where anyone is.
 
 ## Sending, and the outbox
 
@@ -1467,6 +1734,9 @@ most once every four hours a chat. While it is on, the chat list says
 - So a reply goes out only while Ferritext receives messages on that
   device (the app open, or its background service running). A message
   that waited at the relay is answered when it arrives.
+- **Words of their own for one contact** (20.0): their chat's page,
+  *Away reply*. Left empty, they get the usual words. Kept on this
+  device only.
 
 ## Background delivery
 
@@ -1573,7 +1843,11 @@ is installed, against the `cryptography` library's own ML-KEM.
 - **Verifying** compares a code worked out from both public keys (twelve
   groups of five digits, the same on both phones only if each has the
   other's real key), so a relay that handed out a false address would be
-  found out.
+  found out. To scan theirs on a phone (21.1), *Scan their code* first
+  says what to do, step by step: their code is in your chat's menu ›
+  *Verify…* on their phone; your phone's own camera app takes the
+  picture, the code filling most of it, and its tick (*OK* or *Done* on
+  some phones) brings the picture back for Ferritext to read.
 - **Link previews** are off unless turned on. Then the sender's device
   fetches them — only from public addresses, a little of each page, three
   redirects at most — and sends them inside the sealed message; a preview
@@ -1631,7 +1905,7 @@ a phone only in a backup you make and seal here.
 | `android/` | What Android compiles or ships beside the Python, in one folder. Java: `CallAudio` (a call's microphone and speaker, on threads of their own, and where the sound goes), `Notifier` and `NotifyReceiver` (notifications, and what is done to them), `QrReader` (QR codes in photos). Resources: the cleartext policy for the relay, the status-bar icon, the camera's folder, the launch screen at night. |
 | `CREDITS.md` | The open-source work Ferritext is made with, and its licences. |
 | `tools/publish_release.sh` | Puts a build's files on its version's GitHub Release, once (run by CI). |
-| `desktop/` | Desktop packaging (Nuitka: `build_desktop.sh`, which builds the Windows executable), the headless test suites, and the tools that capture and time the app. |
+| `desktop/` | Desktop packaging (Nuitka: `build_desktop.py`, and `build_exe.bat` for Windows), the headless test suites, and the tools that capture and time the app. |
 | `.github/workflows/build-apk.yml` | Tests → the signed APK and the Windows executable, side by side → a GitHub Release with the three deliverables. |
 | `.github/workflows/apk-next.yml` | The APK on the next platform, a debug build for phones to try (16.0). |
 
@@ -1660,6 +1934,8 @@ python3 desktop/test_backup.py main.py      # runs each device under xvfb-run it
 xvfb-run -a python3.13 desktop/test_video.py main.py   # needs PyAV (requirements-exe.txt)
 xvfb-run -a python3 desktop/test_videomsg.py main.py   # more is checked where PyAV is
 python3 desktop/smoke_exe.py desktop/dist/Ferritext-17.0.0-windows.exe  # a built executable
+xvfb-run -a python3 desktop/e2e_remote.py main.py   # a remote session, end to end (PyAV)
+python desktop\e2e_remote.py desktop\dist\Ferritext.exe   # ...with a built executable
 ```
 
 | Suite | Covers |
@@ -1682,7 +1958,9 @@ python3 desktop/smoke_exe.py desktop/dist/Ferritext-17.0.0-windows.exe  # a buil
 | `test_backup.py` | Backup and restore end to end, each device a process of its own: a full phone restored through the screens (every table, its files, writing and reading again), beside another identity, Unicode passphrases, without media, a damaged database changing nothing, backups from 11.0, 13.0 and 15.1.1, a full disk, a large backup timed, Android's document copies off the UI thread, automatic backups (made with no one there, the last three kept, the newest restored elsewhere with the passphrase) |
 | `test_video.py` | 17.0's pictures (PyAV): the ladder and a room's three sizes, pieces and how they are put back (losses, key frames), what a 1-to-1 picture may take through each relay, the pictures' thread when someone leaves, a camera coded at three sizes at once, decoding to a tile's size, a group's and a 1-to-1 call's engines trading sealed pictures (sizes asked for, key frames, the sound stepping down with the picture), recording a call and its seal |
 | `test_videomsg.py` | 18.1's video messages. Without any video library, as a phone's Python runs them: NAL units, a picture's size from its parameter set (sets written bit by bit here, and x264's own), ADTS sound, the MP4 written and read back, 4,000 files with their tables changed at random (read with every picture inside the file, or refused), the recorder against stand-ins for a phone's camera coder and recorder (where a recording begins, what ends it, a camera that goes quiet, a relay that takes smaller files, the sound cut to the pictures, what is let go), the bubble and what it says while not here, the camera key, the recording sheet (stopped where it is when the app leaves the screen or a call begins; closed only by Delete and Send once it records), a phone's permissions, and taking a photo once Android gives the camera. With PyAV: a real recording opened by FFmpeg without a warning, a flash and a tone within a tenth of a second of each other, and one recorded, sent and played in the app |
-| `smoke_exe.py` | A built executable started twice in an empty home, as a person would: up, its window drawn, no crash in its log; its size and both start times (CI runs it on Windows) |
+| `smoke_exe.py` | A built executable started twice in an empty home, as a person would: up, its window drawn, no crash in its log; its size and both start times; and (20.0) its `--check` against plain Python's: it must not be able to do less (CI runs it on Windows) |
+| `test_remote.py` | Remote control and remote sessions (19.0): the events' packets, who may control whom, the access list, special keys, the programs, a restart from afar, the watcher; Windows' and X11's input through stand-ins |
+| `e2e_remote.py` | 20.0: a remote session from end to end with real programs. The away computer is the program itself (`main.py`, or a built executable given as the argument), a controller on the real API, a stand-in relay, and a window that writes down every click and key it is given: the picture, the pointer, buttons, wheel, a drag, typing and editing, shortcuts, a crash (the watcher brings it back), a restart from afar, a new session. Needs a desktop it can send input to (X11 under xvfb-run, or Windows) |
 
 To get `old.py`: `git show v9.1.0:main.py > old.py` (or the latest tag before
 the version under test).
@@ -1749,19 +2027,23 @@ libjpeg-turbo, libpng, libwebp and Pillow, `tools/apk-next/recipes`): `cp -r rec
 tools/apk-next/recipes/` then `buildozer --profile next android debug` with
 Buildozer 1.6.0. `.github/workflows/apk-next.yml` builds it.
 
-**The Windows executable** is built on Windows, as CI builds it: from Git
-Bash, with Python 3.13 and Visual Studio's C++ build tools. Its packages are
-pinned in `desktop/requirements-exe.txt` (the client's own in
-`desktop/requirements.txt`, which the tests run with); raise a pin on purpose,
-once the suites pass with the new version.
+**The Windows executable** is built on Windows, as CI builds it: from a
+Command Prompt, with Python 3.13 and Visual Studio's C++ build tools.
+`desktop\build_exe.bat` makes an environment with the pinned packages
+(`desktop/requirements-exe.txt`; the client's own are in
+`desktop/requirements.txt`, which the tests run with; raise a pin on purpose,
+once the suites pass with the new version) and builds:
 
-```bash
-pip install -r desktop/requirements-exe.txt
-ONEFILE=1 PY=python NAME=Ferritext-17.0.0-windows.exe bash desktop/build_desktop.sh
-python desktop/smoke_exe.py desktop/dist/Ferritext-17.0.0-windows.exe
+```bat
+desktop\build_exe.bat
+python desktop\smoke_exe.py desktop\dist\Ferritext-20.0.0-windows.exe
 ```
 
-On Linux and macOS the same script builds that system's executable.
+`smoke_exe.py` starts the executable as a person would and holds it against
+plain Python: `--check` lists what a build can do on this computer (video,
+screen sharing, remote control, Opus, QR codes...), and the executable must
+not have less. On Linux and macOS `python3 desktop/build_desktop.py --onefile`
+builds that system's executable.
 
 The mark and icons are regenerated with `python3 tools/make_logo.py` (Pillow
 only).

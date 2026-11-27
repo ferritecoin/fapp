@@ -634,7 +634,7 @@ class Harness(App):
 
         class Shell:
             manager = type("Mgr", (), {"current": "chats"})()
-        self.handled = M.FextApp._on_keyboard(Shell(), Window, 27)
+        self.handled = M.FextApp._step_back(Shell())
         Clock.schedule_once(self.closed, 0.5)
 
     def closed(self, _dt):

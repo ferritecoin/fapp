@@ -262,6 +262,72 @@ def click_emoji_again():
 step(click_emoji_again, 0.6)
 
 
+# 20.0: a phone is told where the field is when the keyboard is asked for.
+# Asked for while the emoji panel was still closing, the field was taken
+# to be where the panel had held it, and sat under the keyboard.
+EMOJI = {"asked": []}                 # (the field's y, panel open) at focus
+
+
+def emoji_opened():
+    s = screen()
+    s.entry.input.focus = False
+    s.open_emoji()
+    s.entry.input.bind(focus=lambda w, on: on and EMOJI["asked"].append(
+        (s.entry.y, s.emoji_panel.is_open)))
+
+
+step(emoji_opened, 0.3)
+
+
+def emoji_to_keyboard():
+    s = screen()
+    EMOJI["held"] = s.entry.y             # the field, over the open panel
+    s.toggle_emoji()                      # Keyboard, on the emoji key
+    check("Emoji, then Keyboard: the keyboard is not asked for before the "
+          "page has taken its shape", not EMOJI["asked"] and
+          not s.emoji_panel.is_open and not s.entry.input.focus)
+
+
+step(emoji_to_keyboard, 0.3)
+
+
+def keyboard_asked_settled():
+    s, asked, held = screen(), EMOJI["asked"], EMOJI["held"]
+    check("...and is, with the field back at the bottom (it was asked for "
+          "with the field still up where the panel held it)",
+          len(asked) == 1 and asked[0][0] < held - M.dp(200) and
+          not asked[0][1], (asked, held))
+    M.IS_MOBILE = True                    # a phone: a tap on the field
+    s.entry.input.focus = False
+    s.open_emoji()
+
+
+step(keyboard_asked_settled, 0.3)
+
+
+def field_tapped_over_emoji():
+    del EMOJI["asked"][:]
+    screen().entry.input.focus = True
+
+
+step(field_tapped_over_emoji, 0.3)
+
+
+def field_tapped_settled():
+    s, asked, held = screen(), EMOJI["asked"], EMOJI["held"]
+    M.IS_MOBILE = False
+    check("a tap on the field with the emoji open: the panel closes and "
+          "the keyboard is asked for again, the field at the bottom",
+          not s.emoji_panel.is_open and s.entry.input.focus and
+          len(asked) == 2 and asked[0][0] == held and
+          asked[1][0] < held - M.dp(200) and not asked[1][1],
+          (asked, held))
+    s.entry.input.focus = False
+
+
+step(field_tapped_settled, 0.4)
+
+
 def click_attach():
     class Chooser:
         def __init__(self, callback):
@@ -271,11 +337,42 @@ def click_attach():
             pass
     M.ImageChooserModal = Chooser
     x, y = centre(screen().attach_button)
-    click(x, y, lambda: check("a click on the paperclip offers a photo",
-                              OPENED and OPENED[-1][0] == "chooser"))
+
+    def offered():
+        """20.0: the paperclip's sheet of icons; its first is the gallery."""
+        sheet = (sheets(M.AttachSheet) or [None])[0]
+        names = [tile.label for tile in sheet.tiles] if sheet else []
+        check("a click on the paperclip opens the sheet of what can be "
+              "sent, each with its icon",
+              names[:2] == ["Gallery", "Camera"] and "Document" in names
+              and all(tile.icon for tile in sheet.tiles), str(names))
+        if sheet:
+            squares = [next(i for i in tile.canvas.before.children
+                            if isinstance(i, M.SmoothRoundedRectangle))
+                       for tile in sheet.tiles]
+            check("...each icon's square in the middle of its tile, over "
+                  "its name (they sat half a column to the left, the first "
+                  "cut off)",
+                  all(abs(square.pos[0] + square.size[0] / 2 -
+                          (tile.x + tile.width / 2)) < 1 and
+                      square.pos[0] >= tile.x
+                      for tile, square in zip(sheet.tiles, squares)),
+                  [(round(s.pos[0]), round(t.x), round(t.width))
+                   for t, s in zip(sheet.tiles, squares)])
+            sheet.tiles[0].dispatch("on_release")
+    click(x, y, offered)
 
 
 step(click_attach, 0.6)
+
+
+def gallery_chosen():
+    check("...Gallery offers a photo, the sheet put away",
+          OPENED and OPENED[-1][0] == "chooser" and
+          not sheets(M.AttachSheet))
+
+
+step(gallery_chosen, 0.4)
 
 
 def click_camera_without_one():
@@ -302,14 +399,26 @@ def states_empty():
     s = screen()
     s.entry.text = ""
     s._sync_composer(animate=False)
-    check("nothing written: your initial, the camera and a microphone",
-          s.me_holder.width == M.TOUCH and s.me_holder.opacity == 1 and
+    check("nothing written: the camera and a microphone",
           s.camera_button.width == s.entry.KEY and
           s.action_button.icon == "mic" and
           s.action_button.label == "Record a voice message")
-    me = s.me_holder.children[0] if s.me_holder.children else None
-    check("...the initial is the identity you are writing as",
-          me is not None and me.label == "Writing as @writer")
+    check("20.0: no identity to switch beside the field (a tap meant for "
+          "the emoji key switched users): the field and the button alone",
+          list(s.composer.children)[::-1] == [s.entry, s.action_holder] and
+          not any(isinstance(w, M.AvatarButton) for w in s.composer.walk())
+          and s.entry.x >= M.dp(8))
+    check("21.0 (NEXT29): with one identity the field's hint is 'Message'",
+          s.entry.input.hint_text == "Message", s.entry.input.hint_text)
+    other, _o, _oa, _on = M.mine_identity()
+    added = app.keys.add_identity(other, "Work")    # (made the active one)
+    app.keys.activate(ME)
+    app.refresh_chat(PEER)
+    check("…with several, it says who you write as: 'Message as @writer'",
+          s.entry.input.hint_text == "Message as @writer",
+          s.entry.input.hint_text)
+    app.keys.remove_identity(added)
+    app.refresh_chat(PEER)
 
 
 step(states_empty, 0.2)
@@ -326,14 +435,13 @@ step(states_typing, 0.6)
 
 def states_typing_check():
     s = screen()
-    check("writing: they fold away, and the microphone becomes send",
-          s.me_holder.width == 0 and s.camera_button.width == 0 and
+    check("writing: the camera folds away, and the microphone becomes send",
+          s.camera_button.width == 0 and
           s.action_button.icon == "send" and
           s.action_button.icon_scale == 1.0 and
           s.action_button.label == "Send" and
           s.attach_button.width == s.entry.KEY,
-          f"me={s.me_holder.width} cam={s.camera_button.width} "
-          f"icon={s.action_button.icon}")
+          f"cam={s.camera_button.width} icon={s.action_button.icon}")
     s.entry.text = ""
 
 
@@ -343,8 +451,7 @@ step(states_typing_check, 0.6)
 def states_back():
     s = screen()
     check("cleared, the composer is as it was",
-          s.me_holder.width == M.TOUCH and s.camera_button.width > 0 and
-          s.action_button.icon == "mic")
+          s.camera_button.width > 0 and s.action_button.icon == "mic")
     M.ConversationScreen._can_record = False
     s._sync_composer(animate=False)
     check("where nothing can record, the button stays send",
@@ -365,7 +472,18 @@ def record_start():
     click(x, y)
 
 
-step(record_start, 1.6)
+step(record_start, 0.4)
+
+
+def record_heard():
+    """21.0: recorded until there is more than a second of sound, not for a
+    fixed time, as hold_heard: the tone's process started more than a
+    second late on Windows' runner (run 44: a note of 0.9 s)."""
+    s = screen()
+    return s.recorder is None or s.recorder.elapsed_ms >= 1200
+
+
+step(record_heard, 0.1)
 
 
 def record_running():

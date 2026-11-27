@@ -15,6 +15,7 @@ import os
 import sys
 import tempfile
 import threading
+import types
 import time
 from pathlib import Path
 import uuid
@@ -484,6 +485,112 @@ check("a voice note arrives with its length and waveform",
       M.message_ext(voice)["media"].get("wave"))
 check("the recording file is removed after sending (a copy is kept)",
       not os.path.exists(rec))
+
+print("\n20.0: documents, a contact handed on, the attachment sheet")
+from pathlib import Path                                       # noqa: E402
+doc = os.path.join(os.environ["HOME"], "Q3 report (final).pdf")
+payload = b"%PDF-1.7\n" + os.urandom(3000)
+open(doc, "wb").write(payload)
+alice.conversation_screen.reply_to = None
+alice.send_file(doc)
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+got = bob.store.messages_for(alice.keys.address)[-1]
+media = M.message_ext(got).get("media") or {}
+check("a document arrives as it is, under its own name, with words an "
+      "app before 20.0 can show",
+      got["kind"] == "file" and
+      got["body"] == "Document: Q3 report (final).pdf" and
+      media.get("name") == "Q3 report (final).pdf" and
+      media.get("mime") == "application/octet-stream" and
+      media.get("size") == len(payload), (got["kind"], got["body"], media))
+pump(bob)
+wait_for(lambda: bob.store.message(got["id"])["media_state"] == "ready")
+row = bob.store.message(got["id"])
+check("...fetched, opened and kept whole, with its ending",
+      row["media_state"] == "ready" and
+      Path(row["media_path"]).read_bytes() == payload and
+      row["media_path"].endswith(".pdf"), row["media_state"])
+check("...and the sender's own file is left where it was",
+      os.path.exists(doc))
+opened = []
+real_open, M.open_folder_in_explorer = M.open_folder_in_explorer, \
+    lambda folder: opened.append(folder) or True
+bob.save_document(row)
+bob.save_document(row)
+downloads = Path(os.environ["HOME"]) / "Downloads"
+check("Save puts a copy in Downloads and opens the folder; a second one "
+      "takes a name of its own (the app opens no document itself)",
+      (downloads / "Q3 report (final).pdf").read_bytes() == payload and
+      (downloads / "Q3 report (final) (1).pdf").exists() and
+      opened == [downloads, downloads], opened)
+M.open_folder_in_explorer = real_open
+check("a document's name is its last part only, without the signs a file "
+      "system refuses, its ending kept when it is cut",
+      M.file_name("../../etc/passwd") == "passwd" and
+      M.file_name("C:\\Users\\x\\a<b>:c?.txt") == "abc.txt" and
+      M.file_name("x" * 300 + ".docx").endswith(".docx") and
+      len(M.file_name("x" * 300 + ".docx")) == M.FILE_NAME_MAX and
+      M.file_name("...") == "" and M.file_name(7) == "" and
+      M.sanitize_media(dict(media, name="..\\evil/run.exe"))["name"] ==
+      "run.exe" and M.media_suffix("file", None, "a.tar.GZ") == "gz" and
+      M.media_suffix("file", None, "no ending") == "bin")
+check("...in previews, quotes and notifications it is named a document",
+      M.shown_body("file", got["body"]) ==
+      "Document: Q3 report (final).pdf" and
+      M.tr(M.QUOTE_NAMES["file"]) == "Document" and
+      M.message_text(got) == "")
+big = os.path.join(os.environ["HOME"], "too big.bin")
+open(big, "wb").write(b"0" * 2048)
+real_limit, alice.media_limit = alice.media_limit, lambda peer: 1024
+sent_before = len(alice.store.messages_for(bob.keys.address))
+alice.send_file(big)
+wait_for(lambda: False, 0.5)
+check("one over the relay's limit is not sent",
+      len(alice.store.messages_for(bob.keys.address)) == sent_before)
+del alice.__dict__["media_limit"]
+pk, *_rest = M.mine_identity()
+erin = M.address_from_priv(pk)
+alice.store.upsert_contact(erin, "erin", M.pub_to_compressed(
+    M.priv_to_pub(pk)).hex(), listed=True)
+relay.mail.clear()
+alice.send_contact(bob.keys.address, erin)
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+card = bob.store.messages_for(alice.keys.address)[-1]
+check("a contact handed on arrives as a card: their name and address, "
+      "and words an older app can read",
+      M.message_ext(card).get("card") == {"a": erin, "u": "erin"} and
+      card["body"] == f"Contact: @erin {erin}", card["body"])
+check("...a card with no real address, or a made-up name, is not one",
+      "card" not in M.sanitize_ext({"card": {"a": "Fec-not-one"}}) and
+      M.sanitize_ext({"card": {"a": erin, "u": "no such\nname"}})["card"]
+      == {"a": erin, "u": ""})
+asked = []
+real_sheet = M.AddContactModal
+M.AddContactModal = lambda app: types.SimpleNamespace(
+    entry=types.SimpleNamespace(text=""), open=lambda: asked.append("open"),
+    _submit=lambda: asked.append("look up"))
+opened_chats = []
+bob.open_conversation, real_conv = opened_chats.append, bob.open_conversation
+bob.conversation_screen.on_contact_card(erin)
+check("a tap on it looks the person up at the relay to add them (the "
+      "relay vouches for their key, not whoever sent the card)",
+      asked == ["open", "look up"] and not opened_chats, asked)
+bob.conversation_screen.on_contact_card(alice.keys.address)
+check("...or opens their chat when they are a contact already",
+      opened_chats == [alice.keys.address] and asked == ["open", "look up"])
+M.AddContactModal = real_sheet
+del bob.__dict__["open_conversation"]
+alice.conversation_screen.attach_menu()
+sheet = next(w for w in M.Window.children if isinstance(w, M.AttachSheet))
+names = [tile.label for tile in sheet.tiles]
+check("the paperclip opens the attachment sheet: icons in a grid, with "
+      "more than photos (it opened the photo picker)",
+      names[:2] == ["Gallery", "Camera"] and
+      {"Document", "Contact"} <= set(names) and
+      all(tile.icon in M.ATTACH_TINTS for tile in sheet.tiles), names)
+sheet.dismiss()
 
 print("\nVideo messages (18.1)")
 import struct                                                  # noqa: E402
@@ -1573,7 +1680,7 @@ with bob.store._lock:
     bob.store._db.commit()
 check("rules left behind by an older release's newer state are not used",
       bob.store.group(rgid)["rules"] == {} and
-      M.LocalStore.SCHEMA_VERSION == 14)
+      M.LocalStore.SCHEMA_VERSION == 15)
 
 print("\n17.4: a group's topics")
 check("topics keep good ids and names, once each; none without a list",
@@ -2446,6 +2553,40 @@ check("...the next message gets them",
       written(jon, I, "And now?") is not None
       and autos(jon, I)[-1] == ("in", "Back on Monday."), autos(jon, I))
 
+# 20.0: a contact's own away reply (their chat's info page; optional).
+ivy.open_conversation(J)
+ivy.open_chat_info()
+row = next(w for w in ivy.chat_info_screen.body.walk()
+           if isinstance(w, M.ListRow) and w.title.text == "Away reply")
+check("20.0: a contact's page has their away reply: the usual words until "
+      "they are given their own",
+      row.hint.text == "The usual words (Settings › Away)", row.hint.text)
+row.dispatch("on_release")
+sheet = next(w for w in M.Window.children
+             if isinstance(w, M.TextPromptSheet))
+sheet.entry.text = "Jon, call my desk: 555 0100."
+sheet._save()
+check("...words of their own are kept, and due at their next message",
+      ivy.store.get_contact(J)["away_text"] == "Jon, call my desk: 555 0100."
+      and ivy.store.get_contact(J)["away_at"] == 0)
+check("...which they get, in place of the usual ones",
+      written(jon, I, "Any news?") is not None
+      and autos(jon, I)[-1] == ("in", "Jon, call my desk: 555 0100."),
+      autos(jon, I)[-1])
+row = next(w for w in ivy.chat_info_screen.body.walk()
+           if isinstance(w, M.ListRow) and w.title.text == "Away reply")
+row.dispatch("on_release")
+sheet = next(w for w in M.Window.children
+             if isinstance(w, M.TextPromptSheet))
+sheet.entry.text = ""
+sheet._save()
+check("...left empty, they get the usual words again",
+      ivy.store.get_contact(J)["away_text"] == "" and
+      written(jon, I, "And tomorrow?") is not None and
+      autos(jon, I)[-1] == ("in", "Back on Monday."), autos(jon, I)[-1])
+ivy.close_chat_info()
+ivy.go_back_to_chats()
+
 ivy.store.set_away_at(J, 0)
 relay.mail.clear()
 club = jon.create_group("Away Club", [I])
@@ -2454,7 +2595,7 @@ jon.send_text(club, "Anyone about?")
 hand_over()
 check("a group's messages get none, nor does an invitation to one",
       ivy.store.messages_for(club)[-1]["body"] == "Anyone about?"
-      and autos(ivy, club) == [] and len(autos(ivy, J)) == 3,
+      and autos(ivy, club) == [] and len(autos(ivy, J)) == 5,
       (autos(ivy, club), autos(ivy, J)))
 
 alice.store.upsert_contact(I, "ivy", ivy.keys.public_key_hex)
@@ -2630,10 +2771,486 @@ store13._db.execute("PRAGMA user_version = 13")
 store13._db.commit()
 store13.close()
 store14 = M.LocalStore(Path(probe_db))
-check("a store from 18.x opens with the pins table, as schema 14",
-      store14._db.execute("PRAGMA user_version").fetchone()[0] == 14 and
-      store14.pins("x") == [])
+check("a store from 18.x opens with the pins table and (20.0) each "
+      "contact's own away reply, as schema 15",
+      store14._db.execute("PRAGMA user_version").fetchone()[0] == 15 and
+      store14.pins("x") == [] and "away_text" in [
+          row[1] for row in store14._db.execute(
+              "PRAGMA table_info(contacts)")])
 store14.close()
+
+print("\n21.0 (POLL29): polls")
+good = {"q": "Where on Saturday?", "o": ["the lake", "the hill", "home"],
+        "m": False, "u": 0}
+check("a poll is kept whole: its question, 2 to 10 different choices, one "
+      "or several, an end",
+      M.sanitize_poll(good) == good and
+      M.sanitize_poll(dict(good, o=["only one"])) is None and
+      M.sanitize_poll(dict(good, o=[str(n) for n in range(11)])) is None and
+      M.sanitize_poll(dict(good, o=["a", "a"])) is None and
+      M.sanitize_poll(dict(good, o=["a", " "])) is None and
+      M.sanitize_poll(dict(good, q="")) is None and
+      M.sanitize_poll(dict(good, u=-1)) is None)
+check("a vote is the places of choices in range, each once; one alone "
+      "unless several are allowed; [] takes it back",
+      M.poll_picks([1], good) == [1] and M.poll_picks([], good) == [] and
+      M.poll_picks([0, 2], good) is None and
+      M.poll_picks([0, 2], dict(good, m=True)) == [0, 2] and
+      M.poll_picks([3], good) is None and M.poll_picks([True], good) is None
+      and M.poll_picks([1, 1], dict(good, m=True)) is None and
+      M.poll_picks("1", good) is None)
+
+
+def poll_cid(app, peer, question):
+    return next(m["client_msg_id"] for m in app.store.messages_for(peer)
+                if (M.message_ext(m).get("poll") or {}).get("q") == question)
+
+
+sent_and_delivered(lambda: alice.send_poll(B, good))
+cid = poll_cid(alice, B, good["q"])
+held = bob.store.message_by_cid(A, cid)
+check("sent: the other side holds the poll, and its words for apps before "
+      "21.0",
+      held is not None and M.message_ext(held).get("poll") == good and
+      held["body"].startswith("📊 Where on Saturday?") and
+      "○ the hill" in held["body"])
+sent_and_delivered(lambda: bob.vote_poll(A, cid, [1]))
+check("a vote: counted on both sides", alice.store.poll_votes(B, cid) ==
+      {B: [1]} and bob.store.poll_votes(A, cid) == {B: [1]})
+time.sleep(0.01)
+sent_and_delivered(lambda: bob.vote_poll(A, cid, [0]))
+check("…changed: the newest counts", alice.store.poll_votes(B, cid) ==
+      {B: [0]})
+time.sleep(0.01)
+sent_and_delivered(lambda: alice.vote_poll(B, cid, [2]))
+time.sleep(0.01)
+sent_and_delivered(lambda: bob.vote_poll(A, cid, []))
+check("…its asker votes too; a vote taken back is no longer counted",
+      bob.store.poll_votes(A, cid) == {A: [2]} and
+      alice.store.poll_votes(B, cid) == {A: [2]})
+check("a vote for two where one is allowed is refused",
+      (bob.vote_poll(A, cid, [0, 1]) or True) and
+      bob.store.poll_votes(A, cid) == {A: [2]})
+check("in a chat of two, only its asker may end it",
+      alice.can_end_poll(B, alice.store.message_by_cid(B, cid)) and
+      not bob.can_end_poll(A, bob.store.message_by_cid(A, cid)))
+relay.mail.clear()
+threading.Thread(target=lambda: bob._send_control(
+    A, {"op": "pollend", "cid": cid}, "x"), daemon=True).start()
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+check("…an end sent all the same by the other is not taken",
+      alice.store.poll_ended(B, cid) is None)
+sent_and_delivered(lambda: alice.end_poll(B, cid))
+check("ended by its asker: ended on both sides",
+      alice.store.poll_ended(B, cid) and bob.store.poll_ended(A, cid))
+relay.mail.clear()
+threading.Thread(target=lambda: bob._send_control(
+    A, {"op": "vote", "cid": cid, "v": [1]}, "x"), daemon=True).start()
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+bob.vote_poll(A, cid, [1])
+check("…and a vote after its end counts on neither side",
+      alice.store.poll_votes(B, cid) == {A: [2]} and
+      bob.store.poll_votes(A, cid) == {A: [2]})
+past = dict(good, q="Lunch?", u=int(time.time()) - 5)
+sent_and_delivered(lambda: alice.send_poll(B, past))
+late = poll_cid(alice, B, "Lunch?")
+bob.vote_poll(A, late, [0])
+check("a poll past its end takes no vote", bob.store.poll_votes(A, late) ==
+      {})
+several = dict(good, q="What to bring?", o=["tea", "cake", "chairs"],
+               m=True)
+sent_and_delivered(lambda: alice.send_poll(ppeer, several))
+gcid = poll_cid(alice, ppeer, "What to bring?")
+sent_and_delivered(lambda: bob.vote_poll(ppeer, gcid, [0, 2]))
+sent_and_delivered(lambda: cara.vote_poll(ppeer, gcid, [2]))
+votes = alice.store.poll_votes(ppeer, gcid)
+check("in a group, several answers each: every member counts the same "
+      "votes", votes == {B: [0, 2], K: [2]} and
+      cara.store.poll_votes(ppeer, gcid) == votes and
+      bob.store.poll_votes(ppeer, gcid) == votes)
+check("…a member may not end another's poll; its asker may",
+      not cara.can_end_poll(ppeer, cara.store.message_by_cid(ppeer, gcid))
+      and alice.can_end_poll(ppeer, alice.store.message_by_cid(ppeer, gcid)))
+sent_and_delivered(lambda: alice.end_poll(ppeer, gcid))
+check("…ended for every member", bob.store.poll_ended(ppeer, gcid) and
+      cara.store.poll_ended(ppeer, gcid))
+
+print("\n21.0 (MAP29): a place, and a live one")
+spot = {"lat": 51.5007, "lon": -0.1246, "acc": 12, "at": int(time.time())}
+check("a place is kept to a millionth of a degree, its accuracy and time; "
+      "anything off is refused",
+      M.sanitize_location(dict(spot, lat=51.50070012)) == spot and
+      M.sanitize_location(dict(spot, lat=91)) is None and
+      M.sanitize_location(dict(spot, lon=-181)) is None and
+      M.sanitize_location(dict(spot, lat=True)) is None and
+      M.sanitize_location(dict(spot, lat=float("nan"))) is None and
+      M.sanitize_location(dict(spot, acc=-1)) is None and
+      M.sanitize_location("51.5, 0") is None)
+check("a live share's end is within a day of its point",
+      M.sanitize_location(dict(spot, until=spot["at"] + 900))["until"] ==
+      spot["at"] + 900 and
+      M.sanitize_location(dict(spot, until=spot["at"] - 1)) is None and
+      M.sanitize_location(dict(spot, until=spot["at"] + 90000)) is None)
+metres, wind = M.distance_bearing((51.5007, -0.1246), (48.8566, 2.3522))
+check("how far and which way: London to Paris, about 340 km south-east",
+      330_000 < metres < 350_000 and wind == "south-east",
+      f"{metres:.0f} m {wind}")
+check("distances in words",
+      M.distance_words(12.4) == "12 m" and M.distance_words(344) ==
+      "340 m" and M.distance_words(1234) == "1.2 km" and
+      M.distance_words(35_000) == "35 km")
+moved_far = dict(spot, lat=spot["lat"] + 0.001)        # about 111 m north
+check("a live point goes out once it moved or a minute passed, never "
+      "sooner than 15 s; in a big group a minute at most",
+      M.live_due(None, spot, 100.0, False) and
+      not M.live_due((95.0, spot), moved_far, 100.0, False) and
+      M.live_due((80.0, spot), moved_far, 100.0, False) and
+      not M.live_due((80.0, spot), spot, 100.0, False) and
+      M.live_due((39.0, spot), spot, 100.0, False) and
+      not M.live_due((80.0, spot), moved_far, 100.0, True) and
+      M.live_due((39.0, spot), moved_far, 100.0, True))
+check("a place for a phone's maps app: a geo: link",
+      M.map_link(51.5007, -0.1246) ==
+      "geo:51.500700,-0.124600?q=51.500700,-0.124600")
+check("coordinates typed or pasted, with a comma or a space",
+      M.parse_coordinates("51.5007, -0.1246") == (51.5007, -0.1246) and
+      M.parse_coordinates(" 51.5007 -0.1246 ") == (51.5007, -0.1246) and
+      M.parse_coordinates("the lake") is None and
+      M.parse_coordinates("91, 0") is None and
+      M.parse_coordinates("1, 2, 3") is None)
+
+
+class FakePlace:
+    """Where a phone is, as the suites give it (M.LOCATION_SOURCE)."""
+
+    def __init__(self, point):
+        self.point, self.followers = point, []
+
+    def last(self):
+        return self.point
+
+    def follow(self, on_point):
+        if on_point not in self.followers:
+            self.followers.append(on_point)
+
+    def unfollow(self, on_point):
+        if on_point in self.followers:
+            self.followers.remove(on_point)
+
+    def move(self, point):
+        self.point = point
+        for on_point in list(self.followers):
+            on_point(point)
+
+
+def loc_of(app, peer, cid):
+    row = app.store.message_by_cid(peer, cid)
+    return row, M.message_ext(row).get("loc") if row else None
+
+
+check("a computer has no place of its own: no live share from it",
+      M.location_source() is None and alice.share_live(B, spot, 15) is None)
+sent_and_delivered(lambda: alice.send_location(B, spot))
+row = [m for m in bob.store.messages_for(A)
+       if M.message_ext(m).get("loc")][-1]
+check("a place sent: the other side holds it, and its words for apps "
+      "before 21.0",
+      M.message_ext(row)["loc"] == spot and
+      row["body"] == "📍 Location: 51.500700, -0.124600 (±12 m)" and
+      M.location_shown(bob.store, row, spot) == (spot, False))
+M.LOCATION_SOURCE = FakePlace(spot)
+lcid = None
+
+
+def share():
+    global lcid
+    lcid = alice.share_live(B, spot, 15)
+
+
+sent_and_delivered(share)
+row, loc = loc_of(bob, A, lcid)
+check("shared live for 15 minutes: its message ends then, and it runs on "
+      "both sides from its first point",
+      loc is not None and abs(loc["until"] - time.time() - 900) < 5 and
+      M.location_shown(bob.store, row, loc) == (M.sanitize_location(
+          dict(spot, until=loc["until"])), True) and
+      alice.store.own_live_shares() == [(B, lcid, loc["until"])] and
+      alice._live_clock is not None and
+      alice._on_live_point in M.LOCATION_SOURCE.followers)
+relay.mail.clear()
+M.LOCATION_SOURCE.move(dict(moved_far, at=spot["at"] + 5))
+pump(alice)
+check("…a move a few seconds on does not go out yet", not relay.mail)
+alice._live[lcid]["last"] = (time.time() - 20, spot)   # as if 20 s on
+sent_and_delivered(lambda: M.LOCATION_SOURCE.move(
+    dict(moved_far, at=spot["at"] + 20)))
+row, loc = loc_of(bob, A, lcid)
+check("…20 s on, moved 100 m: the new point reaches the other side",
+      M.location_shown(bob.store, row, loc)[0]["at"] == spot["at"] + 20 and
+      alice.store.live_point(B, lcid)["at"] == spot["at"] + 20)
+relay.mail.clear()
+threading.Thread(target=lambda: bob._send_control(
+    A, {"op": "loc", "cid": lcid, "p": dict(spot, at=spot["at"] + 30)},
+    "x"), daemon=True).start()
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+check("…a point for it from anyone but its sharer is not taken",
+      alice.store.live_point(B, lcid)["at"] == spot["at"] + 20)
+sent_and_delivered(lambda: alice.stop_live(B, lcid))
+row, loc = loc_of(bob, A, lcid)
+check("stopped: ended on both sides, no point kept, and the phone's place "
+      "no longer read",
+      M.location_shown(bob.store, row, loc) == (None, False) and
+      bob.store.live_point(A, lcid) is None and bob.store.live_ended(A, lcid)
+      and alice.store.live_ended(B, lcid) and not alice._live and
+      alice._live_clock is None and not M.LOCATION_SOURCE.followers)
+relay.mail.clear()
+threading.Thread(target=lambda: alice._send_control(
+    B, {"op": "loc", "cid": lcid, "p": dict(spot, at=spot["at"] + 40)},
+    "x"), daemon=True).start()
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+check("…a point sent after its end is not taken",
+      bob.store.live_point(A, lcid) is None)
+sent_and_delivered(share)
+alice._live[lcid]["until"] = time.time() - 1
+sent_and_delivered(lambda: alice._live_tick(0))
+check("a share past its time ends by itself, said to the other side",
+      bob.store.live_ended(A, lcid) and not alice._live)
+check("…and a share past its time shows no point even before its end is "
+      "heard", M.location_shown(bob.store, {"peer": A,
+                                            "client_msg_id": "0" * 32},
+                                dict(spot, until=int(time.time()) - 1)) ==
+      (None, False))
+sent_and_delivered(share)
+alice._live.clear()                     # as if the app had been closed
+alice._live_idle()
+alice._resume_live()
+check("the app opened again: its share not yet over goes on",
+      lcid in alice._live and alice._live_clock is not None and
+      alice._on_live_point in M.LOCATION_SOURCE.followers)
+alice._live.clear()
+alice._live_idle()
+M.LOCATION_SOURCE = None
+sent_and_delivered(alice._resume_live)
+check("…on a device that cannot keep it up, it ends, said to the other "
+      "side", bob.store.live_ended(A, lcid) and alice.store.live_ended(
+          B, lcid) and not alice.store.own_live_shares())
+M.LOCATION_SOURCE = FakePlace(spot)
+sent_and_delivered(share)
+local = alice.store.message_by_cid(B, lcid)["id"]
+sent_and_delivered(lambda: alice.delete_messages([local], True))
+check("a live share deleted for everyone stops", not alice._live and
+      bob.store.message_by_cid(A, lcid) is None)
+gcid = None
+
+
+def share_in_group():
+    global gcid
+    gcid = alice.share_live(ppeer, spot, 60)
+
+
+sent_and_delivered(share_in_group)
+relay.mail.clear()
+threading.Thread(target=lambda: cara._send_control(
+    ppeer, {"op": "loc", "cid": gcid, "p": dict(spot, at=spot["at"] + 30)},
+    "x"), daemon=True).start()
+wait_for(lambda: relay.mail)
+deliver(relay, parties)
+row, loc = loc_of(bob, ppeer, gcid)
+check("in a group: a member's point for another's share is not taken",
+      M.location_shown(bob.store, row, loc)[0]["at"] == spot["at"])
+sent_and_delivered(lambda: alice.stop_live(ppeer, gcid))
+check("…stopped: ended for every member", bob.store.live_ended(ppeer, gcid)
+      and cara.store.live_ended(ppeer, gcid))
+M.LOCATION_SOURCE = None
+
+print("\n20.0 (GROUPWIDE27): slow mode, about this group, @everyone")
+check("the rules keep a pace Ferritext offers and a few lines of text, and "
+      "nothing else by those names",
+      M.sanitize_group_rules({"slow": 60, "about": "  Tea,\x00 Tuesdays "},
+                             {B, K}) == {"slow": 60,
+                                         "about": "Tea, Tuesdays"} and
+      M.sanitize_group_rules({"slow": 7}, {B}) == {} and
+      M.sanitize_group_rules({"slow": True, "about": 5}, {B}) == {} and
+      M.sanitize_group_rules({"slow": "60"}, {B}) == {} and
+      len(M.sanitize_group_rules({"about": "x" * 9000}, {B})["about"])
+      == M.MAX_GROUP_ABOUT)
+check("slow mode's wait: none before a first message, none for an admin, "
+      "else what is left of the pace",
+      M.slow_wait({"slow": 60}, {A}, K, None, 1000.0) == 0 and
+      M.slow_wait({"slow": 60}, {A}, A, 990.0, 1000.0) == 0 and
+      M.slow_wait({"slow": 60}, {A}, K, 990.0, 1000.0) == 50 and
+      M.slow_wait({"slow": 60}, {A}, K, 900.0, 1000.0) == 0 and
+      M.slow_wait({}, {A}, K, 990.0, 1000.0) == 0)
+sent_and_delivered(lambda: alice.set_group_permissions(pgid, [], slow=60))
+check("the owner turns on slow mode: said in every member's chat, and "
+      "kept in each one's rules",
+      said(alice, ppeer, "You turned on slow mode: a member writes once "
+           "in 1 min") and
+      said(cara, ppeer, "turned on slow mode: a member writes once in "
+           "1 min") and
+      bob.store.group(pgid)["rules"].get("slow") == 60 and
+      cara.store.group(pgid)["rules"].get("slow") == 60)
+check("...a pace Ferritext does not offer changes nothing",
+      not alice.set_group_permissions(pgid, [], slow=7) and
+      alice.store.group(pgid)["rules"]["slow"] == 60)
+
+
+def a_minute_on():
+    """As if a minute had passed since cara last wrote in the group."""
+    cara.store._db.execute(
+        "UPDATE messages SET created_at = ? WHERE peer = ? AND "
+        "direction = 'out'", ("2026-01-01T00:00:00+00:00", ppeer))
+    cara.store._db.commit()
+    for party in (alice, bob):
+        party.worker._slow_seen.pop((pgid, K), None)
+
+
+relay.mail.clear()
+check("a member who wrote seconds before it was turned on waits too",
+      cara.slow_stop(ppeer) != "" and
+      cara.send_text(ppeer, "at once") is None and not relay.mail)
+a_minute_on()
+sent_and_delivered(lambda: cara.send_text(ppeer, "one"))
+check("...a minute on, their message goes, as ever",
+      bodies(bob, ppeer)[-1] == "one" and cara.slow_stop(ppeer) != "")
+relay.mail.clear()
+check("...their next, at once, is not sent: they are told how long is "
+      "left",
+      cara.send_text(ppeer, "two") is None and not relay.mail and
+      cara.slow_stop(ppeer).startswith(
+          "Slow mode: you can write here again in ") and
+      bodies(cara, ppeer)[-1] == "one", cara.slow_stop(ppeer))
+cara.open_conversation(ppeer)
+pump(cara)
+cscreen = cara.conversation_screen
+cscreen.entry.text = "what I was about to say"
+cara.send_current()
+check("...and what they had written stays in the field (a sent message "
+      "clears it)",
+      cscreen.entry.text == "what I was about to say" and
+      bodies(cara, ppeer)[-1] == "one")
+cscreen.entry.text = ""
+sent_and_delivered(lambda: alice.send_text(ppeer, "admins are not held"))
+sent_and_delivered(lambda: alice.send_text(ppeer, "twice"))
+check("an admin is not held", bodies(bob, ppeer)[-2:] ==
+      ["admins are not held", "twice"])
+# An app that does not keep the pace (one before 20.0, or one changed):
+# the others hold what comes at more than twice the pace.
+cara.slow_stop = lambda _peer: ""
+sent_and_delivered(lambda: cara.send_text(ppeer, "too soon"))
+check("a message sent all the same, seconds after the last, is held by "
+      "the others: not shown",
+      "too soon" not in bodies(bob, ppeer) and
+      "too soon" not in bodies(alice, ppeer) and
+      "too soon" in bodies(cara, ppeer))
+for party in (alice, bob):
+    party.worker._slow_seen[(pgid, K)] -= 31     # as if half a minute on
+sent_and_delivered(lambda: cara.send_text(ppeer, "half the pace"))
+check("...one at more than half the pace is taken (a slow network never "
+      "costs an honest message)",
+      bodies(bob, ppeer)[-1] == "half the pace" and
+      bodies(alice, ppeer)[-1] == "half the pace")
+del cara.slow_stop
+sent_and_delivered(lambda: alice.set_group_permissions(pgid, [], slow=0))
+relay.mail.clear()
+check("slow mode turned off: said, and a member writes at once again",
+      said(bob, ppeer, "turned off slow mode") and
+      "slow" not in bob.store.group(pgid)["rules"] and
+      cara.slow_stop(ppeer) == "" and
+      cara.send_text(ppeer, "three") is not None)
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+sheet = M.GroupRightsSheet(alice, pgid, lambda: None)
+check("the sheet What members can do shows the pace (off)",
+      sheet.slow.value == "0")
+sheet.slow.value = "300"
+sheet._save()
+check("...and sets it", alice.store.group(pgid)["rules"].get("slow") == 300)
+wait_for(lambda: len(relay.mail) >= 2)
+deliver(relay, parties)
+sent_and_delivered(lambda: alice.set_group_permissions(pgid, [], slow=0))
+
+about = "The tea rota, and who brings what. Be kind."
+sent_and_delivered(lambda: alice.set_group_about(pgid, about))
+check("About this group: the owner's lines reach every member's rules "
+      "and are said in each chat",
+      bob.store.group(pgid)["rules"].get("about") == about and
+      said(bob, ppeer, "About this group: " + about) and
+      said(alice, ppeer, "You wrote what this group is about: " + about))
+check("...a member may not write them; the same lines again change "
+      "nothing",
+      not cara.set_group_about(pgid, "mine now") and
+      not alice.set_group_about(pgid, about))
+alice.open_conversation(ppeer)
+alice.open_chat_info()
+pump(alice)
+page = alice.group_info_screen
+titles = {w.title.text: w for w in page.body.walk()
+          if isinstance(w, M.ListRow)}
+check("...the group's page shows them, first under This group",
+      "About this group" in titles and
+      titles["About this group"].hint.text == about, sorted(titles))
+alice.close_chat_info()
+sent_and_delivered(lambda: alice.add_group_members(pgid, [D]))
+pump(dave)
+check("a member who joins is told what the group is about",
+      said(dave, ppeer, "About this group: " + about) and
+      dave.store.group(pgid)["rules"].get("about") == about)
+sent_and_delivered(lambda: alice.set_group_about(pgid, ""))
+check("...taken away: said, and gone from the rules",
+      "about" not in bob.store.group(pgid)["rules"] and
+      said(bob, ppeer, "took away what this group is about"))
+
+bob.store.set_mute(ppeer, 0)                   # muted until turned on
+sent_and_delivered(lambda: alice.send_text(ppeer, "@everyone bring cups"))
+got = bob.store.messages_for(ppeer)[-1]
+check("an admin's @everyone reaches a member as a mention of them, by "
+      "name as it were: through their mute, with the @ beside the group",
+      got["body"] == "@everyone bring cups" and
+      B in M.message_ext(got).get("mn", ()) and
+      K in M.message_ext(cara.store.messages_for(ppeer)[-1]).get("mn", ())
+      and bob.store.mentions_unread(ppeer, B) and
+      not M.notification_text(bob.store, ppeer, got["body"], "text", A,
+                              mentioned=True)[2],
+      M.message_ext(got))
+sent_and_delivered(lambda: cara.send_text(ppeer, "@everyone hello"))
+got = bob.store.messages_for(ppeer)[-1]
+check("a member's @everyone is words, no more",
+      got["body"] == "@everyone hello" and
+      "mn" not in M.message_ext(got) and "ev" not in M.message_ext(got))
+ext = {"ev": True}
+sent_and_delivered(lambda: cara._queue_message(
+    ppeer, "@everyone look", dict(ext, k="text"), "text", ext))
+got = bob.store.messages_for(ppeer)[-1]
+check("...nor one that carries the mark all the same (an app changed to "
+      "send it): the mark of someone who is not an admin is dropped",
+      got["body"] == "@everyone look" and
+      "mn" not in M.message_ext(got) and "ev" not in M.message_ext(got),
+      M.message_ext(got))
+bob.store.set_mute(ppeer, None)
+alice.open_conversation(ppeer)
+pump(alice)
+ascreen = alice.conversation_screen
+ascreen.entry.text = "@ev"
+ascreen.entry.input.cursor = ascreen.entry.input.get_cursor_from_index(3)
+ascreen._sync_mentions()
+offered = list(ascreen.mention_strip.found)
+ascreen.pick_mention(M.MENTION_ALL, "")
+check("the composer offers @everyone to an admin, first, and a tap "
+      "writes it",
+      offered[:1] == [("everyone", "")] and
+      ascreen.entry.text == "@everyone ", (offered, ascreen.entry.text))
+ascreen.entry.text = ""
+cscreen.entry.text = "@ev"
+cscreen.entry.input.cursor = cscreen.entry.input.get_cursor_from_index(3)
+cscreen._sync_mentions()
+check("...and not to a member",
+      ("everyone", "") not in cscreen.mention_strip.found)
+cscreen.entry.text = ""
 
 print("\nIdentity rename")
 old_user = alice.keys.username

@@ -25,6 +25,9 @@ on:
         description: "Windows and Ubuntu too"
         type: boolean
         default: true
+      suites:
+        description: "Only these suites there (names with spaces between; empty: all)"
+        default: ""
 
 permissions:
   contents: read
@@ -146,6 +149,16 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
+      # The runner's free disk differs from run to run: API 36's emulator
+      # asked for 7.4 GB for its data and found 7.0 GB (run 52). These are
+      # tools no phone's check uses: .NET, Haskell and CodeQL's bundles.
+      - name: Room on the disk for the emulator
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL
+          df -h / | tail -1
+
       - name: Start the emulator
         run: bash tools/devices/emulator.sh "${{ matrix.api }}"
 
@@ -223,11 +236,12 @@ jobs:
         env:
           LIBGL_ALWAYS_SOFTWARE: "1"
           PYTHONUNBUFFERED: "1"
+          SUITES: ${{ inputs.suites }}
         run: |
           # Windows' runner has no graphics card: Kivy draws through ANGLE
           # (Direct3D in software), as the EXE's start in build-apk.yml.
           if [ "$RUNNER_OS" = Windows ]; then export KIVY_GL_BACKEND=angle_sdl2; fi
-          python tools/devices/run_suites.py main.py out
+          python tools/devices/run_suites.py main.py out $SUITES
 
       - name: Keep the logs
         if: always()

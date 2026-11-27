@@ -50,7 +50,6 @@ M = importlib.util.module_from_spec(_spec)
 sys.modules["fext_gest"] = M
 _spec.loader.exec_module(M)
 from kivy.base import EventLoop                                # noqa: E402
-from kivy.clock import Clock                                   # noqa: E402
 from kivy.core.window import Window                            # noqa: E402
 from kivy.metrics import dp                                    # noqa: E402
 
@@ -295,6 +294,166 @@ check("a tap on a message that has a reaction does not crash it either",
       crashed is None, repr(crashed))
 screen.close_strip()
 
+print("\n20.0: a press shows in the bubble's own shape, at once")
+pump(0.3)
+row = screen._rows[row.msg_id]
+bubble = row.bubble
+
+
+def pressed():
+    return bubble._press_tint.a > 0
+
+
+def words():
+    """A point on the message's words (its reactions are below them)."""
+    return bubble.to_window(bubble.center_x, bubble.top - M.dp(16))
+
+
+wash = bubble._press_wash
+down(*words())
+pump(M.ScrollView.PRESS_AFTER + 0.05)
+check("a finger on a message: its bubble is washed at once, in its own "
+      "bounds and corners (which message is held is seen before the "
+      "hold selects it)",
+      pressed() and tuple(wash.pos) == tuple(bubble.pos) and
+      tuple(wash.size) == tuple(bubble.size) and
+      list(wash.radius) == list(bubble._ground.radius) and
+      not screen.selecting, (pressed(), wash.size, bubble.size))
+up()
+pump(0.2)
+check("...and clear again when it is let go", not pressed())
+screen.close_strip()
+down(*words())
+pump(M.APPEARANCE.hold + 0.45)
+check("held: the message is selected, and the row's own mark takes over",
+      screen.selecting and not pressed() and row._tint.a > 0)
+up()
+pump(0.2)
+screen.clear_selection()
+pump(0.2)
+for choice, short_of, past in (("long", 0.38, 0.62), ("short", 0.15, 0.32)):
+    M.save_pref("hold", choice)             # as Settings › Appearance does
+    M.APPEARANCE.resolve()
+    screen.close_strip()
+    pump(0.2)
+    down(*words())
+    pump(short_of)
+    early = screen.selecting
+    pump(past - short_of)
+    check(f"21.0 (SELECT29): a hold is as long as Settings says ({choice}: "
+          f"{M.APPEARANCE.hold} s): not selected at {short_of} s, selected "
+          f"at {past} s", not early and screen.selecting,
+          (early, screen.selecting))
+    up()
+    pump(0.2)
+    screen.clear_selection()
+    pump(0.2)
+M.save_pref("hold", "default")
+M.APPEARANCE.resolve()
+check("…and Medium, the default, is 0.3 s (0.42 s before 21.0)",
+      M.APPEARANCE.hold == 0.3)
+bx, by = words()
+down(bx, by)
+move_to(bx, by + M.dp(40))
+check("moved away (a scroll): no wash is left behind", not pressed())
+up()
+pump(0.2)
+gap_x = row.x + M.dp(4) if bubble.x - row.x > M.dp(20) else row.right - M.dp(4)
+down(gap_x, by)
+pump(M.ScrollView.PRESS_AFTER + 0.05)
+check("a press beside the bubble, in its row, washes nothing",
+      not pressed())
+up()
+pump(0.3)
+screen.close_strip()
+
+print("\n20.0: part of a message's words marked with the mouse (a "
+      "computer)")
+# The owner's note on GROUPWIDE27: the mouse marks the words wanted, a
+# double click a whole word, and how much is marked can be changed.
+from kivy.core.clipboard import Clipboard                      # noqa: E402
+from kivy.input.postproc import kivy_postproc_modules          # noqa: E402
+WORDS = "the quick brown fox jumps over the lazy dog"
+app.store.add_in(other, WORDS, datetime.now(timezone.utc).isoformat(), 9001,
+                 uuid.uuid4().hex, unread=False)
+app.refresh_chat(other)
+pump(0.5)
+words = next(b for b in screen._bubbles.values()
+             if b.msg.get("body") == WORDS).body
+for module in kivy_postproc_modules.values():   # double taps, as App.run
+    EventLoop.add_postproc_module(module)       # has them
+M.SWIPE_MOUSE = False                           # a computer's mouse
+
+
+def gap(index):
+    """Where the gap before character `index` of the words is, in the
+    window."""
+    return (words.to_window(words.x, 0)[0] + words.padding[0] +
+            words._text_width(WORDS[:index]),
+            words.to_window(0, words.center_y)[1])
+
+
+def key(code, scan, mods=(), text=None, hold=False):
+    Window.dispatch("on_key_down", code, scan, text, list(mods))
+    if not hold:
+        Window.dispatch("on_key_up", code, scan)
+
+
+at = WORDS.index("quick")
+down(*gap(at))
+pump(0.35)                                      # past the scroller's hold
+move_to(*gap(at + len("quick brown")), steps=10, each=0.02)
+up()
+pump(0.3)
+check("a drag across words marks exactly those, and raises no menu",
+      words.selection_text == "quick brown" and screen.menu.concealed and
+      not screen.selected, repr(words.selection_text))
+Clipboard.copy("")
+key(99, 6, ["ctrl"], "c")
+pump(0.2)
+check("...Ctrl+C copies them", Clipboard.paste() == "quick brown",
+      repr(Clipboard.paste()))
+key(304, 225, ["shift"], hold=True)             # Shift, held
+for _ in range(4):
+    key(275, 79, ["shift"])                     # Right
+pump(0.2)
+more = words.selection_text
+for _ in range(9):
+    key(276, 80, ["shift"])                     # Left
+Window.dispatch("on_key_up", 304, 225)
+pump(0.2)
+check("...Shift with the arrow keys marks more, or less",
+      more == "quick brown fox" and words.selection_text == "quick ",
+      (more, words.selection_text))
+key(97, 4, ["ctrl"], "a")
+pump(0.2)
+check("...Ctrl+A marks the whole message", words.selection_text == WORDS)
+ex, ey = centre(screen.entry)
+down(ex, ey)
+up()
+pump(0.3)
+check("a click elsewhere takes the marking away", not words.selection_text)
+fx, fy = gap(WORDS.index("fox") + 1)
+down(fx, fy)
+up()
+down(fx, fy)
+up()
+pump(0.5)
+check("a double click marks the whole word, the message's menu put away "
+      "again", words.selection_text == "fox" and screen.menu.concealed,
+      (words.selection_text, screen.menu.concealed))
+down(ex, ey)
+up()
+pump(0.3)
+screen.close_strip()
+for module in kivy_postproc_modules.values():
+    EventLoop.remove_postproc_module(module)
+M.SWIPE_MOUSE = True
+app.store._db.execute("DELETE FROM messages WHERE body = ?", (WORDS,))
+app.store._db.commit()
+app.refresh_chat(other)
+pump(0.4)
+
 print("\nWho reacted (v13)")
 peer, cid = msg["peer"], msg["client_msg_id"]
 THUMBS, HEART = "\U0001F44D", "\u2764\ufe0f"
@@ -313,7 +472,7 @@ def listed(sheet):
 
 row = screen._rows[row.msg_id]
 down(*centre(row.bubble.reactions.chip_for(THUMBS)))
-pump(M.BubbleRow.LONG_PRESS + 0.25)
+pump(M.APPEARANCE.hold + 0.25)
 up()
 pump(0.4)
 sheet = (reactors_sheets() or [None])[0]
@@ -379,7 +538,7 @@ screen.clear_selection()
 pump(0.3)
 row = screen._rows[row.msg_id]
 down(*centre(row.bubble.body))
-pump(M.BubbleRow.LONG_PRESS + 0.25)
+pump(M.APPEARANCE.hold + 0.25)
 up()
 pump(0.3)
 check("...and so does holding it there", screen.selecting and

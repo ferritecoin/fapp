@@ -183,7 +183,7 @@ work = Path(tempfile.mkdtemp(prefix="dist-"))
 (work / "src" / "main").mkdir(parents=True)
 manifest = work / "src" / "main" / "AndroidManifest.xml"
 # What p4a v2024.01.21's template renders for `services = Fextsync:...,
-# Fextcall:..., Fextshare:...`:
+# Fextcall:..., Fextshare:..., Fextcam:..., Fextloc:...`:
 manifest.write_text('''<manifest><application>
         <activity android:name="org.kivy.android.PythonActivity"
                   android:label="@string/app_name" />
@@ -195,16 +195,62 @@ manifest.write_text('''<manifest><application>
                  android:process=":service_fextcall" />
         <service android:name="org.fext.fext.ServiceFextshare"
                  android:process=":service_fextshare" />
+        <service android:name="org.fext.fext.ServiceFextcam"
+                 android:process=":service_fextcam" />
+        <service android:name="org.fext.fext.ServiceFextloc"
+                 android:process=":service_fextloc" />
 </application></manifest>''')
+# ...and SDL's own Java, which python-for-android copies into the build
+# (bootstrap.py: _copy_in_final_files) before the hook runs: the part of
+# it the hook changes (20.0).
+sdl_java = work / hook.SDL_ACTIVITY
+sdl_java.parent.mkdir(parents=True)
+sdl_java.write_text('''    public boolean deleteSurroundingText(int beforeLength, int afterLength) {
+        if (Build.VERSION.SDK_INT <= 29) {
+            nativeGenerateScancodeForUnichar('\\b');
+        }
+
+        if (!super.deleteSurroundingText(beforeLength, afterLength)) {
+            return false;
+        }
+        return true;
+    }
+
+    public static native void onNativeKeyDown(int keycode);
+    public static native void onNativeKeyUp(int keycode);
+
+    @Override
+    public void onBackPressed() {
+        boolean trapBack = SDLActivity.nativeGetHintBoolean(
+            "SDL_ANDROID_TRAP_BACK_BUTTON", false);
+        if (trapBack) {
+            return;
+        }
+        if (!isFinishing()) {
+            super.onBackPressed();
+        }
+    }
+''')
 cwd = os.getcwd()
 os.chdir(work)
 try:
     hook.before_apk_assemble(None)
-    once = manifest.read_text()
+    once, java_once = manifest.read_text(), sdl_java.read_text()
     hook.before_apk_assemble(None)
-    twice = manifest.read_text()
+    twice, java_twice = manifest.read_text(), sdl_java.read_text()
 finally:
     os.chdir(cwd)
+check("(20.0) SDL's Java in the build is given the keyboard's backspace "
+      "(test_screen.py has what it does), once however often it runs",
+      "fextBefore" in java_once and java_once == java_twice)
+back_body = java_once.split("public void onBackPressed() {", 1)[-1]
+check("(21.1) ...and Back that SDL did not take as a key (another source "
+      "than a keyboard's) goes to the app as the Back key, before "
+      "Android's own Back, which closed the app; once",
+      java_once.count("fextNotYet") == 1 and
+      back_body.index("onNativeKeyDown(android.view.KeyEvent.KEYCODE_BACK)")
+      < back_body.index("trapBack") and
+      java_once.count("{") == java_once.count("}"))
 check("declares foregroundServiceType on OUR services only",
       once.count('foregroundServiceType="dataSync"') == 1 and
       'ServiceFextsync" android:foregroundServiceType="dataSync"' in once and
@@ -216,6 +262,15 @@ check("...(18.0) the share service as 'mediaProjection', so a phone's "
       "screen may be captured",
       'ServiceFextshare" android:foregroundServiceType="mediaProjection"'
       in once)
+check("...(20.0) the camera service as 'camera', so a video call keeps "
+      "its camera out of sight",
+      'ServiceFextcam" android:foregroundServiceType="camera"' in once and
+      "Fextcam:main.py:foreground" in
+      (ROOT / "buildozer.spec").read_text() and
+      "FOREGROUND_SERVICE_CAMERA" in (ROOT / "buildozer.spec").read_text())
+check("...(21.0) the location service as 'location', so a live share "
+      "goes on out of sight",
+      'ServiceFextloc" android:foregroundServiceType="location"' in once)
 check("running the hook twice changes nothing", once == twice)
 check("(17.2) the app's activity may shrink to picture in picture, for a "
       "video call over other apps",
@@ -336,24 +391,60 @@ def say(*words):
 def notices():
     """python-for-android's notice (its id 1) first; the app's own after."""
     shown.append(1)
-    return ([], [1]) if len(shown) < 3 else ([M.NOTICE_SECRET], [])
+    return ([], [1], None) if len(shown) < 3 else \
+        ([M.NOTICE_SECRET], [], M.NOTICE_MIN)
 
 
 try:
     verdict = M._selftest_service_notice(say, 5.0, started.append, notices)
     check("the self-test starts the service, waits until its own secret "
-          "notice is the only one a service shows, and stops it",
+          "notice, kept out of the status bar, is the only one a service "
+          "shows, and stops it",
           verdict == "PASS" and started == [True, False] and
           len(shown) == 3, (verdict, started, shown, said))
     shown.clear()
     verdict = M._selftest_service_notice(
-        say, 1.0, started.append, lambda: ([0], []))
+        say, 1.0, started.append, lambda: ([0], [], M.NOTICE_MIN))
     check("...a notice a locked phone would show fails it",
           verdict == "FAIL" and "visibility [0]" in said[-1][2], said[-1])
     verdict = M._selftest_service_notice(
-        say, 1.0, started.append, lambda: ([M.NOTICE_SECRET], [1]))
+        say, 1.0, started.append,
+        lambda: ([M.NOTICE_SECRET], [1], M.NOTICE_MIN))
     check("...and so does python-for-android's notice still there",
           verdict == "FAIL", said[-1])
+    verdict = M._selftest_service_notice(
+        say, 1.0, started.append,
+        lambda: ([M.NOTICE_SECRET], [], M.NOTICE_LOW))
+    check("21.0: ...LOW passes: from Android 8.1 Android itself raises a "
+          "running service's MIN notice to LOW (run 44, Android 11), and "
+          "only its person can lower it (Settings › Notifications opens "
+          "where)", verdict == "PASS", said[-1])
+    verdict = M._selftest_service_notice(
+        say, 1.0, started.append,
+        lambda: ([M.NOTICE_SECRET], [], 3))
+    check("...a louder one (DEFAULT: a sound) fails it", verdict == "FAIL"
+          and "importance 3" in said[-1][2], said[-1])
+    # 20.0: a video call's notification, read back as Android holds it.
+    rung, texts = [], [None, None, "Incoming video call"]
+    verdict = M._selftest_call_notice(say, 5.0, rung.append,
+                                      lambda: texts.pop(0))
+    check("20.0: the self-test rings a video call's notification, reads "
+          "that it says so, and takes it down",
+          verdict == "PASS" and rung == [True, False] and not texts and
+          said[-1][0] == "call-notice", (verdict, rung, said[-1]))
+    check("...one that reads as a voice call fails it",
+          M._selftest_call_notice(say, 1.0, rung.append, lambda:
+                                  "Incoming voice call") == "FAIL")
+    check("...and where notifications are not allowed, it is skipped",
+          M._selftest_call_notice(say, 0.7, rung.append, lambda: None)
+          == "SKIP" and rung[-1] is False)
+    M._SDK[:] = [27]
+    check("...Android 8 keeps it low: its own notice of a service's "
+          "hidden one would be louder",
+          M._selftest_service_notice(
+              say, 1.0, started.append,
+              lambda: ([M.NOTICE_SECRET], [], M.NOTICE_LOW)) == "PASS")
+    M._SDK[:] = [34]
     M._SDK[:] = [21]
     check("...before Android 6, which cannot be asked, it is skipped",
           M._selftest_service_notice(say, 1.0, started.append,

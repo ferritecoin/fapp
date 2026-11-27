@@ -114,7 +114,27 @@ SCREENS = ("chats", "chats_pressed", "menu", "chat", "call_refused", "chat_info"
            "remote_checklist", "remote_note", "remote_keys", "remote_cad",
            "remote_programs", "remote_restart", "remote_computers",
            # 19.0 (PINS26): a chat's pinned messages: the bar, the list
-           "pin_bar", "pins_sheet")
+           "pin_bar", "pins_sheet",
+           # 20.0: the paperclip's sheet; a chat with documents and a
+           # contact handed on; a finger resting on a message; a video
+           # call with both microphones off, and the two pictures swapped;
+           # a group's page with what it is about and slow mode, and the
+           # sheet that sets its pace
+           "attach_sheet", "chat_documents", "message_pressed",
+           "video_call_muted", "video_call_swapped", "group_about",
+           "group_slow",
+           # 21.0: Select text; how long a hold takes; a poll written and
+           # one voted on; a place: the sheet as a phone shows it, and a
+           # chat with places (one live); a program that does not answer
+           # on the computer controlled (End it); the service's sheet
+           "select_text", "settings_hold", "poll_sheet", "chat_poll",
+           "location_sheet", "chat_location", "remote_hung",
+           "remote_service",
+           # 21.1: controlling a computer from a phone, a trackpad: the
+           # pointer drawn here over their zoomed picture; the call while
+           # no picture of their screen has come; the steps before a
+           # phone's camera app opens to scan a code
+           "remote_trackpad", "remote_waiting", "scan_steps")
 
 parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
 parser.add_argument("client", help="the main.py to capture")
@@ -600,8 +620,11 @@ def scroll_settings_to(title, page="settings"):
     is in view."""
     title = getattr(M, "tr", str)(title)      # in the app's language (15.1)
     page = app.manager.get_screen(page)
+    # A row chosen from a few (Theme, Hold to select) has its title in
+    # tracked capitals, a CapsLabel, which is not a Label (21.0).
+    titled = (Label, getattr(M, "CapsLabel", Label))
     for w in walk(page):
-        if isinstance(w, Label) and title.lower() in (w.text or "").lower():
+        if isinstance(w, titled) and title.lower() in (w.text or "").lower():
             view = next((a for a in ancestors(w)
                          if isinstance(a, ScrollView)), None)
             if view is not None:
@@ -1029,6 +1052,98 @@ def pins_chat():
     app.open_conversation(alex)
 
 
+def attach_sheet():
+    """20.0: the paperclip in alex's chat (before 20.0: a photo to
+    choose)."""
+    app.open_conversation(alex)
+    Clock.schedule_once(lambda _dt: app.conversation_screen.entry
+                        .attach_button.dispatch("on_release"), 0.5)
+
+
+def documents_chat():
+    """20.0: alex's chat with a document from them that waits for a tap,
+    one sent, and a contact handed on (before 20.0: their words)."""
+    for i, (out, text, media, card) in enumerate((
+            (False, "Document: Lease 2027.pdf",
+             {"kind": "file", "mime": "application/octet-stream",
+              "size": 412_300, "name": "Lease 2027.pdf"}, None),
+            (True, "Document: measurements.xlsx",
+             {"kind": "file", "mime": "application/octet-stream",
+              "size": 18_900, "name": "measurements.xlsx"}, None),
+            (False, "Contact: @bea", None, {"a": bea, "u": "bea"}))):
+        _sid[0] += 1
+        cid = uuid.uuid4().hex
+        ext = {"media": media} if media else {"card": card}
+        if out:
+            kept = M.MEDIA_DIR / "capture_document.xlsx"
+            M.MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+            kept.write_bytes(b"a stand-in file")
+            local = app.store.add_out(alex, text, at(300 + i), cid,
+                                      kind="file", ext=ext,
+                                      media_path=str(kept),
+                                      media_state="ready")
+            app.store.mark_sent(local, _sid[0])
+            app.store.apply_receipt(_sid[0], "read")
+        else:
+            if media:
+                media.update(blob="d" * 32, sha="0" * 64,
+                             key=M.b64e(bytes(32)))
+            app.store.add_in(alex, text, at(300 + i), _sid[0], cid,
+                             unread=False, kind="file" if media else "text",
+                             ext=ext, media_state="pending" if media else "")
+    app.fetch_media = lambda local_id: None
+    app.open_conversation(alex)
+
+
+def press_message():
+    """20.0: a finger resting on the open chat's newest plain words (a
+    card or a plan in a bubble is a button of its own, and lights
+    itself)."""
+    screen = app.conversation_screen
+
+    def plain(msg):
+        ext = M.message_ext(msg)
+        return (msg.get("kind") or "text") == "text" and msg.get("body") \
+            and not (ext.get("card") or ext.get("plan") or ext.get("call"))
+    bubble = next(screen._bubbles[i] for i in sorted(screen._bubbles,
+                                                     reverse=True)
+                  if plain(screen._bubbles[i].msg))
+    PRESS["at"] = bubble.to_window(bubble.x + bubble.width / 2,
+                                   bubble.y + bubble.height / 2)
+    finger("fingerdown", *PRESS["at"])
+
+
+def video_call_marks(swapped=False):
+    """20.0: the 1-to-1 video call with both microphones off, each said
+    by its picture; `swapped`: one's own picture as the large one."""
+    video_call(mine=True)
+    if app.call is None:
+        return
+    app.call.muted = True
+    app.call.engine = StandInEngine()     # the marks show once connected
+    call_people(app.call.session, [(alex, {"micEnabled": False,
+                                           "cameraEnabled": True})])
+    overlay = app._call_overlay
+    if swapped and hasattr(overlay, "swap"):
+        overlay.swap()
+    app.show_call()
+
+
+def group_about(sheet=False):
+    """20.0: the group's page with what it is about and slow mode on;
+    `sheet`: What members can do, where its pace is set."""
+    close_sheets()
+    gid = M.gid_of(group)
+    if hasattr(M, "slow_wait"):
+        app.store.save_group(dict(app._group_state(gid), r={
+            "slow": 60, "about": "Plans for the week, and who brings what. "
+                                 "Be kind; keep it short."}), "active")
+    app.open_conversation(group)
+    app.open_chat_info()
+    if sheet and hasattr(M, "GroupRightsSheet"):
+        M.GroupRightsSheet(app, gid, lambda: None).open()
+
+
 def remote_access():
     """19.0: Remote access with one person listed and a session kept."""
     if not hasattr(M, "RemoteAccessSheet"):
@@ -1089,6 +1204,10 @@ def remote_191(what: str):
                          "n": "Office PC", "si": True,
                          "u": time.time() + 30 * 86400}
     app._refresh_call()
+    if what == "hung":                      # 21.0 (NEXT29): End it
+        app.call.rc_state.update(s="hung", hp={"w": 1, "p": 10,
+                                               "x": "ledger.exe"})
+        app._refresh_call()
     if what == "keys":
         M.RemoteKeysSheet(app).open()
     elif what == "cad":
@@ -1103,6 +1222,179 @@ def remote_191(what: str):
              "h": True},
             {"w": 4, "p": 13, "t": "Device Manager", "x": "mmc.exe",
              "a": True}]))
+
+
+# ---- 21.0 ---------------------------------------------------------------------
+HERE = {"lat": 51.50335, "lon": -0.11949, "acc": 8}      # by the river
+THERE = {"lat": 51.51384, "lon": -0.09835, "acc": 12}    # 1.9 km north-east
+
+
+class CapturePlace:
+    """Where this phone is, for the screens a phone shows (a computer
+    has no place of its own)."""
+
+    def last(self):
+        return dict(HERE, at=int(time.time()) - 30)
+
+    def follow(self, on_point):
+        on_point(self.last())
+
+    def unfollow(self, on_point):
+        pass
+
+
+def as_a_phone():
+    """The location screens as a phone draws them."""
+    if hasattr(M, "LocationSheet"):
+        M.LOCATION_SOURCE, M.OPENS_MAPS = CapturePlace(), True
+        app._here = (CapturePlace().last(), time.monotonic())
+
+
+def select_text():
+    """21.0 (SELECT29): Select text from the menu of the open chat's
+    newest words that came in: the sheet, its first words marked (before
+    21.0: no such sheet)."""
+    close_sheets()
+    screen = app.conversation_screen
+    for msg_id in sorted(screen._bubbles, reverse=True):
+        msg = screen._bubbles[msg_id].msg
+        words = msg.get("body") or ""
+        if msg["direction"] == "in" and len(words.split()) > 3 and \
+                (msg.get("kind") or "text") == "text" and \
+                not M.message_ext(msg).get("call"):
+            break
+    else:
+        return
+    try:
+        sheet = M.QuoteSheet(words, app.copy_text, select=True)
+    except TypeError:                               # before 21.0
+        return
+    sheet.open()
+    Clock.schedule_once(lambda _dt: sheet.field.select_text(
+        0, len(" ".join(words.split()[:3]))), 0.3)
+
+
+def poll_sheet():
+    """21.0 (POLL29): a poll being written in alex's chat."""
+    app.open_conversation(alex)
+    if not hasattr(M, "PollSheet"):
+        return
+    sheet = M.PollSheet(lambda poll: None)
+    sheet.question.text = "Where shall we eat on Friday?"
+    for n, words in enumerate(("The noodle bar", "Mario's", "Cook at mine")):
+        sheet.choices[n].text = words           # each one written adds one
+    sheet.open()
+
+
+def poll_chat():
+    """21.0: alex's chat with alex's poll, voted on by both (before
+    21.0: its words)."""
+    close_sheets()
+    poll = {"q": "Where shall we eat on Friday?",
+            "o": ["The noodle bar", "Mario's", "Cook at mine"], "m": False,
+            "u": int(time.time()) + 2 * 86400}
+    body = M.poll_body(poll) if hasattr(M, "poll_body") else \
+        "📊 " + poll["q"] + "".join("\n○ " + o for o in poll["o"])
+    _sid[0] += 1
+    cid = uuid.uuid4().hex
+    app.store.add_in(alex, body, at(400), _sid[0], cid, unread=False,
+                     ext={"poll": poll})
+    if hasattr(app.store, "set_vote"):
+        app.store.set_vote(alex, cid, alex, [1], at(401))
+        app.store.set_vote(alex, cid, me, [1], at(402))
+    app.open_conversation(alex)
+
+
+def location_sheet():
+    """21.0 (MAP29): Location, as a phone shows it: where it is, sent as
+    it is or shared live."""
+    close_sheets()
+    as_a_phone()
+    app.open_conversation(alex)
+    if hasattr(M, "LocationSheet"):
+        M.LocationSheet(app, alex, live=True).open()
+
+
+def location_chat():
+    """21.0: alex's chat: a place alex sent (how far from here, which
+    way), a live share of alex's that ended, and one of yours, running
+    (before 21.0: their words)."""
+    close_sheets()
+    as_a_phone()
+    now = int(time.time())
+
+    def words(loc):
+        return M.location_body(loc) if hasattr(M, "location_body") else \
+            f"📍 Location: {loc['lat']:.6f}, {loc['lon']:.6f}"
+    for n, (out, loc) in enumerate((
+            (False, dict(THERE, at=now - 1200)),
+            (False, dict(THERE, at=now - 7200, until=now - 3600)),
+            (True, dict(HERE, at=now - 120, until=now + 45 * 60)))):
+        _sid[0] += 1
+        cid = uuid.uuid4().hex
+        if out:
+            local = app.store.add_out(alex, words(loc), at(410 + n), cid,
+                                      ext={"loc": loc})
+            app.store.mark_sent(local, _sid[0])
+            app.store.apply_receipt(_sid[0], "read")
+            if hasattr(app.store, "set_live_point"):
+                app.store.set_live_point(alex, cid, dict(HERE, at=now - 60))
+        else:
+            app.store.add_in(alex, words(loc), at(410 + n), _sid[0], cid,
+                             unread=False, ext={"loc": loc})
+            if "until" in loc and hasattr(app.store, "end_live"):
+                app.store.end_live(alex, cid)
+    app.open_conversation(alex)
+
+
+def service_sheet():
+    """21.0 (SERVICE29): the service's sheet, set up on this computer
+    (before 21.0: none)."""
+    close_sheets()
+    if not hasattr(M, "DeskServiceSheet"):
+        return
+    M.service_why_not = lambda: ""
+    M.service_state = lambda reg=None: {"version": M.APP_VERSION,
+                                        "prompts": False}
+    M.DeskServiceSheet(app).open()
+
+
+def remote_trackpad(picture: bool = True):
+    """21.1: controlling alex's computer from this phone, as a trackpad:
+    the pointer drawn here (an I-beam: alex's computer says its shape)
+    over their picture, zoomed in twice by a pinch; `picture` False: none
+    of their screen has come yet."""
+    remote_call(computer=False)
+    view = app._call_overlay
+    if not picture:                       # (before 21.1: a black screen)
+        app._call_frames.pop((alex, "s"), None)
+        app._refresh_call()
+        if_present(view, "refresh_note")
+        return
+    if view is None or not hasattr(view.remote, "pointer_said"):
+        return                            # before 21.1: as it was
+    app.call.rc_state = {"s": "ok", "n": "Office PC", "pt": True}
+    app._refresh_call()
+    remote = view.remote
+    remote.mode, remote.at = "trackpad", (0.56, 0.42)
+    view.picture.zoom_at(2.0, *view.picture.center)
+    remote.pointer_said("ibeam", None, False)
+
+
+def scan_steps():
+    """21.1: Verify sam › Scan their code, on a phone: what to do, step by
+    step, before its camera app opens (before 21.1: the camera at once,
+    which here does nothing)."""
+    verify_sheet()
+    sheet = next((v for v in Window.children if isinstance(v, M.Sheet)),
+                 None)
+    if sheet is None or not hasattr(M, "ScanStepsSheet"):
+        return
+    M.IS_ANDROID = True
+    try:
+        sheet._scan()
+    finally:
+        M.IS_ANDROID = False
 
 
 def remote_computers():
@@ -2215,6 +2507,41 @@ STEPS = [
      if hasattr(M, "PinsSheet") else None, 0.8, "pins_sheet"),
     (close_sheets, 0.3, None),
     (app.go_back_to_chats, 0.4, None),
+    (attach_sheet, 1.4, "attach_sheet"),
+    (close_sheets, 0.4, None),
+    (documents_chat, 1.2, "chat_documents"),
+    (press_message, 0.2, "message_pressed"),
+    (slide_off, 0.5, None),
+    (video_call_marks, 1.0, "video_call_muted"),
+    (lambda: video_call_marks(True), 1.0, "video_call_swapped"),
+    (video_call_end, 0.4, None),
+    (group_about, 1.0, "group_about"),
+    (lambda: group_about(True), 0.8, "group_slow"),
+    (close_sheets, 0.3, None),
+    (app.go_back_to_chats, 0.4, None),
+    # 21.0
+    (lambda: app.open_conversation(group), 1.0, None),
+    (select_text, 1.0, "select_text"),
+    (close_sheets, 0.3, None),
+    (app.go_back_to_chats, 0.4, None),
+    (app.open_settings, 0.8, None),
+    (lambda: scroll_settings_to("Hold to select"), 0.5, "settings_hold"),
+    (app.close_settings, 0.4, None),
+    (poll_sheet, 1.0, "poll_sheet"),
+    (poll_chat, 1.2, "chat_poll"),
+    (location_sheet, 1.0, "location_sheet"),
+    (location_chat, 1.2, "chat_location"),
+    (app.go_back_to_chats, 0.4, None),
+    (lambda: remote_191("hung"), 1.0, "remote_hung"),
+    (video_call_end, 0.4, None),
+    (service_sheet, 0.8, "remote_service"),
+    (close_sheets, 0.3, None),
+    (remote_trackpad, 1.0, "remote_trackpad"),
+    (video_call_end, 0.4, None),
+    (lambda: remote_trackpad(picture=False), 1.0, "remote_waiting"),
+    (video_call_end, 0.4, None),
+    (scan_steps, 0.8, "scan_steps"),
+    (close_sheets, 0.3, None),
 ]
 assert [s for *_, s in STEPS if s] == list(SCREENS)
 

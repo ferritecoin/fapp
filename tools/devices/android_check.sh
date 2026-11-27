@@ -4,8 +4,14 @@
 # its verdicts read from logcat, a screenshot and the logs kept in OUT_DIR.
 # The self-test's checks: call-classes, call-audio, codecs-encoders,
 # codecs-decoders, camera, (18.0) screen, (18.1) video-message, (18.2)
-# video-draw (a decoder's rows drawn by the graphics chip), and (18.1)
-# back: Android's Back key, pressed here, as the app took it.
+# video-draw (a decoder's rows drawn by the graphics chip), (18.1) back:
+# Android's Back key, pressed here, as the app took it, (21.1)
+# back-activity: a Back no view took (the activity's onBackPressed, given by
+# the self-test), (21.0) location (a GPS fix given
+# here as it waits) and location-service, and (21.1) string-extra (a
+# string put on an Intent reads back as one) and live-notice (the
+# location service's notice says with whom and until when; its Stop ends
+# the service).
 #
 #   tools/devices/android_check.sh APP_DEBUG.apk OUT_DIR
 #
@@ -80,6 +86,9 @@ free_mb() { df -m --output=avail / | tail -1 | tr -d ' '; }
 
 # The app started with its self-test, and its verdict waited for (five
 # minutes at the most, or until the app is gone): sets $verdict.
+# 21.0: location on, for the location check (each way an Android takes it)
+"$ADB" shell cmd location set-location-enabled true > /dev/null 2>&1 || true
+"$ADB" shell settings put secure location_mode 3 > /dev/null 2>&1 || true
 selftest() {
   "$ADB" logcat -c
   # -W: the launch's result, or why there was none (run 5, API 21: silence).
@@ -104,6 +113,8 @@ selftest() {
     if [ "$n" -gt 15 ] && ! "$ADB" shell ps 2>/dev/null | grep -q "$PKG"; then
       break
     fi
+    # 21.0: a GPS fix for the location check (longitude first)
+    timeout 10 "$ADB" emu geo fix -0.1246 51.5007 > /dev/null 2>&1 || true
     sleep 2
   done
   echo "free disk: $(free_mb) MB"
@@ -152,6 +163,21 @@ if [ -n "$verdict" ]; then
     sleep 1
   done
 fi
+# 21.1: a Back that no view takes (no view has the focus once the keyboard
+# has gone) goes to the activity's own onBackPressed, which closed the app
+# from whatever page (the owner's "Back exits all the way out"). After
+# "back", the self-test opens a second sheet and gives that handler a Back
+# itself; this waits for what it says (back-activity).
+after_other=""
+if timeout 30 "$ADB" logcat -d -s python:I 2>/dev/null \
+     | grep -q 'FEXT-SELFTEST back PASS'; then
+  for _ in $(seq 15); do
+    timeout 30 "$ADB" logcat -d -s python:I 2>/dev/null \
+      | grep -q 'FEXT-SELFTEST back-activity ' && break
+    sleep 1
+  done
+  after_other="$(front)"
+fi
 timeout 60 "$ADB" logcat -d > "$OUT/logcat.txt" 2>&1
 grep -o 'FEXT-SELFTEST .*' "$OUT/logcat.txt" | tr -d '\r' > "$OUT/selftest.txt"
 cat "$OUT/selftest.txt"
@@ -167,6 +193,11 @@ if [ -n "$verdict" ] && ! grep -q 'FEXT-SELFTEST back ' "$OUT/selftest.txt"; the
   fi
   echo "in front now:"; front
   grep -E "python +:|SDL +: (on|native)" "$OUT/logcat.txt" | tail -25
+fi
+if grep -q 'FEXT-SELFTEST back PASS' "$OUT/selftest.txt" && \
+   ! grep -q 'FEXT-SELFTEST back-activity ' "$OUT/selftest.txt"; then
+  echo "::error::a Back no view took (the activity's onBackPressed) did not reach the app; in front after it:"
+  echo "$after_other"; failed=1
 fi
 "$ADB" shell ps 2>/dev/null | grep -q "$PKG" || {
   echo "::error::the app is no longer running"; failed=1; }

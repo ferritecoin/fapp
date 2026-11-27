@@ -13,12 +13,20 @@ the errors the log holds, for a look (on Linux, Kivy's probes for xclip
 and mtdev log some that do no harm), and what the executable itself wrote:
 a start that fails before Kivy's log begins says why there.
 
+Then it is held against plain Python: `--check` makes a build say what it
+can do on this computer, each part tried for real (a picture coded and
+decoded, the screen read once, the input injector made...). Whatever this
+Python can do with ../main.py, the executable must do too, and video,
+screen sharing and remote control it must do in any case: a build lacks
+whatever Nuitka did not see, and the app then does without, silently.
+
 "Drawn" is judged from screenshots, the screen before the start against
 the screen after: something must have appeared (half a percent of the
 screen), and what appeared must have detail, not be one flat colour, as a
 window that failed to draw would be. Run it on a machine with a screen
 (GitHub's Windows runners have one).
 """
+import json
 import os
 import subprocess
 import sys
@@ -32,6 +40,9 @@ EXE = Path(sys.argv[1]).resolve()
 OUT = Path(sys.argv[2] if len(sys.argv) > 2 else "smoke_exe").resolve()
 OUT.mkdir(parents=True, exist_ok=True)
 STARTED = "Start application main loop"     # Kivy logs it when it is up
+MAIN = Path(__file__).resolve().parent.parent / "main.py"
+#: What a release promises on every computer it runs on.
+PROMISED = ("video (PyAV)", "screen sharing", "remote control")
 RESULTS = []
 
 
@@ -139,10 +150,45 @@ def start(n, home, env):
     return up
 
 
+def can_do(command, name, home, env):
+    """What a build says it can do here (--check): {part: "" or why not}."""
+    report = OUT / f"check_{name}.json"
+    report.unlink(missing_ok=True)
+    try:
+        subprocess.run(command + ["--check", str(report)], env=env,
+                       cwd=str(home), timeout=180, capture_output=True)
+        return json.loads(report.read_text("utf-8"))
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        return {"report": f"none ({type(exc).__name__}: {exc})"}
+
+
+def against_python(home, env):
+    exe = can_do([str(EXE)], "exe", home, env)
+    python = can_do([sys.executable, str(MAIN)], "python", home, env)
+    check("the executable says what it can do (--check)", "version" in exe,
+          str(exe))
+    check("...and so does plain Python", "version" in python, str(python))
+    if "version" not in exe or "version" not in python:
+        return
+    for part, why in python.items():
+        if part in ("version", "compiled", "python"):
+            continue
+        ours = exe.get(part, "not reported")
+        if part in PROMISED:
+            check(f"{part}: in the executable", ours == "", ours)
+        elif why:
+            print(f"  [SKIP] {part}: not on this computer's Python either "
+                  f"({why[:80]})")
+        else:
+            check(f"{part}: in the executable, as in Python", ours == "",
+                  ours)
+
+
 print(f"{EXE.name}: {EXE.stat().st_size / 1e6:.1f} MB")
 home, env = fresh_home()
 for n in (1, 2):
     start(n, home, env)
+against_python(home, env)
 passed = sum(RESULTS)
 print(f"\n  {passed}/{len(RESULTS)} passed")
 sys.exit(0 if passed == len(RESULTS) else 1)

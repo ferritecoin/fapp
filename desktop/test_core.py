@@ -1178,6 +1178,10 @@ check("the key for another device carries both keys, in a text no WIF or "
       (priv_a, bytes.fromhex(seed)) and
       M.json.loads(alice.keys.private_export())["key_for_another_device"]
       == both)
+wrapped = both[:40] + "\n" + both[40:90] + " \r\n  " + both[90:]
+check("20.0 (F6): one a wrapped e-mail broke into lines, with spaces, is "
+      "read as the key it is; a character changed is refused as before",
+      M.parse_identity_key(wrapped) == (priv_a, bytes.fromhex(seed)))
 M.DATA_DIR = Path(tempfile.mkdtemp(prefix="fext-device-"))
 M.IDENTITIES_PATH = M.DATA_DIR / "identities.json"
 second = M.IdentityManager()

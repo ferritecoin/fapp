@@ -35,8 +35,12 @@ say "image: $IMAGE"
 
 echo no | "$BIN/avdmanager" create avd --force -n "api$API" -k "$IMAGE" \
   -d pixel_5 > /dev/null
+# A 4 GB data partition: the self-test needs little, and the image's own
+# default (7 GB for API 36) did not fit on the runner (run 44: "Not enough
+# space to create userdata partition. Available: 6981.93 MB"). The emulator
+# still asked for 7.4 GB in run 52, so the workflow makes room first.
 "$SDK/emulator/emulator" -avd "api$API" -no-window -no-snapshot -noaudio \
-  -no-boot-anim -gpu swiftshader_indirect -memory 3072 \
+  -no-boot-anim -gpu swiftshader_indirect -memory 3072 -partition-size 4096 \
   -camera-back emulated -camera-front emulated > "$LOG" 2>&1 &
 EMULATOR=$!
 say "booting"

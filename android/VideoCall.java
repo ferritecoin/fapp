@@ -1095,6 +1095,9 @@ public class VideoCall {
     /** One stream decoded by this phone's decoder for its codec, each
      * picture scaled (nearest pixel) to the tile it is drawn in. */
     public static class Decoder {
+        /** 21.1: the largest picture a stream carries (main.py:
+         * VIDEO_MAX_PIECES pieces of VIDEO_PIECE_BYTES), with room. */
+        static final int MOST_IN = 1 << 20;
         private final MediaCodec codec;
         private long at = 0;
         private int pictures = 0;
@@ -1127,6 +1130,11 @@ public class VideoCall {
                 format.setInteger(MediaFormat.KEY_COLOR_FORMAT,
                         MediaCodecInfo.CodecCapabilities
                                 .COLOR_FormatYUV420Flexible);
+                // 21.1: room for the largest picture a stream carries
+                // (main.py: VIDEO_MAX_PIECES): a decoder sized for 640x360
+                // may take less than a shared screen's first picture, and
+                // no picture of it then ever decoded.
+                format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, MOST_IN);
                 if (prompt && Build.VERSION.SDK_INT >= 30
                         && codec.getCodecInfo().getCapabilitiesForType(mime)
                                 .isFeatureSupported(MediaCodecInfo
@@ -1196,6 +1204,12 @@ public class VideoCall {
             }
             ByteBuffer buffer = codec.getInputBuffer(in);
             buffer.clear();
+            if (buffer.capacity() < data.length) {
+                codec.queueInputBuffer(in, 0, 0, at, 0);   // handed back
+                refused = "a picture of " + data.length
+                        + " bytes, the decoder's room " + buffer.capacity();
+                return false;
+            }
             buffer.put(data);
             codec.queueInputBuffer(in, 0, data.length, at, 0);
             at += 33333;

@@ -78,18 +78,51 @@ import time
 SERVICE_NAME = "fextsync"          # must match `services =` in buildozer.spec
 CALL_SERVICE_NAME = "fextcall"     # likewise
 SHARE_SERVICE_NAME = "fextshare"   # likewise (18.0, PHONESHARE)
+CAMERA_SERVICE_NAME = "fextcam"    # likewise (20.0)
+LOCATION_SERVICE_NAME = "fextloc"  # likewise (21.0)
 ANDROID_SERVICE = os.environ.get("PYTHON_NAME", "").lower()
-if ANDROID_SERVICE == SHARE_SERVICE_NAME:
+if ANDROID_SERVICE in (SHARE_SERVICE_NAME, CAMERA_SERVICE_NAME,
+                       LOCATION_SERVICE_NAME):
     # 18.0: Android lets the screen be captured only while the app runs a
     # foreground service of the 'mediaProjection' type, started after the
     # person said yes (ShareService). Android puts it in the foreground
     # before this runs: it says so (its flag file's name and ".up"), then
-    # waits as the call service does.
+    # waits as the call service does. 20.0: and lets a call's camera stay
+    # on out of sight only while one of the 'camera' type runs
+    # (CameraService). 21.0: and tells an app out of sight where the phone
+    # is only while one of the 'location' type runs (LocationService).
     _flag = os.environ.get("PYTHON_SERVICE_ARGUMENT", "")
     if _flag:
         open(_flag + ".up", "w").close()
-    _until = time.time() + 6 * 3600
+    # Six hours at most; a live share's nine (it lasts up to eight).
+    _until = time.time() + (9 if ANDROID_SERVICE == LOCATION_SERVICE_NAME
+                            else 6) * 3600
+
+    def _live_notice(said: str) -> str:
+        """21.1 (LIVENOTICE30): the location service's notice made the
+        app's own (Notifier.liveNotice): the words the app wrote into the
+        flag file (with whom, until when), and Stop. Posted again when
+        they change; python-for-android's stays if this fails."""
+        try:
+            with open(_flag, encoding="utf-8") as f:
+                words = f.read()
+        except OSError:                   # (the flag gone as it was read)
+            return said
+        if words != said and words.startswith("{"):
+            try:
+                import json
+                from jnius import autoclass
+                told = json.loads(words)
+                autoclass("org.fext.notify.Notifier").liveNotice(
+                    autoclass("org.kivy.android.PythonService").mService,
+                    told["title"], told["text"], _flag)
+            except Exception as exc:      # said once for these words
+                print("fext: the live location's notice:", repr(exc))
+        return words
+    _said = ""
     while _flag and os.path.exists(_flag) and time.time() < _until:
+        if ANDROID_SERVICE == LOCATION_SERVICE_NAME:
+            _said = _live_notice(_said)
         time.sleep(1.0)
     raise SystemExit
 if ANDROID_SERVICE == CALL_SERVICE_NAME:
@@ -339,6 +372,1237 @@ if __name__ == "__main__" and GUARD_FLAG in sys.argv[1:]:
                    else Path.home() / ".fext")
     raise SystemExit
 
+
+# ---- 21.0 (SERVICE29): the lock screen reached from afar, a Windows service --
+# The owner (27 November): "we need a complete version of this, and then we
+# need to start using it". Without it, remote control stops where Windows
+# keeps programs out: the lock and sign-in screens, a permission prompt, a
+# window run as administrator, and the stand-in Windows puts in front of a
+# program that does not answer. Two parts of this same program, started
+# with a flag, import nothing below this point (Python's own ctypes; no
+# window, no packages, no network):
+#   SERVICE_FLAG  the service (SYSTEM, session 0): keeps one DESK_FLAG helper
+#                 running on the session the screen shows, and asks Windows
+#                 for Ctrl+Alt+Del (SendSAS, which only a service may) when
+#                 the helper says so. Nothing else.
+#   DESK_FLAG     the helper (SYSTEM, on the screen's session): follows the
+#                 desktop Windows shows (the person's, the lock screen, a
+#                 permission prompt), copies it into memory that the
+#                 person's Ferritext may read, and puts in the pointer and
+#                 keys it is given. It talks only through two pipes on this
+#                 computer (DESK_IN, DESK_SCREEN) that only SYSTEM and the
+#                 person signed in on that screen may open, in fixed-size
+#                 records (DESK_RECORD). It holds no identity and reads no
+#                 text from anyone.
+# The person's Ferritext uses the helper when it answers (DeskLink), and
+# its own capture and SendInput when not. Settings installs the service,
+# with Windows' own permission prompt (service_install, further down).
+# .private/PLAN_WINSERVICE.md has the design and its reasons.
+SERVICE_FLAG, DESK_FLAG = "--service", "--desk"
+#: Settings' steps, each run as administrator in a process of its own: the
+#: service set up (or updated), removed, or its setting changed
+#: (service_run, further down).
+SERVICE_INSTALL, SERVICE_REMOVE, SERVICE_SET = (
+    "--service-install", "--service-remove", "--service-set")
+WIN_SERVICE = "FerritextDesk"
+WIN_SERVICE_SHOWN = "Ferritext remote access"
+#: The helper's two pipes, each followed by the session's number: one for
+#: the pointer and keys (nothing comes back), one for the screen.
+DESK_IN = "\\\\.\\pipe\\FerritextDesk-in-"
+DESK_SCREEN = "\\\\.\\pipe\\FerritextDesk-screen-"
+DESK_VERSION = 1
+#: One record either way: kind, flag, a (16 bits), b, c, d (32 bits each).
+DESK_RECORD = struct.Struct("<BBHiii")
+# The person's Ferritext to the helper...
+DESK_HELLO, DESK_MOVE, DESK_BUTTON, DESK_WHEEL, DESK_KEY, DESK_UNIT, \
+    DESK_GRAB, DESK_SAS, DESK_STATE = range(1, 10)
+# ...and back (with DESK_HELLO and DESK_STATE): the screen's memory, given
+# to the person's process to read (b: its handle there, c: its size), and
+# a picture in it (flag: what is shown, b and c: its size, d: its number).
+DESK_MAP, DESK_FRAME = 10, 11
+#: What the screen shows (DESK_FRAME's flag, DESK_STATE's a): the
+#: person's desktop, the lock or sign-in screen, a permission prompt, the
+#: screen saver, nothing that can be read.
+DESK_PERSON, DESK_LOCKED, DESK_PROMPT, DESK_SAVER, DESK_UNSEEN = range(5)
+#: The rights the helper opens the desktop in front with (all of a
+#: desktop's own: reading it, its windows, journal playback for input).
+DESK_RIGHTS = 0x01FF
+#: The service's settings, which only an administrator may change
+#: (HKEY_LOCAL_MACHINE): its version, and whether a session may answer a
+#: permission prompt (off unless turned on: a program run by the person
+#: could otherwise use Ferritext to make itself administrator).
+DESK_PARAMETERS = ("SYSTEM\\CurrentControlSet\\Services\\" + WIN_SERVICE +
+                   "\\Parameters")
+_DESK_DLLS = None
+
+
+def _desk_dlls():
+    """(kernel32, user32, gdi32, advapi32), with the prototypes the service
+    and its helper use: handles as pointers, so none is cut to 32 bits."""
+    global _DESK_DLLS
+    if _DESK_DLLS is not None:
+        return _DESK_DLLS
+    import ctypes
+    from ctypes import wintypes as w
+    H, P, D, B, I, U = ctypes.c_void_p, ctypes.c_void_p, w.DWORD, w.BOOL, \
+        ctypes.c_int, ctypes.c_uint
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    u = ctypes.WinDLL("user32", use_last_error=True)
+    g = ctypes.WinDLL("gdi32", use_last_error=True)
+    a = ctypes.WinDLL("advapi32", use_last_error=True)
+    PD, PH, PU = ctypes.POINTER(D), ctypes.POINTER(H), ctypes.POINTER(w.ULONG)
+    for dll, name, res, args in (
+            (k, "CreateNamedPipeW", H, (w.LPCWSTR, D, D, D, D, D, D, P)),
+            (k, "ConnectNamedPipe", B, (H, P)),
+            (k, "DisconnectNamedPipe", B, (H,)),
+            (k, "ReadFile", B, (H, P, D, PD, P)),
+            (k, "WriteFile", B, (H, P, D, PD, P)),
+            (k, "CreateFileW", H, (w.LPCWSTR, D, D, P, D, D, H)),
+            (k, "WaitNamedPipeW", B, (w.LPCWSTR, D)),
+            (k, "GetNamedPipeClientSessionId", B, (H, PU)),
+            (k, "GetNamedPipeClientProcessId", B, (H, PU)),
+            (k, "CreateFileMappingW", H, (H, P, D, D, D, w.LPCWSTR)),
+            (k, "MapViewOfFile", P, (H, D, D, D, ctypes.c_size_t)),
+            (k, "UnmapViewOfFile", B, (P,)),
+            (k, "DuplicateHandle", B, (H, H, H, PH, D, B, D)),
+            (k, "OpenProcess", H, (D, B, D)),
+            (k, "GetCurrentProcess", H, ()),
+            (k, "GetCurrentProcessId", D, ()),
+            (k, "ProcessIdToSessionId", B, (D, PD)),
+            (k, "WTSGetActiveConsoleSessionId", D, ()),
+            (k, "CloseHandle", B, (H,)),
+            (k, "CreatePipe", B, (PH, PH, P, D)),
+            (k, "SetHandleInformation", B, (H, D, D)),
+            (k, "WaitForMultipleObjects", D, (D, PH, B, D)),
+            (k, "CreateEventW", H, (P, B, B, w.LPCWSTR)),
+            (k, "SetEvent", B, (H,)),
+            (k, "ResetEvent", B, (H,)),
+            (k, "GetModuleHandleW", H, (w.LPCWSTR,)),
+            (k, "TerminateProcess", B, (H, U)),
+            (k, "CreateToolhelp32Snapshot", H, (D, D)),
+            (k, "Process32FirstW", B, (H, P)),
+            (k, "Process32NextW", B, (H, P)),
+            (k, "LocalFree", P, (P,)),
+            (k, "SetDefaultDllDirectories", B, (D,)),
+            (u, "OpenInputDesktop", H, (D, B, D)),
+            (u, "GetForegroundWindow", H, ()),
+            (u, "EnumDesktopWindows", B, (H, P, P)),
+            (u, "IsWindowVisible", B, (H,)),
+            (u, "GetWindowRect", B, (H, P)),
+            (u, "GetWindowDisplayAffinity", B, (H, PD)),
+            (u, "PrintWindow", B, (H, H, U)),
+            (u, "GetClassNameW", I, (H, w.LPWSTR, I)),
+            (u, "GetWindowThreadProcessId", D, (H, P)),
+            (u, "GetKeyboardLayout", H, (D,)),
+            (u, "VkKeyScanExW", ctypes.c_short, (w.WCHAR, H)),
+            (u, "MapVirtualKeyExW", U, (U, U, H)),
+            (u, "SetThreadDesktop", B, (H,)),
+            (u, "CloseDesktop", B, (H,)),
+            (u, "GetUserObjectInformationW", B, (H, I, P, D, PD)),
+            (u, "GetDC", H, (H,)),
+            (u, "ReleaseDC", I, (H, H)),
+            (u, "GetSystemMetrics", I, (I,)),
+            (u, "SendInput", U, (U, P, I)),
+            (u, "GetCursorInfo", B, (P,)),
+            (u, "GetIconInfo", B, (H, P)),
+            (u, "DrawIconEx", B, (H, I, I, H, I, I, U, H, U)),
+            (u, "DefWindowProcW", ctypes.c_ssize_t,
+             (H, U, ctypes.c_size_t, ctypes.c_ssize_t)),
+            (u, "RegisterClassExW", w.ATOM, (P,)),
+            (u, "CreateWindowExW", H, (D, w.LPCWSTR, w.LPCWSTR, D, I, I, I,
+                                       I, H, H, H, P)),
+            (u, "DestroyWindow", B, (H,)),
+            (u, "PeekMessageW", B, (P, H, U, U, U)),
+            (u, "TranslateMessage", B, (P,)),
+            (u, "DispatchMessageW", ctypes.c_ssize_t, (P,)),
+            (u, "BeginPaint", H, (H, P)),
+            (u, "EndPaint", B, (H, P)),
+            (u, "GetClientRect", B, (H, P)),
+            (u, "FillRect", I, (H, P, H)),
+            (u, "DrawTextW", I, (H, w.LPCWSTR, I, P, U)),
+            (u, "SetLayeredWindowAttributes", B, (H, D, ctypes.c_ubyte, D)),
+
+            (g, "CreateCompatibleDC", H, (H,)),
+            (g, "CreateCompatibleBitmap", H, (H, I, I)),
+            (g, "GetPixel", D, (H, I, I)),
+            (g, "DeleteDC", B, (H,)),
+            (g, "CreateDIBSection", H, (H, P, U, ctypes.POINTER(P), H, D)),
+            (g, "SelectObject", H, (H, H)),
+            (g, "DeleteObject", B, (H,)),
+            (g, "BitBlt", B, (H, I, I, I, I, H, I, I, D)),
+            (g, "GdiFlush", B, ()),
+            (g, "CreateSolidBrush", H, (D,)),
+            (g, "SetBkMode", I, (H, I)),
+            (g, "SetTextColor", D, (H, D)),
+            (a, "OpenProcessToken", B, (H, D, PH)),
+            (a, "DuplicateTokenEx", B, (H, D, P, I, I, PH)),
+            (a, "SetTokenInformation", B, (H, I, P, D)),
+            (a, "GetTokenInformation", B, (H, I, P, D, PD)),
+            (a, "ConvertSidToStringSidW", B, (P, ctypes.POINTER(P))),
+            (a, "GetSecurityInfo", D, (H, I, D, ctypes.POINTER(P),
+                                       ctypes.POINTER(P), P, P,
+                                       ctypes.POINTER(P))),
+            (a, "ConvertStringSecurityDescriptorToSecurityDescriptorW", B,
+             (w.LPCWSTR, D, ctypes.POINTER(P), PU)),
+            (a, "CreateProcessAsUserW", B,
+             (H, w.LPCWSTR, w.LPWSTR, P, P, B, D, P, w.LPCWSTR, P, P)),
+            (a, "StartServiceCtrlDispatcherW", B, (P,)),
+            (a, "RegisterServiceCtrlHandlerExW", H, (w.LPCWSTR, P, P)),
+            (a, "SetServiceStatus", B, (H, P))):
+        try:
+            function = getattr(dll, name)
+        except AttributeError:          # an older Windows lacks it
+            continue
+        function.restype, function.argtypes = res, list(args)
+    _DESK_DLLS = (k, u, g, a)
+    return _DESK_DLLS
+
+
+def program_file() -> str:
+    """The program file this process runs. In the EXE not sys.executable,
+    which Nuitka makes the program's folder and the name of the Python
+    that built it: a python.exe that is not there (build run 168). In a
+    one-file EXE, the program it unpacked, beside all it needs."""
+    if "__compiled__" in globals() and sys.platform == "win32":
+        import ctypes
+        path = ctypes.create_unicode_buffer(32768)
+        if ctypes.WinDLL("kernel32").GetModuleFileNameW(None, path,
+                                                         len(path)):
+            return path.value
+    return sys.executable
+
+
+def _desk_log(text: str) -> None:
+    """A line in desk.log beside the program (Program Files, where only
+    administrators and SYSTEM write); past 256 KB its older half is let
+    go. Never an error of its own."""
+    try:
+        here = Path(program_file() if "__compiled__" in globals()
+                    else os.path.abspath(sys.argv[0])).parent
+        path = here / "desk.log"
+        if path.exists() and path.stat().st_size > 256 * 1024:
+            kept = path.read_bytes()[-128 * 1024:]
+            path.write_bytes(kept[kept.find(b"\n") + 1:])
+        with open(path, "a", encoding="utf-8") as out:
+            out.write(time.strftime("%Y-%m-%d %H:%M:%S ") +
+                      f"[{os.getpid()}] {text}\n")
+    except OSError:
+        pass
+
+
+def _desk_session(pid: Optional[int] = None) -> int:
+    """The session a process (this one) runs in."""
+    import ctypes
+    from ctypes import wintypes
+    k = _desk_dlls()[0]
+    found = wintypes.DWORD(0xFFFFFFFF)
+    k.ProcessIdToSessionId(k.GetCurrentProcessId() if pid is None else pid,
+                           ctypes.byref(found))
+    return found.value
+
+
+def _desk_sid(token) -> str:
+    """A token's user, as Windows writes a SID ("S-1-5-18" is SYSTEM)."""
+    import ctypes
+    from ctypes import wintypes
+    k, _u, _g, a = _desk_dlls()
+    need = wintypes.DWORD()
+    a.GetTokenInformation(token, 1, None, 0, ctypes.byref(need))  # TokenUser
+    if not need.value:
+        return ""
+    buffer = ctypes.create_string_buffer(need.value)
+    if not a.GetTokenInformation(token, 1, buffer, need, ctypes.byref(need)):
+        return ""
+    sid = ctypes.c_void_p.from_buffer(buffer).value   # TOKEN_USER's first
+    text = ctypes.c_void_p()
+    if not a.ConvertSidToStringSidW(sid, ctypes.byref(text)):
+        return ""
+    try:
+        return ctypes.wstring_at(text.value)
+    finally:
+        k.LocalFree(text)
+
+
+def _desk_session_user(session: int) -> str:
+    """The SID of the person signed in on `session`, "" while nobody is
+    (the sign-in screen). Only SYSTEM may ask Windows this."""
+    import ctypes
+    try:
+        wts = ctypes.WinDLL("wtsapi32", use_last_error=True)
+        wts.WTSQueryUserToken.argtypes = [ctypes.c_ulong,
+                                          ctypes.POINTER(ctypes.c_void_p)]
+    except OSError:
+        return ""
+    token = ctypes.c_void_p()
+    if not wts.WTSQueryUserToken(session, ctypes.byref(token)):
+        return ""
+    try:
+        return _desk_sid(token)
+    finally:
+        _desk_dlls()[0].CloseHandle(token)
+
+
+def _desk_security(sddl: str):
+    """SECURITY_ATTRIBUTES from Windows' security language (SDDL); kept
+    with the descriptor's memory, which Windows allocated."""
+    import ctypes
+    from ctypes import wintypes
+
+    class SECURITY_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("nLength", wintypes.DWORD),
+                    ("lpSecurityDescriptor", ctypes.c_void_p),
+                    ("bInheritHandle", wintypes.BOOL)]
+    a = _desk_dlls()[3]
+    descriptor = ctypes.c_void_p()
+    if not a.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl, 1, ctypes.byref(descriptor), None):
+        raise OSError(ctypes.get_last_error(), "the pipe's security")
+    return SECURITY_ATTRIBUTES(ctypes.sizeof(SECURITY_ATTRIBUTES),
+                               descriptor, False)
+
+
+def desk_pipe_security(user_sid: str) -> str:
+    """The helper's pipes: owned by SYSTEM (a program that is not SYSTEM
+    cannot make a pipe that says so: the person's Ferritext checks it
+    before it sends a key), open to SYSTEM and to the person signed in on
+    the screen, to nobody else and to no other computer."""
+    person = f"(A;;GRGW;;;{user_sid})" if user_sid else ""
+    return "O:SYG:SYD:P(A;;GA;;;SY)" + person
+
+
+class _DeskShared:
+    """What the helper's threads share: who is connected, what the screen
+    shows, and whether a session may answer a permission prompt."""
+
+    def __init__(self, session: int, report=None) -> None:
+        self.session, self.report = session, report
+        self.lock = threading.Lock()
+        self.connected = 0
+        self.kind, self.desk = DESK_PERSON, "Default"
+        self.prompts, self._read = False, 0.0
+        self.chinese = False
+
+    def answer_prompts(self) -> bool:
+        """The service's setting, read again every few seconds."""
+        now = time.monotonic()
+        if now - self._read > 3.0:
+            self._read = now
+            try:
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                    DESK_PARAMETERS) as key:
+                    self.prompts = winreg.QueryValueEx(
+                        key, "AnswerPrompts")[0] == 1
+            except OSError:
+                self.prompts = False
+        return self.prompts
+
+
+def _desk_running(image: str, session: int) -> bool:
+    """A process of `image` (e.g. "consent.exe") runs on `session`."""
+    return any(name == image and _desk_session(pid) == session
+               for pid, name in _desk_processes().items())
+
+
+def _desk_processes() -> dict:
+    """Every process's program, by its id: {pid: "logonui.exe"}."""
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", ctypes.c_wchar * 260)]
+    k = _desk_dlls()[0]
+    snap = k.CreateToolhelp32Snapshot(0x2, 0)          # TH32CS_SNAPPROCESS
+    if not snap or snap == ctypes.c_void_p(-1).value:
+        return {}
+    found = {}
+    try:
+        entry = PROCESSENTRY32W(dwSize=ctypes.sizeof(PROCESSENTRY32W))
+        more = k.Process32FirstW(snap, ctypes.byref(entry))
+        while more:
+            found[entry.th32ProcessID] = entry.szExeFile.lower()
+            more = k.Process32NextW(snap, ctypes.byref(entry))
+        return found
+    finally:
+        k.CloseHandle(snap)
+
+
+def _desk_windows() -> str:
+    """What the desktop in front shows, for the log: its visible top-level
+    windows as program/class, the first eight. Never an error of its own."""
+    try:
+        return _desk_windows_seen()
+    except Exception as exc:                  # a log line, not a failure
+        return f"({type(exc).__name__}: {exc})"
+
+
+def _desk_windows_seen() -> str:
+    import ctypes
+    from ctypes import wintypes
+    _k, u, g, _a = _desk_dlls()
+    desk = u.OpenInputDesktop(0, False, DESK_RIGHTS)
+    if not desk:
+        return "(the desktop in front could not be opened)"
+    u.SetThreadDesktop(desk)        # this thread has no window: it may move
+    names, seen = _desk_processes(), []
+
+    def colours(hwnd, width, height) -> int:
+        """How many colours the window draws of itself (PrintWindow, its
+        full content), on a 16x12 grid: 1 is a blank window."""
+        screen = u.GetDC(None)
+        dc = g.CreateCompatibleDC(screen)
+        bits = g.CreateCompatibleBitmap(screen, width, height)
+        old = g.SelectObject(dc, bits)
+        try:
+            u.PrintWindow(hwnd, dc, 2)               # PW_RENDERFULLCONTENT
+            return len({g.GetPixel(dc, width * i // 16, height * j // 12)
+                        for i in range(16) for j in range(12)})
+        finally:
+            g.SelectObject(dc, old)
+            g.DeleteObject(bits)
+            g.DeleteDC(dc)
+            u.ReleaseDC(None, screen)
+
+    dwm = ctypes.WinDLL("dwmapi")
+
+    def one(hwnd, _lparam):
+        if len(seen) < 8 and u.IsWindowVisible(hwnd):
+            kind = ctypes.create_unicode_buffer(64)
+            u.GetClassNameW(hwnd, kind, 64)
+            pid = wintypes.DWORD()
+            u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            box, cloaked = wintypes.RECT(), wintypes.DWORD()
+            u.GetWindowRect(hwnd, ctypes.byref(box))
+            dwm.DwmGetWindowAttribute(ctypes.c_void_p(hwnd), 14,  # CLOAKED
+                                      ctypes.byref(cloaked), 4)
+            kept = wintypes.DWORD()             # kept from screen copies?
+            u.GetWindowDisplayAffinity(hwnd, ctypes.byref(kept))
+            width, height = box.right - box.left, box.bottom - box.top
+            seen.append(f"{names.get(pid.value, pid.value)}/{kind.value} "
+                        f"{width}x{height}, "
+                        f"{colours(hwnd, width, height)} colours" +
+                        (" (hidden by Windows)" if cloaked.value else "") +
+                        (f" (kept from copies: {kept.value:#x})"
+                         if kept.value else "") +
+                        (" (in front)" if hwnd == u.GetForegroundWindow()
+                         else ""))
+        return True
+    try:
+        u.EnumDesktopWindows(desk, ctypes.WINFUNCTYPE(
+            wintypes.BOOL, ctypes.c_void_p, ctypes.c_void_p)(one), None)
+    finally:
+        u.CloseDesktop(desk)
+    return ", ".join(seen) or "no window"
+
+
+def _desk_follow(state: dict, shared: _DeskShared) -> int:
+    """This thread moved to the desktop Windows shows now, if it changed:
+    the person's ("Default"), the lock screen's and permission prompts'
+    ("Winlogon"), the screen saver's. What it shows (DESK_PERSON...)."""
+    import ctypes
+    from ctypes import wintypes
+    _k, u, _g, _a = _desk_dlls()
+    now = time.monotonic()
+    if now - state.get("at", 0.0) < 0.05:            # checked just now
+        return state.get("kind", DESK_UNSEEN)
+    state["at"] = now
+    # Every desktop right: Windows ignores, without an error, SendInput on
+    # a desktop opened without DESKTOP_JOURNALPLAYBACK (0x0020), as the
+    # lock screen's would be. MAXIMUM_ALLOWED if that is refused.
+    desk = u.OpenInputDesktop(0, False, DESK_RIGHTS)
+    every = bool(desk)
+    desk = desk or u.OpenInputDesktop(0, False, 0x02000000)
+    if not desk:
+        state["kind"] = DESK_UNSEEN
+        return DESK_UNSEEN
+    name = ctypes.create_unicode_buffer(64)
+    need = wintypes.DWORD()
+    u.GetUserObjectInformationW(desk, 2, name, ctypes.sizeof(name),
+                                ctypes.byref(need))            # UOI_NAME
+    if name.value != state.get("name"):
+        if u.SetThreadDesktop(desk):
+            if state.get("desk"):
+                u.CloseDesktop(state["desk"])
+            state["desk"], state["name"] = desk, name.value
+            state.pop("dc", None)                     # a new screen's DC
+            _desk_log(f"helper: on the {name.value} desktop" +
+                      ("" if every else " (not every right: input there "
+                       "may be ignored)"))
+        else:
+            u.CloseDesktop(desk)
+            _desk_log(f"helper: could not move to {name.value} "
+                      f"({ctypes.get_last_error()})")
+    else:
+        u.CloseDesktop(desk)
+    low = (state.get("name") or "").lower()
+    if low == "default":
+        kind = DESK_PERSON
+    elif low == "screen-saver":
+        kind = DESK_SAVER
+    elif low == "winlogon":
+        if now - state.get("checked", 0.0) > 0.5:
+            state["checked"] = now
+            state["prompt"] = _desk_running("consent.exe", shared.session)
+        kind = DESK_PROMPT if state.get("prompt") else DESK_LOCKED
+    else:
+        kind = DESK_UNSEEN
+    state["kind"] = kind
+    with shared.lock:
+        shared.kind, shared.desk = kind, state.get("name") or ""
+    return kind
+
+
+class _DeskGrab:
+    """The screen copied into memory the person's process may read: the
+    whole of Windows' virtual screen (every monitor, as the pointer's
+    positions count it), 32 bits a pixel, rows top first, with the pointer
+    drawn as gdigrab draws it. One picture at a time: the person's
+    Ferritext asks for the next once it has copied the last."""
+
+    def __init__(self, client_pid: int) -> None:
+        self.client_pid = client_pid
+        self.size = (0, 0)
+        self.section = self.view_dc = self.bitmap = self.old = None
+        self.serial = 0
+
+    def _make(self, width: int, height: int) -> Optional[int]:
+        """Memory for a picture of this size; its handle in the person's
+        process (to read only), or None."""
+        import ctypes
+        from ctypes import wintypes
+        k, _u, g, _a = _desk_dlls()
+        self.close()
+        size = width * height * 4
+        section = k.CreateFileMappingW(ctypes.c_void_p(-1), None, 0x04, 0,
+                                       size, None)      # PAGE_READWRITE
+        if not section:
+            return None
+
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [("biSize", wintypes.DWORD), ("biWidth", ctypes.c_long),
+                        ("biHeight", ctypes.c_long), ("biPlanes", wintypes.WORD),
+                        ("biBitCount", wintypes.WORD),
+                        ("biCompression", wintypes.DWORD),
+                        ("biSizeImage", wintypes.DWORD),
+                        ("biXPelsPerMeter", ctypes.c_long),
+                        ("biYPelsPerMeter", ctypes.c_long),
+                        ("biClrUsed", wintypes.DWORD),
+                        ("biClrImportant", wintypes.DWORD)]
+        header = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), width,
+                                  -height, 1, 32, 0, size, 0, 0, 0, 0)
+        bits = ctypes.c_void_p()
+        dc = g.CreateCompatibleDC(None)
+        bitmap = g.CreateDIBSection(dc, ctypes.byref(header), 0,
+                                    ctypes.byref(bits), section, 0)
+        if not dc or not bitmap:
+            if dc:
+                g.DeleteDC(dc)
+            k.CloseHandle(section)
+            return None
+        self.section, self.view_dc, self.bitmap = section, dc, bitmap
+        self.old = g.SelectObject(dc, bitmap)
+        self.size = (width, height)
+        client = k.OpenProcess(0x0040, False, self.client_pid)  # DUP_HANDLE
+        theirs = ctypes.c_void_p()
+        if client:
+            try:
+                k.DuplicateHandle(k.GetCurrentProcess(), section, client,
+                                  ctypes.byref(theirs), 0x0004, False,
+                                  0)                     # FILE_MAP_READ only
+            finally:
+                k.CloseHandle(client)
+        if not theirs.value:
+            _desk_log(f"helper: the screen's memory not given "
+                      f"({ctypes.get_last_error()})")
+            self.close()
+            return None
+        return theirs.value
+
+    def grab(self, pointer: bool) -> tuple:
+        """(handle for DESK_MAP or None, width, height): the screen copied."""
+        _k, u, g, _a = _desk_dlls()
+        x, y = u.GetSystemMetrics(76), u.GetSystemMetrics(77)
+        width, height = u.GetSystemMetrics(78), u.GetSystemMetrics(79)
+        if width <= 0 or height <= 0:
+            return None, 0, 0
+        mapped = None
+        if (width, height) != self.size or self.view_dc is None:
+            mapped = self._make(width, height)
+            if mapped is None:
+                return None, 0, 0
+        screen = u.GetDC(None)
+        try:
+            g.BitBlt(self.view_dc, 0, 0, width, height, screen, x, y,
+                     0x00CC0020 | 0x40000000)      # SRCCOPY | CAPTUREBLT
+        finally:
+            u.ReleaseDC(None, screen)
+        if pointer:
+            self._pointer(x, y)
+        g.GdiFlush()
+        self.serial += 1
+        return mapped, width, height
+
+    def _pointer(self, x0: int, y0: int) -> None:
+        import ctypes
+        from ctypes import wintypes
+        _k, u, g, _a = _desk_dlls()
+
+        class CURSORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
+                        ("hCursor", ctypes.c_void_p),
+                        ("ptScreenPos", wintypes.POINT)]
+
+        class ICONINFO(ctypes.Structure):
+            _fields_ = [("fIcon", wintypes.BOOL), ("xHotspot", wintypes.DWORD),
+                        ("yHotspot", wintypes.DWORD),
+                        ("hbmMask", ctypes.c_void_p),
+                        ("hbmColor", ctypes.c_void_p)]
+        info = CURSORINFO(cbSize=ctypes.sizeof(CURSORINFO))
+        if not u.GetCursorInfo(ctypes.byref(info)) or not info.flags & 1 \
+                or not info.hCursor:
+            return
+        icon = ICONINFO()
+        hot = (0, 0)
+        if u.GetIconInfo(info.hCursor, ctypes.byref(icon)):
+            hot = (icon.xHotspot, icon.yHotspot)
+            for bitmap in (icon.hbmMask, icon.hbmColor):
+                if bitmap:
+                    g.DeleteObject(bitmap)
+        u.DrawIconEx(self.view_dc, info.ptScreenPos.x - hot[0] - x0,
+                     info.ptScreenPos.y - hot[1] - y0, info.hCursor, 0, 0,
+                     0, None, 0x0003)                         # DI_NORMAL
+
+    def close(self) -> None:
+        k, _u, g, _a = _desk_dlls()
+        if self.view_dc:
+            if self.old:
+                g.SelectObject(self.view_dc, self.old)
+            g.DeleteDC(self.view_dc)
+        if self.bitmap:
+            g.DeleteObject(self.bitmap)
+        if self.section:
+            k.CloseHandle(self.section)
+        self.section = self.view_dc = self.bitmap = self.old = None
+        self.size = (0, 0)
+
+
+def _desk_read(pipe) -> Optional[tuple]:
+    """The next record from `pipe`, unpacked; None once it is closed."""
+    import ctypes
+    from ctypes import wintypes
+    k = _desk_dlls()[0]
+    size = DESK_RECORD.size
+    buffer = ctypes.create_string_buffer(size)
+    got, done = wintypes.DWORD(), 0
+    while done < size:
+        if not k.ReadFile(pipe, ctypes.byref(buffer, done), size - done,
+                          ctypes.byref(got), None) or not got.value:
+            return None
+        done += got.value
+    return DESK_RECORD.unpack(buffer.raw)
+
+
+def _desk_write(pipe, kind: int, flag: int = 0, a: int = 0, b: int = 0,
+                c: int = 0, d: int = 0) -> bool:
+    import ctypes
+    from ctypes import wintypes
+    data = DESK_RECORD.pack(kind, flag, a, b, c, d)
+    sent = wintypes.DWORD()
+    return bool(_desk_dlls()[0].WriteFile(pipe, data, len(data),
+                                          ctypes.byref(sent), None)) \
+        and sent.value == len(data)
+
+
+def _desk_screen(pipe, client_pid: int, shared: _DeskShared) -> None:
+    """One connection to the screen's pipe: pictures when asked
+    (DESK_GRAB), what the screen shows (DESK_STATE)."""
+    grab, state = _DeskGrab(client_pid), {}
+    try:
+        while True:
+            record = _desk_read(pipe)
+            if record is None:
+                return
+            kind, flag = record[0], record[1]
+            if kind == DESK_HELLO:
+                shared.chinese = bool(flag & 1)
+                _desk_write(pipe, DESK_HELLO, 0, DESK_VERSION,
+                            shared.session, os.getpid())
+            elif kind == DESK_GRAB:
+                shown = _desk_follow(state, shared)
+                mapped, width, height = grab.grab(bool(flag & 1))
+                if mapped is not None:
+                    _desk_write(pipe, DESK_MAP, 0, 0, mapped,
+                                width * height * 4)
+                _desk_write(pipe, DESK_FRAME, shown, 0, width, height,
+                            grab.serial)
+            elif kind == DESK_STATE:
+                shown = _desk_follow(state, shared)
+                _desk_write(pipe, DESK_STATE, int(shared.answer_prompts()),
+                            shown)
+    finally:
+        grab.close()
+
+
+class _DeskInput:
+    """The pointer and keys put in on the desktop Windows shows, from a
+    process that runs as SYSTEM there: no window refuses them (one run as
+    administrator, the stand-in of one that does not answer, the lock
+    screen's password)."""
+
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                        ("mouseData", wintypes.DWORD),
+                        ("dwFlags", wintypes.DWORD),
+                        ("time", wintypes.DWORD),
+                        ("dwExtraInfo", ctypes.c_size_t)]
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                        ("dwFlags", wintypes.DWORD),
+                        ("time", wintypes.DWORD),
+                        ("dwExtraInfo", ctypes.c_size_t)]
+
+        class HARDWAREINPUT(ctypes.Structure):
+            _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD),
+                        ("wParamH", wintypes.WORD)]
+
+        class _UNION(ctypes.Union):
+            _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT),
+                        ("hi", HARDWAREINPUT)]
+
+        class INPUT(ctypes.Structure):
+            _fields_ = [("type", wintypes.DWORD), ("u", _UNION)]
+        self._ct, self._INPUT, self._UNION = ctypes, INPUT, _UNION
+        self._MOUSE, self._KEYS = MOUSEINPUT, KEYBDINPUT
+
+    def _send(self, *inputs) -> int:
+        """How many Windows took (0: refused)."""
+        array = (self._INPUT * len(inputs))(*inputs)
+        return _desk_dlls()[1].SendInput(len(inputs), array,
+                                         self._ct.sizeof(self._INPUT))
+
+    def _mouse(self, flags: int, x: int = 0, y: int = 0, data: int = 0):
+        return self._INPUT(type=0, u=self._UNION(mi=self._MOUSE(
+            dx=x, dy=y, mouseData=data & 0xFFFFFFFF, dwFlags=flags)))
+
+    def _key(self, vk: int, scan: int, flags: int):
+        return self._INPUT(type=1, u=self._UNION(ki=self._KEYS(
+            wVk=vk, wScan=scan, dwFlags=flags)))
+
+    def typed(self, unit: int) -> list:
+        """21.0: a character as the keys that make it on the keyboard layout
+        of the window in front, Shift, Ctrl and Alt with it: the lock
+        screen's password box takes keys, where a person's own programs
+        also take the character itself (VK_PACKET). [] if none makes it."""
+        if 0xD800 <= unit <= 0xDFFF:                      # half of a pair
+            return []
+        u = _desk_dlls()[1]
+        layout = u.GetKeyboardLayout(u.GetWindowThreadProcessId(
+            u.GetForegroundWindow(), None))
+        code = u.VkKeyScanExW(chr(unit), layout)
+        if code == -1 or code & 0xF800:     # no key; or Hankaku and others
+            return []
+        vk, shifts = code & 0xFF, code >> 8
+        held = [(vk_, scan) for bit, vk_, scan in (
+            (1, 0x10, 0x2A), (2, 0x11, 0x1D), (4, 0x12, 0x38)) if shifts & bit]
+        scan = u.MapVirtualKeyExW(vk, 0, layout)      # MAPVK_VK_TO_VSC
+        return [self._key(m, s, 0) for m, s in held] + [
+            self._key(vk, scan, 0), self._key(vk, scan, 0x0002)] + [
+            self._key(m, s, 0x0002) for m, s in reversed(held)]
+
+    def do(self, kind: int, flag: int, a: int, b: int, c: int,
+           as_keys: bool = False) -> int:
+        """One record, its every field checked (anything else dropped).
+        `as_keys`: characters typed as keys (not on the person's desktop).
+        How many events Windows took (-1: none put in)."""
+        here = 0x0001 | 0x8000 | 0x4000      # MOVE|ABSOLUTE|VIRTUALDESK
+        if kind in (DESK_MOVE, DESK_BUTTON) and not (
+                0 <= b <= 65535 and 0 <= c <= 65535):
+            return -1
+        if kind == DESK_MOVE:
+            return self._send(self._mouse(here, b, c))
+        elif kind == DESK_BUTTON and a in (1, 2, 3):
+            press = {1: (0x0002, 0x0004), 2: (0x0008, 0x0010),
+                     3: (0x0020, 0x0040)}[a][0 if flag & 1 else 1]
+            return self._send(self._mouse(here, b, c), self._mouse(press))
+        if kind == DESK_WHEEL and abs(b) <= 12000 and abs(c) <= 12000:
+            events = ([self._mouse(0x0800, data=c)] if c else []) + \
+                ([self._mouse(0x1000, data=b)] if b else [])
+            return self._send(*events) if events else -1
+        if kind == DESK_KEY and 1 <= a <= 254 and 0 <= b <= 255:
+            return self._send(self._key(a, b, (0x0001 if flag & 2 else 0) |
+                                        (0 if flag & 1 else 0x0002)))
+        if kind == DESK_UNIT and 1 <= a <= 0xFFFF:
+            keys = self.typed(a) if as_keys else []
+            if keys:                     # pressed and let go at its press
+                return self._send(*keys) if flag & 1 else -1
+            return self._send(self._key(0, a, 0x0004 |
+                                        (0 if flag & 1 else 0x0002)))
+        return -1
+
+
+def _desk_in(pipe, _client_pid: int, shared: _DeskShared, tell) -> None:
+    """One connection to the pointer and keys' pipe. On a permission prompt
+    only the pointer moves, unless the service's setting allows more;
+    Ctrl+Alt+Del goes to the service (`tell`)."""
+    put, state = _DeskInput(), {}
+    while True:
+        record = _desk_read(pipe)
+        if record is None:
+            return
+        kind, flag, a, b, c, _d = record
+        if kind == DESK_SAS:
+            tell(b"SAS\n")
+            threading.Timer(3.0, lambda: _desk_log(       # what came up
+                "helper: 3 s after Ctrl+Alt+Del: " + _desk_windows())).start()
+            continue
+        if kind not in (DESK_MOVE, DESK_BUTTON, DESK_WHEEL, DESK_KEY,
+                        DESK_UNIT):
+            continue
+        shown = _desk_follow(state, shared)
+        if shown == DESK_PROMPT and kind != DESK_MOVE and \
+                not shared.answer_prompts():
+            continue
+        took = put.do(kind, flag, a, b, c, as_keys=shown != DESK_PERSON)
+        if state.get("told") != state.get("name") and took >= 0:
+            state["told"] = state.get("name")    # once a desktop: for the log
+            _desk_log(f"helper: input on the {state['told']} desktop "
+                      f"({'taken' if took else 'refused'} by Windows)")
+
+
+#: The bar's words on the lock screen and permission prompts (the helper
+#: has no translations of its own; the person's Ferritext says which).
+DESK_BAR_WORDS = ("Ferritext: this computer is being used from afar",
+                  "Ferritext：这台电脑正被远程使用")
+
+
+def _desk_bar(shared: _DeskShared) -> None:
+    """While a session is connected and the screen shows the lock screen,
+    a permission prompt or the screen saver, a red bar across its top says
+    so, as the person's Ferritext does on their own desktop: whoever is at
+    the computer sees that someone far away uses it. A window can only be
+    made by a thread on the desktop it is shown on, and that thread can
+    only move to another desktop without one: the bar is made again on
+    each."""
+    import ctypes
+    from ctypes import wintypes
+    k, u, g, _a = _desk_dlls()
+    PROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_void_p,
+                              ctypes.c_uint, ctypes.c_size_t,
+                              ctypes.c_ssize_t)
+
+    class PAINTSTRUCT(ctypes.Structure):
+        _fields_ = [("hdc", ctypes.c_void_p), ("fErase", wintypes.BOOL),
+                    ("rcPaint", wintypes.RECT), ("fRestore", wintypes.BOOL),
+                    ("fIncUpdate", wintypes.BOOL),
+                    ("rgbReserved", ctypes.c_byte * 32)]
+
+    class WNDCLASSEXW(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_uint), ("style", ctypes.c_uint),
+                    ("lpfnWndProc", PROC), ("cbClsExtra", ctypes.c_int),
+                    ("cbWndExtra", ctypes.c_int),
+                    ("hInstance", ctypes.c_void_p),
+                    ("hIcon", ctypes.c_void_p), ("hCursor", ctypes.c_void_p),
+                    ("hbrBackground", ctypes.c_void_p),
+                    ("lpszMenuName", wintypes.LPCWSTR),
+                    ("lpszClassName", wintypes.LPCWSTR),
+                    ("hIconSm", ctypes.c_void_p)]
+
+    def paint(hwnd, message, wparam, lparam):
+        if message != 0x000F:                               # WM_PAINT
+            return u.DefWindowProcW(hwnd, message, wparam, lparam)
+        ps, rect = PAINTSTRUCT(), wintypes.RECT()
+        dc = u.BeginPaint(hwnd, ctypes.byref(ps))
+        u.GetClientRect(hwnd, ctypes.byref(rect))
+        brush = g.CreateSolidBrush(0x002A2AC8)               # red (BGR)
+        u.FillRect(dc, ctypes.byref(rect), brush)
+        g.DeleteObject(brush)
+        g.SetBkMode(dc, 1)                                  # TRANSPARENT
+        g.SetTextColor(dc, 0x00FFFFFF)
+        u.DrawTextW(dc, DESK_BAR_WORDS[int(shared.chinese)], -1,
+                    ctypes.byref(rect), 0x25)    # CENTER|VCENTER|SINGLELINE
+        u.EndPaint(hwnd, ctypes.byref(ps))
+        return 0
+    procedure = PROC(paint)
+    kind = WNDCLASSEXW(cbSize=ctypes.sizeof(WNDCLASSEXW),
+                       lpfnWndProc=procedure,
+                       hInstance=k.GetModuleHandleW(None),
+                       lpszClassName="FerritextDeskBar")
+    if not u.RegisterClassExW(ctypes.byref(kind)):
+        _desk_log(f"helper: no bar ({ctypes.get_last_error()})")
+        return
+    state, bar, shown_on = {}, None, None
+    message = (ctypes.c_byte * 48)()                        # an MSG
+    while True:
+        with shared.lock:
+            wanted = shared.connected > 0 and shared.kind in (
+                DESK_LOCKED, DESK_PROMPT, DESK_SAVER)
+            desk = shared.desk
+        if bar and (not wanted or desk != shown_on):
+            u.DestroyWindow(bar)
+            bar = None
+        if wanted and bar is None:
+            _desk_follow(state, shared)
+            shown_on = state.get("name")
+            width = u.GetSystemMetrics(0)                   # SM_CXSCREEN
+            bar = u.CreateWindowExW(
+                0x00000008 | 0x00000080 | 0x08000000 | 0x00080000 |
+                0x00000020,          # TOPMOST TOOLWINDOW NOACTIVATE LAYERED
+                "FerritextDeskBar", "Ferritext", 0x80000000 | 0x10000000,
+                0, 0, width, 30, None, None, kind.hInstance, None)
+            if bar:                                # POPUP | VISIBLE above
+                u.SetLayeredWindowAttributes(bar, 0, 235, 0x2)  # LWA_ALPHA
+        while u.PeekMessageW(message, None, 0, 0, 1):       # PM_REMOVE
+            u.TranslateMessage(message)
+            u.DispatchMessageW(message)
+        time.sleep(0.2)
+
+
+def _desk_serve(prefix: str, shared: _DeskShared, user_sid: str,
+                work) -> None:
+    """One of the helper's pipes, for one connection at a time from the
+    screen's own session; `work(pipe, client's process, shared)` serves
+    it. The pipe is made once, first of its name (a pipe someone made
+    before is not used)."""
+    import ctypes
+    from ctypes import wintypes
+    k = _desk_dlls()[0]
+    name = prefix + str(shared.session)
+    security = _desk_security(desk_pipe_security(user_sid))
+    pipe = k.CreateNamedPipeW(
+        name, 0x00000003 | 0x00080000,   # DUPLEX | FIRST_PIPE_INSTANCE
+        0x00000008, 1, 1 << 16, 1 << 16, 0,    # REJECT_REMOTE_CLIENTS
+        ctypes.byref(security))
+    if not pipe or pipe == ctypes.c_void_p(-1).value:
+        _desk_log(f"helper: no pipe {name} ({ctypes.get_last_error()})")
+        return
+    _desk_log(f"helper: {name} ready")
+    while True:
+        if not k.ConnectNamedPipe(pipe, None) and \
+                ctypes.get_last_error() != 535:      # PIPE_CONNECTED
+            time.sleep(0.5)
+            continue
+        session, client = wintypes.ULONG(), wintypes.ULONG()
+        k.GetNamedPipeClientSessionId(pipe, ctypes.byref(session))
+        k.GetNamedPipeClientProcessId(pipe, ctypes.byref(client))
+        if session.value == shared.session:
+            with shared.lock:
+                shared.connected += 1
+            try:
+                work(pipe, client.value, shared)
+            except Exception as exc:
+                _desk_log(f"helper: {name}: {type(exc).__name__}: {exc}")
+            finally:
+                with shared.lock:
+                    shared.connected -= 1
+        k.DisconnectNamedPipe(pipe)
+
+
+def desk_main(argv: list) -> None:
+    """The helper (DESK_FLAG [handle]): its two pipes, until the service
+    ends it. `handle`, given by the service: where Ctrl+Alt+Del is asked
+    for."""
+    import ctypes
+    from ctypes import wintypes
+    k, u, _g, _a = _desk_dlls()
+    try:
+        k.SetDefaultDllDirectories(0x00001000)   # no DLL from PATH or here
+    except AttributeError:
+        pass
+    try:                     # pixels as the screen has them, every monitor
+        u.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+    except AttributeError:
+        u.SetProcessDPIAware()
+    at = argv.index(DESK_FLAG)
+    service = int(argv[at + 1]) if len(argv) > at + 1 and \
+        argv[at + 1].isdigit() else 0
+    session = _desk_session()
+    shared = _DeskShared(session)
+    user = _desk_session_user(session)
+    _desk_log(f"helper: session {session}, its person "
+              f"{'known' if user else 'not signed in'}")
+    tell_lock = threading.Lock()
+
+    def tell(data: bytes) -> None:
+        if not service:
+            return
+        sent = wintypes.DWORD()
+        with tell_lock:
+            k.WriteFile(ctypes.c_void_p(service), data, len(data),
+                        ctypes.byref(sent), None)
+
+    threading.Thread(target=_desk_bar, args=(shared,), daemon=True,
+                     name="desk-bar").start()
+    threading.Thread(target=_desk_serve, daemon=True, name="desk-in",
+                     args=(DESK_IN, shared, user,
+                           lambda p, c, s: _desk_in(p, c, s, tell))).start()
+    _desk_serve(DESK_SCREEN, shared, user, _desk_screen)
+
+
+# ---- the service --------------------------------------------------------------
+class _ServiceState:
+    """The service's own state, between Windows' calls and its loop."""
+    handle = None
+    stop = None          # an event: Windows asked it to stop
+    changed = None       # an event: the screen's session changed
+    keep: list = []      # what ctypes must not free while Windows holds it
+
+
+def _service_report(state: int, code: int = 0) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    class SERVICE_STATUS(ctypes.Structure):
+        _fields_ = [(n, wintypes.DWORD) for n in (
+            "dwServiceType", "dwCurrentState", "dwControlsAccepted",
+            "dwWin32ExitCode", "dwServiceSpecificExitCode", "dwCheckPoint",
+            "dwWaitHint")]
+    accepts = 0 if state != 4 else 0x01 | 0x04 | 0x80   # STOP|SHUTDOWN|SESSION
+    status = SERVICE_STATUS(0x10, state, accepts, code, 0, 0,
+                            5000 if state in (2, 3) else 0)
+    _desk_dlls()[3].SetServiceStatus(_ServiceState.handle,
+                                     ctypes.byref(status))
+
+
+def _service_control(control, event, _data, _context):
+    """Windows' calls (on a thread of its own): stop, shut down, and a
+    session that connected, disconnected, signed in or out."""
+    k = _desk_dlls()[0]
+    if control in (1, 5):                           # STOP, SHUTDOWN
+        _service_report(3)                          # STOP_PENDING
+        k.SetEvent(_ServiceState.stop)
+    elif control == 14 and event in (1, 2, 5, 6):   # SESSIONCHANGE
+        k.SetEvent(_ServiceState.changed)
+    return 0
+
+
+def _service_helper(session: int, command: list):
+    """The helper started on `session` as SYSTEM: (its process, the read
+    end of what it tells the service), or (None, None)."""
+    import ctypes
+    from ctypes import wintypes
+    k, _u, _g, a = _desk_dlls()
+
+    class SECURITY_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("nLength", wintypes.DWORD),
+                    ("lpSecurityDescriptor", ctypes.c_void_p),
+                    ("bInheritHandle", wintypes.BOOL)]
+
+    class STARTUPINFOW(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("lpReserved", wintypes.LPWSTR),
+                    ("lpDesktop", wintypes.LPWSTR),
+                    ("lpTitle", wintypes.LPWSTR)] + \
+            [(n, wintypes.DWORD) for n in (
+                "dwX", "dwY", "dwXSize", "dwYSize", "dwXCountChars",
+                "dwYCountChars", "dwFillAttribute", "dwFlags")] + \
+            [("wShowWindow", wintypes.WORD), ("cbReserved2", wintypes.WORD),
+             ("lpReserved2", ctypes.c_void_p), ("hStdInput", ctypes.c_void_p),
+             ("hStdOutput", ctypes.c_void_p), ("hStdError", ctypes.c_void_p)]
+
+    class PROCESS_INFORMATION(ctypes.Structure):
+        _fields_ = [("hProcess", ctypes.c_void_p), ("hThread", ctypes.c_void_p),
+                    ("dwProcessId", wintypes.DWORD),
+                    ("dwThreadId", wintypes.DWORD)]
+    own, token = ctypes.c_void_p(), ctypes.c_void_p()
+    if not a.OpenProcessToken(k.GetCurrentProcess(), 0x000F01FF,
+                              ctypes.byref(own)):        # TOKEN_ALL_ACCESS
+        return None, None
+    try:
+        if not a.DuplicateTokenEx(own, 0x02000000, None, 2, 1,
+                                  ctypes.byref(token)):  # a primary token
+            return None, None
+    finally:
+        k.CloseHandle(own)
+    reader, writer = ctypes.c_void_p(), ctypes.c_void_p()
+    try:
+        number = wintypes.DWORD(session)
+        if not a.SetTokenInformation(token, 12, ctypes.byref(number), 4):
+            _desk_log(f"service: session {session} refused "
+                      f"({ctypes.get_last_error()})")     # TokenSessionId
+            return None, None
+        inherit = SECURITY_ATTRIBUTES(ctypes.sizeof(SECURITY_ATTRIBUTES),
+                                      None, True)
+        if not k.CreatePipe(ctypes.byref(reader), ctypes.byref(writer),
+                            ctypes.byref(inherit), 0):
+            return None, None
+        k.SetHandleInformation(reader, 1, 0)        # only the writer passes
+        line = subprocess.list2cmdline(command + [DESK_FLAG,
+                                                  str(writer.value)])
+        start = STARTUPINFOW(cb=ctypes.sizeof(STARTUPINFOW),
+                             lpDesktop="winsta0\\default")
+        info = PROCESS_INFORMATION()
+        if not a.CreateProcessAsUserW(token, None, line, None, None, True,
+                                      0x08000000, None, None,   # NO_WINDOW
+                                      ctypes.byref(start),
+                                      ctypes.byref(info)):
+            _desk_log(f"service: the helper did not start "
+                      f"({ctypes.get_last_error()})")
+            k.CloseHandle(reader)
+            return None, None
+        k.CloseHandle(info.hThread)
+        _desk_log(f"service: helper {info.dwProcessId} on session {session}")
+        return info.hProcess, reader
+    finally:
+        k.CloseHandle(token)
+        if writer:
+            k.CloseHandle(writer)
+
+
+def _service_listen(reader) -> None:
+    """What the helper tells the service: Ctrl+Alt+Del, asked for."""
+    import ctypes
+    from ctypes import wintypes
+    k = _desk_dlls()[0]
+    buffer, got, pending = ctypes.create_string_buffer(64), \
+        wintypes.DWORD(), b""
+    while k.ReadFile(reader, buffer, 64, ctypes.byref(got), None) and \
+            got.value:
+        pending = (pending + buffer.raw[:got.value])[-64:]
+        while b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            if line == b"SAS":
+                try:
+                    ctypes.WinDLL("sas").SendSAS(False)
+                    _desk_log("service: Ctrl+Alt+Del sent")
+                except (OSError, AttributeError) as exc:
+                    _desk_log(f"service: no Ctrl+Alt+Del: {exc}")
+    k.CloseHandle(reader)
+
+
+def _service_command() -> list:
+    """How this program is started again: the EXE, or this Python with
+    its file (the tests' Windows)."""
+    if "__compiled__" in globals():
+        return [program_file()]
+    return [sys.executable, os.path.abspath(sys.argv[0])]
+
+
+def _service_loop() -> None:
+    """The service's work: one helper on the screen's session, started
+    again if it ends (after 1, 2, 5, then 10 seconds) or when the screen's
+    session changes; ended with the service."""
+    import ctypes
+    k = _desk_dlls()[0]
+    helper, session, waits, last = None, None, (1, 2, 5, 10), 0.0
+    tries = 0
+    command = _service_command()
+    while True:
+        console = k.WTSGetActiveConsoleSessionId()
+        if helper is not None and console != session:
+            k.TerminateProcess(helper, 0)
+            k.CloseHandle(helper)
+            helper = None
+        if helper is None and console != 0xFFFFFFFF and \
+                time.monotonic() - last >= waits[min(tries, 3)]:
+            last, tries = time.monotonic(), tries + 1
+            helper, reader = _service_helper(console, command)
+            if helper is not None:
+                session = console
+                threading.Thread(target=_service_listen, args=(reader,),
+                                 daemon=True).start()
+        handles = [_ServiceState.stop, _ServiceState.changed] + \
+            ([helper] if helper is not None else [])
+        array = (ctypes.c_void_p * len(handles))(*handles)
+        woke = k.WaitForMultipleObjects(len(handles), array, False, 2000)
+        if woke == 0:                                    # stop
+            break
+        if woke == 0xFFFFFFFF:                           # WAIT_FAILED
+            time.sleep(1.0)
+        elif woke == 1:                                  # session changed
+            k.ResetEvent(_ServiceState.changed)
+            if helper is not None:
+                k.TerminateProcess(helper, 0)
+                k.CloseHandle(helper)
+                helper, tries = None, 0
+        elif woke == 2 and helper is not None:           # the helper ended
+            _desk_log("service: the helper ended")
+            k.CloseHandle(helper)
+            helper = None
+        elif helper is not None:
+            tries = 0
+    if helper is not None:
+        k.TerminateProcess(helper, 0)
+        k.CloseHandle(helper)
+
+
+def service_main() -> None:
+    """SERVICE_FLAG: started by Windows' service manager, which calls
+    _run on a thread of its own and waits for the service to say it
+    stopped."""
+    import ctypes
+    from ctypes import wintypes
+    k, _u, _g, a = _desk_dlls()
+    try:
+        k.SetDefaultDllDirectories(0x00001000)
+    except AttributeError:
+        pass
+    MAIN = ctypes.WINFUNCTYPE(None, wintypes.DWORD, ctypes.c_void_p)
+    CONTROL = ctypes.WINFUNCTYPE(wintypes.DWORD, wintypes.DWORD,
+                                 wintypes.DWORD, ctypes.c_void_p,
+                                 ctypes.c_void_p)
+
+    def run(_argc, _argv):
+        handler = CONTROL(_service_control)
+        _ServiceState.keep.append(handler)
+        _ServiceState.handle = a.RegisterServiceCtrlHandlerExW(
+            WIN_SERVICE, handler, None)
+        _ServiceState.stop = k.CreateEventW(None, True, False, None)
+        _ServiceState.changed = k.CreateEventW(None, True, False, None)
+        _service_report(2)                               # START_PENDING
+        _service_report(4)                               # RUNNING
+        _desk_log("service: running")
+        try:
+            _service_loop()
+        except Exception as exc:
+            _desk_log(f"service: {type(exc).__name__}: {exc}")
+        _desk_log("service: stopped")
+        _service_report(1)                               # STOPPED
+
+    class SERVICE_TABLE_ENTRYW(ctypes.Structure):
+        _fields_ = [("lpServiceName", wintypes.LPWSTR),
+                    ("lpServiceProc", MAIN)]
+    main = MAIN(run)
+    table = (SERVICE_TABLE_ENTRYW * 2)(SERVICE_TABLE_ENTRYW(WIN_SERVICE,
+                                                            main),
+                                       SERVICE_TABLE_ENTRYW(None, MAIN()))
+    _ServiceState.keep += [main, table]
+    if not a.StartServiceCtrlDispatcherW(table):
+        _desk_log(f"service: not started by Windows' service manager "
+                  f"({ctypes.get_last_error()})")
+
+
+if __name__ == "__main__" and sys.platform == "win32" and (
+        SERVICE_FLAG in sys.argv[1:] or DESK_FLAG in sys.argv[1:]):
+    if SERVICE_FLAG in sys.argv[1:]:
+        service_main()
+    else:
+        desk_main(sys.argv)
+    raise SystemExit
+if __name__ == "__main__" and sys.platform == "win32" and any(
+        flag in sys.argv[1:] for flag in (SERVICE_INSTALL, SERVICE_REMOVE,
+                                          SERVICE_SET)):
+    # Settings' steps run to their end below this file (service_run) and
+    # need no window: Kivy makes none, as for Android's sync service.
+    # Else it opened one in the middle of Windows' prompt, and on a
+    # computer without OpenGL 2 waited on Kivy's own error box for good
+    # (build run 168).
+    os.environ.update({"KIVY_WINDOW": "none", "KIVY_DPI": "160",
+                       "KIVY_METRICS_DENSITY": "1",
+                       "KIVY_METRICS_FONTSCALE": "1", "KIVY_NO_ARGS": "1",
+                       "KIVY_NO_CONSOLELOG": "1"})
+
 import qrcode
 import requests
 from cryptography.hazmat.backends import default_backend
@@ -409,6 +1673,16 @@ def one_touch_per_finger(config, environ) -> None:
 
 if kivy_platform == "android":
     one_touch_per_finger(Config, os.environ)
+    # 20.0 (the owner: "Tapping back button should navigate out one menu
+    # rather than exit the app altogether"): Back is this app's alone.
+    # Left to SDL's activity, a Back press it does not hand over as a key
+    # ends the activity (SDL: trapped, "to handle the key press ...
+    # reliably"). The app steps back itself (_on_keyboard), and leaves for
+    # the home screen from its outermost page (android_move_to_back).
+    os.environ.setdefault("SDL_ANDROID_TRAP_BACK_BUTTON", "1")
+# ...and Kivy never closes the app on Back or Esc by itself, as it does
+# when no handler took the key (one that failed, or was not bound yet).
+Config.set("kivy", "exit_on_escape", "0")
 # A tap's press shows for at least this long (16.0; Kivy's is 35 ms).
 Config.set("graphics", "min_state_time", "0.12")
 
@@ -785,6 +2059,10 @@ def parse_identity_key(text: str) -> tuple:
     text = text.strip()
     if not text.startswith(DEVICE_KEY_PREFIX):
         return parse_private_key(text), None
+    # 20.0 (F6): a key copied from an e-mail or a chat that wrapped it has
+    # line breaks or spaces inside. A key holds neither, and its checksum
+    # still refuses any other change.
+    text = "".join(text.split())
     try:
         version, payload = b58check_decode(text[len(DEVICE_KEY_PREFIX):])
     except ValueError as exc:
@@ -1228,7 +2506,7 @@ REQUIRE_TLS = _os.environ.get("FEXT_REQUIRE_TLS", "") not in ("", "0", "false")
 
 APP_NAME = "Ferritext"
 #: Must equal `version` in buildozer.spec — CI refuses to build if not.
-APP_VERSION = "19.0.1"
+APP_VERSION = "21.1.0"
 
 # The identity/QR payload keeps carrying the ORIGINAL tag. It is wire data
 # that older clients already produce and consume, so renaming the app must
@@ -1497,7 +2775,11 @@ VIDEO_POSTER_BYTES = 16 * 1024       # its still picture, as a link preview's
 MEDIA_MIME = {"image": ("image/jpeg", "image/png", "image/webp"),
               "voice": ("audio/mp4", "audio/aac", "audio/ogg",
                         "audio/3gpp", "audio/amr", "audio/wav"),
-              "video": ("video/mp4",)}
+              "video": ("video/mp4",),
+              # 20.0: a document, any file as it is, with its name. It is
+              # kept and handed on (Save), never opened or run by the app.
+              "file": ("application/octet-stream",)}
+FILE_NAME_MAX = 120
 
 # ---- v9.1.2 pictures ----------------------------------------------------------
 # A profile picture is small enough to travel inside one ordinary end-to-end
@@ -1946,6 +3228,23 @@ TEXT_SCALES = (("small", N_("S"), 0.9), ("default", N_("M"), 1.0),
                ("large", N_("L"), 1.15), ("largest", N_("XL"), 1.3))
 THEME_CHOICES = (("system", N_("System")), ("light", N_("Light")),
                  ("dark", N_("Dark")))
+#: 21.0 (SELECT29): how long a finger stays still on a message or a chat
+#: before it counts as a hold, which selects it (seconds). The owner asked
+#: for less than the 0.42 s before, and for a choice.
+HOLD_CHOICES = (("short", N_("Short"), 0.25), ("default", N_("Medium"), 0.3),
+                ("long", N_("Long"), 0.5))
+
+
+def hold_left(touch) -> float:
+    """21.0 (SELECT29): what is left of a hold (APPEARANCE.hold) when a row
+    hears of a touch. A list keeps a touch back while it tells a tap from
+    a scroll (Kivy's scroll_timeout, 0.25 s); a finger's hold counts from
+    the finger (before 21.0 it began only after that wait). A mouse's
+    still counts from the row: on a computer a press that rests before a
+    drag marks words, and a right click selects the message."""
+    if getattr(touch, "device", "") == "mouse" and not SWIPE_MOUSE:
+        return APPEARANCE.hold
+    return max(0.0, APPEARANCE.hold - (time.time() - touch.time_start))
 
 
 class _Appearance:
@@ -1954,6 +3253,7 @@ class _Appearance:
     scale = 1.0
     reduce_motion = False
     edge_fade = True                # 18.1: lists fade at their edges
+    hold = 0.3                      # 21.0: seconds to a hold (HOLD_CHOICES)
 
     def resolve(self) -> str:
         """Re-read the preferences and the system; returns the theme name."""
@@ -1970,6 +3270,8 @@ class _Appearance:
         # what make moving between screens read as instant.
         self.reduce_motion = bool(prefs.get("reduce_motion", False))
         self.edge_fade = bool(prefs.get("edge_fade", True))
+        self.hold = dict((k, s) for k, _l, s in HOLD_CHOICES).get(
+            prefs.get("hold", "default"), 0.3)
         # Black is the dark theme's default (v12); a choice of grey stays.
         self.black = bool(prefs.get("black", True))
         if self.mode != "system":
@@ -2790,6 +4092,23 @@ def single_line_text(text: str, limit: int) -> str:
     return flat if len(flat) <= limit else flat[:limit - 1].rstrip() + "…"
 
 
+def file_name(value) -> str:
+    """A document's name as it may be shown and saved under: its last
+    part only (no folder a sender could aim it at), without control
+    characters or the signs a file system refuses, FILE_NAME_MAX long at
+    the most with its ending kept; "" for nothing usable."""
+    if not isinstance(value, str):
+        return ""
+    name = re.split(r"[\\/]", value)[-1]
+    name = re.sub(r'[\x00-\x1f\x7f<>:"|?*]', "", name).strip(" .")
+    if len(name) > FILE_NAME_MAX:
+        stem, dot, ending = name.rpartition(".")
+        ending = dot + ending if dot and len(ending) <= 10 else ""
+        name = (stem if ending else name)[:FILE_NAME_MAX - len(ending)] \
+            + ending
+    return name
+
+
 def message_text(msg: dict) -> str:
     """The words of a message, as a person would quote them: a photo's
     caption, nothing for a voice or video message, the body otherwise."""
@@ -2874,6 +4193,8 @@ def sanitize_media(media) -> Optional[dict]:
     caption = _str(media.get("cap"), 1000)
     if caption:
         out["cap"] = sanitize_text(caption)
+    if kind == "file":                               # 20.0
+        out["name"] = file_name(media.get("name")) or "file"
     return out
 
 
@@ -3254,15 +4575,29 @@ def sanitize_ext(x) -> dict:
         out["fwd"] = 1
     if x.get("auto") in (1, True):
         out["auto"] = 1                       # 18.1 (AWAY): an away reply
+    card = x.get("card")                      # 20.0: a contact handed on
+    if isinstance(card, dict) and valid_address(_str(card.get("a"), 64)
+                                                or ""):
+        name = _str(card.get("u"), 40) or ""
+        out["card"] = {"a": card["a"],
+                       "u": name if valid_username(name) else ""}
     media = sanitize_media(x.get("media"))
     if media:
         out["media"] = media
     mentions = sanitize_mentions(x.get("mn"))
     if mentions:
         out["mn"] = mentions
+    if x.get("ev") is True:                 # 20.0: "@everyone" (mention_all)
+        out["ev"] = True
     plan = sanitize_plan(x.get("plan"))
     if plan is not None:
         out["plan"] = plan                    # 17.2: a planned call
+    poll = sanitize_poll(x.get("poll"))
+    if poll is not None:
+        out["poll"] = poll                    # 21.0: a poll
+    loc = sanitize_location(x.get("loc"))
+    if loc is not None:
+        out["loc"] = loc                      # 21.0: a place, or a live one
     topic = sanitize_topic_id(x.get("tp"))
     if topic:
         out["tp"] = topic                     # 17.4: in a group's topic
@@ -3287,6 +4622,215 @@ def sanitize_plan(raw) -> Optional[dict]:
     if not pid or not _CALL_ID_RE.match(pid) or at is None:
         return None
     return {"id": pid, "at": at, "v": raw.get("v") is True}
+
+
+# ---- 21.0 (MAP29): a place, and a place that moves -----------------------------
+# A place is a message (x.loc: lat, lon, acc, at); a live one also says
+# until when ("until"), and its sharer's later points are sealed control
+# messages ("loc") that move its card's point, until it ends or they stop
+# it, when its card keeps no point at all. No map (the owner: "Use the
+# users' phones' own maps apps"): Open in maps hands the point to the
+# phone's own maps app (a geo: link); a computer copies its coordinates.
+# No map service is asked by the app. The relay sees that someone shares
+# (sealed messages and their rhythm), never where.
+#: How long a live share lasts, as offered (minutes).
+LIVE_FOR = (15, 60, 8 * 60)
+#: A live point goes out once moved LIVE_MOVE metres or LIVE_EVERY seconds
+#: on, never sooner than LIVE_SOONEST; in a group of more than LIVE_CROWD,
+#: every LIVE_EVERY at most (each point is one sealed message a member).
+LIVE_MOVE, LIVE_EVERY, LIVE_SOONEST, LIVE_CROWD = 25.0, 60.0, 15.0, 10
+#: The eight winds a place lies in from another.
+WINDS = (N_("north"), N_("north-east"), N_("east"), N_("south-east"),
+         N_("south"), N_("south-west"), N_("west"), N_("north-west"))
+
+
+def sanitize_location(raw) -> Optional[dict]:
+    """A place as sent (x.loc, or a live share's point): degrees in range,
+    kept to a millionth (about 10 cm), its accuracy in metres, its time
+    (Unix); a live share's end ("until", within a day). None if anything
+    is off."""
+    if not isinstance(raw, dict) or not all(
+            isinstance(raw.get(k), (int, float)) and
+            not isinstance(raw.get(k), bool) for k in ("lat", "lon")):
+        return None
+    lat, lon = float(raw["lat"]), float(raw["lon"])
+    acc, at = _int(raw.get("acc"), 0, 100_000), _int(raw.get("at"), 1, 2 ** 40)
+    if not (math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90
+            and -180 <= lon <= 180) or acc is None or at is None:
+        return None
+    out = {"lat": round(lat, 6), "lon": round(lon, 6), "acc": acc, "at": at}
+    if "until" in raw:
+        until = _int(raw.get("until"), at, at + 24 * 3600)
+        if until is None:
+            return None
+        out["until"] = until
+    return out
+
+
+def distance_bearing(a: tuple, b: tuple) -> tuple:
+    """(metres, wind): how far point `b` (lat, lon) lies from `a`, and in
+    which of the eight winds (WINDS)."""
+    lat1, lon1, lat2, lon2 = map(math.radians, (*a, *b))
+    half = math.sin((lat2 - lat1) / 2) ** 2 + math.cos(lat1) * \
+        math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2
+    metres = 2 * 6_371_000 * math.asin(min(1.0, math.sqrt(half)))
+    y = math.sin(lon2 - lon1) * math.cos(lat2)
+    x = math.cos(lat1) * math.sin(lat2) - \
+        math.sin(lat1) * math.cos(lat2) * math.cos(lon2 - lon1)
+    bearing = (math.degrees(math.atan2(y, x)) + 360) % 360
+    return metres, WINDS[int((bearing + 22.5) // 45) % 8]
+
+
+def distance_words(metres: float) -> str:
+    """'12 m', '340 m' (to ten), '1.2 km', '35 km'."""
+    if metres < 1000:
+        return tr("{n} m", n=max(1, round(metres)) if metres < 100
+                  else int(round(metres, -1)))
+    return tr("{n} km", n=f"{metres / 1000:.1f}" if metres < 10_000
+              else f"{metres / 1000:.0f}")
+
+
+def live_due(last: Optional[tuple], point: dict, now: float,
+             crowd: bool) -> bool:
+    """Whether a live share's new `point` goes out, `last` being (time,
+    point) of the one sent before it."""
+    if last is None:
+        return True
+    since = now - last[0]
+    if since < (LIVE_EVERY if crowd else LIVE_SOONEST):
+        return False
+    moved = distance_bearing((last[1]["lat"], last[1]["lon"]),
+                             (point["lat"], point["lon"]))[0]
+    return since >= LIVE_EVERY or moved >= LIVE_MOVE
+
+
+def map_link(lat: float, lon: float) -> str:
+    """The place as a geo: link, which a phone's maps app takes (the
+    person's choice of app)."""
+    return f"geo:{lat:.6f},{lon:.6f}?q={lat:.6f},{lon:.6f}"
+
+
+def coordinates_text(point: dict) -> str:
+    """'51.500700, -0.124600', as maps apps take them."""
+    return f"{point['lat']:.6f}, {point['lon']:.6f}"
+
+
+def location_body(loc: dict) -> str:
+    """A place in words: what an app before 21.0 shows, and previews."""
+    return ("📍 " + ("Live location" if "until" in loc else "Location") +
+            f": {coordinates_text(loc)} (±{loc['acc']} m)")
+
+
+def location_shown(store, msg: dict, loc: dict) -> tuple:
+    """(the point a place's card shows, whether its live share runs): a
+    place's own; a live share's newest while it runs, and none once it is
+    over (stopped, or its time passed)."""
+    if "until" not in loc:
+        return loc, False
+    peer, cid = msg["peer"], msg.get("client_msg_id")
+    if store is None or not cid or time.time() >= loc["until"] or \
+            store.live_ended(peer, cid):
+        return None, False
+    return store.live_point(peer, cid) or loc, True
+
+
+def live_for_words(minutes: int) -> str:
+    """'15 minutes', '1 hour', '8 hours'."""
+    if minutes < 60:
+        return trn("{n} minute", "{n} minutes", minutes)
+    return trn("{n} hour", "{n} hours", minutes // 60)
+
+
+def parse_coordinates(text: str) -> Optional[tuple]:
+    """'51.5007, -0.1246' (or with a space between) as (lat, lon); None
+    if it is not a place."""
+    parts = re.split(r"[,\s]+", (text or "").strip())
+    try:
+        lat, lon = (float(x) for x in parts if x)
+    except ValueError:
+        return None
+    return (lat, lon) if -90 <= lat <= 90 and -180 <= lon <= 180 else None
+
+
+# ---- 21.0 (POLL29): polls ---------------------------------------------------
+# A poll is a message (x.poll); each member's vote is a sealed control
+# message ("vote") that every device counts for itself, the newest of each
+# member's counting; its asker, or an admin who may delete members'
+# messages, ends it ("pollend"). Nothing of it is known to the relay.
+#: A question and a choice at most this long; 2 to POLL_MAX choices.
+POLL_QUESTION_MAX, POLL_CHOICE_MAX, POLL_MAX = 200, 100, 10
+#: How long a poll stays open, as its sheet offers (seconds; 0: until its
+#: asker ends it).
+POLL_ENDS = (("never", N_("No limit"), 0), ("hour", N_("An hour"), 3600),
+             ("day", N_("A day"), 86400), ("week", N_("A week"), 7 * 86400))
+
+
+def sanitize_poll(raw) -> Optional[dict]:
+    """A poll as sent (x.poll): its question "q", its choices "o" (2 to
+    POLL_MAX, each different), "m" (several may be picked), "u" (when it
+    ends, Unix time; 0: when its asker ends it). None if anything is off:
+    a vote is a choice's place, so the choices are taken whole or not."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("o"), list):
+        return None
+    question = sanitize_text(_str(raw.get("q"), POLL_QUESTION_MAX) or "")
+    choices = [sanitize_text(_str(o, POLL_CHOICE_MAX) or "")
+               for o in raw["o"]]
+    until = _int(raw.get("u"), 0, 2 ** 40)
+    if not question or until is None or not 2 <= len(choices) <= POLL_MAX \
+            or not all(choices) or len(set(choices)) != len(choices):
+        return None
+    return {"q": question, "o": choices, "m": raw.get("m") is True,
+            "u": until}
+
+
+def poll_picks(raw, poll: dict) -> Optional[list]:
+    """A vote's choices (ctl "vote" v): their places, in range, each once,
+    one alone unless the poll allows several; [] takes the vote back.
+    None: not a vote."""
+    if not isinstance(raw, list) or any(
+            _int(p, 0, len(poll["o"]) - 1) is None for p in raw):
+        return None
+    picks = sorted(set(raw))
+    if len(picks) != len(raw) or (len(picks) > 1 and not poll["m"]):
+        return None
+    return picks
+
+
+def poll_open(poll: dict, ended, at: str) -> bool:
+    """Whether a poll takes votes at `at` (an ISO time): not ended by
+    hand, and before its end."""
+    if ended:
+        return False
+    try:
+        when = datetime.fromisoformat(at).timestamp()
+    except (TypeError, ValueError):
+        return False
+    return not poll["u"] or when < poll["u"]
+
+
+def may_end_poll(row: dict, who: str, me: str,
+                 group: Optional[dict]) -> bool:
+    """Whether `who` may end the poll that is message `row`: its asker (on
+    this device, `me` for one sent from here), or in a group an admin who
+    may delete members' messages."""
+    asker = me if row["direction"] == "out" else \
+        (row.get("author") or row["peer"])
+    return who == asker or (group is not None and
+                            group_can(group, who, "delete"))
+
+
+def poll_state(store, peer: str, cid: str, poll: dict) -> tuple:
+    """What a poll's card shows, to tell when it must be drawn again: each
+    vote, and whether it is open."""
+    votes = store.poll_votes(peer, cid)
+    return (tuple(sorted((voter, tuple(picks)) for voter, picks in
+                         votes.items())),
+            poll_open(poll, store.poll_ended(peer, cid), now_iso()))
+
+
+def poll_body(poll: dict) -> str:
+    """A poll in words: what an app before 21.0 shows, and previews."""
+    return "📊 " + poll["q"] + "".join("\n○ " + o for o in poll["o"])
 
 
 def plan_state(plan: dict, now: Optional[float] = None) -> str:
@@ -3560,6 +5104,17 @@ GROUP_RIGHT_WORDS = {"send": N_("messages"),
 #: How long a restriction lasts, as the admin chooses (0: until lifted).
 GROUP_LIMITS = ((3600, N_("An hour")), (86400, N_("A day")),
                 (7 * 86400, N_("A week")), (0, N_("No end")))
+# 20.0 (GROUPWIDE27), each in the rules ("r") too, so an app before 20.0
+# passes over them:
+#   "slow": seconds     slow mode: a member writes once in that long
+#   "about": text       a few lines from the admins, in the group's page,
+#                       and said in the chat to a member who joins
+#: Slow mode's choices: seconds between one member's messages (0: off).
+GROUP_SLOW = ((0, N_("Off")), (10, N_("10 s")), (60, N_("1 min")),
+              (300, N_("5 min")), (3600, N_("1 hour")))
+MAX_GROUP_ABOUT = 500
+#: What a group's admin writes to reach every member (x.ev; mention_all).
+MENTION_ALL = "everyone"
 
 
 def _relay_time(value) -> Optional[float]:
@@ -3599,7 +5154,38 @@ def sanitize_group_rules(raw, members) -> dict:
         out["lim"] = kept
     if raw.get("pin") is True:          # 19.0: members may pin messages
         out["pin"] = True
+    slow = _int(raw.get("slow"), 1, 86400)             # 20.0: slow mode
+    if slow in {seconds for seconds, _label in GROUP_SLOW}:
+        out["slow"] = slow
+    about = sanitize_text(_str(raw.get("about"), 8 * MAX_GROUP_ABOUT) or "")
+    if about:                                          # 20.0: about it
+        out["about"] = about[:MAX_GROUP_ABOUT].strip()
     return out
+
+
+def slow_wait(rules: Optional[dict], admins: set, who: str,
+              last: Optional[float], at: float) -> float:
+    """20.0, slow mode: the seconds `who` must still wait at `at` before
+    writing in a group again, having last written at `last` (None: not
+    yet); 0 when they may. Admins are never held."""
+    slow = (rules or {}).get("slow") or 0
+    if not slow or who in admins or last is None:
+        return 0.0
+    return max(0.0, last + slow - at)
+
+
+def slow_words(seconds: int) -> str:
+    """Slow mode's pace as its sheet names it ("5 min")."""
+    return next((tr(label) for s, label in GROUP_SLOW if s == seconds), "")
+
+
+def mention_all(x: Optional[dict], body: str, group: Optional[dict],
+                sender: str) -> bool:
+    """20.0: does this group message reach every member, as a mention of
+    each (even one who muted the group)? Only an admin's, marked (x.ev)
+    and saying "@everyone": a member's mark counts for nothing."""
+    return bool(x) and x.get("ev") is True and \
+        "@" + MENTION_ALL in body.lower() and sender in group_admins(group)
 
 
 def group_may_pin(group: Optional[dict], who: str) -> bool:
@@ -4613,6 +6199,9 @@ def video_label(duration_ms: int) -> str:
 
 
 _TIMED_BODY = re.compile(r"(Voice|Video) message \((\d+:\d\d)\)")
+#: What a document's message says to an app that knows no documents (before
+#: 20.0), before its name: sent in English, shown in the reader's language.
+FILE_BODY = "Document: "
 
 
 def shown_body(kind: str, body: str) -> str:
@@ -4626,6 +6215,8 @@ def shown_body(kind: str, body: str) -> str:
         return tr("Voice message ({time})", time=timed.group(2))
     if timed and (kind, timed.group(1)) == ("video", "Video"):
         return tr("Video message ({time})", time=timed.group(2))
+    if kind == "file" and (body or "").startswith(FILE_BODY):     # 20.0
+        return tr("Document: {name}", name=body[len(FILE_BODY):])
     return body
 
 
@@ -4655,11 +6246,16 @@ def open_media(blob: bytes, key_b64: str, sha_hex: str) -> bytes:
         raise ValueError("media could not be decrypted")
 
 
-def media_suffix(kind: str, mime: Optional[str]) -> str:
+def media_suffix(kind: str, mime: Optional[str], name: str = "") -> str:
     """The file extension a received photo or voice note is saved under —
-    by its type, so a desktop opens it with the right program."""
+    by its type, so a desktop opens it with the right program. A
+    document's (20.0): its own name's, letters and digits only."""
     if kind == "image":
         return "jpg"
+    if kind == "file":
+        ending = name.rpartition(".")[2] if "." in name else ""
+        return ending.lower() if ending.isalnum() and len(ending) <= 10 \
+            else "bin"
     if kind == "voice":
         return {"audio/wav": "wav", "audio/ogg": "ogg", "audio/aac": "aac",
                 "audio/3gpp": "3gp", "audio/amr": "amr"}.get(mime or "",
@@ -5039,11 +6635,14 @@ def android_context():
 #: callback, pyjnius's proxy (a Python Runnable is one) and the share
 #: service ({package}: the app's, which p4a names its services after).
 SHARE_SERVICE_CLASS = "{package}.Service" + SHARE_SERVICE_NAME.capitalize()
+CAMERA_SERVICE_CLASS = "{package}.Service" + CAMERA_SERVICE_NAME.capitalize()
+LOCATION_SERVICE_CLASS = "{package}.Service" + \
+    LOCATION_SERVICE_NAME.capitalize()
 ANDROID_CALL_CLASSES = ("org.fext.call.CallAudio", "org.fext.call.VideoCall",
                         "org.fext.call.VideoCall$Decoder",
                         "org.fext.call.ProjectionStop",
                         "org.jnius.NativeInvocationHandler",
-                        SHARE_SERVICE_CLASS)
+                        SHARE_SERVICE_CLASS, CAMERA_SERVICE_CLASS)
 
 
 def android_find_call_classes() -> None:
@@ -5089,9 +6688,18 @@ def android_calls_too_old() -> bool:
         return False
 
 
+def _jstring(text: str):
+    """A Java String, for a method that also has a char[] form, such as
+    Intent.putExtra: pyjnius scores a Python str the same for both and
+    takes the char[] one (Devices run 61), which getStringExtra reads as
+    null."""
+    autoclass, _ = _jni()
+    return autoclass("java.lang.String")(text)
+
+
 def _charseq(text: str):
-    autoclass, cast = _jni()
-    return cast("java.lang.CharSequence", autoclass("java.lang.String")(text))
+    _, cast = _jni()
+    return cast("java.lang.CharSequence", _jstring(text))
 
 
 def android_request_permissions(permissions: list, callback=None) -> None:
@@ -5210,7 +6818,7 @@ def android_notify(peer: str, title: str, text: str) -> None:
     intent.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP |
                     Intent.FLAG_ACTIVITY_CLEAR_TOP |
                     Intent.FLAG_ACTIVITY_NEW_TASK)
-    intent.putExtra("fext_peer", peer)
+    intent.putExtra("fext_peer", _jstring(peer))
     PendingIntent = autoclass("android.app.PendingIntent")
     flags = PendingIntent.FLAG_UPDATE_CURRENT
     if android_sdk() >= 23:
@@ -5250,7 +6858,7 @@ def notification_lines(store: "LocalStore", peer: str) -> list:
         if kind == "image":
             text = tr("Photo · {caption}", caption=text) if text else \
                 tr("Photo")
-        elif kind in ("voice", "video"):
+        elif kind in ("voice", "video", "file"):
             text = shown_body(kind, msg.get("body") or "") or \
                 tr(QUOTE_NAMES[kind])
         try:
@@ -5299,9 +6907,11 @@ def android_notification_words() -> None:
              "calls": tr("Calls"), "calls_about": tr("Incoming voice calls"),
              "you": tr("You"), "reply": tr("Reply"),
              "read": tr("Mark as read"), "incoming": tr("Incoming voice call"),
+             "incoming_video": tr("Incoming video call"),
              "decline": tr("Decline"), "answer": tr("Answer"),
              "ready": tr("Ready for new messages"),
-             "service": tr("Receive messages while closed")}
+             "service": tr("Receive messages while closed"),
+             "live": tr("Live location"), "stop": tr("Stop")}
     try:
         notifier.setWords(android_context(), list(words),
                           list(words.values()))
@@ -5310,14 +6920,15 @@ def android_notification_words() -> None:
 
 
 def android_call_notification(app, peer: str, call_id: str,
-                              name: str) -> bool:
+                              name: str, video: bool = False) -> bool:
     """Ring for an incoming call while the app is not on screen: over the
-    lock screen where Android allows it, with Answer and Decline."""
+    lock screen where Android allows it, with Answer and Decline. 20.0:
+    a video call is named as one (`video`)."""
     notifier = _notifier()
     if notifier is None:
         return False
     notifier.incomingCall(android_context(), CALL_NOTIFICATION_ID, peer,
-                          call_id, name, app.keys.address)
+                          call_id, name, app.keys.address, bool(video))
     return True
 
 
@@ -5331,6 +6942,43 @@ def android_full_screen_allowed() -> bool:
             android_context()))
     except Exception:
         return True
+
+
+def android_service_notice_importance() -> Optional[int]:
+    """21.0: the importance of the channel of "Ready for new messages"
+    (Notifier.CHANNEL_SERVICE) now: NOTICE_MIN once its person hid it from
+    the status bar; None before Android 8 or when Android does not say."""
+    if not IS_ANDROID:
+        return None
+    try:
+        if android_sdk() < 26:
+            return None
+        manager = android_context().getSystemService("notification")
+        channel = manager.getNotificationChannel(SERVICE_CHANNEL)
+        return None if channel is None else int(channel.getImportance())
+    except Exception:
+        log.exception("could not read the service notice's channel")
+        return None
+
+
+def android_open_service_notice_settings() -> None:
+    """21.0: Android's settings for "Ready for new messages" alone (its
+    channel), where its person can hide it from the status bar: Android
+    lets no app hide its own running service's notice (from 8.1 it raises
+    the least importance an app asks for), only its person."""
+    try:
+        autoclass, _ = _jni()
+        Intent = autoclass("android.content.Intent")
+        ctx = android_context()
+        intent = Intent("android.settings.CHANNEL_NOTIFICATION_SETTINGS")
+        intent.putExtra("android.provider.extra.APP_PACKAGE",
+                        _jstring(ctx.getPackageName()))
+        intent.putExtra("android.provider.extra.CHANNEL_ID",
+                        _jstring(SERVICE_CHANNEL))
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        ctx.startActivity(intent)
+    except Exception:
+        log.exception("could not open the service notice's settings")
 
 
 def android_open_full_screen_settings() -> None:
@@ -5700,18 +7348,35 @@ def android_save_document(path: str, name: str,
     intent = Intent(Intent.ACTION_CREATE_DOCUMENT)
     intent.addCategory(Intent.CATEGORY_OPENABLE)
     intent.setType("application/octet-stream")
-    intent.putExtra(Intent.EXTRA_TITLE, autoclass("java.lang.String")(name))
+    intent.putExtra(Intent.EXTRA_TITLE, _jstring(name))
     android_context().startActivityForResult(intent, REQ_SAVE_FILE)
 
 
+def android_document_name(uri) -> str:
+    """The name Android shows for a chosen file ("" where it says none)."""
+    try:
+        cursor = android_context().getContentResolver().query(
+            uri, ["_display_name"], None, None, None)
+        try:
+            if cursor is not None and cursor.moveToFirst():
+                return str(cursor.getString(0) or "")
+        finally:
+            if cursor is not None:
+                cursor.close()
+    except Exception:
+        log.exception("a chosen file's name")
+    return ""
+
+
 def android_open_document(callback: Callable[[Optional[str]], None],
-                          on_copying: Optional[Callable[[], None]] = None
-                          ) -> None:
+                          on_copying: Optional[Callable[[], None]] = None,
+                          named: bool = False) -> None:
     """The system's Open dialog, for any file: `callback(path)` gets a
     private copy of the one chosen (in the cache folder; the caller deletes
     it), or None if it could not be read. The copy is made off the UI
     thread (16.0: a large backup from a cloud drive had frozen the app);
-    `on_copying()` as it begins."""
+    `on_copying()` as it begins. 20.0, `named`: callback(path, name), the
+    name Android shows for it (a document sent under its own name)."""
     autoclass, _ = _jni()
     from android import activity
 
@@ -5738,7 +7403,10 @@ def android_open_document(callback: Callable[[Optional[str]], None],
                 discard_cache_file(str(target))
                 run_on_ui(callback, None)
                 return
-            run_on_ui(callback, str(target))
+            if named:
+                run_on_ui(callback, str(target), android_document_name(uri))
+            else:
+                run_on_ui(callback, str(target))
         off_ui(copy)
 
     activity.bind(on_activity_result=on_result)
@@ -5926,8 +7594,10 @@ def start_with_windows(reg=None) -> bool:
         import winreg as reg
     try:
         with reg.OpenKey(reg.HKEY_CURRENT_USER, STARTUP_RUN_KEY) as key:
-            return reg.QueryValueEx(key, APP_NAME)[0] == \
-                f'"{exe}" {STARTUP_FLAG}'
+            # 20.0 (F7): regardless of letter case, as Windows itself
+            # compares paths.
+            return str(reg.QueryValueEx(key, APP_NAME)[0]).lower() == \
+                f'"{exe}" {STARTUP_FLAG}'.lower()
     except OSError:
         return False
 
@@ -6051,7 +7721,7 @@ def downloads_by_itself(store: "LocalStore", row: dict) -> bool:
         return not metered or download_pref("dl_photos_metered")
     if row.get("kind") == "voice":
         return not metered or download_pref("dl_voice_metered")
-    return not (metered and row.get("kind") == "video")
+    return not (metered and row.get("kind") in ("video", "file"))
 
 
 def android_style_system_bars() -> None:
@@ -7936,7 +9606,12 @@ CALL_PCM48_LOW = PcmFormat(16000, 1, 5)
 CALL_RING_SECONDS = 45          # unanswered for this long: "No answer"
 CALL_OFFER_MAX_AGE = 40         # an offer older than this is a missed call
 CALL_CONNECT_SECONDS = 15       # answered, but no way found to each other
-CALL_DROP_SECONDS = 20          # nothing heard for this long: the call drops
+#: Nothing heard for this long: the call drops. 20.0: two minutes, not
+#: twenty seconds (the owner: "We should not drop the call, but rather let
+#: it prefer to attempt to reconnect"). All that time the call says
+#: "Reconnecting…" and its engine keeps trying every way it has (CallEngine:
+#: REG_QUIET, RENEW_EVERY); either side can still hang up.
+CALL_DROP_SECONDS = 120
 #: 18.1: the loudest sample of a frame below which a call's sound is a
 #: pause (of 32767; about -36 dBFS): there the jitter buffer may skip frames
 #: unheard to give back delay (JitterBuffer.get).
@@ -9234,6 +10909,30 @@ class CallRefused(Exception):
     13.4's 403 restricted); its words, as restricted_text says them."""
 
 
+class LoopWaker:
+    """21.0 (NEXT29): wakes a call's loop from another thread at once (a
+    packet the WebSocket handed over waited for the loop's select, up to
+    20 ms): a pair of sockets, the loop's select waiting on one."""
+
+    def __init__(self) -> None:
+        self.sock, self._other = socket.socketpair()
+        for end in (self.sock, self._other):
+            end.setblocking(False)
+
+    def wake(self) -> None:
+        with contextlib.suppress(OSError):    # (full: it is awake already)
+            self._other.send(b"\0")
+
+    def drain(self) -> None:
+        with contextlib.suppress(OSError):
+            self.sock.recv(4096)
+
+    def close(self) -> None:
+        for end in (self.sock, self._other):
+            with contextlib.suppress(OSError):
+                end.close()
+
+
 class CallEngine(threading.Thread):
     """Everything a call does once it is set up, on one thread: one UDP
     socket, used both with the relay and straight with the other device;
@@ -9272,6 +10971,11 @@ class CallEngine(threading.Thread):
     PING_EARLY, PING_SEARCH, PING_KEEP = 0.1, 0.5, 1.0
     FRESH = 2.5                           # a way heard from within this works
     REG_RETRY, REG_KEEP = 0.3, 10.0
+    #: 20.0: while nothing is heard, the relay is told where this side is
+    #: every REG_QUIET seconds (its address may have changed: Wi-Fi to
+    #: mobile data), and the app is asked for a new pass to the relay's
+    #: call port every RENEW_EVERY (the one it has runs out): "renew".
+    REG_QUIET, RENEW_EVERY = 1.0, 20.0
     #: What an 'opus48' call steps through when packets are lost, kbit/s.
     BITRATES = (48, 64, 96, 128, 192)
     ADAPT_EVERY = 2.0
@@ -9282,8 +10986,11 @@ class CallEngine(threading.Thread):
                  send_ws: Optional[Callable[[bytes, int, bytes], bool]] = None,
                  audio_factory: Optional[Callable[[], CallAudio]] = None,
                  relay_pps: int = 150, relay_kbps: int = 0,
-                 unanswered: bool = False, hidden: bool = False):
+                 unanswered: bool = False, hidden: bool = False,
+                 drop_after: float = 0.0):
         super().__init__(daemon=True, name="fext-call")
+        #: Nothing heard for this long ends it (0: CALL_DROP_SECONDS).
+        self.drop_after = drop_after
         self.call_id, self.tag, self.role = call_id, tag, role
         self.relay, self.ticket = relay, ticket
         self._on_event, self._send_ws = on_event, send_ws
@@ -9292,6 +10999,7 @@ class CallEngine(threading.Thread):
         self.sock.bind(("0.0.0.0", 0))
         self.sock.setblocking(False)
         self.port = self.sock.getsockname()[1]
+        self._waker = LoopWaker()                # 21.0: ws_packet's
         self.keys: Optional[CallKeys] = None
         self._early_at = 0.0              # the quick search began (_search)
         # 18.1 (CALLPRIV): see direct_allowed. 19.0: a remote session is
@@ -9383,6 +11091,7 @@ class CallEngine(threading.Thread):
         self.path: Optional[str] = None
         self.last_heard: Optional[float] = None
         self._quiet = False
+        self._renew_at = 0.0
         self.level_in = self.level_out = 0
         self.sent = self.received = 0
 
@@ -9549,10 +11258,12 @@ class CallEngine(threading.Thread):
             self.input_in = InputIn(injector)
         try:
             self.input_in.take(payload)
-        except Exception:
+        except Exception as exc:
             if not self._input_refused:
                 self._input_refused = True
                 log.exception("remote: the input could not be done")
+                remote_log(tr("the pointer and keys could not be put in: "
+                              "{why}", why=f"{type(exc).__name__}: {exc}"))
 
     def _stop_input(self) -> None:
         if self.input_in is not None:
@@ -9748,12 +11459,13 @@ class CallEngine(threading.Thread):
         budget = self._video_budget()
         if budget is not None:
             kbps = min(kbps, budget)
-        short = VIDEO_SCREEN.short
-        told, size = self._vkbps.get("s", kbps), (short, codec)
+        if "s" not in self._vplanned:   # 21.1 (SCREEN60): a share begins:
+            self._sfps = screen_fps()     # its rate, as its capture's
+        short, fps = VIDEO_SCREEN.short, self._sfps
+        told, size = self._vkbps.get("s", kbps), (short, codec, fps)
         if self._vplanned.get("s") != size or abs(kbps - told) > told // 10:
             self._vplanned["s"], self._vkbps["s"] = size, kbps
-            self._on_event("video_plan", ("s", (short, VIDEO_SCREEN.fps,
-                                                kbps), codec))
+            self._on_event("video_plan", ("s", (short, fps, kbps), codec))
 
     def _delay_grew(self, now: float) -> bool:
         """19.0.1: the way's delay now well over the least it has been (a
@@ -9843,6 +11555,7 @@ class CallEngine(threading.Thread):
 
     def ws_packet(self, data: bytes) -> None:
         self._inbox.put(data)
+        self._waker.wake()
 
     def meter(self) -> dict:
         """F16 (17.2): the way now, for the call's meter (meter_lines)."""
@@ -9870,10 +11583,13 @@ class CallEngine(threading.Thread):
             while not self._halt.is_set():
                 wait = max(0.0, min(tick - time.monotonic(), 0.02))
                 try:
-                    ready, _w, _x = select.select([self.sock], [], [], wait)
+                    ready, _w, _x = select.select(
+                        [self.sock, self._waker.sock], [], [], wait)
                 except (OSError, ValueError):
                     break
-                if ready:
+                if self._waker.sock in ready:
+                    self._waker.drain()
+                if self.sock in ready:
                     self._drain_udp()
                 self._drain_inbox()
                 while not self._jobs.empty():
@@ -9905,6 +11621,7 @@ class CallEngine(threading.Thread):
             self.sock.close()
         except OSError:
             pass
+        self._waker.close()
         if IS_ANDROID:
             # A thread that used Java must leave the JVM before it ends.
             try:
@@ -10090,6 +11807,12 @@ class CallEngine(threading.Thread):
             self._on_event("bye", None)
             self._halt.set()
 
+    def renew(self, relay: Optional[tuple], ticket: str) -> None:
+        """20.0: a new pass to the relay's call port (the app's answer to
+        "renew"), used from the next registration, which is due now."""
+        if relay is not None and ticket:
+            self.relay, self.ticket, self._reg_at = relay, ticket, 0.0
+
     # ---- packets out ----------------------------------------------------------
     def _paths(self, now: float) -> list:
         fresh = [p for p in ("direct", "relay", "ws")
@@ -10157,9 +11880,13 @@ class CallEngine(threading.Thread):
 
     # ---- every 20 ms ----------------------------------------------------------
     def _tick(self, now: float) -> None:
+        if self._quiet and now - self._renew_at >= self.RENEW_EVERY:
+            self._renew_at = now
+            self._on_event("renew", None)
         if self.relay is not None and self.ticket:
-            due = self.REG_KEEP if self.relay_ok else (
-                self.REG_RETRY if self._reg_tries < 10 else 2.0)
+            due = (self.REG_QUIET if self._quiet else self.REG_KEEP) \
+                if self.relay_ok else (
+                    self.REG_RETRY if self._reg_tries < 10 else 2.0)
             if now - self._reg_at >= due:
                 self._reg_at = now
                 self._reg_tries += 1
@@ -10226,7 +11953,7 @@ class CallEngine(threading.Thread):
             if silent > 3.0 and not self._quiet:
                 self._quiet = True
                 self._on_event("quiet", None)
-            if silent > CALL_DROP_SECONDS:
+            if silent > (self.drop_after or CALL_DROP_SECONDS):
                 self._on_event("lost", None)
                 self._halt.set()
 
@@ -10532,6 +12259,7 @@ class RoomEngine(threading.Thread):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("0.0.0.0", 0))
         self.sock.setblocking(False)
+        self._waker = LoopWaker()                # 21.0: ws_packet's
         self._aead = AESGCM(media_key)
         self._seq = {track: 0 for track in ROOM_TRACK.values()}
         self._voices: dict = {}           # member index -> _RoomVoice
@@ -10632,6 +12360,7 @@ class RoomEngine(threading.Thread):
 
     def ws_packet(self, data: bytes) -> None:
         self._inbox.put(data)
+        self._waker.wake()
 
     def routes(self) -> list:
         """Where the sound can go now (a phone's earpiece, speaker,
@@ -10656,10 +12385,13 @@ class RoomEngine(threading.Thread):
                 step = min(10, self._send_ms()) / 1000.0
                 wait = max(0.0, min(tick - time.monotonic(), step))
                 try:
-                    ready, _w, _x = select.select([self.sock], [], [], wait)
+                    ready, _w, _x = select.select(
+                        [self.sock, self._waker.sock], [], [], wait)
                 except (OSError, ValueError):
                     break
-                if ready:
+                if self._waker.sock in ready:
+                    self._waker.drain()
+                if self.sock in ready:
                     self._drain_udp()
                 while not self._inbox.empty():
                     self._packet(self._inbox.get_nowait())
@@ -10716,6 +12448,7 @@ class RoomEngine(threading.Thread):
             self.sock.close()
         except OSError:
             pass
+        self._waker.close()
         if IS_ANDROID:
             try:
                 from jnius import detach
@@ -10992,6 +12725,15 @@ VIDEO_KEY, VIDEO_START, VIDEO_LAYER = 0x80, 0x40, 0x03
 _VIDEO_PIECE = struct.Struct("!BBIHH")
 
 
+def screen_fps() -> int:
+    """21.1 (SCREEN60): pictures a second this computer's shared screen is
+    read and sent at: 30, or 60 where Settings › Remote access › Smoother
+    screen is on (what changes is read 8 ms sooner on average, and moves
+    smoother; twice the work of reading and comparing it, and more data
+    while things move)."""
+    return 60 if load_prefs().get("remote_smooth") is True else 30
+
+
 def video_ceiling() -> VideoRung:
     """Settings › Calls › Video quality: the most a call's camera sends."""
     chosen = load_prefs().get("video_quality")
@@ -11017,11 +12759,20 @@ def video_layers(top: VideoRung) -> tuple:
             (top.short, top.fps, top.kbps))
 
 
-def video_size(width: int, height: int, short: int) -> tuple:
+def video_size(width: int, height: int, short: int,
+               longest: int = 0) -> tuple:
     """width × height scaled to `short` pixels on its shorter side (never
-    up), both sides even, as the coders need."""
+    up), and (21.1) to `longest` on its longer where one is given, both
+    sides even, as the coders need."""
     k = min(1.0, short / max(1, min(width, height)))
+    if longest:
+        k = min(k, longest / max(1, width, height))
     return max(2, int(width * k) & ~1), max(2, int(height * k) & ~1)
+
+
+#: 21.1: a shared screen's longer side at the most: a phone's decoder
+#: takes 3840 (4K) across, not two or three screens side by side.
+SCREEN_LONGEST = 3840
 
 
 def video_fit(width: int, height: int, box_w: float, box_h: float,
@@ -11169,7 +12920,13 @@ class VideoAssembler:
         be decoded, else None."""
         self.heard = now
         if (self.done is not None and number <= self.done) or \
-                not 0 <= index < count <= VIDEO_MAX_PIECES:
+                not 0 <= index < count:
+            return None
+        if count > VIDEO_MAX_PIECES:
+            # 21.1: more than a picture may hold: lost, so that a key frame
+            # is asked for and the sender's ceiling comes down (before, it
+            # was dropped unsaid, and nothing was asked for).
+            self._give_up(number)
             return None
         entry = self._open.get(number)
         if entry is None:
@@ -11446,11 +13203,19 @@ _FFMPEG_DECODERS = {"h264": ("h264",), "hevc": ("hevc",),
 #: 19.0 (V2): x264 in its high profile (CABAC, the 8x8 transform), at
 #: the slowest of X264_PRESETS this computer keeps up with (18.2 sent
 #: `ultrafast`, `baseline`: about 1.2 dB worse at the same bits).
+#: 21.1: a key frame asked for (a picture lost, a viewer whose decoder
+#: started late) must be one a decoder can start from: an IDR, the stream's
+#: parameters before it. A graphics chip's coder makes an intra picture that
+#: is neither unless told (FFmpeg's forced_idr, 0 by default), so a viewer
+#: that missed the first picture waited for good: the owner's PC, its
+#: screen never seen on a phone. x264's key frames are IDRs already.
+#: nvenc's `delay` 0: each picture out as it is coded, not one behind.
 _FFMPEG_OPTIONS = {
     "libx264": {"tune": "zerolatency", "profile": "high"},
-    "nvenc": {"preset": "p1", "tune": "ll", "zerolatency": "1"},
-    "qsv": {"preset": "veryfast", "async_depth": "1"},
-    "amf": {"usage": "ultralowlatency"},
+    "nvenc": {"preset": "p1", "tune": "ll", "zerolatency": "1",
+              "delay": "0", "forced-idr": "1"},
+    "qsv": {"preset": "veryfast", "async_depth": "1", "forced_idr": "1"},
+    "amf": {"usage": "ultralowlatency", "forced_idr": "1"},
     "videotoolbox": {"realtime": "1"},
     "mf": {"scenario": "display_remoting"},
 }
@@ -11535,8 +13300,9 @@ X264_BUSY, X264_IDLE, X264_PATIENCE = 0.5, 0.2, 20.0
 #: rate factor) under its rung's bitrate as a ceiling: still text is sharp
 #: and costs little; a screen that moves takes up to the ceiling.
 SCREEN_CRF = 23
-#: A graphics chip's coders (the names' ends).
-_HARDWARE_CODERS = ("_nvenc", "_qsv", "_amf", "_videotoolbox")
+#: A graphics chip's coders (the names' ends); 21.1: Windows' own (Media
+#: Foundation's, a chip's or its own) proved the same way.
+_HARDWARE_CODERS = ("_nvenc", "_qsv", "_amf", "_videotoolbox", "_mf")
 
 
 def _hardware_coder(name: str) -> bool:
@@ -11609,13 +13375,22 @@ class FfmpegEncoder:
 
     @staticmethod
     def _prove(av, ctx, width: int, height: int) -> None:
-        """A graphics chip's coder codes one grey picture, or raises."""
+        """A graphics chip's coder codes two grey pictures, the second
+        asked to be a key frame, and both come out as key frames; else it
+        raises. 21.1: a coder that makes no key frame when asked never lets
+        a viewer that missed one start again (_FFMPEG_OPTIONS)."""
+        from av.video.frame import PictureType       # type: ignore
         picture = av.VideoFrame(width, height, "yuv420p")
         for plane in picture.planes:
             plane.update(bytes([128]) * plane.buffer_size)
-        picture.pts = 0
-        ctx.encode(picture)
-        ctx.encode(None)                    # and lets it go
+        keys = []
+        for pts in (0, 1):
+            picture.pts = pts
+            picture.pict_type = PictureType.I
+            keys += [p.is_keyframe for p in ctx.encode(picture)]
+        keys += [p.is_keyframe for p in ctx.encode(None)]  # and lets it go
+        if keys != [True, True]:
+            raise RuntimeError(f"no key frame when asked ({keys})")
 
     def _next_pts(self) -> int:
         """Milliseconds since the coder was made, always rising."""
@@ -11799,10 +13574,11 @@ def parse_avfoundation_devices(lines: list) -> tuple:
     return cameras, screens
 
 
-def video_sources(kind: str) -> list:
+def video_sources(kind: str, helper: bool = False) -> list:
     """This computer's cameras (or screens) as VideoSources, the chosen
     one first. FEXT_VIDEO_TEST: a moving test picture instead (the tests,
-    the captures)."""
+    the captures). `helper` (21.0, a remote session on Windows): the
+    screen as the service's helper reads it, first, when it answers."""
     if os.environ.get("FEXT_VIDEO_TEST"):
         size = "1280x720" if kind == "camera" else "1920x1080"
         return [VideoSource(kind, tr("Test picture"), "lavfi",
@@ -11811,8 +13587,10 @@ def video_sources(kind: str) -> list:
         return []
     rung = video_ceiling()
     # 19.0 (V3): a screen at 30 frames a second (18.2: 15), as fast as
-    # FFmpeg's grab gives it; 15 where 30 will not open.
-    screen = ({"framerate": "30"}, {"framerate": "15"})
+    # FFmpeg's grab gives it; 15 where 30 will not open. 21.1: 60 first
+    # where Smoother screen is on (SCREEN60).
+    screen = tuple({"framerate": str(fps)} for fps in
+                   dict.fromkeys((screen_fps(), 30, 15)))
     found = []
     if sys.platform.startswith("linux"):
         if kind == "screen":
@@ -11833,6 +13611,9 @@ def video_sources(kind: str) -> list:
                                          f"/dev/{node.name}",
                                          camera_tries("v4l2", rung)))
     elif sys.platform == "win32":
+        if kind == "screen" and helper and DESK.available():
+            found.append(VideoSource(kind, tr("The whole screen"),
+                                     DESK_SOURCE, "desktop", screen))
         if kind == "screen":
             found.append(VideoSource(kind, tr("The whole screen"),
                                      "gdigrab", "desktop", screen))
@@ -11955,7 +13736,7 @@ class FfmpegVideoCoder:
 
     def __init__(self, source: VideoSource) -> None:
         self.source = source
-        self.capture = VideoCapture(source)
+        self.capture = capture_for(source)        # 21.0: the helper's too
         self.capture.start()
         self.plan: list = []            # [(layer, short, fps, kbps)]
         self.codec = "h264"
@@ -11967,10 +13748,40 @@ class FfmpegVideoCoder:
         self._closed = False
         self._preview: Optional[tuple] = None
         self._preview_box: Optional[tuple] = None
+        self.pointer = self._pointer_wanted = True    # 21.1 (CURSOR30)
 
     @property
     def error(self) -> str:
         return self.capture.error
+
+    def set_pointer(self, drawn: bool) -> bool:
+        """21.1 (CURSOR30): the screen read with its pointer in it, or
+        without (the side controlling draws its own, at once); done by the
+        next poll, on the sending thread (any thread may ask). Whether
+        this capture can leave it out at all."""
+        self._pointer_wanted = bool(drawn) or not self.pointer_can_go
+        return self.pointer_can_go
+
+    @property
+    def pointer_can_go(self) -> bool:
+        return isinstance(self.capture, DeskCapture) or (
+            self.source.kind == "screen" and bool(self.source.options) and
+            self.source.format in ("gdigrab", "x11grab"))
+
+    def _apply_pointer(self) -> None:
+        self.pointer = drawn = self._pointer_wanted
+        if isinstance(self.capture, DeskCapture):
+            self.capture.pointer = drawn
+        elif self.source.kind == "screen" and \
+                self.source.format in ("gdigrab", "x11grab"):
+            # FFmpeg's grab draws it or not from when it opens: opened again.
+            self.source = self.source._replace(options=tuple(
+                dict(o, draw_mouse="1" if drawn else "0")
+                for o in self.source.options))
+            self.capture.stop()
+            self.capture = VideoCapture(self.source)
+            self.capture.start()
+            self._serial = 0
 
     def set_plan(self, plan: list, codec: str) -> None:
         """The sizes to send now (each layer's shorter side, frames a
@@ -11998,6 +13809,17 @@ class FfmpegVideoCoder:
         """The next picture coded at every size due: [(layer, codec, key,
         data)]."""
         self._polled = time.monotonic()
+        if self.capture.error and isinstance(self.capture, DeskCapture):
+            # 21.0: the service's helper went (stopped, removed): the
+            # screen read as before, by FFmpeg's grab.
+            sources = video_sources("screen")
+            if sources:
+                self.source, self._serial = sources[0], 0
+                self.capture = VideoCapture(self.source)
+                self.capture.start()
+                self.pointer = True              # drawn in, until asked
+        if self._pointer_wanted != self.pointer and not self._closed:
+            self._apply_pointer()
         got = self.capture.next_frame(self._serial, timeout)
         if got is None or self._closed:
             return []
@@ -12013,7 +13835,8 @@ class FfmpegVideoCoder:
         every = VIDEO_SCREEN_KEY_EVERY if screen else VIDEO_KEY_EVERY
         out = []
         for layer, short, fps, kbps in plan:
-            size = video_size(frame.width, frame.height, short)
+            size = video_size(frame.width, frame.height, short,
+                              SCREEN_LONGEST if screen else 0)
             held = self._coders.get(layer)
             if held is None or held[0].size != size or \
                     held[0].codec != codec or held[0].fps != fps:
@@ -12048,7 +13871,8 @@ class FfmpegVideoCoder:
                 if is_key:
                     held[2] = now
                 out.append((layer, codec, is_key, data))
-            self._pace(layer, held, now)
+            if not self._owes_key(layer, held, key, coded):
+                self._pace(layer, held, now)
         for layer in [n for n in self._coders if n not in
                       {p[0] for p in plan}]:
             self._coders.pop(layer)[0].close()
@@ -12088,8 +13912,40 @@ class FfmpegVideoCoder:
             log.warning("video: no coder for %s: %s", size, exc)
             return None
         held = self._coders[layer] = [encoder, now, None, None, None, None,
-                                      now]
+                                      now, None]
         return held
+
+    #: 21.1: pictures a coder may hand out once asked for a key frame,
+    #: none of them one, before it is taken to make none: room for a coder
+    #: some pictures behind (a quarter of a second at 30 a second).
+    KEY_OWED_MOST = 8
+
+    def _owes_key(self, layer: int, held: list, asked: bool,
+                  coded: list) -> bool:
+        """21.1: True when this size's coder, asked for a key frame, has
+        handed out KEY_OWED_MOST pictures since and none was one (held[7]
+        counts them). Its viewer could never start again: it is put aside
+        (and, a chip's, not used again this run) and the next poll makes
+        another, whose first picture is a key frame. FfmpegEncoder._prove
+        tries a chip's coder for this first; this is the last word."""
+        if any(is_key for _data, is_key in coded):
+            held[7] = None
+            return False
+        if asked and held[7] is None:
+            held[7] = 0
+        if held[7] is None:
+            return False
+        held[7] += len(coded)
+        if held[7] < self.KEY_OWED_MOST:
+            return False
+        coder = held[0]
+        log.warning("video: %s made no key frame when asked: another coder "
+                    "from now on", coder.name)
+        if coder.name != "libx264":
+            _VIDEO_CAN.setdefault("bad", set()).add(coder.name)
+        self._coders.pop(layer, None)
+        coder.close()
+        return True
 
     def _pace(self, layer: int, held: list, now: float) -> None:
         """19.0 (V2): x264's setting kept to what this computer codes in
@@ -12192,11 +14048,28 @@ class VideoReceiver(threading.Thread):
     for a key frame: on_key(who, track, layer), at most twice a second."""
 
     KEY_EVERY = 0.5
+    #: 20.0: a device that cannot keep up (the owner: "Older phones
+    #: receiving side video of other user is frozen"). A picture more than
+    #: VIDEO_LATE behind is decoded and not drawn (18.1), so that the
+    #: device catches up. One on which decoding alone takes longer than
+    #: the pictures come never does: every picture was late, none was
+    #: drawn, and the other side stood still for good. So what waits is
+    #: let go once it is SKIP seconds behind, and a key frame asked for:
+    #: the picture moves on from now. After STRAINS of those within
+    #: STRAIN seconds the other side is asked for a picture half as wide
+    #: and tall (`ease`: 1, 2, then 4; `on_strain` tells whoever says
+    #: what this device shows), a quarter of the work.
+    SKIP, STRAINS, STRAIN = 1.0, 2, 30.0
 
     def __init__(self, on_key: Callable,
-                 decoder: Optional[Callable] = None) -> None:
+                 decoder: Optional[Callable] = None,
+                 on_strain: Optional[Callable] = None,
+                 on_picture: Optional[Callable] = None) -> None:
         super().__init__(daemon=True, name="fext-video-in")
-        self.on_key = on_key
+        self.on_key, self.on_strain = on_key, on_strain
+        self.on_picture = on_picture        # 21.0: one is ready (this thread)
+        self.ease, self.skips = 1, 0
+        self._strain: dict = {}     # (who, track) -> when it was let go
         self._decoder = decoder or (android_call_decoder if IS_ANDROID
                                     else FfmpegDecoder)
         self._inbox: "queue.Queue" = queue.Queue(maxsize=4000)
@@ -12206,6 +14079,10 @@ class VideoReceiver(threading.Thread):
         self._boxes: dict = {}      # (who, track) -> (w, h, fill)
         self._latest: dict = {}     # (who, track) -> (serial, rgb, w, h, fmt)
         self._asked: dict = {}      # (who, track) -> when
+        self._shown: dict = {}      # (who, track) -> since when (21.1)
+        self._decoded: set = set()  # (who, track): a picture decoded
+        self._waits: dict = {}      # (who, track): its next wait (21.1)
+        self._said: dict = {}       # (who, track) -> a fault logged when
         self._halt = threading.Event()
         self.pictures = 0
         self.late = 0               # ...of them, too late to draw (18.2)
@@ -12222,8 +14099,11 @@ class VideoReceiver(threading.Thread):
         """Where (who, track) is drawn now, in pixels; None: not drawn."""
         if box is None:
             self._boxes.pop((who, track), None)
+            self._shown.pop((who, track), None)
+            self._decoded.discard((who, track))   # shown again: watched again
         else:
             self._boxes[(who, track)] = (box[0], box[1], fill)
+            self._shown.setdefault((who, track), time.monotonic())
 
     def latest(self, who, track: str) -> Optional[tuple]:
         return self._latest.get((who, track))
@@ -12266,6 +14146,9 @@ class VideoReceiver(threading.Thread):
                behind: float = 0.0) -> None:
         """One piece, `behind` seconds after it came in."""
         if len(payload) < _VIDEO_PIECE.size:
+            return
+        if behind > self.SKIP:
+            self._let_go(who, track, now)
             return
         cid, flags, number, index, count = _VIDEO_PIECE.unpack_from(payload)
         codec = next((c for c, i in VIDEO_CODEC_IDS.items() if i == cid),
@@ -12311,17 +14194,62 @@ class VideoReceiver(threading.Thread):
                 asks -= 1
                 time.sleep(VIDEO_ASK_AGAIN)
                 out = decoder.decode(b"", box[:2], box[2])
-        except Exception:
+        except Exception as exc:
             layer = self._current.get((who, track), 0)
             stream = self._streams.get((who, track, layer))
             if stream is not None:
                 stream.need_key, stream.skipped = True, stream.skipped + 1
-            self._ask(who, track, layer, time.monotonic())
+            now = time.monotonic()
+            if now - self._said.get((who, track), -60.0) >= 60.0:
+                self._said[(who, track)] = now     # 21.1: said, once a minute
+                log.warning("video: a %s picture (%s, %d bytes) could not be "
+                            "decoded: %s", track, codec, len(data), exc)
+            self._ask(who, track, layer, now)
             return
         if out is not None:
+            self._decoded.add((who, track))         # 21.1: one came out
             serial = self._latest.get((who, track), (0,))[0] + 1
             self._latest[(who, track)] = (serial,) + tuple(out)
             self.pictures += 1
+            if self.on_picture is not None:
+                self.on_picture()
+
+    def _let_go(self, who, track: str, now: float) -> None:
+        """Too far behind to catch up (SKIP): every piece of (who, track)
+        still waiting is dropped, and a key frame asked for at once."""
+        kept = []
+        try:
+            while True:
+                item = self._inbox.get_nowait()
+                if item[1] is None or (item[0], item[1]) != (who, track):
+                    kept.append(item)
+        except queue.Empty:
+            pass
+        for item in kept:
+            try:
+                self._inbox.put_nowait(item)
+            except queue.Full:
+                break
+        layer = self._current.get((who, track), 0)
+        stream = self._streams.get((who, track, layer))
+        if stream is not None:
+            stream.need_key, stream.skipped = True, stream.skipped + 1
+        self._asked.pop((who, track), None)
+        self._ask(who, track, layer, now)
+        self.skips += 1
+        recent = [at for at in self._strain.get((who, track), [])
+                  if now - at < self.STRAIN] + [now]
+        self._strain[(who, track)] = recent
+        if len(recent) >= self.STRAINS and self.ease < 4:
+            self.ease *= 2
+            self._strain[(who, track)] = []
+            log.info("video: this device cannot keep up: a picture 1/%d "
+                     "as large is asked for", self.ease)
+            if self.on_strain is not None:
+                try:
+                    self.on_strain()
+                except Exception:
+                    log.exception("video: asking for a smaller picture")
 
     def _ask(self, who, track: str, layer: int, now: float) -> None:
         if now - self._asked.get((who, track), 0.0) >= self.KEY_EVERY:
@@ -12336,7 +14264,19 @@ class VideoReceiver(threading.Thread):
     #: was, for the picture that follows (VideoAssembler.follows).
     QUIET, GONE = 5.0, 600.0
 
+    #: 21.1: a picture shown for this long with none decoded yet is asked
+    #: for again until one is, twice as long between asks each time, up to
+    #: NOTHING_MOST: its first can be lost whole, and a still screen sends
+    #: no other (the owner's phone, no picture ever).
+    NOTHING_YET, NOTHING_MOST = 1.5, 12.0
+
     def _check(self, now: float) -> None:
+        for key, since in list(self._shown.items()):
+            wait = self._waits.get(key, self.NOTHING_YET)
+            if key not in self._decoded and now - since >= self.NOTHING_YET \
+                    and now - self._asked.get(key, 0.0) >= wait:
+                self._waits[key] = min(self.NOTHING_MOST, wait * 2)
+                self._ask(key[0], key[1], self._current.get(key, 0), now)
         for (who, track, layer), stream in list(self._streams.items()):
             if now - stream.heard > self.GONE:
                 del self._streams[(who, track, layer)]
@@ -12352,9 +14292,12 @@ class VideoReceiver(threading.Thread):
         # list(table) copies each at once: the UI thread adds to _boxes
         # (show) while this runs, and a dict changed under a loop raises.
         for table in (self._streams, self._current, self._decoders,
-                      self._latest, self._boxes, self._asked):
+                      self._latest, self._boxes, self._asked, self._shown,
+                      self._said, self._waits):
             for key in [k for k in list(table) if k[0] == who]:
                 table.pop(key, None)
+        for key in [k for k in list(self._decoded) if k[0] == who]:
+            self._decoded.discard(key)
 
 
 # ---- phones: Android's own camera and coders (android/VideoCall.java) -------
@@ -12591,33 +14534,50 @@ class ShareService:
     this file): started, awaited (it makes a file once it is up), stopped
     with the share."""
 
+    CLASS, FLAG, WORDS = SHARE_SERVICE_CLASS, ".share_active", \
+        N_("Sharing your screen")
+
     def __init__(self) -> None:
-        self.flag = DATA_DIR / ".share_active"
+        self.flag = DATA_DIR / self.FLAG
         self.up = Path(str(self.flag) + ".up")
 
     def _java(self):
         ctx = android_context()            # its class: found already, on
-        return ctx, _jni()[0](SHARE_SERVICE_CLASS.format(   # the UI thread
+        return ctx, _jni()[0](self.CLASS.format(            # the UI thread
             package=ctx.getPackageName()))
 
-    def start(self, timeout: float = 20.0) -> bool:
+    def launch(self) -> None:
+        """Asked to start; its process makes `.up` once it runs. On the UI
+        thread, unless its class was found there before: a thread of
+        Python's own cannot find the app's Java classes (21.0, Devices run
+        52 on Android 5: "ClassNotFoundException")."""
+        with contextlib.suppress(OSError):
+            self.up.unlink()
+        self.flag.write_text(self.flag_text())
+        ctx, service = self._java()
+        service.start(ctx, "ic_stat_ferritext", APP_NAME,
+                      tr(self.WORDS), str(self.flag))
+
+    def flag_text(self) -> str:
+        """What its flag file holds: when it was asked for."""
+        return str(time.time())
+
+    def wait_up(self, timeout: float) -> bool:
         """Running in the foreground within `timeout` seconds? Its process
         starts Python before it says so, which a slow phone takes a while
         to do (18.0.2: 20 s, not 6, which an emulator on a busy machine
         overran); the wait ends as soon as it is up."""
-        for path in (self.up,):
-            with contextlib.suppress(OSError):
-                path.unlink()
-        self.flag.write_text(str(time.time()))
-        ctx, service = self._java()
-        service.start(ctx, "ic_stat_ferritext", APP_NAME,
-                      tr("Sharing your screen"), str(self.flag))
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             if self.up.exists():
                 return True
             time.sleep(0.05)
         return False
+
+    def start(self, timeout: float = 20.0) -> bool:
+        """Launched, and running in the foreground within `timeout`?"""
+        self.launch()
+        return self.wait_up(timeout)
 
     def stop(self) -> None:
         for path in (self.flag, self.up):
@@ -12626,6 +14586,218 @@ class ShareService:
         with contextlib.suppress(Exception):
             ctx, service = self._java()
             service.stop(ctx)
+
+
+class CameraService(ShareService):
+    """20.0: likewise of type camera. Android gives an app out of sight
+    no camera unless it runs one, started while the app was in sight: it
+    runs while a call's camera is on (FextApp._camera_service), and the
+    other side keeps seeing this one when the app leaves the screen (the
+    owner: "Focusing out of app cuts the video connection - it should
+    keep it"). Its notification says the camera is on."""
+
+    CLASS, FLAG, WORDS = CAMERA_SERVICE_CLASS, ".camera_active", \
+        N_("Camera on in a call")
+
+    @property
+    def on(self) -> bool:
+        return self.flag.exists()
+
+
+class LocationService(ShareService):
+    """21.0 (MAP29): likewise of type location: Android tells an app out
+    of sight where the phone is only while one runs, started in sight. It
+    runs while a live location is shared; its notice says so."""
+
+    CLASS, FLAG, WORDS = LOCATION_SERVICE_CLASS, ".location_active", \
+        N_("Sharing your location")
+
+    # 21.1 (LIVENOTICE30): its notice says with whom and until when (`text`,
+    # in the flag file, which its process shows: the top of main.py), and
+    # has Stop, which works while the app is closed (NotifyReceiver leaves
+    # "flag.stopped" and takes the flag away; the app ends the shares).
+    text = ""
+
+    def flag_text(self) -> str:
+        return json.dumps({"title": tr(self.WORDS), "text": self.text})
+
+    def say(self, text: str) -> None:
+        """Its notice's words, now: told to its process if it runs
+        (written whole, then put in place: never read half-written)."""
+        self.text = text
+        if self.flag.exists():
+            spare = Path(str(self.flag) + ".new")
+            spare.write_text(self.flag_text())
+            replace_file(spare, self.flag)
+
+    @property
+    def stopped_mark(self) -> Path:
+        return Path(str(self.flag) + ".stopped")
+
+    def stopped(self) -> bool:
+        """Stop was tapped on its notice (once: the mark is taken)."""
+        try:
+            self.stopped_mark.unlink()
+            return True
+        except OSError:
+            return False
+
+
+class AndroidLocation:
+    """21.0 (MAP29): where the phone is, from Android's own LocationManager
+    (its GPS and network providers; no other company's service). Several
+    follow it at once (a live share, the location sheet); it is read only
+    while one does."""
+
+    PROVIDERS = ("gps", "network")
+
+    def __init__(self) -> None:
+        self._listener = None
+        self.followers: list = []
+
+    @staticmethod
+    def _manager():
+        autoclass, cast = _jni()
+        return cast("android.location.LocationManager",
+                    android_context().getSystemService("location"))
+
+    @staticmethod
+    def point(location) -> Optional[dict]:
+        if location is None:
+            return None
+        return sanitize_location({
+            "lat": location.getLatitude(), "lon": location.getLongitude(),
+            "acc": int(location.getAccuracy()),
+            "at": int(location.getTime() // 1000)})
+
+    def last(self) -> Optional[dict]:
+        """The newest point Android already holds, if any."""
+        best = None
+        for name in self.PROVIDERS:
+            try:
+                point = self.point(self._manager().getLastKnownLocation(name))
+            except Exception:
+                point = None
+            if point and (best is None or point["at"] > best["at"]):
+                best = point
+        return best
+
+    def follow(self, on_point: Callable[[dict], None]) -> None:
+        """`on_point(point)` on the UI thread as the phone moves, until
+        unfollow(on_point)."""
+        if on_point not in self.followers:
+            self.followers.append(on_point)
+        if self._listener is not None:
+            return
+        from jnius import PythonJavaClass, java_method   # type: ignore
+        source = self
+
+        class Listener(PythonJavaClass):
+            __javainterfaces__ = ["android/location/LocationListener"]
+            __javacontext__ = "app"
+
+            @java_method("(Landroid/location/Location;)V")
+            def onLocationChanged(self, location):
+                point = source.point(location)
+                if point:
+                    Clock.schedule_once(lambda _dt: source.tell(point), 0)
+
+            # Android 12 and later may hand over several at once.
+            @java_method("(Ljava/util/List;)V", name="onLocationChanged")
+            def onLocationsChanged(self, locations):
+                if locations.size():
+                    self.onLocationChanged(locations.get(
+                        locations.size() - 1))
+
+            @java_method("(I)V")
+            def onFlushComplete(self, _code):
+                pass
+
+            @java_method("(Ljava/lang/String;)V")
+            def onProviderEnabled(self, _provider):
+                pass
+
+            @java_method("(Ljava/lang/String;)V")
+            def onProviderDisabled(self, _provider):
+                pass
+
+            @java_method("(Ljava/lang/String;ILandroid/os/Bundle;)V")
+            def onStatusChanged(self, _provider, _status, _extras):
+                pass
+        self._listener = Listener()          # held here: Java holds it too
+        looper = _jni()[0]("android.os.Looper").getMainLooper()
+        for name in self.PROVIDERS:
+            try:                       # (gps: not with an approximate place)
+                self._manager().requestLocationUpdates(
+                    name, 5000, 5.0, self._listener, looper)
+            except Exception as exc:
+                log.info("location: no %s provider (%s)", name, exc)
+
+    def tell(self, point: dict) -> None:
+        for on_point in list(self.followers):
+            on_point(point)
+
+    def unfollow(self, on_point: Callable[[dict], None]) -> None:
+        with contextlib.suppress(ValueError):
+            self.followers.remove(on_point)
+        if not self.followers and self._listener is not None:
+            with contextlib.suppress(Exception):
+                self._manager().removeUpdates(self._listener)
+            self._listener = None
+
+
+#: 21.0 (MAP29): where this device is: Android's (AndroidLocation), a
+#: stand-in in the suites, or None on a computer (no place of its own: a
+#: place is typed there).
+LOCATION_SOURCE = None
+LOCATION_PERMISSIONS = ("android.permission.ACCESS_FINE_LOCATION",
+                        "android.permission.ACCESS_COARSE_LOCATION")
+
+
+def location_source():
+    global LOCATION_SOURCE
+    if LOCATION_SOURCE is None and IS_ANDROID:
+        LOCATION_SOURCE = AndroidLocation()
+    return LOCATION_SOURCE
+
+
+#: Whether a place opens in a maps app of this device's own (a phone's);
+#: a computer copies its coordinates instead.
+OPENS_MAPS = IS_ANDROID
+#: Under this much battery (%), the location sheet says a long share may
+#: stop before its time.
+LOW_BATTERY = 15
+
+
+def show_in_maps(lat: float, lon: float) -> bool:
+    """A place in the phone's own maps app (Android lets the person
+    choose which); False if no app takes it."""
+    try:
+        autoclass, _ = _jni()
+        Intent = autoclass("android.content.Intent")
+        intent = Intent(Intent.ACTION_VIEW, autoclass("android.net.Uri").parse(
+            map_link(lat, lon)))
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        android_context().startActivity(intent)
+        return True
+    except Exception as exc:
+        log.info("no maps app takes a place (%s)", exc)
+        return False
+
+
+def battery_percent() -> Optional[int]:
+    """How full the phone's battery is, if Android says."""
+    if not IS_ANDROID:
+        return None
+    try:
+        autoclass, cast = _jni()
+        manager = cast("android.os.BatteryManager", android_context()
+                       .getSystemService("batterymanager"))
+        level = manager.getIntProperty(autoclass(
+            "android.os.BatteryManager").BATTERY_PROPERTY_CAPACITY)
+    except Exception:
+        return None
+    return level if 0 <= level <= 100 else None
 
 
 def screen_size(width: int, height: int, short: int) -> tuple:
@@ -12896,9 +15068,13 @@ def android_selftest_wanted() -> bool:
 #: The self-test's checks, in the order it makes them.
 SELFTEST_CHECKS = ("call-classes", "call-audio", "codecs-encoders",
                    "codecs-decoders", "camera", "screen", "video-message",
-                   "video-draw")
+                   "video-draw", "camera-service")
 #: Notification.VISIBILITY_SECRET and FLAG_FOREGROUND_SERVICE (Android).
 NOTICE_SECRET, NOTICE_OF_SERVICE = -1, 0x40
+#: NotificationManager.IMPORTANCE_MIN and IMPORTANCE_LOW.
+NOTICE_MIN, NOTICE_LOW = 1, 2
+#: Notifier.CHANNEL_SERVICE: "Ready for new messages"'s channel.
+SERVICE_CHANNEL = "quiet"
 
 
 def android_selftest() -> None:
@@ -12920,7 +15096,8 @@ def android_selftest() -> None:
 
     def run() -> None:
         verdicts = []
-        if android_calls_too_old():                # 17.3: none on Android 5
+        too_old = android_calls_too_old()
+        if too_old:                                # 17.3: none on Android 5
             # The coders, the camera and the screen are a call's parts, and
             # their Java (VideoCall) is looked for only where calls start.
             for check in SELFTEST_CHECKS:
@@ -12936,19 +15113,24 @@ def android_selftest() -> None:
             verdicts.append(_selftest_screen(say))
             verdicts.append(_selftest_video_message(say))
             verdicts.append(_selftest_draw(say))
+            verdicts.append(_selftest_camera_service(say))
         verdicts.append(_selftest_service_notice(say))
-        checked = [v for v in verdicts if v != "SKIP"]
-        done = f"{checked.count('PASS')}/{len(checked)}"
+        verdicts.append(_selftest_call_notice(say))
+        verdicts += _selftest_location(say)                     # 21.0
+        verdicts.append(_selftest_string_extra(say))            # 21.1
+        verdicts.append(_selftest_live_notice(say))
 
         def finish() -> None:
             # "done" once the Back sheet is open: the emulators' check
             # presses Back on reading it. A UI thread that has stopped
             # never says it, which that check reports as no verdict.
+            verdicts.append(_selftest_call_lobby(say, too_old))
+            checked = [v for v in verdicts if v != "SKIP"]
             try:
                 _selftest_back(say)
             except Exception as exc:
                 say("back", "FAIL", repr(exc))
-            say("done", done)
+            say("done", f"{checked.count('PASS')}/{len(checked)}")
 
         run_on_ui(finish)
 
@@ -12968,48 +15150,298 @@ def _selftest_service_notice(say: Callable[..., str], wait: float = 45.0,
     try:
         if android_sdk() < 23:           # no asking what is shown before 6
             return say("service-notice", "SKIP", "needs Android 6")
+        # 20.0: its channel asks for the least importance (MIN from Android
+        # 9, LOW on 8). 21.0: from Android 8.1 Android itself raises a
+        # running service's MIN notice to LOW (run 44, Android 11: "importance
+        # 2"), unless its person lowered it in the channel's settings, which
+        # Settings › Notifications now opens. Either is right.
+        quiet = (None,) if android_sdk() < 26 else (NOTICE_MIN, NOTICE_LOW)
         start(True)
         until = time.time() + wait
         while True:
-            own, others = notices()
-            ok = own == [NOTICE_SECRET] and not others
+            own, others, importance = notices()
+            ok = own == [NOTICE_SECRET] and not others and \
+                importance in quiet
             if ok or time.time() > until:
                 break
             time.sleep(0.5)
         start(False)
         return say("service-notice", "PASS" if ok else "FAIL",
-                   f"its own: visibility {own} (secret is {NOTICE_SECRET}); "
+                   f"its own: visibility {own} (secret is {NOTICE_SECRET}), "
+                   f"importance {importance} (allowed {quiet}); "
                    f"others of a service: {others}")
     except Exception as exc:
         return say("service-notice", "FAIL", repr(exc))
 
 
+def _selftest_location(say: Callable[..., str], wait: float = 40.0,
+                       up_wait: float = 25.0) -> list:
+    """21.0 (MAP29): where the phone is, from Android's LocationManager as
+    a live share follows it (the emulators' check gives a GPS fix while
+    it waits), and the location service launched as a live share launches
+    it (on the UI thread), up within `up_wait` seconds, and stopped. SKIP
+    without the permission; the first also with location off."""
+    if not any(android_has_permission(p) for p in LOCATION_PERMISSIONS):
+        return [say(check, "SKIP", "no location permission")
+                for check in ("location", "location-service")]
+    verdicts = []
+    try:
+        manager, on = AndroidLocation._manager(), []
+        for name in AndroidLocation.PROVIDERS:
+            with contextlib.suppress(Exception):   # (none of that name)
+                if manager.isProviderEnabled(name):
+                    on.append(name)
+        if not on:
+            verdicts.append(say("location", "SKIP", "location is off"))
+        else:
+            source, points, got = AndroidLocation(), [], threading.Event()
+
+            def found(point: dict) -> None:
+                points.append(point)
+                got.set()
+            run_on_ui(source.follow, found)        # as a live share does
+            got.wait(wait)
+            run_on_ui(source.unfollow, found)
+            verdicts.append(say(
+                "location", "PASS" if points else "FAIL",
+                f"{coordinates_text(points[0])} (±{points[0]['acc']} m)"
+                if points else f"no point in {wait:.0f} s from "
+                f"{','.join(on)}"))
+    except Exception as exc:
+        verdicts.append(say("location", "FAIL", repr(exc)))
+    try:
+        service, launched, failed = LocationService(), threading.Event(), []
+
+        def launch() -> None:
+            try:
+                service.launch()
+            except Exception as exc:
+                failed.append(exc)
+            launched.set()
+        run_on_ui(launch)
+        launched.wait(10.0)
+        if failed:
+            raise failed[0]
+        up = service.wait_up(up_wait)
+        service.stop()
+        verdicts.append(say("location-service", "PASS" if up else "FAIL",
+                            "up" if up else f"not up in {up_wait:.0f} s"))
+    except Exception as exc:
+        verdicts.append(say("location-service", "FAIL", repr(exc)))
+    return verdicts
+
+
+def _selftest_live_notice(say: Callable[..., str], wait: float = 20.0,
+                          service=None, shown: Callable = None,
+                          press_stop: Callable = None) -> str:
+    """21.1 (LIVENOTICE30): the location service's notice as a live share
+    starts it: the app's own, saying the words it was given (with whom,
+    until when), and its Stop, pressed as its button presses it (the
+    broadcast it sends), ends the service and leaves the app its mark.
+    `service`, `shown` and `press_stop` stand in for Android in the
+    desktop tests."""
+    try:
+        if not any(android_has_permission(p) for p in LOCATION_PERMISSIONS):
+            return say("live-notice", "SKIP", "no location permission")
+        if android_sdk() < 23:           # no asking what is shown before 6
+            return say("live-notice", "SKIP", "needs Android 6")
+        service = service or LocationService()
+        shown = shown or android_live_notice_text
+        press_stop = press_stop or android_press_live_stop
+        service.text = tr("With {name} until {time}", name="the self-test",
+                          time="12:00")
+        run_on_ui(service.launch)
+        until = time.time() + wait
+        while (text := shown()) is None and time.time() < until:
+            time.sleep(0.25)
+        if text != service.text:
+            service.stop()
+            return say("live-notice", "FAIL", f"shown: {text!r}")
+        press_stop(service)
+        until = time.time() + wait
+        while (service.flag.exists() or shown() is not None) and \
+                time.time() < until:
+            time.sleep(0.25)
+        gone, ended, marked = not service.flag.exists(), shown() is None, \
+            service.stopped()
+        service.stop()
+        return say("live-notice", "PASS" if gone and ended and marked
+                   else "FAIL", f"{text!r}; Stop: the service "
+                   f"{'ended' if gone and ended else 'still running'}, the "
+                   f"app {'told' if marked else 'not told'}")
+    except Exception as exc:
+        return say("live-notice", "FAIL", repr(exc))
+
+
+def android_notice_words(own_id: int) -> Optional[str]:
+    """The words of the app's notice `own_id` showing now ("" if it has
+    none), or None if it is not shown (Android 6 and later)."""
+    manager = android_context().getSystemService("notification")
+    for shown in manager.getActiveNotifications():
+        if shown.getId() == own_id:
+            text = shown.getNotification().extras.getCharSequence(
+                "android.text")
+            # A CharSequence that is a String comes over as Python's str
+            # (run 44, Android 11, and run 59, Android 16: "'str' object
+            # has no attribute 'toString'"); a styled one as a Java object.
+            if text is None:
+                return ""
+            return text if isinstance(text, str) else str(text.toString())
+    return None
+
+
+def android_live_notice_text() -> Optional[str]:
+    """The words of the location service's notice now, or None if none is
+    shown (Notifier.LIVE_NOTICE)."""
+    return android_notice_words(_notifier().LIVE_NOTICE)
+
+
+def android_press_live_stop(service: "LocationService") -> None:
+    """What the notice's Stop sends, sent: built in Java as the notice
+    builds it (Notifier.pressStopLive). From Python, pyjnius took the
+    activity for setClassName's package name (Devices run 60) and gave the
+    flag to putExtra as a char[], which the receiver reads as none (61)."""
+    _notifier().pressStopLive(android_context(), str(service.flag))
+
+
+def _selftest_string_extra(say: Callable[..., str]) -> str:
+    """21.1: a string put on an Intent reads back as one (_jstring), as a
+    notice's tap needs it to open its chat. The detail says what a Python
+    str gives: pyjnius takes putExtra's char[] form for it (Devices run
+    61), which Android reads back as none."""
+    try:
+        autoclass, _ = _jni()
+        intent = autoclass("android.content.Intent")()
+        intent.putExtra("java", _jstring("fext"))
+        intent.putExtra("python", "fext")
+        java, python = (intent.getStringExtra(key)
+                        for key in ("java", "python"))
+        return say("string-extra", "PASS" if java == "fext" else "FAIL",
+                   f"a Java String read back as {java!r}, a Python str "
+                   f"as {python!r}")
+    except Exception as exc:
+        return say("string-extra", "FAIL", repr(exc))
+
+
+def _selftest_camera_service(say: Callable[..., str], service=None,
+                             wait: float = 25.0) -> str:
+    """20.0: the camera service (CameraService) comes up on this Android,
+    and is stopped. SKIP without the camera's permission: Android 14
+    starts none then (the app starts it once a call's camera is on, so
+    with it)."""
+    try:
+        if service is None and not android_has_permission(
+                "android.permission.CAMERA"):
+            return say("camera-service", "SKIP", "no camera permission")
+        service = service or CameraService()
+        up = service.start(wait)
+        service.stop()
+        return say("camera-service", "PASS" if up else "FAIL",
+                   "up" if up else f"not up in {wait:.0f} s")
+    except Exception as exc:
+        return say("camera-service", "FAIL", repr(exc))
+
+
+def _selftest_call_notice(say: Callable[..., str], wait: float = 10.0,
+                          ring: Callable[[bool], None] = None,
+                          shown: Callable[[], Optional[str]] = None) -> str:
+    """20.0: a video call's notification as Android holds it: it says
+    "video" (it rang as a voice call), then is taken down. SKIP where
+    notifications are not allowed (Android 13 asks first) or cannot be
+    read back (before Android 6). `ring` and `shown` stand in for Android
+    in the desktop tests."""
+    def android_ring(on: bool) -> None:
+        if on:
+            _notifier().incomingCall(
+                android_context(), CALL_NOTIFICATION_ID, "F" * 34,
+                "0" * 32, "Self-test", "F" * 34, True)
+        else:
+            android_cancel_call_notification()
+
+    ring, shown = ring or android_ring, shown or android_call_notice_text
+    try:
+        if android_calls_too_old() or android_sdk() < 23:
+            return say("call-notice", "SKIP", "needs Android 6")
+        ring(True)
+        until, text = time.time() + wait, None
+        while text is None and time.time() < until:
+            time.sleep(0.3)
+            text = shown()
+        ring(False)
+        if text is None:
+            return say("call-notice", "SKIP", "no notification shown: not "
+                       "allowed here, it seems")
+        return say("call-notice", "PASS" if "video" in text.lower()
+                   else "FAIL", f"it reads: {text}")
+    except Exception as exc:
+        return say("call-notice", "FAIL", repr(exc))
+
+
+def android_call_notice_text() -> Optional[str]:
+    """The words of the call notification showing now, or None."""
+    return android_notice_words(CALL_NOTIFICATION_ID)
+
+
+def _selftest_call_lobby(say: Callable[..., str],
+                         too_old: bool = False) -> str:
+    """20.0: a video call's lobby drawn on this device (the UI thread):
+    what Answer opens. A lobby that cannot be drawn here would stop a
+    call being answered; this says so by name."""
+    try:
+        if too_old:
+            return say("call-lobby", "SKIP", "calls need Android 6")
+        app = App.get_running_app()
+        session = CallSession("F" * 34, "G" * 34, group=False, video=True,
+                              host="F" * 34, session_id="0" * 32)
+        lobby = CallLobby(app, session, name="Self-test", title="Self-test")
+        lobby.open(animation=False)
+        ok = lobby in Window.children and lobby.camera_button is not None
+        lobby.dismiss(animation=False)
+        return say("call-lobby", "PASS" if ok else "FAIL",
+                   f"{len(lobby.devices)} device rows")
+    except Exception as exc:
+        return say("call-lobby", "FAIL", repr(exc))
+
+
 def android_service_notices() -> tuple:
     """What the app's services show now (Android 6 and later): the
     lock-screen visibility of the sync service's own notice
-    (Notifier.SERVICE_NOTICE), and the ids of any others."""
+    (Notifier.SERVICE_NOTICE), the ids of any others, and its channel's
+    importance (None before Android 8, which has no channels)."""
     ctx = android_context()
     own_id = _notifier().SERVICE_NOTICE
-    own, others = [], []
-    for shown in ctx.getSystemService("notification").getActiveNotifications():
+    manager = ctx.getSystemService("notification")
+    own, others, importance = [], [], None
+    for shown in manager.getActiveNotifications():
         notice = shown.getNotification()
         if not notice.flags & NOTICE_OF_SERVICE:
             continue
         if shown.getId() == own_id:
             own.append(notice.visibility)
+            if android_sdk() >= 26:
+                importance = manager.getNotificationChannel(
+                    notice.getChannelId()).getImportance()
         else:
             others.append(shown.getId())
-    return own, others
+    return own, others, importance
 
 
-def _selftest_back(say: Callable[..., str], wait: float = 5.0) -> None:
+def _selftest_back(say: Callable[..., str], wait: float = 5.0,
+                   check: str = "back") -> None:
     """18.1: Android's Back key. A sheet is left open at the end of the
     self-test; the emulators' check then presses Back as a thumb does
     (adb), and this says what reached the app: Kivy's key 27, and the
     sheet closed by it (a sheet takes Back itself; _on_keyboard takes the
     rest). The sheet is looked for until it has gone, `wait` seconds at
     the most: it closes with a movement, which a slow device draws in
-    its own time (Devices run 26, Android 16: still open after 0.6 s)."""
+    its own time (Devices run 26, Android 16: still open after 0.6 s).
+
+    21.1: then a second sheet, before "back" is said, and a Back given
+    to the activity's own handler ("back-activity"): where a press finds
+    no view to take it (no view has the focus once the keyboard has
+    gone), Android hands it to onBackPressed, which closed the app from
+    whatever page (the owner's phone). p4a_hook.py's BACK_TO_APP gives it
+    to the app as a Back key instead."""
     sheet = Sheet("Back")
     sheet.add(InfoLabel("The self-test is done. Back closes this."))
 
@@ -13021,7 +15453,9 @@ def _selftest_back(say: Callable[..., str], wait: float = 5.0) -> None:
             closed = sheet not in Window.children
             if not closed and time.monotonic() < until:
                 return None                # looked for again
-            say("back", "PASS" if key == 27 and closed else "FAIL", f"key "
+            if check == "back" and key == 27 and closed and IS_ANDROID:
+                _selftest_back(say, wait, "back-activity")
+            say(check, "PASS" if key == 27 and closed else "FAIL", f"key "
                 f"{key}, the sheet {'closed' if closed else 'still open'}")
             return False                   # said once: no more looks
 
@@ -13030,6 +15464,20 @@ def _selftest_back(say: Callable[..., str], wait: float = 5.0) -> None:
 
     sheet.open()
     Window.bind(on_keyboard=pressed)        # bound last, so heard first
+    if check == "back-activity":
+        Clock.schedule_once(lambda _dt: _back_to_activity(), 1.0)
+
+
+def _back_to_activity() -> None:
+    """The self-test's Back that no view took: the activity's own
+    onBackPressed, on Android's UI thread."""
+    from android.runnable import run_on_ui_thread   # type: ignore
+
+    @run_on_ui_thread
+    def press() -> None:
+        _jni()[0]("org.kivy.android.PythonActivity").mActivity \
+            .onBackPressed()
+    press()
 
 
 def _selftest_call_audio(say: Callable[..., str]) -> list:
@@ -13287,8 +15735,9 @@ def call_video_why_not(track: str = "v") -> str:
     return ""
 
 
-def make_video_coder(track: str):
-    """This device's camera ('v') or screen ('s'), ready to code."""
+def make_video_coder(track: str, helper: bool = False):
+    """This device's camera ('v') or screen ('s'), ready to code; a remote
+    session's screen through the service's helper (`helper`, 21.0)."""
     if IS_ANDROID and track == "s":                      # 18.0 (PHONESHARE)
         grant, AndroidScreenCoder.granted = AndroidScreenCoder.granted, None
         if grant is None:
@@ -13297,7 +15746,8 @@ def make_video_coder(track: str):
         return AndroidScreenCoder(grant)
     if IS_ANDROID:
         return AndroidVideoCoder(video_ceiling())
-    sources = video_sources("camera" if track == "v" else "screen")
+    sources = video_sources("camera" if track == "v" else "screen",
+                            helper=helper)
     if not sources:
         raise RuntimeError(call_video_why_not(track))
     return FfmpegVideoCoder(sources[0])
@@ -13309,33 +15759,43 @@ class CallVideo:
     engine is up: attach), the others' (one VideoReceiver), and the
     textures the call's screens draw, refreshed 30 times a second on the
     UI thread (tick). `who_of(user)` names a person as the engine does (a
-    room's member index; the peer of a 1-to-1 call)."""
+    room's member index; the peer of a 1-to-1 call).
+
+    21.0 (NEXT29): the others' pictures are drawn as they come (`_soon`),
+    DRAW_MOST a second at most (each is a texture's upload): before, a
+    picture waited for the next of the 30 ticks, up to 33 ms (17 on
+    average), and a call sent 60 a second was drawn at 30."""
 
     FPS = 30
+    DRAW_MOST = 30 if IS_MOBILE else 60
 
     def __init__(self, me: str, textures: dict, on_key: Callable,
-                 on_failed: Callable, who_of: Callable = lambda u: u) -> None:
+                 on_failed: Callable, who_of: Callable = lambda u: u,
+                 on_strain: Optional[Callable] = None) -> None:
         self.me, self.textures = me, textures
         self.on_failed, self.who_of = on_failed, who_of
         self.coders: dict = {}                 # track -> coder
         self.senders: dict = {}                # track -> VideoSender
-        self.receiver = VideoReceiver(on_key)
+        self.receiver = VideoReceiver(on_key, on_strain=on_strain,
+                                      on_picture=self._soon)
         self.receiver.start()
+        self._pending, self._ticked = False, 0.0
         self.view: dict = {}                   # (user, track) -> tile
         self._drawn: dict = {}                 # (user, track) -> serial
         self._yuv: dict = {}        # (user, track) -> YuvPicture (18.2)
         self._emit: Optional[Callable] = None
         self._clock = Clock.schedule_interval(self.tick, 1 / self.FPS)
 
-    def start(self, track: str) -> str:
-        """This device's camera or screen on: '' or why not."""
+    def start(self, track: str, helper: bool = False) -> str:
+        """This device's camera or screen on: '' or why not. `helper`: a
+        remote session's screen, through the service's helper (21.0)."""
         if track in self.coders:
             return ""
         why = call_video_why_not(track)
         if why:
             return why
         try:
-            self.coders[track] = make_video_coder(track)
+            self.coders[track] = make_video_coder(track, helper)
         except Exception as exc:
             return str(exc) or type(exc).__name__
         if self._emit is not None:
@@ -13375,6 +15835,14 @@ class CallVideo:
         if coder is not None:
             coder.ask_key(layer)
 
+    def set_pointer(self, drawn: bool) -> bool:
+        """21.1 (CURSOR30): this side's shared screen with its pointer in
+        it, or without; whether it can be read without it."""
+        coder = self.coders.get("s")
+        if coder is None or not hasattr(coder, "set_pointer"):
+            return False
+        return coder.set_pointer(drawn)
+
     def set_view(self, tiles: dict) -> None:
         """What the call's screen shows now: {(user, track): tile}."""
         for user, track in set(self.view) - set(tiles):
@@ -13387,9 +15855,23 @@ class CallVideo:
                                    video_box(tile.size, track), track == "v")
         self.tick()
 
+    def _soon(self) -> None:
+        """(The receiver's thread.) A picture is ready: drawn at the UI
+        thread's next frame, DRAW_MOST a second at most."""
+        if self._pending:
+            return
+        self._pending = True
+        Clock.schedule_once(self._pushed, max(
+            0.0, self._ticked + 1 / self.DRAW_MOST - time.monotonic()))
+
+    def _pushed(self, _dt: float) -> None:
+        self._pending = False           # before the tick reads the newest
+        self.tick()
+
     def tick(self, _dt: float = 0) -> None:
         """Each new picture into its texture. A Clock callback that raises
         ends the app (Kivy): a fault here is logged, once, and skipped."""
+        self._ticked = time.monotonic()
         try:
             self._tick()
         except Exception:
@@ -14298,6 +16780,15 @@ def call_offer_age(sig: dict, api: Optional["ApiClient"]) -> float:
     from when it took the offer (`relay_at`) to its time now, a clock both
     ends share; by the caller's own (`t`) only where that is not known.
     Timed by two devices' clocks, a minute apart, every call was missed."""
+    if sig.get("aged"):
+        # 20.0: an offer the background service kept (keep_call_offer): its
+        # age when kept, by the service's knowledge of the relay's clock,
+        # and the time since, by this device's own. The app, just
+        # started, does not know the relay's clock yet: judged by this
+        # phone's clock alone, a phone set a minute fast missed every
+        # call answered from its notification.
+        age, kept = sig["aged"]
+        return age + max(0.0, time.time() - kept)
     if sig.get("relay_at") and api is not None:
         return api.relay_now() - sig["relay_at"]
     return time.time() - sig["t"] if sig.get("t") else 0.0
@@ -14351,6 +16842,16 @@ class Call:
         self.rc_number = 0
         self.rc_said: tuple = (None, 0.0)
         self.restarting = False
+        # 21.1 (CURSOR30): the computer: the side controlling draws the
+        # pointer (`rc_pointer_here`), and its picture is read without it
+        # (`rc_pointer_out`); its shape and where it was last told, and
+        # how many ticks running it was not where they put it. The side
+        # controlling: what their computer said (shape, (x, y) or None).
+        self.rc_pointer_here = self.rc_pointer_out = False
+        self.rc_pointer_said: Optional[tuple] = None
+        self.rc_pointer_odd = 0
+        self.rc_pointer: Optional[tuple] = None
+        self.rc_began = 0.0            # 21.1: this side began to control
 
     @property
     def tag_bytes(self) -> bytes:
@@ -14542,7 +17043,28 @@ REMOTE_KEYS = (("enter", "tab", "backspace", "escape", "delete", "insert",
                 "down", "shift", "ctrl", "alt", "meta", "capslock", "space",
                 "printscreen", "menu") +
                tuple(f"f{n}" for n in range(1, 13)) +
-               tuple("abcdefghijklmnopqrstuvwxyz0123456789"))
+               tuple("abcdefghijklmnopqrstuvwxyz0123456789") +
+               # 20.0: the signs' keys, for the shortcuts made with them
+               # (Ctrl+/ comments a line, Ctrl+- makes a page smaller,
+               # Ctrl+` opens an editor's terminal). Named as X11 names
+               # them, for a US keyboard's keys.
+               ("minus", "equal", "bracketleft", "bracketright",
+                "backslash", "semicolon", "apostrophe", "grave", "comma",
+                "period", "slash"))
+#: How many of them 19.0 knew. A computer says how many it knows in its
+#: state (20.0: "k"), and is sent no key beyond: a packet with a key a
+#: computer does not know is refused whole (unpack_input).
+REMOTE_KEYS_19 = 70
+#: The signs' keys by what they type unshifted on a US keyboard.
+REMOTE_SIGNS = {"-": "minus", "=": "equal", "[": "bracketleft",
+                "]": "bracketright", "\\": "backslash", ";": "semicolon",
+                "'": "apostrophe", "`": "grave", ",": "comma",
+                ".": "period", "/": "slash"}
+#: Keys whose text goes as typed text (INPUT_TEXT), in whatever layout the
+#: controlling keyboard has; they go as keys only in a shortcut (with
+#: Ctrl, Alt or the system key held).
+REMOTE_TYPED = frozenset("abcdefghijklmnopqrstuvwxyz0123456789") | \
+    frozenset(REMOTE_SIGNS.values()) | {"space"}
 REMOTE_MODIFIERS = ("shift", "ctrl", "alt", "meta")
 #: The buttons: 1 left, 2 right, 3 middle; as a bit each in a packet's
 #: "held" byte (1, 2, 4).
@@ -14749,7 +17271,8 @@ class WindowsInjector(RemoteInjector):
     """Windows' SendInput, through ctypes. Positions over the whole desktop
     (every screen: MOUSEEVENTF_VIRTUALDESK, as gdigrab's "desktop" reads
     it). Typed text as Unicode key presses, so the two keyboard layouts
-    need not match; named keys (shortcuts, arrows) as virtual keys.
+    need not match; named keys (shortcuts, arrows) as virtual keys with
+    their scan codes.
     Windows refuses a program input into one running as administrator
     (UIPI), and into the sign-in, lock and permission (UAC) screens:
     SendInput then does nothing, and that is said once in the log."""
@@ -14763,6 +17286,10 @@ class WindowsInjector(RemoteInjector):
     _VK.update({f"f{n}": 0x6F + n for n in range(1, 13)})
     _VK.update({c: ord(c.upper()) for c in "abcdefghijklmnopqrstuvwxyz"})
     _VK.update({c: ord(c) for c in "0123456789"})
+    _VK.update({"minus": 0xBD, "equal": 0xBB, "bracketleft": 0xDB,
+                "bracketright": 0xDD, "backslash": 0xDC, "semicolon": 0xBA,
+                "apostrophe": 0xDE, "grave": 0xC0, "comma": 0xBC,
+                "period": 0xBE, "slash": 0xBF})           # VK_OEM_*
     #: Keys Windows needs flagged as the keyboard's extended ones.
     _EXTENDED = {"delete", "insert", "home", "end", "pageup", "pagedown",
                  "left", "right", "up", "down", "meta", "printscreen",
@@ -14810,6 +17337,8 @@ class WindowsInjector(RemoteInjector):
             self._refused = True
             log.warning("remote: Windows refused input (a window run as "
                         "administrator, or the sign-in or lock screen)")
+            remote_log(tr("Windows refused the pointer and keys: a window "
+                          "above Ferritext's rights, or a security screen"))
 
     def _mouse(self, flags: int, x: int = 0, y: int = 0, data: int = 0):
         return self._INPUT(type=0, u=self._UNION(mi=self._MOUSE(
@@ -14845,7 +17374,13 @@ class WindowsInjector(RemoteInjector):
             return
         flags = (0x0001 if name in self._EXTENDED else 0) | \
             (0 if down else 0x0002)
-        self._send([self._key(vk, 0, flags)])
+        # 20.0: with the key's scan code too (MapVirtualKey, the key as
+        # the keyboard's hardware names it). A program that reads keys by
+        # scan code, not by Windows' virtual key, took none of them: a
+        # game, a virtual machine, another remote desktop, anything
+        # built on SDL (found by desktop/e2e_remote.py on Windows).
+        scan = self._user32.MapVirtualKeyW(vk, 0) & 0xFF
+        self._send([self._key(vk, scan, flags)])
 
     def text(self, text: str) -> None:
         units = text.encode("utf-16-le")
@@ -14880,6 +17415,7 @@ class X11Injector(RemoteInjector):
              "capslock": "Caps_Lock", "space": "space",
              "printscreen": "Print", "menu": "Menu"}
     _SYMS.update({f"f{n}": f"F{n}" for n in range(1, 13)})
+    _SYMS.update({name: name for name in REMOTE_SIGNS.values()})
 
     def __init__(self, display: Optional[str] = None) -> None:
         super().__init__()
@@ -15067,6 +17603,369 @@ class X11Injector(RemoteInjector):
             self._dpy = None
 
 
+# ---- 21.0 (SERVICE29): the service's helper, from the person's Ferritext -----
+#: VideoSource.format of the screen read through the helper (DeskCapture).
+DESK_SOURCE = "fext-desk"
+
+
+def desk_pipe_owner(handle) -> str:
+    """Who made a pipe, as a SID ("S-1-5-18": SYSTEM; "" when Windows does
+    not say). Only a process running as SYSTEM can make one SYSTEM owns."""
+    import ctypes
+    k, _u, _g, a = _desk_dlls()
+    owner, descriptor = ctypes.c_void_p(), ctypes.c_void_p()
+    if a.GetSecurityInfo(handle, 6, 1, ctypes.byref(owner), None, None,
+                         None, ctypes.byref(descriptor)) != 0:
+        return ""            # SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION
+    try:
+        text = ctypes.c_void_p()
+        if not a.ConvertSidToStringSidW(owner, ctypes.byref(text)):
+            return ""
+        try:
+            return ctypes.wstring_at(text.value)
+        finally:
+            k.LocalFree(text)
+    finally:
+        k.LocalFree(descriptor)
+
+
+class DeskLink:
+    """One of the helper's two pipes on this session (DESK_SCREEN, DESK_IN).
+    It is used only once its owner proves to be SYSTEM: a program of the
+    person's could otherwise make a pipe of that name first, and be sent
+    what is typed into the lock screen. One record at a time, under its
+    lock; on the screen's pipe, the answers up to the one awaited."""
+
+    def __init__(self, prefix: str) -> None:
+        self.prefix = prefix
+        self.pipe = None
+        self.lock = threading.Lock()
+
+    def _open(self) -> bool:
+        import ctypes
+        if self.pipe is not None:
+            return True
+        k = _desk_dlls()[0]
+        name = self.prefix + str(_desk_session())
+        for _try in range(2):
+            pipe = k.CreateFileW(name, 0xC0000000, 0, None, 3, 0x00110000,
+                                 None)       # SQOS: the server may not act as us
+            if pipe and pipe != ctypes.c_void_p(-1).value:
+                break
+            if ctypes.get_last_error() != 231 or \
+                    not k.WaitNamedPipeW(name, 1000):          # PIPE_BUSY
+                return False
+        else:
+            return False
+        if desk_pipe_owner(pipe) != "S-1-5-18":
+            log.warning("remote: %s is not the service's: not used", name)
+            k.CloseHandle(pipe)
+            return False
+        self.pipe = pipe
+        return True
+
+    def ask(self, kind: int, flag: int = 0, a: int = 0, b: int = 0,
+            c: int = 0, d: int = 0, until: int = 0) -> Optional[list]:
+        """A record sent, and the answers up to the first of kind `until`
+        (none: [] once sent); None when the helper is not there."""
+        with self.lock:
+            if not self._open():
+                return None
+            if not _desk_write(self.pipe, kind, flag, a, b, c, d):
+                self._close()
+                return None
+            answers = []
+            while until and len(answers) < 4:
+                record = _desk_read(self.pipe)
+                if record is None:
+                    self._close()
+                    return None
+                answers.append(record)
+                if record[0] == until:
+                    break
+            return answers
+
+    def _close(self) -> None:
+        if self.pipe is not None:
+            _desk_dlls()[0].CloseHandle(self.pipe)
+            self.pipe = None
+
+    def close(self) -> None:
+        with self.lock:
+            self._close()
+
+
+class DeskClient:
+    """This Ferritext's use of the service's helper: its screen (in memory
+    the helper hands over to read only) and its pointer and keys, while a
+    remote session wants them (`acquire`, `release`). The helper draws its
+    bar on the lock screen while either pipe is open, so neither is kept
+    open between sessions."""
+
+    #: Not asked again for this long after the helper did not answer.
+    MISSING = 10.0
+
+    def __init__(self) -> None:
+        self.screen, self.input = DeskLink(DESK_SCREEN), DeskLink(DESK_IN)
+        self.users = 0
+        self._lock = threading.Lock()
+        self._view, self._view_size = None, 0
+        self._missing = 0.0
+
+    def acquire(self) -> bool:
+        """The helper answers, of this version: one more user of it."""
+        if not IS_WINDOWS:
+            return False
+        with self._lock:
+            if time.monotonic() - self._missing < self.MISSING:
+                return False
+            got = self.screen.ask(DESK_HELLO, int(LANG.code.startswith("zh")),
+                                  until=DESK_HELLO) if self.users == 0 \
+                else [(DESK_HELLO, 0, DESK_VERSION, 0, 0, 0)]
+            if not got or got[-1][0] != DESK_HELLO or \
+                    got[-1][2] != DESK_VERSION:
+                if got:
+                    log.warning("remote: the service is of another version "
+                                "(%s): Settings › Remote access updates it",
+                                got[-1][2])
+                    remote_log(tr("the service is of another version: "
+                                  "update it in Settings › Remote access"))
+                self._missing = time.monotonic()
+                self.screen.close()
+                return False
+            self.users += 1
+            return True
+
+    def release(self) -> None:
+        with self._lock:
+            self.users = max(0, self.users - 1)
+            if self.users == 0:
+                self.screen.close()
+                self.input.close()
+                self._unmap()
+
+    def forget(self) -> None:
+        """Asked afresh next time (the service was just set up)."""
+        self._missing = 0.0
+
+    def available(self) -> bool:
+        """Whether the helper answers here now (asked, then let go)."""
+        if not self.acquire():
+            return False
+        self.release()
+        return True
+
+    def grab(self, pointer: bool = True) -> Optional[tuple]:
+        """The screen copied now: (what it shows, width, height, where its
+        pixels are in this process), or None."""
+        got = self.screen.ask(DESK_GRAB, int(pointer), until=DESK_FRAME)
+        if not got or got[-1][0] != DESK_FRAME:
+            return None
+        for kind, _flag, _a, b, c, _d in got:
+            if kind == DESK_MAP:
+                self._map(b, c)
+        _kind, shown, _a, width, height, _d = got[-1]
+        if self._view is None or width <= 0 or height <= 0 or \
+                width * height * 4 > self._view_size:
+            return None
+        return shown, width, height, self._view
+
+    def state(self) -> Optional[tuple]:
+        """(what the screen shows, whether a session may answer a
+        permission prompt), or None."""
+        got = self.screen.ask(DESK_STATE, until=DESK_STATE)
+        if not got or got[-1][0] != DESK_STATE:
+            return None
+        return got[-1][2], bool(got[-1][1])
+
+    def send(self, kind: int, flag: int = 0, a: int = 0, b: int = 0,
+             c: int = 0) -> bool:
+        return self.input.ask(kind, flag, a, b, c) is not None
+
+    def _map(self, handle: int, size: int) -> None:
+        """The helper's new memory for the screen, mapped here to read."""
+        k = _desk_dlls()[0]
+        self._unmap()
+        view = k.MapViewOfFile(handle, 0x0004, 0, 0, size)  # FILE_MAP_READ
+        k.CloseHandle(handle)            # the view keeps the memory
+        if view:
+            self._view, self._view_size = view, size
+
+    def _unmap(self) -> None:
+        if self._view is not None:
+            _desk_dlls()[0].UnmapViewOfFile(self._view)
+            self._view, self._view_size = None, 0
+
+
+#: This process's helper, used by a remote session (nothing is opened until
+#: one asks).
+DESK = DeskClient()
+
+
+def desk_frame(av, address: int, width: int, height: int):
+    """A picture of the helper's memory as FFmpeg holds a screen's
+    (32-bit BGRA), copied row by row: FFmpeg's rows may be longer than the
+    screen's (about 2 ms for 1080p)."""
+    import ctypes
+    frame = av.VideoFrame(width, height, "bgra")
+    plane = frame.planes[0]
+    row, line, into = width * 4, plane.line_size, plane.buffer_ptr
+    if line == row:
+        ctypes.memmove(into, address, row * height)
+    else:
+        for y in range(height):
+            ctypes.memmove(into + y * line, address + y * row, row)
+    return frame
+
+
+class DeskCapture(threading.Thread):
+    """VideoCapture's way through the service's helper (21.0, a remote
+    session's screen): the whole screen as Windows shows it, the lock
+    screen and permission prompts too, `fps` pictures a second (21.1:
+    screen_fps), with the pointer in it while `pointer` (CURSOR30). `shown`:
+    what the last picture shows (DESK_PERSON...). When the helper goes
+    (the service was stopped, the screen's session changed) it is asked
+    again for MISSING seconds, then this stops with `error` set."""
+
+    MISSING = 10.0
+
+    def __init__(self, source: VideoSource) -> None:
+        super().__init__(daemon=True, name="fext-capture-desk")
+        self.source = source
+        self.fps = screen_fps()                    # 21.1: SCREEN60
+        self.pointer = True      # 21.1 (CURSOR30): drawn in on the desktop
+        self.error = ""
+        self.gave: Optional[tuple] = None
+        self.shown = DESK_PERSON
+        self._cond = threading.Condition()
+        self._frame, self._serial = None, 0
+        self._halt = threading.Event()
+
+    def run(self) -> None:
+        av = _pyav()
+        if av is None or not DESK.acquire():
+            with self._cond:
+                self.error = tr("The service's helper did not answer")
+                self._cond.notify_all()
+            return
+        try:
+            self._loop(av)
+        finally:
+            DESK.release()
+
+    def _loop(self, av) -> None:
+        period, due, lost = 1.0 / self.fps, time.monotonic(), None
+        while not self._halt.is_set():
+            # The pointer always on a screen not the person's (a lock
+            # screen, a prompt): its shape is not known on this side.
+            got = DESK.grab(self.pointer or self.shown != DESK_PERSON)
+            now = time.monotonic()
+            if got is None:
+                lost = lost or now
+                if now - lost > self.MISSING:
+                    with self._cond:
+                        self.error = tr("The service's helper stopped")
+                        self._cond.notify_all()
+                    log.warning("remote: the service's helper stopped")
+                    remote_log(tr("the screen through the service stopped: "
+                                  "Ferritext reads it itself again"))
+                    return
+                self._halt.wait(0.5)
+                continue
+            lost = None
+            shown, width, height, address = got
+            frame = desk_frame(av, address, width, height)
+            if self.gave is None or self.gave[:2] != (width, height):
+                self.gave = (width, height, self.fps)
+                log.info("video: the screen through the service, %sx%s",
+                         width, height)
+            with self._cond:
+                self.shown = shown
+                self._frame, self._serial = frame, self._serial + 1
+                self._cond.notify_all()
+            due = max(due + period, now - period)
+            self._halt.wait(max(0.0, due - time.monotonic()))
+
+    def next_frame(self, after: int, timeout: float) -> Optional[tuple]:
+        """(serial, frame) newer than `after`, or None in `timeout`."""
+        with self._cond:
+            if self._serial <= after and not self.error:
+                self._cond.wait(timeout)
+            if self._serial <= after:
+                return None
+            return self._serial, self._frame
+
+    def stop(self) -> None:
+        self._halt.set()
+
+
+def capture_for(source: VideoSource):
+    """The thread that reads `source`: the helper's (21.0), or FFmpeg's."""
+    if source.format == DESK_SOURCE:
+        return DeskCapture(source)
+    return VideoCapture(source)
+
+
+class HelperInjector(WindowsInjector):
+    """WindowsInjector's events put in by the service's helper (21.0),
+    which runs as SYSTEM on the screen: the lock screen's password, a
+    window run as administrator, one that does not answer, and a
+    permission prompt when the service lets a session answer one.
+    Ctrl+Alt+Del from afar is Windows' own (SendSAS, through the service).
+    An event the helper did not take is put in as before, by SendInput."""
+
+    def __init__(self, user32=None) -> None:
+        super().__init__(user32)
+        self._mods: set = set()
+        self._sas = False
+        self._held = DESK.acquire()
+
+    def move(self, x: int, y: int) -> None:
+        if not DESK.send(DESK_MOVE, 0, 0, x, y):
+            super().move(x, y)
+
+    def button(self, button: int, down: bool, x: int, y: int) -> None:
+        if not DESK.send(DESK_BUTTON, int(down), button, x, y):
+            super().button(button, down, x, y)
+
+    def wheel(self, dx: int, dy: int) -> None:
+        if not DESK.send(DESK_WHEEL, 0, 0, dx, dy):
+            super().wheel(dx, dy)
+
+    def key(self, name: str, down: bool) -> None:
+        vk = self._VK.get(name)
+        if vk is None:
+            return
+        if name in ("ctrl", "alt"):
+            (self._mods.add if down else self._mods.discard)(name)
+        if name == "delete" and (self._sas or {"ctrl", "alt"} <= self._mods):
+            if down and not self._sas:
+                self._sas = DESK.send(DESK_SAS)
+            elif not down:
+                self._sas = False
+            if self._sas or not down:
+                return
+        scan = self._user32.MapVirtualKeyW(vk, 0) & 0xFF
+        if not DESK.send(DESK_KEY, int(down) | (2 if name in self._EXTENDED
+                                                 else 0), vk, scan):
+            super().key(name, down)
+
+    def text(self, text: str) -> None:
+        for at, char in enumerate(text):
+            units = char.encode("utf-16-le")
+            for unit in (int.from_bytes(units[n:n + 2], "little")
+                         for n in range(0, len(units), 2)):
+                if not (DESK.send(DESK_UNIT, 1, unit) and
+                        DESK.send(DESK_UNIT, 0, unit)):
+                    super().text(text[at:])
+                    return
+
+    def close(self) -> None:
+        if self._held:
+            self._held = False
+            DESK.release()
+
+
 def remote_injector() -> Optional[RemoteInjector]:
     """This computer's way to be controlled: Windows' SendInput, X11's
     XTEST; None where there is none (a phone, a Mac for now, Wayland, X11
@@ -15077,8 +17976,9 @@ def remote_injector() -> Optional[RemoteInjector]:
     if IS_MOBILE:
         return None
     try:
-        if IS_WINDOWS:
-            return WindowsInjector()
+        if IS_WINDOWS:              # 21.0: the service's helper, if it answers
+            return HelperInjector() if DESK.available() else \
+                WindowsInjector()
         if sys.platform.startswith("linux") and os.environ.get("DISPLAY") \
                 and os.environ.get("XDG_SESSION_TYPE", "x11") != "wayland":
             return X11Injector()
@@ -15099,6 +17999,18 @@ def remote_control_possible() -> bool:
     return _VIDEO_CAN["remote"]
 
 
+def remote_control_why_not() -> str:
+    """'' when this computer can be controlled from afar; else why not.
+    20.0: Settings says it, where the Remote access row used to be
+    missing without a word (an EXE built without its video package: its
+    person looked for a setting that was not there)."""
+    if remote_control_possible():
+        return ""
+    return call_video_why_not("s") or tr(
+        "This computer takes no pointer or keys from another program "
+        "(Wayland, or a Mac for now)")
+
+
 #: Remote access (unattended): how long a grant lasts, the choices offered
 #: (days; 0 until removed).
 REMOTE_GRANTS = ((1, N_("For a day")), (7, N_("For a week")),
@@ -15109,6 +18021,11 @@ REMOTE_GRANTS = ((1, N_("For a day")), (7, N_("For a week")),
 #: controls, this often, for this long: ten minutes, a computer's restart
 #: and sign-in. Its screen is due this soon once it is answered.
 REMOTE_RETRY_EVERY, REMOTE_RETRY_FOR = 5.0, 600.0
+#: 20.0: a remote session that hears nothing drops this soon, where a call
+#: between people waits CALL_DROP_SECONDS: a computer that crashed or
+#: restarted comes back as a new program, which only a new session reaches,
+#: and a session held open on the computer's side would keep the next out.
+REMOTE_DROP_SECONDS = 20
 #: 19.0.1: ...and for this long after a restart asked from afar (Windows'
 #: updates can hold one for a while).
 REMOTE_RESTART_WAIT = 1200.0
@@ -15297,7 +18214,8 @@ def parse_rcmd(payload: bytes) -> Optional[dict]:
 
 
 #: What the screen of a controlled computer can be (windows_screen_state).
-REMOTE_SCREENS = ("ok", "secure", "admin")
+REMOTE_SCREENS = ("ok", "secure", "admin",
+                  "locked", "prompt", "prompt-view", "hung")       # 21.0
 
 
 def sanitize_remote_state(word: dict) -> dict:
@@ -15313,7 +18231,119 @@ def sanitize_remote_state(word: dict) -> dict:
             "u": until if isinstance(until, (int, float)) and
             not isinstance(until, bool) and 0 <= until < 4e9 else None,
             "si": word.get("si") if isinstance(word.get("si"), bool)
-            else None}
+            else None,
+            "k": _int(word.get("k"), REMOTE_KEYS_19, 255) or REMOTE_KEYS_19,
+            # 21.0: the service's helper in use there (Ctrl+Alt+Del for
+            # real), and the program in front that does not answer.
+            "sv": word.get("sv") is True,
+            # 21.1 (CURSOR30): its picture without the pointer.
+            "pt": word.get("pt") is True,
+            "hp": (sanitize_programs([word["hp"]]) or [None])[0]
+            if isinstance(word.get("hp"), dict) else None}
+
+
+# ---- 21.0 (NEXT29): what a controlled computer keeps of its sessions ------
+#: Its file in the data folder; the lines it keeps; the lines the side
+#: controlling may ask for (Keys › What went wrong there).
+REMOTE_LOG, REMOTE_LOG_LINES, REMOTE_LOG_SENT = "remote.log", 300, 40
+#: The longest text a session's shared clipboard carries, either way.
+REMOTE_CLIP_MAX = 8000
+
+
+def remote_log(text: str) -> None:
+    """A line in this computer's log of its remote sessions (the owner's
+    NEXT29): when one began and ended, and what went wrong in it, so that
+    one that failed while nobody was there can be explained afterwards,
+    here (Settings › Remote access) or from afar. What happened, and
+    when: never keys, words typed, messages or the screen."""
+    line = time.strftime("%Y-%m-%d %H:%M ") + " ".join(
+        "".join(c if c.isprintable() else " " for c in text).split())[:200]
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        path = DATA_DIR / REMOTE_LOG
+        lines = path.read_text("utf-8").splitlines() if path.exists() \
+            else []
+        lines = (lines + [line])[-REMOTE_LOG_LINES:]
+        path.write_text("\n".join(lines) + "\n", "utf-8")
+    except OSError:
+        log.exception("remote: its log")
+
+
+def remote_log_lines() -> list:
+    """The log's lines, oldest first."""
+    try:
+        return (DATA_DIR / REMOTE_LOG).read_text("utf-8").splitlines()
+    except OSError:
+        return []
+
+
+def remote_log_clear() -> None:
+    try:
+        (DATA_DIR / REMOTE_LOG).unlink()
+    except OSError:
+        pass
+
+
+def remote_screen_said(word: str, hung: Optional[dict] = None) -> str:
+    """A screen's state word (remote_screen_state) as the log says it."""
+    return {"secure": tr("the screen: a Windows security screen, which "
+                         "cannot be seen from afar"),
+            "admin": tr("the screen: a window run as administrator in "
+                        "front, which takes no input from afar"),
+            "hung": tr("the screen: {program} does not answer, in front",
+                       program=(hung or {}).get("x") or tr("a program")),
+            "locked": tr("the screen: locked"),
+            "prompt": tr("the screen: a permission prompt"),
+            "prompt-view": tr("the screen: a permission prompt, which a "
+                              "session may not answer here"),
+            "ok": tr("the screen: usable again")}.get(word, word)
+
+
+def rcmd_text_parts(text: str, room: int = RCMD_BYTES - 160) -> list:
+    """Text cut into pieces that each fit a PKT_RCMD word once written as
+    JSON in UTF-8 (a character takes 1 to 6 bytes there); at least one."""
+    parts, piece, size = [], [], 0
+    for char in text:
+        cost = len(json.dumps(char, ensure_ascii=False).encode()) - 2
+        if size + cost > room and piece:
+            parts.append("".join(piece))
+            piece, size = [], 0
+        piece.append(char)
+        size += cost
+    parts.append("".join(piece))
+    return parts
+
+
+def rcmd_list_parts(lines: list, room: int = RCMD_BYTES - 160) -> list:
+    """Lines put in groups that each fit a PKT_RCMD word; at least one."""
+    parts, group, size = [], [], 0
+    for line in lines:
+        cost = len(json.dumps(line, ensure_ascii=False).encode()) + 1
+        if size + cost > room and group:
+            parts.append(group)
+            group, size = [], 0
+        group.append(line)
+        size += cost
+    parts.append(group)
+    return parts
+
+
+def clipboard_text() -> str:
+    """The clipboard's text ('' when it holds none, or cannot be read)."""
+    try:
+        text = Clipboard.paste()
+    except Exception:
+        log.exception("could not read the clipboard")
+        return ""
+    return text if isinstance(text, str) else ""
+
+
+def sanitize_log_lines(raw) -> list:
+    """Lines of a computer's log as it sent them, each checked."""
+    return [" ".join("".join(c if c.isprintable() else " "
+                             for c in line).split())[:200]
+            for line in (raw if isinstance(raw, list) else [])
+            if isinstance(line, str)][:REMOTE_LOG_SENT]
 
 
 def sanitize_programs(raw) -> list:
@@ -15498,6 +18528,12 @@ def _win32():
     user32.GetWindowThreadProcessId.argtypes = [
         H, ctypes.POINTER(wintypes.DWORD)]
     user32.IsWindowVisible.argtypes = user32.IsHungAppWindow.argtypes = [H]
+    user32.GetClassNameW.argtypes = [H, ctypes.c_wchar_p, ctypes.c_int]
+    try:                                # 21.0: Windows' own, not documented
+        user32.HungWindowFromGhostWindow.restype = H
+        user32.HungWindowFromGhostWindow.argtypes = [H]
+    except AttributeError:
+        pass
     user32.GetWindow.restype = H
     user32.GetWindow.argtypes = [H, ctypes.c_uint]
     user32.GetWindowTextW.argtypes = [H, ctypes.c_wchar_p, ctypes.c_int]
@@ -15567,13 +18603,43 @@ def _window_above_us(hwnd, user32, kernel32, advapi32) -> bool:
     return level is None or (ours is not None and level > ours)
 
 
+def windows_hung_front(dlls=None) -> Optional[dict]:
+    """21.0 (NEXT29): the program in front, when it does not answer:
+    {"w": its window, "p": its process, "x": its program}; None while it
+    answers. Windows then puts a stand-in window of its own there (class
+    "Ghost", owned by the desktop's window manager), into which no
+    program's input goes: 20.0's state said "run as administrator"."""
+    import ctypes
+    from ctypes import wintypes
+    user32, kernel32, _advapi32 = dlls or _win32()
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return None
+    name = ctypes.create_unicode_buffer(32)
+    user32.GetClassNameW(hwnd, name, 32)
+    if name.value == "Ghost":
+        try:
+            hwnd = user32.HungWindowFromGhostWindow(hwnd)
+        except AttributeError:
+            hwnd = None
+        if not hwnd:
+            return {"w": 0, "p": 0, "x": ""}
+    elif not user32.IsHungAppWindow(hwnd):
+        return None
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return {"w": int(hwnd), "p": int(pid.value),
+            "x": _process_name(pid.value, kernel32)}
+
+
 def windows_screen_state(dlls=None) -> str:
     """19.0.1 (REMOTE191): what the controlled computer's screen is now:
     "ok"; "secure", a Windows security screen (locked, a permission
     prompt, Ctrl+Alt+Del's), which no program can show or use from afar;
     "admin", a window run as administrator in front (Task Manager, an
-    installer), which takes no input from Ferritext. `dlls` stands in for
-    _win32() in the tests."""
+    installer), which takes no input from Ferritext; "hung" (21.0), a
+    program in front that does not answer. `dlls` stands in for _win32()
+    in the tests."""
     import ctypes
     from ctypes import wintypes
     user32, kernel32, advapi32 = dlls or _win32()
@@ -15590,6 +18656,8 @@ def windows_screen_state(dlls=None) -> str:
             return "secure"
     finally:
         user32.CloseDesktop(desk)
+    if windows_hung_front((user32, kernel32, advapi32)) is not None:
+        return "hung"
     hwnd = user32.GetForegroundWindow()
     if hwnd and _window_above_us(hwnd, user32, kernel32, advapi32):
         return "admin"
@@ -15686,15 +18754,118 @@ def windows_close_program(hwnd: int, pid: int, dlls=None) -> tuple:
 def remote_screen_state() -> str:
     """The controlled computer's screen (windows_screen_state); "ok"
     wherever there is nothing to tell (X11 takes input on its lock screen
-    too). FEXT_REMOTE_TEST: what the tests set."""
+    too). 21.0: while a session uses the service's helper, what it sees:
+    "locked" (the lock or sign-in screen, which can be typed into),
+    "prompt" (a permission prompt, answered from afar where the service
+    allows it, else "prompt-view"); a window run as administrator is
+    usable then. FEXT_REMOTE_TEST: what the tests set."""
     if os.environ.get("FEXT_REMOTE_TEST"):
         return os.environ.get("FEXT_REMOTE_SCREEN", "ok")
     if IS_WINDOWS:
         try:
-            return windows_screen_state()
+            seen = DESK.state() if DESK.users else None
+            if seen is None:
+                return windows_screen_state()
+            return desk_screen_word(seen[0], seen[1], windows_hung_front)
         except Exception:
             log.exception("remote: the screen's state")
     return "ok"
+
+
+def desk_screen_word(shown: int, prompts: bool, hung: Callable) -> str:
+    """21.0: the screen's state word from what the service's helper sees
+    (DESK_PERSON...) and whether a session may answer a permission prompt;
+    `hung()`: the program in front that does not answer, or None."""
+    if shown == DESK_LOCKED:
+        return "locked"
+    if shown == DESK_PROMPT:
+        return "prompt" if prompts else "prompt-view"
+    if shown == DESK_UNSEEN:
+        return "secure"
+    return "hung" if hung() is not None else "ok"
+
+
+#: The tests' program that does not answer (FEXT_REMOTE_TEST).
+_REMOTE_TEST_HUNG: dict = {}
+
+#: 21.1 (CURSOR30): Windows' own pointers (LoadCursorW's IDC_ numbers) by
+#: POINTER_SHAPES' names; any other (a program's own) is told as an arrow.
+_WIN_POINTERS = {32512: "arrow", 32513: "ibeam", 32514: "wait",
+                 32515: "crosshair", 32642: "size_nwse", 32643: "size_nesw",
+                 32644: "size_we", 32645: "size_ns", 32646: "size_all",
+                 32648: "no", 32649: "hand", 32650: "wait_arrow"}
+#: What windows_pointer_now keeps (user32, CURSORINFO, handles' names); the
+#: tests' pointer (FEXT_REMOTE_TEST: "c", "x", "y").
+_WIN_POINTER: dict = {}
+_REMOTE_TEST_POINTER: dict = {}
+
+
+def remote_pointer_now() -> Optional[tuple]:
+    """21.1 (CURSOR30): this computer's pointer, (shape, x, y): x and y
+    shares (0 to 65535) of the whole desktop as the injectors count them,
+    the shape "none" while it is hidden. None where this computer cannot
+    tell (Windows only, for now: elsewhere the picture keeps its pointer),
+    or cannot now (a secure screen, which the service's helper reads with
+    its pointer in it)."""
+    if os.environ.get("FEXT_REMOTE_TEST"):
+        got = _REMOTE_TEST_POINTER
+        return (got["c"], got["x"], got["y"]) if got else None
+    if not IS_WINDOWS or _WIN_POINTER.get("broken"):
+        return None
+    try:
+        return windows_pointer_now()
+    except Exception:
+        log.exception("remote: the pointer cannot be read; drawn in")
+        _WIN_POINTER["broken"] = True
+        return None
+
+
+def windows_pointer_now(user32=None) -> Optional[tuple]:
+    """remote_pointer_now on Windows: GetCursorInfo (microseconds, so
+    twenty times a second costs nothing)."""
+    import ctypes
+    from ctypes import wintypes
+    kept = _WIN_POINTER
+    if "u" not in kept:
+        u = user32 or ctypes.WinDLL("user32", use_last_error=True)
+
+        class CURSORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
+                        ("hCursor", ctypes.c_void_p),
+                        ("ptScreenPos", wintypes.POINT)]
+        u.LoadCursorW.restype = ctypes.c_void_p
+        u.LoadCursorW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        names = {u.LoadCursorW(None, number): name
+                 for number, name in _WIN_POINTERS.items()}
+        names.pop(None, None)
+        kept.update(u=u, info=CURSORINFO, names=names)
+    u, info = kept["u"], kept["info"]()
+    info.cbSize = ctypes.sizeof(info)
+    if not u.GetCursorInfo(ctypes.byref(info)):
+        return None
+    left, top = u.GetSystemMetrics(76), u.GetSystemMetrics(77)
+    width, height = u.GetSystemMetrics(78), u.GetSystemMetrics(79)
+    if width <= 1 or height <= 1:
+        return None
+    shape = kept["names"].get(info.hCursor, "arrow") \
+        if info.flags & 1 and info.hCursor else "none"   # CURSOR_SHOWING
+    return (shape,
+            min(65535, max(0, round((info.ptScreenPos.x - left) * 65535 /
+                                    (width - 1)))),
+            min(65535, max(0, round((info.ptScreenPos.y - top) * 65535 /
+                                    (height - 1)))))
+
+
+def remote_hung_program() -> Optional[dict]:
+    """windows_hung_front(), where this computer can tell."""
+    if os.environ.get("FEXT_REMOTE_TEST"):
+        return dict(_REMOTE_TEST_HUNG) or None
+    if IS_WINDOWS:
+        try:
+            return windows_hung_front()
+        except Exception:
+            log.exception("remote: the program in front")
+    return None
 
 
 def remote_programs() -> Optional[list]:
@@ -15733,9 +18904,15 @@ def remote_close_program(hwnd: int, pid: int) -> tuple:
 
 def computer_restart(note: str) -> tuple:
     """This computer restarted (in 15 seconds on Windows, with `note` in
-    its notice): (done, why not). FEXT_REMOTE_TEST: only counted."""
-    if os.environ.get("FEXT_REMOTE_TEST"):
+    its notice): (done, why not). FEXT_REMOTE_TEST: only counted.
+    FEXT_RESTART_TEST: `note` written to the file it names instead, for
+    whoever plays the restart (desktop/e2e_remote.py ends this program and
+    its watcher, then starts it as a sign-in would)."""
+    played = os.environ.get("FEXT_RESTART_TEST")
+    if played or os.environ.get("FEXT_REMOTE_TEST"):
         _REMOTE_TEST_RESTARTS.append(note)
+        if played:
+            Path(played).write_text(note, encoding="utf-8")
         return True, ""
     if IS_WINDOWS:
         command = ["shutdown", "/r", "/t", "15", "/d", "p:0:0", "/c",
@@ -18626,6 +21803,28 @@ class LocalStore:
     -- (every member): on each message the newest word wins, by when its
     -- author's app signed it (`at`); an unpinned row is kept (on_ 0), so a
     -- late "pin" cannot bring it back. Keyed by the message's client id.
+    CREATE TABLE IF NOT EXISTS live_points (  -- 21.0: a live share's newest
+        peer  TEXT NOT NULL,
+        cid   TEXT NOT NULL,
+        point TEXT NOT NULL,          -- JSON: lat, lon, acc, at; {} once ended
+        ended INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (peer, cid)
+    );
+    CREATE TABLE IF NOT EXISTS poll_votes (   -- 21.0: each one's newest vote
+        peer  TEXT NOT NULL,
+        cid   TEXT NOT NULL,
+        voter TEXT NOT NULL,
+        picks TEXT NOT NULL,          -- JSON: the choices' places
+        at    TEXT NOT NULL,
+        PRIMARY KEY (peer, cid, voter)
+    );
+    CREATE TABLE IF NOT EXISTS poll_ends (    -- 21.0: polls ended by hand
+        peer TEXT NOT NULL,
+        cid  TEXT NOT NULL,
+        by   TEXT NOT NULL,
+        at   TEXT NOT NULL,
+        PRIMARY KEY (peer, cid)
+    );
     CREATE TABLE IF NOT EXISTS pins (
         peer TEXT NOT NULL,
         cid  TEXT NOT NULL,
@@ -18683,7 +21882,8 @@ class LocalStore:
     #:        join_links, join_asks, join_asked (JOIN174) — new tables
     #:   13   v18.1: contacts.away_at (their last automatic reply from us)
     #:   14   v19.0: pins (a chat's pinned messages) — a new table
-    SCHEMA_VERSION = 14
+    #:   15   v20.0: contacts.away_text (their own automatic reply)
+    SCHEMA_VERSION = 15
 
     #: Additive migrations: (table, column, statements). Applied when the
     #: column is missing, decided by inspection rather than by catching the
@@ -18826,6 +22026,12 @@ class LocalStore:
         ("contacts", "away_at", (
             "ALTER TABLE contacts ADD COLUMN away_at REAL NOT NULL "
             "DEFAULT 0",)),
+        # ---- schema 15 (v20.0) ----------------------------------------------
+        # The automatic reply this contact gets in place of the usual
+        # words (Settings › Away); '': the usual words.
+        ("contacts", "away_text", (
+            "ALTER TABLE contacts ADD COLUMN away_text TEXT NOT NULL "
+            "DEFAULT ''",)),
     )
 
     #: contacts.caps bit: this peer has sent us a valid v9 extension block,
@@ -19054,6 +22260,14 @@ class LocalStore:
         with self._lock:
             self._db.execute("UPDATE contacts SET away_at = ? WHERE "
                              "address = ?", (at, address))
+            self._db.commit()
+
+    def set_away_text(self, address: str, words: str) -> None:
+        """20.0: the automatic reply this contact gets ('': the usual
+        words). New words are due at their next message (away_at 0)."""
+        with self._lock:
+            self._db.execute("UPDATE contacts SET away_text = ?, away_at = 0 "
+                             "WHERE address = ?", (words, address))
             self._db.commit()
 
     def set_contact_setting(self, address: str, field: str, value: int) -> None:
@@ -19951,6 +23165,9 @@ class LocalStore:
             self._db.execute("DELETE FROM reactions WHERE peer = ?", (peer,))
             self._db.execute("DELETE FROM reactions_more WHERE peer = ?",
                              (peer,))
+            for table in ("poll_votes", "poll_ends", "live_points"):  # 21.0
+                self._db.execute(f"DELETE FROM {table} WHERE peer = ?",
+                                 (peer,))
             self._db.commit()
         return len(ids)
 
@@ -20122,6 +23339,113 @@ class LocalStore:
                     (peer, peer, PINS_MAX))
             self._db.commit()
             return True
+
+    # ---- 21.0 (MAP29): live shares ----------------------------------------
+    def set_live_point(self, peer: str, cid: str, point: dict) -> bool:
+        """A live share's newest point (newest by its own time); False if
+        older than the one held, or the share has ended."""
+        with self._lock:
+            held = self._db.execute(
+                "SELECT point, ended FROM live_points WHERE peer = ? AND "
+                "cid = ?", (peer, cid)).fetchone()
+            if held is not None and (held["ended"] or json.loads(
+                    held["point"]).get("at", 0) >= point["at"]):
+                return False
+            self._db.execute(
+                "INSERT OR REPLACE INTO live_points (peer, cid, point, ended) "
+                "VALUES (?, ?, ?, 0)", (peer, cid, json.dumps(point)))
+            self._db.commit()
+            return True
+
+    def live_point(self, peer: str, cid: str) -> Optional[dict]:
+        """A running share's newest point, else None."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT point FROM live_points WHERE peer = ? AND cid = ? "
+                "AND ended = 0", (peer, cid)).fetchone()
+        return json.loads(row["point"]) if row else None
+
+    def end_live(self, peer: str, cid: str) -> bool:
+        """A share ended: it keeps no point. False if it already was."""
+        with self._lock:
+            held = self._db.execute(
+                "SELECT ended FROM live_points WHERE peer = ? AND cid = ?",
+                (peer, cid)).fetchone()
+            if held is not None and held["ended"]:
+                return False
+            self._db.execute(
+                "INSERT OR REPLACE INTO live_points (peer, cid, point, ended) "
+                "VALUES (?, ?, '{}', 1)", (peer, cid))
+            self._db.commit()
+            return True
+
+    def live_ended(self, peer: str, cid: str) -> bool:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT ended FROM live_points WHERE peer = ? AND cid = ?",
+                (peer, cid)).fetchone()
+        return bool(row and row["ended"])
+
+    def own_live_shares(self) -> list:
+        """(peer, cid, until) of this identity's own live shares that have
+        not ended."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT m.* FROM live_points l JOIN messages m ON m.peer = "
+                "l.peer AND m.client_msg_id = l.cid WHERE l.ended = 0 AND "
+                "m.direction = 'out'").fetchall()
+        shares = []
+        for row in rows:
+            loc = message_ext(dict(row)).get("loc") or {}
+            if "until" in loc:
+                shares.append((row["peer"], row["client_msg_id"],
+                               loc["until"]))
+        return shares
+
+    # ---- 21.0 (POLL29): polls ---------------------------------------------
+    def set_vote(self, peer: str, cid: str, voter: str, picks: list,
+                 at: str) -> bool:
+        """`voter`'s vote in the poll `cid` (its choices' places; [] none),
+        as of `at`, the ISO time their app signed: False when what is held
+        is as new or newer."""
+        with self._lock:
+            held = self._db.execute(
+                "SELECT at FROM poll_votes WHERE peer = ? AND cid = ? AND "
+                "voter = ?", (peer, cid, voter)).fetchone()
+            if held is not None and held["at"] >= at:
+                return False
+            self._db.execute(
+                "INSERT OR REPLACE INTO poll_votes (peer, cid, voter, picks, "
+                "at) VALUES (?, ?, ?, ?, ?)",
+                (peer, cid, voter, json.dumps(picks), at))
+            self._db.commit()
+            return True
+
+    def poll_votes(self, peer: str, cid: str) -> dict:
+        """{voter: [places picked]} for each who has a vote in."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT voter, picks FROM poll_votes WHERE peer = ? AND "
+                "cid = ?", (peer, cid)).fetchall()
+        votes = {row["voter"]: json.loads(row["picks"]) for row in rows}
+        return {voter: picks for voter, picks in votes.items() if picks}
+
+    def end_poll(self, peer: str, cid: str, by: str, at: str) -> bool:
+        """The poll `cid` ended by `by` at `at`; False if it already was."""
+        with self._lock:
+            done = self._db.execute(
+                "INSERT OR IGNORE INTO poll_ends (peer, cid, by, at) VALUES "
+                "(?, ?, ?, ?)", (peer, cid, by, at)).rowcount
+            self._db.commit()
+        return done > 0
+
+    def poll_ended(self, peer: str, cid: str) -> Optional[dict]:
+        """{"by", "at"} of a poll ended by hand, else None."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT by, at FROM poll_ends WHERE peer = ? AND cid = ?",
+                (peer, cid)).fetchone()
+        return dict(row) if row else None
 
     def unpin_all(self, peer: str, by: str, at: str) -> int:
         """Every pin in `peer` older than `at` unpinned; how many."""
@@ -20634,6 +23958,16 @@ class LocalStore:
                 (json.dumps({"call": card}), row_id))
             self._db.commit()
 
+    def last_sent(self, peer: str) -> Optional[float]:
+        """When this device's person last wrote in chat `peer` (seconds
+        since 1970), or None: slow mode counts from it."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT created_at FROM messages WHERE peer = ? AND "
+                "direction = 'out' ORDER BY id DESC LIMIT 1",
+                (peer,)).fetchone()
+        return stamp_seconds(row["created_at"]) if row else None
+
     def add_event(self, peer: str, body: str,
                   created_at: Optional[str] = None) -> int:
         """A line of conversation history that nobody sent — "Ann added
@@ -21104,6 +24438,9 @@ class SyncWorker(threading.Thread):
         # purpose: a restart is exactly when a key problem may have been
         # fixed, so the count should start again.
         self._decrypt_failures: dict = {}
+        #: 20.0, slow mode: (group, member) -> when their last message taken
+        #: here was written (_too_soon). In memory: counted since the start.
+        self._slow_seen: dict = {}
         # Which heartbeat this worker keeps alive ('app' or 'service'); see
         # write_heartbeat. None disables beating (tests).
         self.beat_owner: Optional[str] = "app"
@@ -21420,6 +24757,7 @@ class SyncWorker(threading.Thread):
 
         conversation, author = sender, None
         kind, ext, media_state = "text", None, ""
+        slow_mark = None            # 20.0: (group, sender) and when written
         if x is not None:
             # A verified block proves this peer runs v9: remember it, so the
             # screen can offer what only v9 peers understand.
@@ -21454,13 +24792,24 @@ class SyncWorker(threading.Thread):
                                            "group message from a non-member")
                     return server_id
                 conversation, author = group_peer(gid), sender
-                held = self._group_held(gid, sender, x,
-                                        stamp_seconds(msg.get("created_at")))
+                taken = stamp_seconds(msg.get("created_at"))
+                held = self._group_held(gid, sender, x, taken)
+                if not held and x.get("k") != "call":
+                    # 20.0, slow mode: a message counts as written when
+                    # its sender says, or when the relay took it if that
+                    # is earlier (a clock set ahead gains nothing).
+                    written = stamp_seconds(payload.get("sent_at"))
+                    written = min(written, taken) if None not in (
+                        written, taken) else taken
+                    if self._too_soon(gid, sender, written):
+                        held = "slow mode's pace"
+                    else:
+                        slow_mark = ((gid, sender), written)
                 if held:
                     # 17.4: stopped by the group's admin when the relay took
                     # it. Not shown; acknowledged, so the relay forgets it.
-                    MessageFlowLog.let_go(server_id, who, "held: the group's "
-                                          f"admin stopped its {held}")
+                    MessageFlowLog.let_go(server_id, who, "held by the "
+                                          f"group's rules: {held}")
                     return server_id
                 if x.get("k") == "call":
                     return self._call_invite(server_id, sender, conversation,
@@ -21477,6 +24826,13 @@ class SyncWorker(threading.Thread):
                                          x.get("call"), who)
             ext = sanitize_ext_with_body(
                 x, sanitize_text(str(payload.get("body", "")))) or None
+            if (ext or {}).pop("ev", None) and author is not None and \
+                    mention_all(x, str(payload.get("body", "")),
+                                self.app.store.group(gid), sender):
+                # 20.0: a group admin's "@everyone" mentions this device's
+                # person, as if by name (anyone else's mark was dropped).
+                me = self.app.keys.address
+                ext["mn"] = [a for a in ext.get("mn", ()) if a != me] + [me]
             media = (ext or {}).get("media")
             if x.get("k") == "media" and media is not None:
                 kind, media_state = media["kind"], "pending"
@@ -21507,6 +24863,8 @@ class SyncWorker(threading.Thread):
             return server_id
 
         self._decrypt_failures.pop(server_id, None)
+        if slow_mark is not None and slow_mark[1] is not None:
+            self._slow_seen[slow_mark[0]] = slow_mark[1]
         if x is not None:
             self._picture_hints(sender, x)
         MessageFlowLog.tick(2, server_id,
@@ -21627,6 +24985,21 @@ class SyncWorker(threading.Thread):
             if stop is not None:
                 return stop[0]
         return ""
+
+    def _too_soon(self, gid: str, sender: str,
+                  written: Optional[float]) -> bool:
+        """20.0, slow mode: was this message of `sender`'s written too soon
+        after their last in group `gid`? The sender's app keeps the pace;
+        here only what comes at more than twice the pace is held (a slow
+        network must never cost an honest message), counted from their
+        last message this device took since it started."""
+        group = self.app.store.group(gid) or {}
+        rules = group.get("rules") or {}
+        if not rules.get("slow") or written is None:
+            return False
+        return slow_wait(rules, group_admins(group), sender,
+                         self._slow_seen.get((gid, sender)),
+                         written) > rules["slow"] / 2
 
     def _as_request(self, server_id, sender: str, who: str,
                     ctl: Optional[dict]) -> tuple:
@@ -21758,6 +25131,10 @@ class SyncWorker(threading.Thread):
             store.add_event(peer, tr("{who} added you to “{group}”",
                                      who=self._who(sender),
                                      group=state["name"]))
+            about = (state.get("r") or {}).get("about")
+            if about:                   # 20.0: said to each who joins
+                store.add_event(peer, tr("About this group: {words}",
+                                         words=about))
             self.app.ui_queue.put(("message_stored", peer))
             return
         if sender not in group_admins(local):
@@ -21882,6 +25259,18 @@ class SyncWorker(threading.Thread):
                     "{who} turned off {what} for members" if right in after
                     else "{who} turned {what} back on for members",
                     who=who, what=tr(GROUP_RIGHT_WORDS[right])))
+        slow = new.get("slow") or 0                          # 20.0
+        if slow != (old.get("slow") or 0):
+            store.add_event(peer, tr(
+                "{who} turned on slow mode: a member writes once in {time}",
+                who=who, time=slow_words(slow)) if slow else
+                tr("{who} turned off slow mode", who=who))
+        about = new.get("about") or ""       # also a member who has joined
+        if about != (old.get("about") or ""):
+            store.add_event(peer, tr("About this group: {words}",
+                                     words=about) if about else
+                            tr("{who} took away what this group is about",
+                               who=who))
         mine = (new.get("lim") or {}).get(me)
         if mine == (old.get("lim") or {}).get(me):
             return
@@ -22061,6 +25450,51 @@ class SyncWorker(threading.Thread):
                         "{name} pinned a message", name=name))
             else:
                 changed = False
+            if changed:
+                self.app.ui_queue.put(("message_stored", conversation))
+            return server_id
+        if op == "loc":
+            # 21.0 (MAP29): a live share's next point, or its end: from its
+            # sharer alone, while it runs. An end keeps no point.
+            target = _str(ctl.get("cid"), 64)
+            row = store.message_by_cid(conversation, target, "in") \
+                if target and _TOKEN_RE.match(target) else None
+            loc = message_ext(row).get("loc") if row else None
+            if not loc or "until" not in loc or (
+                    row.get("author") or row["peer"]) != sender or \
+                    store.live_ended(conversation, target):
+                return server_id
+            if ctl.get("stop") is True or time.time() > loc["until"]:
+                changed = store.end_live(conversation, target)
+            else:
+                point = sanitize_location(ctl.get("p"))
+                changed = point is not None and \
+                    point["at"] <= time.time() + 120 and \
+                    store.set_live_point(conversation, target, point)
+            if changed:
+                self.app.ui_queue.put(("message_stored", conversation))
+            return server_id
+        if op in ("vote", "pollend"):
+            # 21.0 (POLL29): a vote in a poll of this chat (the newest of
+            # each one's counts), or the poll ended: by its asker, or an
+            # admin who may delete members' messages. Neither once ended.
+            target = _str(ctl.get("cid"), 64)
+            row = store.message_by_cid(conversation, target) \
+                if target and _TOKEN_RE.match(target) else None
+            poll = message_ext(row).get("poll") if row else None
+            at = sent_at or now_iso()
+            if poll is None or not poll_open(
+                    poll, store.poll_ended(conversation, target), at):
+                return server_id
+            if op == "vote":
+                picks = poll_picks(ctl.get("v"), poll)
+                changed = picks is not None and store.set_vote(
+                    conversation, target, sender, picks, at)
+            else:
+                changed = may_end_poll(row, sender, self.app.keys.address,
+                                       store.group(gid_of(conversation))
+                                       if gid_of(conversation) else None) \
+                    and store.end_poll(conversation, target, sender, at)
             if changed:
                 self.app.ui_queue.put(("message_stored", conversation))
             return server_id
@@ -23203,6 +26637,15 @@ def icon_geometry(name: str, cx: float, cy: float, size: float, rgba,
         Line(bezier=[tip[0], tip[1], cx - d * h * .55, cy + h * .22,
                      cx - d * h * .78, cy - h * .05,
                      cx - d * h * .70, cy - h * .66], **line)
+    elif name == "poll":                     # 21.0: three bars of a count
+        for y, end in ((7, 15), (12, 20), (17, 11)):
+            Line(points=G(4, y, end, y), width=w * 1.6, cap="round")
+    elif name == "select":                   # 21.0: an I-beam in a line
+        Line(points=G(12, 5, 12, 19), **line)
+        Line(points=G(9.5, 5, 14.5, 5), **line)
+        Line(points=G(9.5, 19, 14.5, 19), **line)
+        Line(points=G(3.5, 12, 8, 12), **line)
+        Line(points=G(16, 12, 20.5, 12), **line)
     elif name == "copy":
         r = size * .08
         Line(rounded_rectangle=(cx - h * .70, cy - h * .76, h * 1.0, h * 1.16,
@@ -23403,6 +26846,12 @@ def icon_geometry(name: str, cx: float, cy: float, size: float, rgba,
                          px - h * .46 * s, cy - h * .16,
                          px + h * .46 * s, cy - h * .16,
                          px + h * .50 * s, cy - h * .70], **line)
+    elif name == "file":                       # 20.0: a document
+        Line(points=G(6.5, 3, 14, 3, 18.5, 7.5, 18.5, 21, 6.5, 21),
+             close=True, **line)
+        Line(points=G(14, 3, 14, 7.5, 18.5, 7.5), **line)
+        Line(points=G(9.5, 12.5, 15.5, 12.5), **line)
+        Line(points=G(9.5, 16.5, 15.5, 16.5), **line)
     elif name == "bookmark":
         Line(points=[cx - h * .46, cy + h * .76, cx - h * .46, cy - h * .74,
                      cx, cy - h * .36, cx + h * .46, cy - h * .74,
@@ -23785,20 +27234,30 @@ class ScrollView(KivyScrollView):
         ud = touch.ud.get(self._get_uid())
         if self._touch is not touch or not ud or ud["mode"] != "unknown":
             return
-        under = None
+        under = bubble = None
         for widget in self._viewport.walk(restrict=True) \
                 if self._viewport else ():
-            if isinstance(widget, ButtonBehavior) and not widget.disabled \
-                    and widget.collide_point(*widget.to_widget(*touch.pos)):
+            if not widget.collide_point(*widget.to_widget(*touch.pos)):
+                continue
+            if isinstance(widget, ButtonBehavior) and not widget.disabled:
                 under = widget                   # the innermost one wins
+            elif isinstance(widget, MessageBubble):
+                bubble = widget
         if under is not None and under.state == "normal":
             under.state = "down"
             touch.ud["fext_lit"] = under
+        elif under is None and bubble is not None:
+            # 20.0: a message: its bubble washed (MessageBubble.set_pressed)
+            bubble.set_pressed(True)
+            touch.ud["fext_lit_bubble"] = bubble
 
     def _unlight(self, touch) -> None:
         lit = touch.ud.pop("fext_lit", None)
         if lit is not None and lit not in touch.ud:   # it never had it
             lit.state = "normal"
+        bubble = touch.ud.pop("fext_lit_bubble", None)
+        if bubble is not None:
+            bubble.set_pressed(False)
 
     def on_scroll_move(self, touch):
         moved = super().on_scroll_move(touch)
@@ -24555,7 +28014,9 @@ class MentionStrip(ConcealableBox):
             chip.width = dp(54) + min(dp(160), measure_text(
                 text, fs(15), dp(400))[0])
             paint_round(chip, T.surface_hi, radius=dp(18))
-            chip.add_widget(Avatar(address, name, diameter=dp(28),
+            # 20.0: "@everyone" names no one address: the group's disc.
+            chip.add_widget(Avatar(address or name, name, diameter=dp(28),
+                                   kind="dm" if address else "group",
                                    pos_hint={"center_y": .5}))
             chip.add_widget(single_line(text, fs(15), T.text))
             self.add_widget(chip)
@@ -25028,16 +28489,23 @@ class VerifySheet(Sheet):
         self.dismiss()
 
     def _scan(self) -> None:
-        if IS_ANDROID:
-            def failed(why: str) -> None:
-                self.set_status(self.status, why, COL_DANGER)
-            try:
-                android_take_photo(self._read, failed)
-            except Exception:
-                log.exception("camera failed")
-                failed(tr("Couldn't open the camera"))
+        if IS_ANDROID:                  # 21.1: the steps first (ScanSteps)
+            ScanStepsSheet(tr("Ask them to show their code: on their phone, "
+                              "your chat's menu (its three dots), then "
+                              "Verify. Yours is on this screen, for them "
+                              "to scan."),
+                           self._camera).open()
         else:
             open_desktop_camera(self._read, on_choose=self._pick)
+
+    def _camera(self) -> None:
+        def failed(why: str) -> None:
+            self.set_status(self.status, why, COL_DANGER)
+        try:
+            android_take_photo(self._read, failed)
+        except Exception:
+            log.exception("camera failed")
+            failed(tr("Couldn't open the camera"))
 
     def _pick(self) -> None:
         ImageChooserModal(self._read, title=tr("Their code")).open()
@@ -25062,6 +28530,32 @@ class VerifySheet(Sheet):
                                             "not the one this chat is "
                                             "with. Do not mark them "
                                             "verified."), COL_DANGER)
+
+
+class ScanStepsSheet(Sheet):
+    """21.1 (ANSWERS30: scanning a code on a phone was unclear): before the
+    phone's own camera app opens to take a picture of a code, what to do,
+    step by step: where the code is (`where`), the camera's own tick
+    that brings the picture back, and what then. "Open the camera" goes on
+    (`go`); a phone's camera app is not Ferritext's, so this is said
+    before it opens, not in it."""
+
+    def __init__(self, where: str, go: Callable[[], None]) -> None:
+        super().__init__(tr("Scan a code, step by step"))
+        steps = (where,
+                 tr("Tap Open the camera: your phone's own camera app "
+                    "opens."),
+                 tr("Hold the phone so that the code fills most of the "
+                    "picture, square on, sharp and still, then take the "
+                    "picture."),
+                 tr("Tap the tick (OK or Done on some phones) to bring the "
+                    "picture back to Ferritext; Retake to take it again."),
+                 tr("Ferritext reads the code and says what it found. Not "
+                    "read? Try again a little further away, in good light."))
+        for n, step in enumerate(steps, 1):
+            self.add(InfoLabel(f"{n}.  {step}", font_size=fs(15)))
+        self.add(Btn(tr("Open the camera"), on_release=lambda _w: (
+            self.dismiss(), go())))
 
 
 class LinkSheet(Sheet):
@@ -25796,6 +29290,7 @@ class MobileDataSheet(Sheet):
                         "{size}."),
             "video": N_("You are not on Wi-Fi. This video message is "
                         "{size}."),
+            "file": N_("You are not on Wi-Fi. This document is {size}."),
         }.get(msg.get("kind"), N_("You are not on Wi-Fi. This photo is "
                                   "{size}.")), size=size))
         self.app, self.msg, self._quiet = app, msg, False
@@ -26223,12 +29718,16 @@ class NewIdentityModal(Sheet):
                 return
             self.key_entry.text = text
             self._import_key()
-        if IS_ANDROID:
+        def camera() -> None:
             try:
                 android_take_photo(read, failed)
             except Exception:
                 log.exception("camera failed")
                 failed(tr("Couldn't open the camera"))
+        if IS_ANDROID:                  # 21.1: the steps first (ScanSteps)
+            ScanStepsSheet(tr("On the other device: My profile › Reveal "
+                              "the private key. Its code shows below the "
+                              "keys."), camera).open()
         else:
             open_desktop_camera(read, on_choose=lambda: ImageChooserModal(
                 read, title=tr("A key's code")).open())
@@ -26396,12 +29895,14 @@ class ChatPickSheet(Sheet):
 
     def __init__(self, app: "FextApp", title: str,
                  on_pick: Callable[[str], None],
-                 skip: Optional[str] = None) -> None:
+                 skip: Optional[str] = None,
+                 peers: Optional[list] = None) -> None:
         super().__init__(title)
         self.card.padding = [0, dp(8), 0, dp(18)]
         self.title_label.padding = [dp(22), 0]
         self.on_pick = on_pick
-        self.peers = [p for p in chat_targets(app) if p != skip]
+        self.peers = [p for p in (chat_targets(app) if peers is None
+                                  else peers) if p != skip]
         rows = []
         for peer in self.peers:
             name, kind = conversation_title(app, peer)
@@ -26415,22 +29916,494 @@ class ChatPickSheet(Sheet):
         Clock.schedule_once(lambda _dt: self.on_pick(peer), 0.05)
 
 
-class QuoteSheet(Sheet):
-    """18.2: the words of the message being replied to, for the part to
-    quote to be marked: drag across it (on a phone: hold a word, then
-    move the handles). The reply then quotes that part alone."""
+class AttachTile(ButtonBehavior, Widget):
+    """One choice of the attachment sheet: its icon in a rounded square,
+    its name under it."""
 
-    def __init__(self, text: str, on_quote: Callable[[str], None]) -> None:
-        super().__init__(tr("Quote a part"), subtitle=tr(
-            "Mark the words to quote: drag across them, or hold a word "
-            "and move the handles."))
+    SIDE = dp(64)
+
+    def __init__(self, icon: str, words: str, tint: str,
+                 on_tap: Callable[[], None]) -> None:
+        super().__init__(size_hint=(1, None), height=self.SIDE + dp(10) +
+                         line_height(13.5) + dp(10))
+        self.icon, self.tint, self.label = icon, tint, words
+        self.caption = single_line(words, fs(13.5), T.text_2,
+                                   halign="center", size_hint=(None, None))
+        self.add_widget(self.caption)
+        self.bind(pos=self._draw, size=self._draw, state=self._draw,
+                  on_release=lambda _w: on_tap())
+
+    def _draw(self, *_a) -> None:
+        side = self.SIDE
+        # From x and width themselves: inside a size change, center_x can
+        # still be the one from before it (the squares sat half a column
+        # to the left, the first cut off).
+        x, y = self.x + (self.width - side) / 2, self.y + self.height - side
+        self.canvas.before.clear()
+        with self.canvas.before:
+            Color(*C(T.surface_hi if self.state == "down" else T.surface))
+            SmoothRoundedRectangle(pos=(x, y), size=(side, side),
+                                   radius=[corner(dp(18))])
+            Color(*C(T.rule))
+            Line(rounded_rectangle=(x, y, side, side, corner(dp(18))),
+                 width=dp(1))
+            draw_icon(self.icon, x + side / 2, y + side / 2, dp(26),
+                      C(self.tint))
+        lh = line_height(13.5)
+        self.caption.size = self.caption.text_size = (self.width, lh)
+        self.caption.pos = (self.x, y - dp(8) - lh)
+
+
+#: The attachment sheet's colours, one a kind, the same in every theme
+#: (each reads on the sheet's light and dark grounds).
+ATTACH_TINTS = {"image": "#3b82f6", "camera": "#ec4899", "video": "#f97316",
+                "file": "#8b5cf6", "person": "#06b6d4", "mic": "#10b981",
+                "poll": "#eab308", "place": "#ef4444"}
+
+
+class AttachSheet(Sheet):
+    """20.0: what can go into a message, as a grid of icons (the paperclip;
+    until 20.0 it opened the photo picker, and photos were all it
+    offered). `choices`: [(icon, words, action)], in order."""
+
+    COLUMNS = 4
+
+    def __init__(self, choices: list) -> None:
+        super().__init__(tr("Attach"))
+        grid = GridLayout(cols=self.COLUMNS, size_hint_y=None,
+                          padding=[dp(8), dp(6)], spacing=[dp(4), dp(8)])
+        grid.bind(minimum_height=grid.setter("height"))
+        self.tiles = [AttachTile(icon, words, ATTACH_TINTS.get(icon, T.accent),
+                                 lambda a=action: self._run(a))
+                      for icon, words, action in choices]
+        for tile in self.tiles:
+            grid.add_widget(tile)
+        self.add(grid)
+
+    def _run(self, action: Callable) -> None:
+        self.dismiss()
+        Clock.schedule_once(lambda _dt: action(), 0.05)
+
+
+class PollSheet(Sheet):
+    """21.0 (POLL29): a poll to send: its question, its choices (a new
+    field as the last one is written, up to POLL_MAX), one answer or
+    several, and how long it stays open. `on_send(poll)`, in
+    sanitize_poll's form."""
+
+    def __init__(self, on_send: Callable[[dict], None]) -> None:
+        super().__init__(tr("New poll"))
+        self.on_send, self.several = on_send, False
+        self.question = Field(hint=tr("Ask a question"), label=tr("Question"))
+        self.question.input.bind(text=lambda *_a: self._sync())
+        self.add(self.question)
+        self.choices: list = []
+        self.box = BoxLayout(orientation="vertical", size_hint_y=None)
+        self.box.bind(minimum_height=self.box.setter("height"))
+        self.add(self.box)
+        self.add(rows_card([ListRow(
+            "check", tr("Several answers"),
+            tr("Each person may pick more than one"),
+            control=ToggleSwitch(False, self._set_several))]))
+        self.add(CapsLabel(tr("Open for"), size=11, color=T.text_3))
+        self.ends = Segmented([(k, tr(words)) for k, words, _s in POLL_ENDS],
+                              "never")
+        self.add(self.ends)
+        self.button = Btn(tr("Send the poll"),
+                          on_release=lambda _w: self._go())
+        self.add(self.button)
+        self.add(Btn(tr("Cancel"), kind="text",
+                     on_release=lambda _w: self.dismiss()))
+        for _n in range(2):
+            self._add_choice()
+        self._sync()
+
+    def _set_several(self, on: bool) -> None:
+        self.several = on
+
+    def _add_choice(self) -> None:
+        field = Field(hint=tr("Choice {n}", n=len(self.choices) + 1))
+        field.input.bind(text=lambda *_a: self._sync())
+        self.choices.append(field)
+        self.box.add_widget(field)
+
+    def poll(self) -> Optional[dict]:
+        """What is written, as a poll; None while it is not one yet."""
+        seconds = dict((k, s) for k, _w, s in POLL_ENDS)[self.ends.value]
+        return sanitize_poll({
+            "q": self.question.text.strip(),
+            "o": [c.text.strip() for c in self.choices if c.text.strip()],
+            "m": self.several,
+            "u": int(time.time()) + seconds if seconds else 0})
+
+    def _sync(self) -> None:
+        if all(c.text.strip() for c in self.choices) and \
+                len(self.choices) < POLL_MAX:
+            self._add_choice()
+        self.button.disabled = self.poll() is None
+
+    def _go(self) -> None:
+        poll = self.poll()
+        if poll is not None:
+            self.dismiss()
+            self.on_send(poll)
+
+
+class PollChoice(ButtonBehavior, BoxLayout):
+    """A choice in a poll's card: a ring (a box where several may be
+    picked), filled where it is yours; its words; how many picked it; and
+    under them a bar of its share of those who voted."""
+
+    HEIGHT = dp(44)
+
+    def __init__(self, words: str, count: int, share: float, picked: bool,
+                 several: bool, on_tap: Optional[Callable] = None) -> None:
+        super().__init__(size_hint_y=None, height=self.HEIGHT,
+                         spacing=dp(10), padding=[0, 0, 0, dp(8)])
+        self.picked, self.share, self.several = picked, share, several
+        self.mark = Widget(size_hint_x=None, width=dp(20))
+        self.add_widget(self.mark)
+        self.label = Label(text=words, font_size=fs(15.5), color=C(T.text),
+                           halign="left", valign="middle", shorten=True,
+                           shorten_from="right")
+        self.label.bind(size=lambda w, v: setattr(w, "text_size", v))
+        self.add_widget(self.label)
+        self.number = Label(text=str(count) if count else "",
+                            font_size=fs(14), color=C(T.text_2),
+                            size_hint_x=None, width=dp(28), halign="right",
+                            valign="middle")
+        self.number.bind(size=lambda w, v: setattr(w, "text_size", v))
+        self.add_widget(self.number)
+        with self.canvas.before:
+            Color(*C(T.rule))
+            self._track = RoundedRectangle(radius=[dp(2)])
+            Color(*C(T.accent))
+            self._fill = RoundedRectangle(radius=[dp(2)])
+        self.bind(pos=self._paint, size=self._paint)
+        # The ring is drawn where the mark is, and the row places its
+        # children a frame after it moves itself.
+        self.mark.bind(pos=self._paint)
+        if on_tap is not None:
+            self.bind(on_release=lambda _w: on_tap())
+
+    def _paint(self, *_a) -> None:
+        x0 = self.x + dp(30)
+        span = max(0.0, self.right - x0)
+        self._track.pos = self._fill.pos = (x0, self.y + dp(2))
+        self._track.size = (span, dp(4))
+        self._fill.size = (span * self.share, dp(4))
+        m = self.mark
+        cx, cy, r = m.center_x, self.y + dp(8) + (self.height - dp(8)) / 2, \
+            dp(9)
+        self.ring_at = (cx, cy)                 # where the ring is drawn
+        m.canvas.clear()
+        with m.canvas:
+            Color(*C(T.accent if self.picked else T.text_3))
+            if self.several:
+                Line(rounded_rectangle=(cx - r, cy - r, 2 * r, 2 * r, dp(4)),
+                     width=dp(1.5))
+            else:
+                Line(circle=(cx, cy, r), width=dp(1.5))
+            if self.picked:
+                Ellipse(pos=(cx - r + dp(3), cy - r + dp(3)),
+                        size=(2 * r - dp(6), 2 * r - dp(6)))
+
+
+class PollCard(BoxLayout):
+    """21.0 (POLL29): a poll in its message's bubble (MessageBubble.card):
+    its question; each choice with its share of the votes, yours marked;
+    and how many voted, and when it ends. A tap on a choice votes (on
+    yours, takes the vote back); none once it has ended."""
+
+    def __init__(self, msg: dict, poll: dict, screen, **kw) -> None:
+        kw.setdefault("orientation", "vertical")
+        kw.setdefault("size_hint", (None, None))
+        kw.setdefault("padding", [dp(2), dp(4), dp(2), dp(2)])
+        kw.setdefault("spacing", dp(4))
+        super().__init__(**kw)
+        app, peer, cid = screen.app, msg["peer"], msg.get("client_msg_id")
+        store = app.store
+        votes = store.poll_votes(peer, cid) if store and cid else {}
+        ended = store.poll_ended(peer, cid) if store and cid else None
+        live = poll_open(poll, ended, now_iso())
+        mine = set(votes.get(app.keys.address, ()))
+        self.question = Label(text=poll["q"], bold=True, font_size=fs(16.5),
+                              color=C(T.text), halign="left", valign="top",
+                              size_hint=(None, None))
+        self.add_widget(self.question)
+        self.choices = []
+        for i, words in enumerate(poll["o"]):
+            count = sum(1 for picks in votes.values() if i in picks)
+            row = PollChoice(words, count, count / len(votes) if votes
+                             else 0.0, i in mine, poll["m"],
+                             (lambda i=i: screen.on_poll_choice(msg, i))
+                             if live else None)
+            self.choices.append(row)
+            self.add_widget(row)
+        said = [trn("{n} vote", "{n} votes", len(votes))]
+        if poll["m"]:
+            said.append(tr("Several answers"))
+        said.append(tr("Ended") if not live else tr(
+            "Ends {when}", when=when_text(poll["u"])) if poll["u"] else "")
+        self.footer = Label(text=" · ".join(w for w in said if w),
+                            font_size=fs(13), color=C(T.text_3),
+                            halign="left", valign="middle",
+                            size_hint=(None, None))
+        self.add_widget(self.footer)
+        self.live, self._laid_at = live, None
+
+    def natural_width(self, max_w: float) -> float:
+        return min(max_w, dp(300))
+
+    def layout_for(self, width: float) -> float:
+        """Laid out `width` wide; returns its height."""
+        if self._laid_at != width:
+            self._laid_at = width
+            inner = width - self.padding[0] - self.padding[2]
+            self.question.text_size = (inner, None)
+            self.question.texture_update()
+            self.question.size = (inner, self.question.texture_size[1])
+            for row in self.choices:
+                row.width = inner
+            self.footer.text_size = (inner, None)
+            self.footer.size = (inner, line_height(13) + dp(4))
+            parts = [self.question, *self.choices, self.footer]
+            self.size = (width, sum(w.height for w in parts) +
+                         self.spacing * (len(parts) - 1) +
+                         self.padding[1] + self.padding[3])
+        return self.height
+
+
+class PollVotesSheet(Sheet):
+    """21.0 (POLL29): who picked each of a poll's choices."""
+
+    def __init__(self, screen, msg: dict, poll: dict) -> None:
+        super().__init__(poll["q"])
+        app = screen.app
+        votes = app.store.poll_votes(msg["peer"], msg["client_msg_id"])
+        for i, words in enumerate(poll["o"]):
+            who = [tr("You") if a == app.keys.address else
+                   screen.author_name(a) for a, picks in votes.items()
+                   if i in picks]
+            self.add(SectionHead(f"{words} · {len(who)}"))
+            self.add(InfoLabel(", ".join(who) or tr("No one yet"),
+                               color=T.text_2, font_size=fs(15)))
+
+
+class LocationSheet(Sheet):
+    """21.0 (MAP29): a place to send. On a phone, where it is (Android's
+    own location; the sheet follows it while open): sent as it is, or
+    shared live for a while (`live`). A computer has no place of its own:
+    a place's coordinates are typed or pasted there, as a maps app or
+    site shows them."""
+
+    def __init__(self, app, peer: str, live: bool) -> None:
+        self.source = location_source()
+        super().__init__(tr("Location"), subtitle="" if self.source else tr(
+            "Paste or type a place's coordinates, as a maps app shows "
+            "them: latitude, then longitude."))
+        self.app, self.peer, self.point = app, peer, None
+        self.field = self.where = self.span = self.live = None
+        if self.source is None:
+            self.field = Field(hint="51.50070, -0.12460",
+                               label=tr("Coordinates"))
+            self.field.input.bind(text=lambda *_a: self._sync())
+            self.add(self.field)
+        else:
+            self.where = InfoLabel("", color=T.text_2, font_size=fs(15))
+            self.add(self.where)
+        self.send = Btn(tr("Send this place"),
+                        on_release=lambda _w: self._send())
+        self.add(self.send)
+        if self.source is not None and live:
+            self.add(CapsLabel(tr("Share live location for"), size=11,
+                               color=T.text_3))
+            self.span = Segmented([(str(m), live_for_words(m))
+                                   for m in LIVE_FOR], str(LIVE_FOR[0]))
+            self.add(self.span)
+            self.live = Btn(tr("Share live location"), kind="quiet",
+                            on_release=lambda _w: self._share())
+            self.add(self.live)
+            battery = battery_percent()
+            if battery is not None and battery < LOW_BATTERY:
+                self.add(InfoLabel(tr(
+                    "Your battery is at {n}%: a long share may stop "
+                    "before its time.", n=battery), color=T.accent,
+                    font_size=fs(13.5)))
+            self.add(InfoLabel(tr(
+                "Your place goes to this chat as you move, sealed like a "
+                "message, until the time ends or you stop it."),
+                color=T.text_3, font_size=fs(13.5)))
+        self.add(Btn(tr("Cancel"), kind="text",
+                     on_release=lambda _w: self.dismiss()))
+        if self.source is not None:
+            last = self.source.last()
+            if last and time.time() - last["at"] < 120:   # still where it was
+                self.point = last
+            self.source.follow(self._found)
+            self.bind(on_dismiss=lambda *_a: self.source.unfollow(
+                self._found))
+        self._sync()
+
+    def _found(self, point: dict) -> None:
+        self.point = point
+        self._sync()
+
+    def chosen(self) -> Optional[dict]:
+        """The place to send: where the phone is, or what is typed."""
+        if self.field is None:
+            return self.point
+        found = parse_coordinates(self.field.text)     # (a computer's)
+        return sanitize_location({"lat": found[0], "lon": found[1],
+                                  "acc": 0, "at": int(time.time())}) \
+            if found else None
+
+    def _sync(self) -> None:
+        if self.where is not None:
+            self.where.text = tr(
+                "Here: {place} (±{accuracy})",
+                place=f"{self.point['lat']:.5f}, {self.point['lon']:.5f}",
+                accuracy=distance_words(self.point["acc"])) \
+                if self.point else tr("Finding where you are…")
+        place = self.chosen()
+        self.send.disabled = place is None
+        if self.live is not None:
+            self.live.disabled = place is None
+
+    def _send(self) -> None:
+        place = self.chosen()
+        if place is not None:
+            self.dismiss()
+            self.app.send_location(self.peer, place)
+
+    def _share(self) -> None:
+        place = self.chosen()
+        if place is not None:
+            self.dismiss()
+            self.app.share_live(self.peer, place, int(self.span.value))
+
+
+class LocationCard(BoxLayout):
+    """21.0 (MAP29): a place in its message's bubble (MessageBubble.card):
+    a pin and what it is; how far it lies from you, and which way, when
+    this phone knows where it is; its coordinates and how near they are;
+    a live share's newest point and when it ends (none once over); Open
+    in maps (the phone's own app); on yours while it runs, Stop sharing."""
+
+    def __init__(self, msg: dict, loc: dict, screen, **kw) -> None:
+        kw.setdefault("orientation", "vertical")
+        kw.setdefault("size_hint", (None, None))
+        kw.setdefault("padding", [dp(2), dp(4), dp(2), 0])
+        kw.setdefault("spacing", dp(2))
+        super().__init__(**kw)
+        app = screen.app
+        point, running = msg.get("live_state") or location_shown(
+            app.store, msg, loc)
+        self.point, self.running = point, running
+        self.head = BoxLayout(size_hint=(None, None), height=dp(28),
+                              spacing=dp(6))
+        self.pin = Widget(size_hint=(None, None), size=(dp(22), dp(28)))
+        self.pin.bind(pos=self._paint, size=self._paint)
+        self.head.add_widget(self.pin)
+        self.title = Label(text=tr("Live location") if "until" in loc
+                           else tr("Location"), bold=True,
+                           font_size=fs(16.5), color=C(T.text),
+                           halign="left", valign="middle")
+        self.title.bind(size=lambda w, v: setattr(w, "text_size", v))
+        self.head.add_widget(self.title)
+        self.add_widget(self.head)
+        lines = []
+        here = app.here() if point and msg["direction"] == "in" else None
+        if here is not None:
+            metres, wind = distance_bearing((here["lat"], here["lon"]),
+                                            (point["lat"], point["lon"]))
+            lines.append(tr("Near you") if metres < 20 else tr(
+                "{distance} {wind} of you", distance=distance_words(metres),
+                wind=tr(wind)))
+        if point:
+            lines.append(f"{point['lat']:.5f}, {point['lon']:.5f}" + (
+                f" · ±{distance_words(point['acc'])}" if point["acc"]
+                else ""))
+        if running:
+            lines.append(tr("Live until {when} · updated {time}",
+                            when=when_text(loc["until"]),
+                            time=datetime.fromtimestamp(
+                                point["at"]).strftime("%H:%M")))
+        elif "until" in loc:
+            lines.append(tr("Live location ended"))
+        self.words = Label(text="\n".join(lines), font_size=fs(14),
+                           color=C(T.text_2), halign="left", valign="top",
+                           size_hint=(None, None))
+        self.add_widget(self.words)
+        self.buttons = BoxLayout(size_hint=(None, None), spacing=dp(8))
+        if point and OPENS_MAPS:
+            self.buttons.add_widget(Btn(
+                tr("Open in maps"), kind="text", height=dp(40),
+                on_release=lambda _w: app.open_place(point)))
+        elif point:
+            self.buttons.add_widget(Btn(
+                tr("Copy the coordinates"), kind="text", height=dp(40),
+                on_release=lambda _w: app.copy_text(
+                    coordinates_text(point))))
+        if running and msg["direction"] == "out":
+            self.buttons.add_widget(Btn(
+                tr("Stop sharing"), kind="text", height=dp(40),
+                on_release=lambda _w: app.stop_live(
+                    msg["peer"], msg["client_msg_id"])))
+        self.buttons.height = dp(40) if self.buttons.children else 0
+        self.add_widget(self.buttons)
+        self._laid_at = None
+
+    def _paint(self, *_a) -> None:
+        pin = self.pin
+        pin.canvas.clear()
+        with pin.canvas:
+            draw_icon("place", pin.center_x, pin.center_y, dp(20),
+                      C(T.accent))
+
+    def natural_width(self, max_w: float) -> float:
+        return min(max_w, dp(280))
+
+    def layout_for(self, width: float) -> float:
+        """Laid out `width` wide; returns its height."""
+        if self._laid_at != width:
+            self._laid_at = width
+            inner = width - self.padding[0] - self.padding[2]
+            self.head.width = self.buttons.width = inner
+            self.words.text_size = (inner, None)
+            self.words.texture_update()
+            self.words.size = (inner, self.words.texture_size[1]
+                               if self.words.text else 0)
+            parts = (self.head, self.words, self.buttons)
+            self.size = (width, sum(w.height for w in parts) +
+                         self.spacing * 2 + self.padding[1] +
+                         self.padding[3])
+        return self.height
+
+
+class QuoteSheet(Sheet):
+    """18.2: a message's words, for a part of them to be marked: drag
+    across it (on a phone: hold a word, then move the handles). Quote a
+    part: the reply quotes that part alone. 21.0 (SELECT29), `select`:
+    Select text, from a message's menu: the part is copied (a hold in the
+    chat selects the whole message, as it always has)."""
+
+    def __init__(self, text: str, on_quote: Callable[[str], None],
+                 select: bool = False) -> None:
+        super().__init__(
+            tr("Select text") if select else tr("Quote a part"),
+            subtitle=tr("Mark the words to copy: drag across them, or hold "
+                        "a word and move the handles." if select else
+                        "Mark the words to quote: drag across them, or hold "
+                        "a word and move the handles."))
         self.on_quote = on_quote
         self.field = SelectableText(text=text, font_size=fs(17),
                                     size_hint=(1, None))
         self.field.bind(minimum_height=self.field.setter("height"),
                         selection_text=lambda *_a: self._sync())
         self.add(self.field)
-        self.button = Btn(tr("Quote the marked words"),
+        self.button = Btn(tr("Copy the marked words") if select else
+                          tr("Quote the marked words"),
                           on_release=lambda _w: self._go())
         self.add(self.button)
         self.add(Btn(tr("Cancel"), kind="text",
@@ -26654,10 +30627,12 @@ class ImageChooserModal(Sheet):
     KINDS = ["*.jpg", "*.jpeg", "*.png", "*.webp", "*.bmp", "*.gif"]
 
     def __init__(self, on_pick: Callable[[str], None],
-                 title: str = "") -> None:
+                 title: str = "", kinds: Optional[list] = None) -> None:
         self._title = title or tr("Send a photo")
         super().__init__(self._title)
         self._on_pick = on_pick
+        if kinds is not None:              # 20.0: a document: any file
+            self.KINDS = kinds
         # The list tells capitals apart where the computer's files do.
         self.chooser = self.add(_file_chooser(
             str(Path.home()), self.KINDS + [k.upper() for k in self.KINDS],
@@ -27066,9 +31041,11 @@ class TextPromptSheet(Sheet):
     """One line of text, confirmed (rename an identity, rename a group)."""
 
     def __init__(self, title: str, label: str, value: str, note: str,
-                 on_save: Callable[[str], bool], limit: int = 40) -> None:
+                 on_save: Callable[[str], bool], limit: int = 40,
+                 empty_ok: bool = False) -> None:
         super().__init__(title)
         self._on_save, self._limit = on_save, limit
+        self._empty_ok = empty_ok     # 20.0: nothing written is an answer
         self.entry = self.add(Field(label=label, on_enter=self._save))
         self.entry.text = value
         if note:
@@ -27080,7 +31057,7 @@ class TextPromptSheet(Sheet):
 
     def _save(self) -> None:
         value = sanitize_text(self.entry.text)[:self._limit].strip()
-        if value and self._on_save(value) is not False:
+        if (value or self._empty_ok) and self._on_save(value) is not False:
             self.dismiss()
 
 
@@ -27913,7 +31890,9 @@ class AboutSheet(Sheet):
 # =============================================================================
 SWIPE_START = dp(16)    # this far sideways, and plainly more than up or down
 SWIPE_REPLY = dp(64)    # a message slid this far to the left is replied to
-SWIPE_MOUSE = False     # a computer's mouse drag selects text instead (tests)
+#: False: a computer's mouse drags select text and its holds count from the
+#: row (hold_left); True: it acts as a finger (tests).
+SWIPE_MOUSE = False
 SWIPE_KINDS = ("back", "menu", "reply")
 
 
@@ -28163,26 +32142,98 @@ class CallButton(ButtonBehavior, BoxLayout):
 
 class CallPicture(Widget):
     """The other side of a 1-to-1 call (17.0): their camera filling the
-    call's screen, or the screen they share, whole."""
+    call's screen, or the screen they share, whole. 21.1: looked at closer
+    (`zoom`, to ZOOM_MOST) and moved about (`focus`: the picture's point
+    at the middle, shares of it from its top left), never past its own
+    edge: a computer's screen on a phone's (RemoteSurface)."""
+
+    ZOOM_MOST = 4.0
 
     def __init__(self, frames: Callable, user: str, **kw) -> None:
         super().__init__(**kw)
         self.frames, self.user, self.track = frames, user, "v"
+        self.zoom, self.focus = 1.0, (0.5, 0.5)
+        self.on_drawn: Optional[Callable] = None
         self.bind(pos=self.refresh, size=self.refresh)
+
+    def rect(self) -> Optional[tuple]:
+        """(left, bottom, width, height) of the picture as drawn now; None
+        while there is none."""
+        tex = self.frames(self.user, self.track)
+        if tex is None or not self.width or not self.height:
+            return None
+        tw, th = tex.size
+        fit = (max if self.track == "v" else min)(self.width / tw,
+                                                  self.height / th)
+        w, h = tw * fit * self.zoom, th * fit * self.zoom
+        left = self.center_x - self.focus[0] * w
+        bottom = self.center_y - (1 - self.focus[1]) * h
+        left = self.center_x - w / 2 if w <= self.width else \
+            min(self.x, max(self.right - w, left))
+        bottom = self.center_y - h / 2 if h <= self.height else \
+            min(self.y, max(self.top - h, bottom))
+        return left, bottom, w, h
 
     def refresh(self, *_a) -> None:
         self.canvas.clear()
-        tex = self.frames(self.user, self.track)
-        if tex is None or not self.width:
+        rect = self.rect()
+        if rect is not None:
+            with self.canvas:
+                Color(1, 1, 1, 1)
+                Rectangle(texture=self.frames(self.user, self.track),
+                          pos=rect[:2], size=rect[2:])
+        if self.on_drawn is not None:
+            self.on_drawn()
+
+    def zoom_at(self, factor: float, x: float, y: float) -> None:
+        """Closer (factor over 1) or further, the picture's point at
+        (x, y) kept there."""
+        rect = self.rect()
+        if rect is None:
             return
-        tw, th = tex.size
-        k = (max if self.track == "v" else min)(self.width / tw,
-                                                 self.height / th)
-        with self.canvas:
-            Color(1, 1, 1, 1)
-            Rectangle(texture=tex, size=(tw * k, th * k),
-                      pos=(self.center_x - tw * k / 2,
-                           self.center_y - th * k / 2))
+        left, bottom, w, h = rect
+        px, py = (x - left) / w, (bottom + h - y) / h
+        zoom = max(1.0, min(self.ZOOM_MOST, self.zoom * factor))
+        w, h = w * zoom / self.zoom, h * zoom / self.zoom
+        self.zoom = zoom
+        self.focus = (px + (self.center_x - x) / w,
+                      py - (self.center_y - y) / h)
+        self._settle()
+
+    def pan(self, dx: float, dy: float) -> None:
+        """Moved by (dx, dy) pixels, as fingers drag it."""
+        rect = self.rect()
+        if rect is not None and (dx or dy):
+            self.focus = (self.focus[0] - dx / rect[2],
+                          self.focus[1] + dy / rect[3])
+            self._settle()
+
+    def show_point(self, px: float, py: float, margin: float) -> None:
+        """Zoomed, moved so that its point (px, py) is `margin` pixels
+        inside the edge (a trackpad's pointer moved there)."""
+        rect = self.rect()
+        if rect is None or self.zoom <= 1.0:
+            return
+        left, bottom, w, h = rect
+        x, y = left + px * w, bottom + (1 - py) * h
+        self.pan(min(0.0, self.right - margin - x) +
+                 max(0.0, self.x + margin - x),
+                 min(0.0, self.top - margin - y) +
+                 max(0.0, self.y + margin - y))
+
+    def unzoom(self) -> None:
+        if self.zoom != 1.0:
+            self.zoom, self.focus = 1.0, (0.5, 0.5)
+            self.refresh()
+
+    def _settle(self) -> None:
+        """`focus` made what is drawn (rect keeps it inside the edges)."""
+        rect = self.rect()
+        if rect is not None:
+            left, bottom, w, h = rect
+            self.focus = ((self.center_x - left) / w,
+                          1 - (self.center_y - bottom) / h)
+        self.refresh()
 
 
 class MeterBars(Widget):
@@ -28350,13 +32401,46 @@ def kivy_remote_keys() -> dict:
              "left": "left", "right": "right", "up": "up", "down": "down",
              "shift": "shift", "rshift": "shift", "ctrl": "ctrl",
              "lctrl": "ctrl", "rctrl": "ctrl", "alt": "alt",
-             "alt-gr": "alt", "super": "meta", "lsuper": "meta",
+             "super": "meta", "lsuper": "meta",
              "rsuper": "meta", "capslock": "capslock", "spacebar": "space",
              "print": "printscreen", "menu": "menu"}
     names.update({f"f{n}": f"f{n}" for n in range(1, 13)})
     names.update({c: c for c in "abcdefghijklmnopqrstuvwxyz0123456789"})
+    names.update(REMOTE_SIGNS)                  # 20.0: for shortcuts
+    # 20.0: the right Alt key is AltGr on most keyboards outside the US
+    # and Britain: it types (@ { [ ] } \ | ~ €), it is no shortcut's Alt.
+    # RemoteSurface sends nothing for it, and what it types goes as text.
+    names["alt-gr"] = "altgr"
     return {code: names[name] for name, code in Keyboard.keycodes.items()
             if name in names}
+
+
+#: 21.1 (CURSOR30): the shapes a computer's pointer is told by, Kivy's
+#: names for a system pointer (set_system_cursor), and "none" while it is
+#: hidden there.
+POINTER_SHAPES = ("arrow", "ibeam", "wait", "crosshair", "wait_arrow",
+                  "size_nwse", "size_nesw", "size_we", "size_ns",
+                  "size_all", "no", "hand", "none")
+
+
+def remote_touch_mode() -> str:
+    """21.1: how a phone's finger controls a computer: "trackpad" (its
+    default: a pointer moved by the finger, as on a laptop's pad, since a
+    finger is wider than what it aims at on a phone) or "touch" (a tap
+    clicks where the finger is). Keys › Trackpad."""
+    mode = load_prefs().get("remote_touch")
+    return mode if mode in ("trackpad", "touch") else "trackpad"
+
+
+def remote_touch_hint(mode: str) -> str:
+    """What a phone is told as it begins to control a computer."""
+    if mode == "trackpad":
+        return tr("Trackpad: slide a finger to move the pointer, tap to "
+                  "click, two fingers to scroll, pinch to zoom. Keys › "
+                  "Trackpad to tap where you point instead.")
+    return tr("Touch: tap where you click, hold for the right button, two "
+              "fingers to scroll, pinch to zoom. Keys › Trackpad for a "
+              "pointer.")
 
 
 class RemoteSurface(Widget):
@@ -28364,17 +32448,31 @@ class RemoteSurface(Widget):
     controls it (CallOverlay). The mouse, a finger and, on a computer, the
     keyboard while the pointer is over their picture, sent as their input
     (`send(kind, fields)`: CallEngine.send_input). Positions are shares of
-    the picture drawn whole (letterboxed) in `picture`.
+    the picture as drawn (CallPicture.rect).
 
-    A phone: a tap clicks, a finger held still HOLD seconds clicks with the
-    right button, a finger drawn drags with the left, two fingers scroll."""
+    21.1: a phone has two ways (remote_touch_mode). Trackpad, the whole
+    screen a pad: one finger moves the pointer as far as it moves (further
+    when quick), a tap clicks where the pointer is, held still then moved
+    drags, held and let go clicks with the right button. Touch: a tap
+    clicks where the finger is, held still clicks with the right button,
+    drawn drags. Both: two fingers tapped together click with the right
+    button, moved together scroll, pinched zoom; zoomed, the trackpad's
+    picture follows its pointer, and two fingers move a touched one about.
+    The pointer is drawn here at once (CURSOR30): its shape as their
+    computer says, where this side put it; a computer's own pointer takes
+    that shape over their picture."""
 
     HOLD = 0.5
     STEP = dp(24)              # two fingers moved this far: a notch
+    ALTGR = 0.1                # Windows' Ctrl before AltGr comes this soon
+    SLOP = dp(10)              # a finger moved less than this: still
+    TWO_TAP = 0.35             # two fingers lifted this soon: a tap
+    PINCH = 0.12               # their distance changed this much: a pinch
 
     def __init__(self, picture: "CallPicture", send: Callable, **kw):
         super().__init__(**kw)
-        self.picture, self.send = picture, send
+        self.picture, self._out = picture, send
+        self._pending_move: Optional[tuple] = None
         self.active = False
         self._over = False
         self._last: Optional[tuple] = None
@@ -28382,25 +32480,40 @@ class RemoteSurface(Widget):
         self._keys: set = set()
         self._fingers: dict = {}            # touch uid -> its last pos
         self._one: Optional[dict] = None    # the one finger's gesture
+        self._two: Optional[dict] = None    # two fingers' gesture (21.1)
         self._hold = None
         self._scroll = 0.0
         self._codes: dict = {}
+        self._altgr, self._ctrl_at = False, 0.0
+        # A computer's fingers (a touch screen) as a touch's; its mouse is
+        # its own (on_touch_down: device "mouse").
+        self.mode = remote_touch_mode() if IS_MOBILE else "touch"
+        self.at = (0.5, 0.5)         # the pointer, shares of their screen
+        self.shape = "arrow"         # its shape there (CURSOR30)
+        self.drawn_there = True      # their picture has it in it
+        picture.on_drawn = self._draw_pointer
 
     # -- on and off ----------------------------------------------------------
-    def start(self) -> None:
+    def start(self) -> bool:
+        """On; True when it was off (21.1: a phone is told its way)."""
         if self.active:
-            return
+            return False
         self.active = True
-        if not IS_MOBILE:
+        if IS_MOBILE:
+            self.mode = remote_touch_mode()
+        else:
             self._codes = kivy_remote_keys()
             Window.bind(mouse_pos=self._hover, on_key_down=self._key_down,
                         on_key_up=self._key_up, on_textinput=self._typed)
+        self._draw_pointer()
+        return True
 
     def stop(self) -> None:
         """Off: nothing held is left held there (the engine says so too)."""
         if not self.active:
             return
         self.active = False
+        self._pending_move = None
         if not IS_MOBILE:
             Window.unbind(mouse_pos=self._hover, on_key_down=self._key_down,
                           on_key_up=self._key_up, on_textinput=self._typed)
@@ -28408,51 +32521,147 @@ class RemoteSurface(Widget):
             self.send(INPUT_KEY, (REMOTE_KEYS.index(name), 0))
         self._keys.clear()
         self._mods.clear()
+        self._altgr = False
         self._fingers.clear()
-        self._one = None
+        self._one = self._two = None
+        self._over = False
         if self._hold is not None:
             self._hold.cancel()
             self._hold = None
+        self._system_cursor()
+        self.picture.unzoom()
+        self.canvas.after.clear()
+
+    def set_mode(self, mode: str) -> None:
+        """Trackpad or Touch, as Keys › Trackpad was just set."""
+        if IS_MOBILE and mode in ("trackpad", "touch"):
+            self.mode = mode
+            self._draw_pointer()
 
     # -- where on their screen -------------------------------------------------
     def where(self, x: float, y: float) -> Optional[tuple]:
         """(x, y) as shares of their picture (0 to 65535, from its top
         left), or None outside it."""
-        pic = self.picture
-        tex = pic.frames(pic.user, pic.track)
-        if tex is None or not pic.width or not pic.height:
+        rect = self.picture.rect()
+        if rect is None:
             return None
-        tw, th = tex.size
-        k = min(pic.width / tw, pic.height / th)
-        dw, dh = tw * k, th * k
-        left, bottom = pic.center_x - dw / 2, pic.center_y - dh / 2
+        left, bottom, dw, dh = rect
         fx, fy = (x - left) / dw, (bottom + dh - y) / dh
         if not (0 <= fx <= 1 and 0 <= fy <= 1):
             return None
         return round(fx * 65535), round(fy * 65535)
 
+    def _shares(self) -> tuple:
+        """The pointer (`at`) as shares the way their input counts them."""
+        return round(self.at[0] * 65535), round(self.at[1] * 65535)
+
+    def send(self, kind: int, fields: tuple) -> None:
+        """An event for their computer. 21.0: the pointer's moves in one
+        of this screen's frames go as one, at its end (a mouse tells its
+        place up to 1000 times a second, and each was a sealed packet);
+        any other event goes at once, after the move waiting."""
+        if kind == INPUT_MOVE:
+            if self._pending_move is None:
+                Clock.schedule_once(self._flush_move, -1)  # this frame's end
+            self._pending_move = tuple(fields)
+            return
+        self._flush_move()
+        self._out(kind, fields)
+
+    def _flush_move(self, _dt: float = 0) -> None:
+        at, self._pending_move = self._pending_move, None
+        if at is not None:
+            self._out(INPUT_MOVE, at)
+
     def _move(self, at: tuple) -> None:
+        """The pointer sent to `at` (shares), and drawn there."""
+        self.at = (at[0] / 65535, at[1] / 65535)
         if at != self._last:
             self._last = at
             self.send(INPUT_MOVE, at)
+        self._draw_pointer()
 
     def _hover(self, _window, pos) -> None:
         if not self.active:
             return
         at = self.where(*self.to_widget(*pos))
-        self._over = at is not None
+        over = at is not None
+        if over != self._over:
+            self._over = over
+            self._system_cursor()
         if at is not None:
             self._move(at)
+
+    # -- their pointer, drawn here (21.1, CURSOR30) ------------------------------
+    def pointer_said(self, shape: str, at: Optional[tuple] = None,
+                     drawn_there: Optional[bool] = None) -> None:
+        """What their computer says of its pointer: its shape; where it is
+        when something there moved it (a trackpad's pointer goes there);
+        whether their picture still has it in it (a locked screen, an
+        older Ferritext)."""
+        self.shape = shape if shape in POINTER_SHAPES else "arrow"
+        if drawn_there is not None:
+            self.drawn_there = drawn_there
+        if at is not None and self.mode == "trackpad" and self._one is None:
+            self.at = (at[0] / 65535, at[1] / 65535)
+        self._system_cursor()
+        self._draw_pointer()
+
+    def _system_cursor(self) -> None:
+        """A computer's own pointer over their picture takes the shape
+        theirs has; the arrow elsewhere, and while theirs is hidden (this
+        one never is: the call's buttons lie over the picture)."""
+        if IS_MOBILE:
+            return
+        over = self.active and self._over and not self.drawn_there
+        try:
+            Window.set_system_cursor(self.shape if over and
+                                     self.shape != "none" else "arrow")
+        except Exception:                  # a window without the call
+            pass
+
+    def _draw_pointer(self, *_a) -> None:
+        """A phone's pointer, where it is: the trackpad's always, a
+        touch's where their picture has none in it."""
+        self.canvas.after.clear()
+        rect = self.picture.rect()
+        if not (self.active and IS_MOBILE and rect is not None and
+                self.shape != "none" and
+                (self.mode == "trackpad" or not self.drawn_there)):
+            return
+        left, bottom, w, h = rect
+        x, y = left + self.at[0] * w, bottom + (1 - self.at[1]) * h
+        s = dp(1)
+        with self.canvas.after:
+            if self.shape == "ibeam":
+                bars = ([x - 4 * s, y + 9 * s, x + 4 * s, y + 9 * s],
+                        [x, y + 9 * s, x, y - 9 * s],
+                        [x - 4 * s, y - 9 * s, x + 4 * s, y - 9 * s])
+                for colour, width in (((0, 0, 0, 1), 3.2), ((1, 1, 1, 1),
+                                                           1.4)):
+                    Color(*colour)
+                    for points in bars:
+                        Line(points=points, width=width * s)
+                return
+            head = [x, y, x, y - 17 * s, x + 12 * s, y - 12 * s]
+            tail = [x + 4.5 * s, y - 11 * s, x + 8.5 * s, y - 20 * s]
+            Color(0, 0, 0, 1)
+            Line(points=tail, width=3.6 * s)
+            Color(1, 1, 1, 1)
+            Line(points=tail, width=1.8 * s)
+            Triangle(points=head)
+            Color(0, 0, 0, 1)
+            Line(points=head, width=1.2 * s, close=True)
 
     # -- the mouse and fingers ---------------------------------------------------
     def on_touch_down(self, touch):
         if not self.active:
             return False
         at = self.where(*touch.pos)
-        if at is None:
-            return False
         button = getattr(touch, "button", "") or ""
         if button.startswith("scroll"):
+            if at is None:
+                return False
             # Kivy's names are the content's way: "scrolldown" is the
             # wheel turned away from you, which scrolls up.
             dy = {"scrolldown": 120, "scrollup": -120}.get(button, 0)
@@ -28460,72 +32669,147 @@ class RemoteSurface(Widget):
             self._move(at)
             self.send(INPUT_WHEEL, (dx, dy))
             return True
-        touch.grab(self)
         if getattr(touch, "device", "") == "mouse" or \
                 button in ("right", "middle"):
+            if at is None:
+                return False
+            touch.grab(self)
             number = {"left": 1, "right": 2, "middle": 3}.get(button, 1)
             touch.ud["remote_button"] = number
             self._move(at)
             self.send(INPUT_BUTTON, (number, 1) + at)
             return True
+        # A finger. Touch: on their picture (or a second finger); trackpad:
+        # anywhere over the call, the whole screen a pad.
+        if not self._fingers and (
+                at is None if self.mode == "touch" else
+                not self.collide_point(*touch.pos)):
+            return False
+        touch.grab(self)
         self._fingers[touch.uid] = touch.pos
-        if len(self._fingers) > 1:           # two fingers: a scroll
-            if self._hold is not None:
-                self._hold.cancel()
-                self._hold = None
+        if len(self._fingers) == 2:
+            self._cancel_hold()
+            one = self._one
+            if one is not None and one["down"]:    # a drag under way: ends
+                self.send(INPUT_BUTTON, (1, 0) + self._shares())
             self._one = None
+            a, b = self._fingers.values()
+            self._two = {"dist": max(1.0, math.dist(a, b)),
+                         "mid": ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2),
+                         "kind": None, "began": time.monotonic()}
             return True
-        self._one = {"at": at, "start": touch.pos, "dragging": False,
-                     "held": False}
+        if len(self._fingers) > 2:
+            return True
+        self._one = {"start": touch.pos, "at": at, "moved": False,
+                     "held": False, "down": False}
         self._hold = Clock.schedule_once(lambda _dt: self._held(),
                                          self.HOLD)
         return True
 
+    def _cancel_hold(self) -> None:
+        if self._hold is not None:
+            self._hold.cancel()
+            self._hold = None
+
     def _held(self) -> None:
-        """A finger held still: a right click where it is."""
+        """A finger held still. Touch: a right click where it is. Trackpad:
+        held, which a move then makes a drag, and letting go a right
+        click."""
         self._hold = None
         one = self._one
-        if one is None or one["dragging"]:
+        if one is None or one["moved"]:
             return
         one["held"] = True
-        self._move(one["at"])
-        self.send(INPUT_BUTTON, (2, 1) + one["at"])
-        self.send(INPUT_BUTTON, (2, 0) + one["at"])
+        if self.mode == "touch" and one["at"] is not None:
+            self._move(one["at"])
+            self.send(INPUT_BUTTON, (2, 1) + one["at"])
+            self.send(INPUT_BUTTON, (2, 0) + one["at"])
 
     def on_touch_move(self, touch):
         if touch.grab_current is not self:
             return False
-        at = self.where(*touch.pos)
         if "remote_button" in touch.ud:
+            at = self.where(*touch.pos)
             if at is not None:
                 self._move(at)
             return True
         last = self._fingers.get(touch.uid)
         self._fingers[touch.uid] = touch.pos
-        if len(self._fingers) > 1:
-            if last is not None:
-                self._scroll += touch.pos[1] - last[1]
-                while abs(self._scroll) >= self.STEP:
-                    notch = 1 if self._scroll > 0 else -1
-                    self._scroll -= notch * self.STEP
-                    # A finger drawn up moves the page up: content down.
-                    self.send(INPUT_WHEEL, (0, -120 * notch))
+        if self._two is not None:          # (one of the two may be up)
+            if len(self._fingers) >= 2:
+                self._two_moved()
             return True
         one = self._one
-        if one is None or one["held"] or at is None:
+        if one is None or last is None:
             return True
-        if not one["dragging"] and (abs(touch.pos[0] - one["start"][0]) +
-                                    abs(touch.pos[1] - one["start"][1])
-                                    > dp(10)):
-            one["dragging"] = True
-            if self._hold is not None:
-                self._hold.cancel()
-                self._hold = None
-            self._move(one["at"])
-            self.send(INPUT_BUTTON, (1, 1) + one["at"])
-        if one["dragging"]:
-            self._move(at)
+        if not one["moved"] and math.dist(touch.pos, one["start"]) > \
+                self.SLOP:
+            one["moved"] = True
+            if not one["held"]:
+                self._cancel_hold()
+            if self.mode == "trackpad" and one["held"]:
+                self.send(INPUT_BUTTON, (1, 1) + self._shares())
+                one["down"] = True             # held, then moved: a drag
+            elif self.mode == "touch" and not one["held"] and \
+                    one["at"] is not None:
+                self._move(one["at"])
+                self.send(INPUT_BUTTON, (1, 1) + one["at"])
+                one["down"] = True
+        if not one["moved"]:
+            return True
+        if self.mode == "trackpad":
+            self._nudge(touch.pos[0] - last[0], touch.pos[1] - last[1])
+        elif one["down"]:
+            at = self.where(*touch.pos)
+            if at is not None:
+                self._move(at)
         return True
+
+    def _nudge(self, dx: float, dy: float) -> None:
+        """The trackpad's pointer moved by a finger's (dx, dy) pixels,
+        across the picture as drawn (finer zoomed), further when the
+        finger is quick; the picture, zoomed, follows it."""
+        rect = self.picture.rect()
+        if rect is None:
+            return
+        gain = 1.0 + min(2.0, math.hypot(dx, dy) / dp(12))
+        self.at = (min(1.0, max(0.0, self.at[0] + dx * gain / rect[2])),
+                   min(1.0, max(0.0, self.at[1] - dy * gain / rect[3])))
+        self.picture.show_point(self.at[0], self.at[1], dp(48))
+        self._move(self._shares())
+
+    def _two_moved(self) -> None:
+        """Two fingers moved: once they have moved enough to tell, a pinch
+        zooms (and moves the picture with them), together they scroll, or,
+        a touched picture zoomed, move it about."""
+        two = self._two
+        (ax, ay), (bx, by) = list(self._fingers.values())[:2]
+        dist = max(1.0, math.hypot(ax - bx, ay - by))
+        mid = ((ax + bx) / 2, (ay + by) / 2)
+        if two["kind"] is None:
+            if abs(dist / two["dist"] - 1) > self.PINCH:
+                two["kind"] = "zoom"
+            elif math.dist(mid, two["mid"]) > self.SLOP:
+                two["kind"] = "pan" if self.mode == "touch" and \
+                    self.picture.zoom > 1.0 else "scroll"
+            else:
+                return
+            two["last_dist"], two["last_mid"] = two["dist"], two["mid"]
+        dx, dy = mid[0] - two["last_mid"][0], mid[1] - two["last_mid"][1]
+        if two["kind"] == "zoom":
+            self.picture.zoom_at(dist / two["last_dist"], *mid)
+            self.picture.pan(dx, dy)
+        elif two["kind"] == "pan":
+            self.picture.pan(dx, dy)
+        else:
+            self._scroll += 2 * dy         # as 19.0's two fingers' sum
+            while abs(self._scroll) >= self.STEP:
+                notch = 1 if self._scroll > 0 else -1
+                self._scroll -= notch * self.STEP
+                # A finger drawn up moves the page up: content down.
+                self.send(INPUT_WHEEL, (0, -120 * notch))
+        two["last_dist"], two["last_mid"] = dist, mid
+        self._draw_pointer()
 
     def on_touch_up(self, touch):
         if touch.grab_current is not self:
@@ -28536,16 +32820,38 @@ class RemoteSurface(Widget):
             self.send(INPUT_BUTTON, (touch.ud["remote_button"], 0) + at)
             return True
         self._fingers.pop(touch.uid, None)
-        one, self._one = self._one, None
-        if self._hold is not None:
-            self._hold.cancel()
-            self._hold = None
-        if one is None or one["held"]:
+        two = self._two
+        if two is not None:
+            if two["kind"] is None and not two.get("clicked") and \
+                    time.monotonic() - two["began"] < self.TWO_TAP:
+                two["clicked"] = True        # two fingers tapped: right
+                at = self._shares() if self.mode == "trackpad" else \
+                    self.where(*two["mid"]) or self._shares()
+                self._move(at)
+                self.send(INPUT_BUTTON, (2, 1) + at)
+                self.send(INPUT_BUTTON, (2, 0) + at)
+            if not self._fingers:
+                self._two = None
             return True
-        if one["dragging"]:
+        one, self._one = self._one, None
+        self._cancel_hold()
+        if one is None:
+            return True
+        if self.mode == "trackpad":
+            at = self._shares()
+            if one["down"]:
+                self.send(INPUT_BUTTON, (1, 0) + at)
+            elif not one["moved"]:             # a tap, or held: a click
+                number = 2 if one["held"] else 1
+                self.send(INPUT_BUTTON, (number, 1) + at)
+                self.send(INPUT_BUTTON, (number, 0) + at)
+            return True
+        if one["held"]:
+            return True
+        if one["down"]:
             at = self.where(*touch.pos) or self._last or one["at"]
             self.send(INPUT_BUTTON, (1, 0) + at)
-        else:                                  # a tap: a click
+        elif one["at"] is not None:            # a tap: a click
             self._move(one["at"])
             self.send(INPUT_BUTTON, (1, 1) + one["at"])
             self.send(INPUT_BUTTON, (1, 0) + one["at"])
@@ -28562,15 +32868,25 @@ class RemoteSurface(Widget):
         name = self._codes.get(key)
         if name is None:
             return True
+        if name == "altgr":
+            # 20.0: AltGr types; Windows gives it as Ctrl then right Alt,
+            # so the Ctrl that came with it is let go there.
+            self._altgr = True
+            if "ctrl" in self._mods and \
+                    time.monotonic() - self._ctrl_at < self.ALTGR:
+                self._mods.discard("ctrl")
+                self.send(INPUT_KEY, (REMOTE_KEYS.index("ctrl"), 0))
+            return True
         if name in REMOTE_MODIFIERS:
             if name not in self._mods:
                 self._mods.add(name)
+                if name == "ctrl":
+                    self._ctrl_at = time.monotonic()
                 self.send(INPUT_KEY, (REMOTE_KEYS.index(name), 1))
             return True
         shortcut = bool(self._mods & {"ctrl", "alt", "meta"})
-        if len(name) == 1 or name == "space":
-            if not shortcut:
-                return True                     # its text comes typed
+        if name in REMOTE_TYPED and (self._altgr or not shortcut):
+            return True                         # its text comes typed
         self._keys.add(name)
         self.send(INPUT_KEY, (REMOTE_KEYS.index(name), 1))
         return True
@@ -28579,6 +32895,8 @@ class RemoteSurface(Widget):
         if not self.active:
             return False
         name = self._codes.get(key)
+        if name == "altgr":
+            self._altgr = False
         for held in (self._mods, self._keys):
             if name in held:
                 held.discard(name)
@@ -28586,8 +32904,8 @@ class RemoteSurface(Widget):
         return self._over
 
     def _typed(self, _window, text: str) -> bool:
-        if not (self.active and self._over) or \
-                self._mods & {"ctrl", "alt", "meta"}:
+        if not (self.active and self._over) or (
+                not self._altgr and self._mods & {"ctrl", "alt", "meta"}):
             return bool(self.active and self._over)
         text = remote_text(text)
         if text:
@@ -28692,6 +33010,22 @@ def remote_note_words(state: Optional[dict], name: str,
         return tr("A window run as administrator is in front: Windows lets "
                   "Ferritext neither use it nor type into it. Click another "
                   "window, or close it from Keys › Programs.")
+    # 21.0: what the service's helper makes usable, and NEXT29's wording.
+    if state.get("s") == "hung":
+        program = (state.get("hp") or {}).get("x") or tr("A program")
+        return tr("{program} does not answer, and is in front: wait for it, "
+                  "or end it.", program=program)
+    if state.get("s") == "locked":
+        return tr("{name}'s computer is locked: type its password to unlock "
+                  "it (Keys › Ctrl+Alt+Del first, where it asks for it).",
+                  name=name)
+    if state.get("s") == "prompt":
+        return tr("A Windows permission prompt is open on {name}'s "
+                  "computer: answer it as if you were there.", name=name)
+    if state.get("s") == "prompt-view":
+        return tr("A Windows permission prompt is open: you see it, but "
+                  "{name}'s computer does not let a session answer one (its "
+                  "Settings › Remote access).", name=name)
     until = state.get("u")
     now = time.time() if now is None else now
     if until and until - now < REMOTE_ENDS_SOON:
@@ -28837,14 +33171,31 @@ class RemoteKeysSheet(Sheet):
         super().__init__(tr("Keys for {name}'s computer", name=app.call_name(
             call.peer) if call else ""))
         self.app = app
-        buttons = [Btn("Ctrl+Alt+Del", kind="quiet", on_release=lambda _w:
-                       self._then(lambda: RemoteCadSheet(app).open()))]
+        # 21.0: their computer runs the service: Ctrl+Alt+Del for real.
+        if ((call.rc_state if call else None) or {}).get("sv"):
+            cad = lambda: app.remote_keys(("ctrl", "alt", "delete"))
+        else:
+            cad = lambda: RemoteCadSheet(app).open()
+        buttons = [Btn("Ctrl+Alt+Del", kind="quiet",
+                       on_release=lambda _w: self._then(cad))]
         buttons += [Btn(tr(label), kind="quiet", on_release=lambda _w, k=combo:
                         app.remote_keys(k)) for label, combo in self.KEYS]
         self.add(FitGrid(buttons))
+        # 21.0 (NEXT29): the clipboard, either way, each time asked for.
+        self.add(SectionHead(tr("Clipboard")))
+        self.add(FitGrid([
+            Btn(tr("Send my clipboard"), kind="quiet", on_release=lambda _w:
+                self._then(app.remote_clip_send)),
+            Btn(tr("Get theirs"), kind="quiet", on_release=lambda _w:
+                self._then(app.remote_clip_get))]))
         self.add(SectionHead(tr("Their computer")))
         mbit = f"{REMOTE_SAVER_KBPS / 1000:g}"
-        self.add(rows_card([
+        way = [ListRow("pointer", tr("Trackpad"), tr(
+            "A pointer your finger moves, as on a laptop's pad; off: tap "
+            "where you click"), control=ToggleSwitch(
+                remote_touch_mode() == "trackpad",
+                lambda on: app.set_remote_touch(on)))] if IS_MOBILE else []
+        self.add(rows_card(way + [
             ListRow("menu", tr("Programs…"), tr(
                 "What is open on it; close one that does not answer"),
                 chevron=True, on_tap=lambda: self._then(app.remote_programs)),
@@ -28852,6 +33203,9 @@ class RemoteKeysSheet(Sheet):
                 "For when it is stuck: a locked screen, a permission prompt"),
                 chevron=True, on_tap=lambda: self._then(
                     lambda: RemoteRestartSheet(app).open())),
+            ListRow("info", tr("What went wrong there…"), tr(
+                "Its log of sessions: when they dropped, and why"),
+                chevron=True, on_tap=lambda: self._then(app.remote_log_ask)),
             ListRow("download", tr("Data saver"), tr(
                 "Their screen at {mbit} Mbit/s at most, for mobile data",
                 mbit=mbit), control=ToggleSwitch(
@@ -28921,6 +33275,35 @@ class RemoteRestartSheet(Sheet):
     def _go(self) -> None:
         self.dismiss()
         self.app.remote_ask({"op": "restart"})
+
+
+class RemoteLogSheet(Sheet):
+    """21.0 (NEXT29): a computer's log of its remote sessions, newest
+    first: this one's (Settings › Remote access, with Clear), or theirs,
+    asked for from afar (`name`)."""
+
+    def __init__(self, app: "FextApp", lines: list,
+                 name: Optional[str] = None) -> None:
+        super().__init__(tr("What went wrong lately") if name is None else
+                         tr("What went wrong on {name}'s computer",
+                            name=name), subtitle=tr(
+            "When sessions began and ended, and what stopped them: the "
+            "screen, the pointer and keys, a restart. Never what was typed "
+            "or shown."))
+        self.app = app
+        shown = list(reversed(lines))[:120]
+        if not shown:
+            self.add(hint(tr("Nothing yet.")))
+        else:
+            self.add(InfoLabel("\n".join(shown), font_size=fs(13),
+                               color=T.text_2))
+        buttons = [Btn(tr("Copy"), kind="quiet", on_release=lambda _w:
+                       app.copy_text("\n".join(lines)))] if lines else []
+        if name is None and lines:
+            buttons.append(Btn(tr("Clear"), kind="danger", on_release=lambda
+                               _w: (remote_log_clear(), self.dismiss())))
+        if buttons:
+            self.add(FitGrid(buttons))
 
 
 class RemoteProgramsSheet(Sheet):
@@ -29077,17 +33460,44 @@ class RemoteAccessSheet(Sheet):
         rename.width = rename.natural_width() + dp(8)
         self.add(SectionHead(tr("This computer")))
         self.add(rows_card([ListRow("screen", device_name(), tr(
-            "What the people listed see it as"), control=rename)], inset=0))
+            "What the people listed see it as"), control=rename),
+            ListRow("screen", tr("Smoother screen"), tr(
+                "Read 60 times a second, not 30, while it is controlled or "
+                "shown to one person: what moves is smoother and seen up to "
+                "8 ms sooner; twice the work for this computer, and more "
+                "data while things move"), control=ToggleSwitch(
+                    screen_fps() == 60,
+                    lambda on: save_pref("remote_smooth", bool(on))))],
+            inset=0))
         self.add(SectionHead(tr("Before you leave")))
         self.add(rows_card(self._checklist(), inset=0))
+        if IS_WINDOWS:                         # 21.0 (SERVICE29)
+            self.add(SectionHead(tr("The lock screen")))
+            self.add(rows_card([ListRow(
+                "lock", tr("Reach the lock screen from afar"),
+                service_words(service_state()), chevron=True,
+                on_tap=lambda: DeskServiceSheet(self.app,
+                                                self._fill).open())],
+                inset=0))
+        reach = tr("Windows lets no one control its sign-in or lock screen, "
+                   "or a program run as administrator.") \
+            if not (IS_WINDOWS and service_state()) else ""
         self.add(hint(tr(
             "Whoever is listed uses this computer as you would: its files, "
             "and Ferritext with every identity in it, unless the app lock is "
-            "on (it then asks for its code when a session starts). Windows "
-            "lets no one control its sign-in or lock screen, or a program "
-            "run as administrator. Whoever holds a listed person's keys can "
-            "reach this computer: list only people you trust.")))
+            "on (it then asks for its code when a session starts).") +
+            (" " + reach if reach else "") + " " + tr(
+            "Whoever holds a listed person's keys can reach this computer: "
+            "list only people you trust.")))
         sessions = remote_sessions()[:5]
+        if sessions or remote_log_lines():
+            self.add(rows_card([ListRow(
+                "info", tr("What went wrong lately"), tr(
+                    "This computer's log of its sessions: when they began "
+                    "and ended, and what stopped them"), chevron=True,
+                on_tap=lambda: RemoteLogSheet(self.app,
+                                              remote_log_lines()).open())],
+                inset=0))
         if sessions:
             self.add(SectionHead(tr("Last sessions")))
             self.add(rows_card([ListRow(
@@ -29178,12 +33588,163 @@ class RemoteAccessSheet(Sheet):
         self._fill()
 
 
+def service_words(state: Optional[dict]) -> str:
+    """21.0: Remote access's row for the service, in a line."""
+    if service_why_not():
+        return service_why_not()
+    if state is None:
+        return tr("Off: Windows keeps its lock screen, Ctrl+Alt+Del and "
+                  "administrators' windows from a session")
+    if state.get("version") != APP_VERSION:
+        return tr("Set up for {old}: update it for {new}",
+                  old=state.get("version") or "?", new=APP_VERSION)
+    return tr("On: a session sees and uses the lock screen, Ctrl+Alt+Del "
+              "and administrators' windows")
+
+
+class DeskServiceSheet(Sheet):
+    """21.0 (SERVICE29): the lock screen reached from afar, a Windows
+    service: what it does and risks, set up, updated or removed (each with
+    Windows' own permission prompt), and its two settings."""
+
+    def __init__(self, app: "FextApp",
+                 then: Optional[Callable] = None) -> None:
+        super().__init__(tr("The lock screen, from afar"), subtitle=tr(
+            "A small Windows service, running as the system, lets a remote "
+            "session see and use what Windows keeps from programs: the lock "
+            "and sign-in screens, Ctrl+Alt+Del, windows run as "
+            "administrator, and permission prompts if you allow it."))
+        self.app, self.then = app, then
+        self._fill()
+
+    def _fill(self, words: str = "", colour=None) -> None:
+        self.body.clear_widgets()
+        why = service_why_not()
+        if why:
+            self.add(hint(why))
+            return
+        state = service_state()
+        if state is None:
+            self.add(hint(tr(
+                "Windows asks for your permission to set it up. It copies "
+                "Ferritext to Program Files, where only administrators can "
+                "change it, and starts with Windows. With it, whoever is on "
+                "your Remote access list can reach this computer's lock "
+                "screen (they still need its password) and its "
+                "administrators' windows.")))
+            self.add(Btn(tr("Set it up…"), on_release=lambda _w: self._ask(
+                SERVICE_INSTALL)))
+        else:
+            old = state.get("version") != APP_VERSION
+            update = None
+            if old:
+                update = Btn(tr("Update"), kind="text", size_hint_x=None,
+                             pos_hint={"center_y": .5}, on_release=lambda _w:
+                             self._ask(SERVICE_INSTALL))
+                update.width = update.natural_width() + dp(8)
+            self.add(rows_card([
+                ListRow("info" if old else "check", tr("Set up"),
+                        service_words(state), control=update),
+                ListRow("lock", tr("Answer permission prompts from afar"),
+                        tr("Off: a session sees Windows' permission prompts "
+                           "but cannot answer them. On: it can — and so "
+                           "could a program on this computer that took "
+                           "Ferritext over, to make itself administrator."),
+                        control=ToggleSwitch(state["prompts"], lambda on:
+                                             self._ask(SERVICE_SET,
+                                                       "1" if on else "0"))),
+                ListRow("screen", tr("Lock when it signs in by itself"), tr(
+                    "After a restart or a power cut, with Windows signing "
+                    "you in by itself: the screen locked at once, and "
+                    "unlocked from afar."), control=ToggleSwitch(
+                        bool(load_prefs().get("desk_lock_after_sign_in")),
+                        lambda on: save_pref("desk_lock_after_sign_in",
+                                             bool(on))))], inset=0))
+            self.add(Btn(tr("Remove the service…"), kind="danger",
+                         on_release=lambda _w: self._remove()))
+        self.status = self.status_label()
+        if words:
+            self.set_status(self.status, words, colour or T.text_2)
+
+    def _remove(self) -> None:
+        MenuSheet([("delete", tr("Remove it"),
+                    lambda: self._ask(SERVICE_REMOVE))],
+                  title=tr("Remove the service?"), subtitle=tr(
+                      "Sessions then stop again where Windows keeps "
+                      "programs out: the lock screen, Ctrl+Alt+Del, "
+                      "administrators' windows.")).open()
+
+    def _ask(self, flag: str, value: str = "") -> None:
+        self.set_status(self.status, tr("Windows asks for your permission…"),
+                        T.text_2)
+        service_ask(flag, self._done, value)
+
+    def _done(self, why: str) -> None:
+        self._fill(why or tr("Done"), T.alert if why else T.text_2)
+        if self.then is not None:
+            self.then()
+
+
+class MicMarks(BoxLayout):
+    """20.0: whose microphone is on and whose is off in a 1-to-1 call,
+    for both sides to see (the owner: "Muted/Unmuted should show as an
+    indicator for both recipients and user"): each side's name with a
+    microphone, struck through and in the alert's colour while muted."""
+
+    def __init__(self, **kw) -> None:
+        kw.setdefault("size_hint_y", None)
+        kw.setdefault("height", line_height(14) + dp(8))
+        kw.setdefault("spacing", dp(18))
+        super().__init__(**kw)
+        self.marks: list = []          # [(who, microphone on)]
+        self.ink: Optional[dict] = None
+
+    def set(self, marks: list, ink: Optional[dict] = None) -> None:
+        """`marks`: [(who, on)] in order; `ink`: the colours over a
+        picture (picture_palette), None on the page's own ground."""
+        if (marks, ink) == (self.marks, self.ink):
+            return
+        self.marks, self.ink = list(marks), ink
+        self.clear_widgets()
+        self.add_widget(Widget())
+        for who, on in marks:
+            self.add_widget(self._mark(who, on))
+        self.add_widget(Widget())
+
+    def _mark(self, who: str, on: bool) -> BoxLayout:
+        quiet = (self.ink or {}).get("text_2", T.text_2)
+        color = quiet if on else T.alert
+        words = who if on else tr("{who} · muted", who=who)
+        # As wide as its words: a label measured before it has a width
+        # of its own cuts them short ("You · mut…").
+        label = single_line(words, fs(14), color, size_hint_x=None,
+                            width=measure_text(words, fs(14), dp(600))[0]
+                            + dp(2))
+        icon = Widget(size_hint_x=None, width=dp(18))
+
+        def draw(w, *_a):
+            w.canvas.clear()
+            with w.canvas:
+                draw_icon("mic" if on else "mic_off", w.x + w.width / 2,
+                          w.y + w.height / 2, dp(15), C(color))
+        icon.bind(pos=draw, size=draw)
+        box = BoxLayout(size_hint_x=None, spacing=dp(4),
+                        width=dp(18) + dp(4) + label.width)
+        box.add_widget(icon)
+        box.add_widget(label)
+        return box
+
+
 class CallOverlay(ModalView):
     """The call, full screen: who, how far along (or how long), which way
     the sound goes, and the controls — answer or decline while it rings;
     mute, the camera, loudspeaker (a phone) or the screen (a computer) and
     hang up once it is on. 17.0: their camera fills it, this device's own
-    is in a corner (a tap there turns a phone to its other camera)."""
+    is in a corner. 20.0: a tap on that corner puts this device's own
+    camera over the screen and theirs in the corner, and a tap there
+    turns it back (`swapped`); a phone's other camera has its own button
+    (it was the tap, which nobody could guess: a phone turned to its back
+    camera, and its torch went out)."""
 
     def __init__(self, app: "FextApp", call: "Call") -> None:
         super().__init__(size_hint=(1, 1), auto_dismiss=False,
@@ -29193,6 +33754,7 @@ class CallOverlay(ModalView):
         self._layout = None
         self._view_keys = None
         self._view: dict = {}          # (user, track) -> what draws it
+        self.swapped = False           # 20.0: this side's camera in the main
         contact = app.store.get_contact(call.peer) if app.store else None
         name = person_name(contact, call.peer, 14)
         stack = FloatLayout()
@@ -29214,6 +33776,7 @@ class CallOverlay(ModalView):
         self.remote = RemoteSurface(self.picture, app.send_remote_input,
                                     size_hint=(1, 1),
                                     pos_hint={"x": 0, "y": 0})
+        self.waiting = False       # 21.1: the note says no picture has come
         stack.add_widget(self.remote)
         # Over a picture, a dark band at the top and the bottom keeps the
         # words and the controls readable (17.0).
@@ -29242,6 +33805,8 @@ class CallOverlay(ModalView):
                                   halign="center", size_hint_y=None,
                                   height=line_height(17) + dp(4))
         root.add_widget(self.status)
+        self.mics = MicMarks()                       # 20.0
+        root.add_widget(self.mics)
         # 17.2 (F16): the way's bars beside it; a tap tells the numbers.
         self.meter = CallMeter(app.show_call_meter)
         meter_row = AnchorLayout(size_hint_y=None, height=self.meter.height)
@@ -29262,13 +33827,14 @@ class CallOverlay(ModalView):
                 session, session.me.user, "v", app.call_frames, tr("You"),
                 disc=dp(34), size_hint=(None, None), size=corner,
                 pos_hint={"right": .96, "top": .76 if narrow else .965},
-                on_pin=lambda *_a: app.flip_call_camera())
+                on_pin=lambda *_a: self.swap())
             # 17.1 (multi-view): their face, while they share their screen
             # with their camera on, in the corner across from this one's.
+            # 20.0: and, swapped, in this one's corner.
             self.face = CallTile(
                 session, call.peer, "v", app.call_frames, name, disc=dp(34),
                 size_hint=(None, None), size=corner,
-                pos_hint={"x": .04, "y": .24})
+                pos_hint=self.FACE_CORNER, on_pin=lambda *_a: self.swap())
             for tile in (self.mine, self.face):
                 tile.opacity, tile.disabled = 0, True
                 stack.add_widget(tile)
@@ -29287,6 +33853,13 @@ class CallOverlay(ModalView):
             corner_box.add_widget(self.record)
         corner_box.width = len(corner_box.children) * (TOUCH + dp(4))
         stack.add_widget(corner_box)
+        # 20.0: top right, a phone's other camera, while its camera is on.
+        self.flip = IconButton("retry", label=tr("Other camera"),
+                               size_hint=(None, None), size=(TOUCH, TOUCH),
+                               pos_hint={"right": .99, "top": .985},
+                               opacity=0, disabled=True)
+        self.flip.bind(on_release=lambda _w: app.flip_call_camera())
+        stack.add_widget(self.flip)
         # 17.3 (REACT1): a reaction over each side for a few seconds, as a
         # group's tiles show them (show_reactions), placed again whenever
         # the layout moves.
@@ -29323,8 +33896,16 @@ class CallOverlay(ModalView):
                                      pos_hint={"x": 0, "top": 1})
         paint_round(self.remote_note, T.accent, radius=0)
         self.remote_note_words = InfoLabel("", font_size=fs(14),
-                                           color=T.on_accent)
+                                           color=T.on_accent,
+                                           pos_hint={"center_y": .5})
         self.remote_note.add_widget(self.remote_note_words)
+        # 21.0 (NEXT29): a program that does not answer, ended from here.
+        self._hung: Optional[dict] = None
+        self.remote_note_end = Btn(tr("End it"), kind="quiet",
+                                   size_hint_x=None, width=0, opacity=0,
+                                   disabled=True, pos_hint={"center_y": .5},
+                                   on_release=lambda _w: self._end_hung())
+        self.remote_note.add_widget(self.remote_note_end)
         self.remote_note_words.bind(height=lambda *_a: self._place_note())
         stack.add_widget(self.remote_note)
         stack.bind(size=lambda *_a: self._place_note())
@@ -29363,6 +33944,20 @@ class CallOverlay(ModalView):
         self.accept = CallButton("phone", tr("Answer"),
                                  lambda: app.answer_call(), kind="accept")
         self.refresh()
+
+    #: Where their face sits while they share their screen (17.1).
+    FACE_CORNER = {"x": .04, "y": .24}
+
+    def swap(self) -> None:
+        """20.0: a tap on the corner's picture: it and the main one change
+        places (both cameras on, no screen shared); _pictures draws it."""
+        session = self.call.session
+        them = session.members.get(self.call.peer) if session else None
+        both = bool(session and session.me.camera and them and them.camera
+                    and not them.screen)
+        if both or self.swapped:
+            self.swapped = both and not self.swapped
+            self._pictures()
 
     def show_reactions(self, *_a) -> None:
         """17.3 (REACT1): each side's reaction while it is fresh
@@ -29495,6 +34090,7 @@ class CallOverlay(ModalView):
                 "connecting": N_("Connecting…")}.get(call.state, ""))
         engine = call.engine
         on = call.state in ("active", "connecting") and engine is not None
+        self._mics(on and not call.remote)
         self.meter.set(meter_bars(engine.way, engine.rtt_ms) if on else 0,
                        call_path_label(call.path, engine.rtt_ms)
                        if on else "")
@@ -29502,18 +34098,35 @@ class CallOverlay(ModalView):
             else (0, True)
         self._pictures()
 
+    def _mics(self, on: bool) -> None:
+        """20.0: both microphones, while the call is on (MicMarks): this
+        side's as it is, theirs once they have said (their media state)."""
+        call, session = self.call, self.call.session
+        them = session.members.get(call.peer) if session else None
+        marks = [(tr("You"), not call.muted)] if on else []
+        if on and them is not None:
+            marks.append((self.name_label.text, bool(them.mic)))
+        self.mics.set(marks, self._ink() if self.picture.opacity else None)
+
     def _pictures(self) -> None:
         """17.0: their camera (or screen) over the screen, the disc and
-        name hidden under it; this device's own camera in its corner."""
+        name hidden under it; this device's own camera in its corner.
+        20.0: or the two the other way round (swap)."""
         call, session = self.call, self.call.session
         them = session.members.get(call.peer) if session else None
         track = "s" if them and them.screen else (
             "v" if them and them.camera else None)
         mine = bool(session and session.me.camera)
-        face = track == "s" and them.camera and presenter_face_shown()
-        if self.picture.track != (track or "v"):
-            self.picture.track = track or "v"
+        self.swapped = swapped = self.swapped and mine and track == "v"
+        face = swapped or (track == "s" and them.camera and
+                           presenter_face_shown())
+        main = (session.me.user if swapped else call.peer, track or "v")
+        if (self.picture.user, self.picture.track) != main:
+            self.picture.user, self.picture.track = main
             self.picture.refresh()
+        if self.face is not None:
+            self.face.pos_hint = self.mine.pos_hint if swapped \
+                else self.FACE_CORNER
         self.picture.opacity = self.scrim.opacity = \
             self.letterbox.opacity = 1 if track else 0
         # Over their picture, light words on dark bands in either theme.
@@ -29529,11 +34142,17 @@ class CallOverlay(ModalView):
         self.disc.opacity = 0 if track else 1
         self.disc.height = 0 if track else dp(136)
         self.top_gap.size_hint_y = 0.02 if track else .22
-        for tile, on in ((self.mine, mine), (self.face, face)):
+        for tile, on in ((self.mine, mine and not swapped),
+                         (self.face, face)):
             if tile is not None:
                 if on and tile.opacity == 0:
                     tile.refresh()
                 tile.opacity, tile.disabled = (1, False) if on else (0, True)
+        flips = mine and IS_ANDROID
+        self.flip.opacity, self.flip.disabled = (1, False) if flips \
+            else (0, True)
+        if flips:
+            self.flip.set_icon("retry", ink["text"] if track else T.text_2)
         self.camera.set_on(mine, "video" if mine else "video_off")
         self.share.set_on(bool(session and session.me.screen))
         self._remote_state(track)
@@ -29542,14 +34161,19 @@ class CallOverlay(ModalView):
             else tr("Voice call · sealed end to end")
         self.show_recording()
         view = {}
-        if track:
-            view[(call.peer, track)] = self.picture
-        if face:
+        if swapped:
+            view[(session.me.user, "v")] = self.picture
             view[(call.peer, "v")] = self.face
-        if mine:
-            view[(session.me.user, "v")] = self.mine
-        if set(view) != self._view_keys and not call.ended:
-            self._view_keys, self._view = set(view), view
+        else:
+            if track:
+                view[(call.peer, track)] = self.picture
+            if face:
+                view[(call.peer, "v")] = self.face
+            if mine:
+                view[(session.me.user, "v")] = self.mine
+        drawn = {key: id(tile) for key, tile in view.items()}
+        if drawn != self._view_keys and not call.ended:
+            self._view_keys, self._view = drawn, view
             self.app.call_view(view)
             self.app.call_media_changed()
 
@@ -29562,7 +34186,12 @@ class CallOverlay(ModalView):
         self.control.set_on(asked, "pointer", tr(
             "Release" if controlling else "Asked…" if asked else "Control"))
         if controlling:
-            self.remote.start()
+            if self.remote.start() and IS_MOBILE:        # 21.1: its way
+                app._set_status(remote_touch_hint(self.remote.mode),
+                                T.text_2)
+            state = call.rc_state or {}
+            self.remote.pointer_said(*(call.rc_pointer or ("arrow", None)),
+                                     drawn_there=not state.get("pt"))
         else:
             self.remote.stop()
         name = app.call_name(call.peer)
@@ -29580,20 +34209,54 @@ class CallOverlay(ModalView):
             (1, False) if on else (0, True)
         note = remote_note_words(call.rc_state, name) \
             if controlling and not call.ended else ""
+        self.waiting = controlling and not note and \
+            self.picture.rect() is None
+        if self.waiting:
+            # 21.1: no picture yet (the owner's phone: none ever came).
+            waited = time.monotonic() - (call.rc_began or time.monotonic())
+            note = tr("Waiting for {name}'s screen…", name=name) \
+                if waited < 12 else tr(
+                    "{name}'s screen has not come through yet: it is asked "
+                    "for again every few seconds. Keys › What went wrong "
+                    "there may say why.", name=name)
         if note != self.remote_note_words.text:
             self.remote_note_words.text = note
+        state = call.rc_state or {}
+        self._hung = state.get("hp") if note and \
+            state.get("s") == "hung" else None
+        end = self.remote_note_end
+        end.opacity, end.disabled = (1, False) if self._hung else (0, True)
+        end.width = end.natural_width() + dp(12) if self._hung else 0
+        self.remote_note.spacing = dp(10) if self._hung else 0
         self._place_note()
+
+    def refresh_note(self) -> None:
+        """21.1: the note again (each second while no picture has come)."""
+        if self.app.controlling(self.call):
+            self._remote_state("s")
+            self._place_note()
 
     def _place_note(self) -> None:
         """19.0.1: the note under the red band, as tall as its words."""
         note, words = self.remote_note, self.remote_note_words
-        note.height = words.height + dp(16) if words.text else 0
+        # As tall as End it, where it shows: one line of words is shorter.
+        tall = max(words.height,
+                   self.remote_note_end.height if self._hung else 0)
+        note.height = tall + dp(16) if words.text else 0
         note.opacity = 1 if words.text else 0
         stack = note.parent
         if stack is not None and stack.height:
             below = self.remote_band.height if self.remote_band.opacity \
                 else 0
             note.pos_hint = {"x": 0, "top": 1 - below / stack.height}
+
+    def _end_hung(self) -> None:
+        """21.0: the note's End it: the program that does not answer on
+        their computer, ended (as Keys › Programs does)."""
+        hung = self._hung
+        if hung:
+            self.app.remote_ask({"op": "end", "w": hung["w"],
+                                 "p": hung["p"]})
 
     def _remote_end(self) -> None:
         """The band's Stop (this computer) or Release (the other side)."""
@@ -31236,7 +35899,6 @@ class ConversationRow(ButtonBehavior, BoxLayout):
     text does. Groups show who spoke last; your own last message shows its
     ticks."""
 
-    LONG_PRESS = 0.42                     # seconds, as BubbleRow
 
     def __init__(self, conv: dict, on_open: Callable[[str], None],
                  author_name: Optional[Callable] = None, screen=None, **kw):
@@ -31393,7 +36055,7 @@ class ConversationRow(ButtonBehavior, BoxLayout):
                 screen.start_selection(self.peer)
                 return True
             self._press = (touch.uid, touch.pos, Clock.schedule_once(
-                lambda _dt: self._long_press(touch), self.LONG_PRESS))
+                lambda _dt: self._long_press(touch), hold_left(touch)))
         return super().on_touch_down(touch)
 
     def _long_press(self, touch):
@@ -32557,7 +37219,7 @@ def texture_from_b64(data: str):
 #: What a quote of a photo, voice or video message without words says.
 #: Sent in English, as before 15.1, and shown in the reader's language.
 QUOTE_NAMES = {"image": N_("Photo"), "voice": N_("Voice message"),
-               "video": N_("Video message")}
+               "video": N_("Video message"), "file": N_("Document")}
 
 
 def quote_text(reply: dict) -> str:
@@ -33003,6 +37665,50 @@ class VoiceContent(BoxLayout):
             self.speed.text = speed_label(voice.speed)
 
 
+class FileContent(BoxLayout):
+    """A document in its bubble (20.0): its mark, its name and its size.
+    A tap fetches it where it waited, and then offers to save it: the app
+    opens no document itself and runs none."""
+
+    def __init__(self, msg: dict, media: dict, screen, **kw):
+        kw.setdefault("size_hint", (None, None))
+        kw.setdefault("height", TOUCH + dp(4))
+        kw.setdefault("spacing", dp(10))
+        super().__init__(**kw)
+        self.msg, self.media, self.screen = msg, media, screen
+        self.button = IconButton("file", tint=T.on_accent, bg=T.accent,
+                                 icon_size=dp(20), label=tr("Save document"),
+                                 pos_hint={"center_y": .5},
+                                 on_release=lambda _w:
+                                 screen.on_media_tap(self.msg))
+        self.add_widget(self.button)
+        texts = BoxLayout(orientation="vertical", padding=[0, dp(4)])
+        self.name = single_line(media.get("name") or "", fs(15.5), T.text)
+        self.about = single_line("", fs(13), T.text_3)
+        texts.add_widget(self.name)
+        texts.add_widget(self.about)
+        self.add_widget(texts)
+        self.refresh(msg)
+
+    def natural_size(self, max_w: float) -> tuple:
+        return min(max_w, dp(260)), self.height
+
+    def refresh(self, msg: dict) -> None:
+        self.msg = msg
+        state = msg.get("media_state") or ""
+        size = size_text(int(self.media.get("size") or 0))
+        icon, words = {
+            "expired": ("retry", tr("No longer on the relay · ask again")),
+            "failed": ("retry", tr("Not fetched · try again")),
+            "pending": ("download", tr("Tap to download")),
+            "downloading": ("download", tr("Downloading…")),
+            "uploading": ("file", tr("Sending…")),
+            "requested": ("download", tr("Asked for again…")),
+        }.get(state, ("file", tr("Tap to save")))
+        self.button.set_icon(icon)
+        self.about.text = f"{size} · {words}"
+
+
 class SpeedChip(ButtonBehavior, Label):
     """A voice note's speed, outlined, tapped to change (v11)."""
 
@@ -33418,6 +38124,13 @@ class MessageBubble(BoxLayout):
             with self.canvas.after:
                 Color(*C(T.rule_strong))
                 self._outline = SmoothLine(width=max(1.0, dp(1) / 2.0))
+        # 20.0: under a finger or the pointer, a wash in the bubble's own
+        # shape, at once (set_pressed): which message is being held is
+        # seen before the hold selects it.
+        with self.canvas.after:
+            self._press_tint = Color(*C(T.text)[:3], 0)
+            self._press_wash = SmoothRoundedRectangle(pos=self.pos,
+                                                      size=self.size)
         self.bind(pos=self._sync_ground, size=self._sync_ground)
         if self.big:
             self.padding = [dp(2), dp(2), dp(2), dp(4)]
@@ -33468,6 +38181,8 @@ class MessageBubble(BoxLayout):
             self.media = VoiceContent(msg, media, screen)
         elif msg.get("kind") == "video" and isinstance(media, dict):
             self.media = VideoContent(msg, media, screen)
+        elif msg.get("kind") == "file" and isinstance(media, dict):  # 20.0
+            self.media = FileContent(msg, media, screen)
         if self.media is not None:
             self.add_widget(self.media)
 
@@ -33485,7 +38200,25 @@ class MessageBubble(BoxLayout):
         # they were sent.
         self.card = None
         preview = ext.get("lp")
-        if isinstance(preview, dict) and preview.get("u") and \
+        person = ext.get("card")
+        if isinstance(ext.get("poll"), dict):                  # 21.0
+            self.card = PollCard(msg, ext["poll"], screen)
+            self.add_widget(self.card)
+        elif isinstance(ext.get("loc"), dict):                 # 21.0
+            self.card = LocationCard(msg, ext["loc"], screen)
+            self.add_widget(self.card)
+        elif isinstance(person, dict) and person.get("a"):     # 20.0
+            # A contact handed on: their name and address, drawn as a
+            # link's card is. A tap looks them up at the relay (which
+            # vouches for the key, not the sender) and adds them.
+            self.card = LinkCard(
+                {"u": "", "s": tr("Contact"),
+                 "t": "@" + person["u"] if person.get("u")
+                 else short_addr(person["a"], 10),
+                 "d": short_addr(person["a"], 12)}, outgoing,
+                on_tap=lambda a=person["a"]: screen.on_contact_card(a))
+            self.add_widget(self.card)
+        elif isinstance(preview, dict) and preview.get("u") and \
                 preview.get("t") and (outgoing or link_previews_enabled()):
             self.card = LinkCard(preview, outgoing,
                                  on_tap=lambda u=preview["u"]:
@@ -33550,6 +38283,14 @@ class MessageBubble(BoxLayout):
             self._outline.rounded_rectangle = (
                 self.x + .5, self.y + .5, self.width - 1, self.height - 1,
                 *radii)
+        self._press_wash.pos, self._press_wash.size = self.pos, self.size
+        self._press_wash.radius = radii
+
+    #: How strong the wash under a press is (of the text's colour).
+    PRESSED = 0.12
+
+    def set_pressed(self, on: bool) -> None:
+        self._press_tint.a = self.PRESSED if on else 0
 
     def meta_key(self) -> tuple:
         """What the time line says: within a run, a line that says the
@@ -33590,8 +38331,11 @@ class MessageBubble(BoxLayout):
         their readable `body` is for older clients, previews and exports."""
         if msg.get("kind") == "image" and isinstance(media, dict):
             return media.get("cap", "")
-        if msg.get("kind") in ("voice", "video") and \
+        if msg.get("kind") in ("voice", "video", "file") and \
                 isinstance(media, dict):
+            return ""
+        ext = message_ext(msg)
+        if ext.get("poll") or ext.get("loc"):     # 21.0: its card says it
             return ""
         return msg["body"]
 
@@ -33681,6 +38425,15 @@ class MessageBubble(BoxLayout):
         before = {c.emoji: c.label.text for c in self.reactions.chips}
         self._set_reactions(msg)
         self._draw_star()
+        # 21.0: a poll's votes, a live share's point: its card made again
+        if isinstance(self.card, (PollCard, LocationCard)):
+            at = self.children.index(self.card)
+            self.remove_widget(self.card)
+            ext = message_ext(msg)
+            self.card = PollCard(msg, ext["poll"], self.screen) \
+                if isinstance(self.card, PollCard) else \
+                LocationCard(msg, ext["loc"], self.screen)
+            self.add_widget(self.card, index=at)
         if self._last_width:
             self.layout_for(self._last_width)
         pending = self.screen.take_pending_pop(msg.get("client_msg_id"))
@@ -33814,7 +38567,6 @@ class BubbleRow(AnchorLayout):
     selected a tap toggles a message in or out instead.
     """
 
-    LONG_PRESS = 0.42                     # seconds
     shift = NumericProperty(0.0)          # v11: slid left, to reply
     #: In a group, theirs share a gutter at the left, where the last
     #: message of each run has its author's disc beside it (v12).
@@ -33938,11 +38690,13 @@ class BubbleRow(AnchorLayout):
         touch.grab(self)
         touch.ud["fext_row"] = True
         self._press = (touch.uid, touch.pos, Clock.schedule_once(
-            lambda _dt: self._long_press(touch), self.LONG_PRESS))
+            lambda _dt: self._long_press(touch), hold_left(touch)))
+        self.bubble.set_pressed(self.bubble.collide_point(*touch.pos))
         super().on_touch_down(touch)       # children: quote, play, chips
         return True
 
     def _long_press(self, touch):
+        self.bubble.set_pressed(False)     # selected now: the row's wash
         if self._press and self._press[0] == touch.uid and not swiped(touch):
             pos, self._press = self._press[1], None
             touch.ud["fext_long_press"] = True
@@ -33964,11 +38718,13 @@ class BubbleRow(AnchorLayout):
             if abs(touch.x - ox) > dp(10) or abs(touch.y - oy) > dp(10):
                 self._press[2].cancel()
                 self._press = None
+                self.bubble.set_pressed(False)      # a scroll, or a slide
         return super().on_touch_move(touch)
 
     def on_touch_up(self, touch):
         if touch.grab_current is self:
             touch.ungrab(self)
+            self.bubble.set_pressed(False)
             pending, self._press = self._press, None
             if pending:
                 pending[2].cancel()
@@ -34503,6 +39259,7 @@ class MenuRow(ButtonBehavior, BoxLayout):
                  danger: bool = False):
         super().__init__(size_hint_y=None, height=MessageMenu.ROW,
                          padding=[dp(16), 0, dp(14), 0], spacing=dp(14))
+        self.on_tap = on_tap             # 21.0: changed as the row is reused
         tint = T.alert if danger else T.text_2
         glyph = Widget(size_hint_x=None, width=dp(22))
         for prop in ("pos", "size"):
@@ -34522,7 +39279,7 @@ class MenuRow(ButtonBehavior, BoxLayout):
                   state=lambda _w, st: setattr(
                       self._tint, "rgba", C(T.press) if st == "down"
                       else (0, 0, 0, 0)),
-                  on_release=lambda _w: on_tap())
+                  on_release=lambda _w: self.on_tap())
 
     def _sync(self, *_a):
         self._rect.pos, self._rect.size = self.pos, self.size
@@ -34533,7 +39290,12 @@ class MessageMenu(Concealable, BoxLayout):
     by it while the quick reactions float over it: reply, copy, forward,
     star, select, delete, and what only some messages have (who reacted,
     a link to copy, edit, send now, who has it). Before, a tap offered
-    the reactions alone and the rest needed a hold."""
+    the reactions alone and the rest needed a hold.
+
+    20.0 (FIXES27): its rows are in a list that scrolls. Your own
+    message's menu has up to nine rows, taller than a phone on its side:
+    its first rows (Reply, Copy) were cut off at the top. fit() keeps it
+    within the chat and the rest scrolls."""
 
     WIDTH, ROW, PAD = dp(236), dp(44), dp(6)
 
@@ -34553,6 +39315,17 @@ class MessageMenu(Concealable, BoxLayout):
             self._edge = SmoothLine(width=1.0)
         self.bind(pos=self._sync, size=self._sync)
         self.rows: list = []
+        #: 21.0: rows already made, by (icon, words, alert): a tap on a
+        #: message shows them again rather than drawing their words anew
+        #: (half of a tap's work).
+        self._made: dict = {}
+        self.natural = 0.0                  # its height with every row shown
+        self.list = BoxLayout(orientation="vertical", size_hint_y=None)
+        # No edge fade here: its square strips would show past the
+        # menu's rounded corners. The bar says there is more.
+        self.scroll = ScrollView(do_scroll_x=False, bar_width=dp(3))
+        self.scroll.add_widget(self.list)
+        self.add_widget(self.scroll)
         self.hide()
 
     def _sync(self, *_a):
@@ -34566,18 +39339,41 @@ class MessageMenu(Concealable, BoxLayout):
     def show(self, items: list) -> None:
         """`items`: (icon, words, action) or (icon, words, action, True)
         for one in the alert colour."""
-        self.clear_widgets()
-        self.rows = [MenuRow(icon, text, action, bool(more and more[0]))
-                     for icon, text, action, *more in items]
+        self.list.clear_widgets()
+        self.rows = []
+        for icon, text, action, *more in items:
+            key = (icon, text, bool(more and more[0]))
+            row = self._made.get(key)
+            if row is None:
+                row = self._made[key] = MenuRow(icon, text, action, key[2])
+            row.on_tap, row.state = action, "normal"
+            self.rows.append(row)
         for row in self.rows:
-            self.add_widget(row)
-        self.height = self.ROW * len(self.rows) + 2 * self.PAD
+            self.list.add_widget(row)
+        self.list.height = self.ROW * len(self.rows)
+        self.natural = self.height = self.list.height + 2 * self.PAD
+        self.scroll.scroll_y = 1
         self.opacity = 1
         self.conceal(False)
+
+    def fit(self, most: float) -> None:
+        """No taller than `most` (never under two rows): the rest scrolls."""
+        self.height = min(self.natural,
+                          max(most, 2 * self.ROW + 2 * self.PAD))
 
     def hide(self) -> None:
         self.opacity = 0
         self.conceal(True)
+
+def composer_hint(keys) -> str:
+    """21.0 (NEXT29): the message field's hint. On a device with several
+    identities it says who you write as ("Message as @mina"): 20.0 took
+    that identity's disc out of the input row (a tap meant for the emoji
+    key switched identities)."""
+    if len(keys.identities) > 1 and keys.username:
+        return tr("Message as @{name}", name=keys.username)
+    return tr("Message")
+
 
 class ComposerInput(BoxLayout):
     """The message field: a pill holding the emoji key, the text and the
@@ -35091,18 +39887,20 @@ class ConversationScreen(SwipeGestures, Screen):
         root.add_widget(self.mention_strip)
 
         # ---- composer --------------------------------------------------------
-        # Nothing written: [you] ( ☺  Message   📎 📷 ) [mic]
-        # Writing:              ( ☺  the text…      📎 ) [send]
-        # The avatar and the camera fold away, and the microphone turns
-        # into the send button.
+        # Nothing written: ( ☺  Message   📎 📷 ) [mic]
+        # Writing:         ( ☺  the text…      📎 ) [send]
+        # The camera folds away, and the microphone turns into the send
+        # button. (Until 20.0 the disc of the identity written as stood
+        # left of the field, and a tap on it switched identities: too
+        # near the emoji key. Identities are switched from the chat
+        # list's header.)
         self._composer_h = max(dp(64), line_height(17) + dp(30))
         self.composer = BoxLayout(size_hint_y=None, height=self._composer_h,
-                                  padding=[dp(4), dp(8), dp(4), dp(8)])
+                                  padding=[dp(10), dp(8), dp(4), dp(8)])
         hairline(self.composer, "top")
-        self.me_holder = AnchorLayout(size_hint_x=None, width=TOUCH)
         self.entry = ComposerInput(on_enter=self.app.send_current,
                                    on_emoji=self.toggle_emoji,
-                                   on_attach=self.pick_image,
+                                   on_attach=self.attach_menu,
                                    on_camera=self.camera_menu)
         self.emoji_button = self.entry.emoji_button
         self.attach_button = self.entry.attach_button
@@ -35114,7 +39912,7 @@ class ConversationScreen(SwipeGestures, Screen):
         self.action_holder.add_widget(self.action_button)
         self.entry.input.bind(text=lambda *_a: self._on_text_changed(),
                               focus=self._on_entry_focus)
-        self.composer_parts = (self.me_holder, self.entry, self.action_holder)
+        self.composer_parts = (self.entry, self.action_holder)
         for part in self.composer_parts:
             self.composer.add_widget(part)
         # Shown instead of the composer when you can no longer write here.
@@ -35210,8 +40008,8 @@ class ConversationScreen(SwipeGestures, Screen):
             self.topic = None                     # 17.4: a chat opens on All
             self.thread = None                    # 18.0: on the whole chat
             self.thread_bar.hide()
-        self._refresh_me()
         self.peer, self.kind, self.group = peer, kind, group
+        self.entry.input.hint_text = composer_hint(self.app.keys)
         self._sync_topics()
         if kind == "self":
             name = tr("Saved messages")
@@ -35503,7 +40301,8 @@ class ConversationScreen(SwipeGestures, Screen):
         (v14) a day passing on a message the relay never took, too."""
         return (msg["status"], msg["read"], msg["body"], msg.get("starred"),
                 msg.get("media_state"), msg.get("media_path"), msg.get("ext"),
-                tuple(msg.get("reactions") or ()), waits_for_tap(msg))
+                tuple(msg.get("reactions") or ()), waits_for_tap(msg),
+                msg.get("poll_state"), msg.get("live_state"))
 
     def _widgets_for(self, msg: dict, ticks_enabled: bool,
                      prev_day: Optional[str]) -> tuple:
@@ -35803,6 +40602,7 @@ class ConversationScreen(SwipeGestures, Screen):
         menu, strip, gap = self.menu, self.strip, dp(6)
         if menu.concealed:
             return
+        menu.fit(self.stack.height - 2 * gap)   # 20.0: taller, it scrolls
         left = self.stack.to_widget(*bubble.to_window(bubble.x, 0))[0]
         x = left + bubble.width - menu.width if bubble.outgoing else left
         x = min(max(dp(8), x), self.stack.width - menu.width - dp(8))
@@ -35816,14 +40616,17 @@ class ConversationScreen(SwipeGestures, Screen):
             y = head + gap
         highest = self.stack.height - menu.height - gap
         if y > highest and not strip.concealed:
-            if self.stack.height >= menu.height + strip.height + 2 * gap:
+            side = x - gap - strip.width if bubble.outgoing else \
+                x + menu.width + gap
+            under = self.stack.height - strip.height - 3 * gap
+            if menu.height > under and \
+                    dp(8) <= side <= self.stack.width - strip.width - dp(8):
+                strip.x = self.stack.x + side   # beside it (a wide window)
+            else:            # the reactions at the top, the menu under them
+                menu.fit(under)        # 21.0: shorter where need be; scrolls
                 strip.y = self.stack.top - gap - strip.height
                 y = strip.y - self.stack.y - gap - menu.height
-            else:                       # beside it, on the other side
-                side = x - gap - strip.width if bubble.outgoing else \
-                    x + menu.width + gap
-                if dp(8) <= side <= self.stack.width - strip.width - dp(8):
-                    strip.x = self.stack.x + side
+                highest = self.stack.height - menu.height - gap
         menu.pos = (self.stack.x + x,
                     self.stack.y + max(gap, min(y, highest)))
 
@@ -36044,7 +40847,7 @@ class ConversationScreen(SwipeGestures, Screen):
         kind = msg.get("kind") or "text"
         if kind == "image":
             return (message_ext(msg).get("media") or {}).get("cap", "")
-        if kind in ("voice", "video"):
+        if kind in ("voice", "video", "file"):
             return ""
         return msg.get("body", "")
 
@@ -36189,6 +40992,10 @@ class ConversationScreen(SwipeGestures, Screen):
         found = []
         if typed is not None:
             start = typed.group(1).lower()
+            # 20.0: an admin may reach every member (mention_all).
+            if MENTION_ALL.startswith(start) and \
+                    self.app.keys.address in group_admins(self.group):
+                found.append((MENTION_ALL, ""))
             for member in (self.group or {}).get("members") or []:
                 address = member.get("a")
                 if not address or address == self.app.keys.address:
@@ -36209,7 +41016,8 @@ class ConversationScreen(SwipeGestures, Screen):
         if typed is None:
             return
         at = typed.start(1) - 1
-        self._mentions[name] = address
+        if address:                 # "@everyone" names no one address
+            self._mentions[name] = address
         self.entry.text = f"{text[:at]}@{name} {text[cursor:]}"
         self.entry.input.cursor = self.entry.input.get_cursor_from_index(
             at + len(name) + 2)
@@ -36487,7 +41295,8 @@ class ConversationScreen(SwipeGestures, Screen):
         def away(action: Callable) -> Callable:
             return lambda: (self.close_strip(), action())
 
-        text = self._text_of(msg)
+        loc = message_ext(msg).get("loc")            # 21.0: its own items
+        text = "" if loc else self._text_of(msg)
         links = links_in(text)
         open_chat = self.closed_note.parent is None
         items = []
@@ -36498,9 +41307,19 @@ class ConversationScreen(SwipeGestures, Screen):
                           away(lambda: self.show_reactors(mid))))
         if open_chat and msg.get("status") != MSG_SCHEDULED:
             items.append(("reply", tr("Reply"), held(self._act_reply)))
+        point = location_shown(self.app.store, msg, loc)[0] if loc else None
+        if point and OPENS_MAPS:
+            items.append(("place", tr("Open in maps"),
+                          away(lambda: self.app.open_place(point))))
+        if point:
+            items.append(("copy", tr("Copy the coordinates"), away(
+                lambda: self.app.copy_text(coordinates_text(point)))))
         if text:
             items.append(("copy", tr("Copy"),
                           away(lambda: self.app.copy_text(text))))
+            items.append(("select", tr("Select text"), away(    # 21.0
+                lambda: QuoteSheet(text, self.app.copy_text,
+                                   select=True).open())))
         if len(links) == 1:
             items.append(("link", tr("Copy the link"),
                           away(lambda: self.app.copy_text(links[0]))))
@@ -36529,6 +41348,16 @@ class ConversationScreen(SwipeGestures, Screen):
                           tr("Unpin") if pinned else tr("Pin"),
                           away(lambda: self.app.pin_message(
                               self.peer, cid, not pinned))))
+        poll, cid_ = message_ext(msg).get("poll"), msg.get("client_msg_id")
+        if poll and cid_ and self.app.store is not None:      # 21.0
+            if self.app.store.poll_votes(self.peer, cid_):
+                items.append(("poll", tr("Votes"), away(
+                    lambda: PollVotesSheet(self, msg, poll).open())))
+            if open_chat and self.app.can_end_poll(self.peer, msg) and \
+                    poll_open(poll, self.app.store.poll_ended(
+                        self.peer, cid_), now_iso()):
+                items.append(("close", tr("End the poll"), away(
+                    lambda: self.app.end_poll(self.peer, cid_))))
         if self.kind == "group" and msg["direction"] == "out":
             items.append(("info", tr("Who has it"),
                           away(lambda: self.open_message_info(msg))))
@@ -36596,6 +41425,8 @@ class ConversationScreen(SwipeGestures, Screen):
                     self.app._set_status(tr("Couldn't play that video "
                                             "message"), T.alert)
                 self.refresh_voice_buttons()
+            elif msg.get("kind") == "file":                    # 20.0
+                self.app.save_document(msg)
 
     # ---- 18.1 (VIDEONOTES): a video message plays in its bubble -------------
     def video_playing(self, msg: dict) -> bool:
@@ -36746,10 +41577,26 @@ class ConversationScreen(SwipeGestures, Screen):
     def toggle_emoji(self) -> None:
         if self.emoji_panel.is_open:
             self.close_emoji()
-            self.entry.input.focus = True
+            self._focus_entry_settled()
         else:
             self._emoji_target = None
             self.open_emoji()
+
+    def _focus_entry_settled(self) -> None:
+        """The keyboard for the field, once the page has taken its new
+        shape. A phone is told where the field is at the moment the
+        keyboard is asked for, and moves the page to keep that place in
+        sight: asked for while the emoji panel was still closing, the
+        field was taken to be where the panel had held it, and then sat
+        under the keyboard (20.0; the owner: "Switching to Emoji then
+        back to Keyboard again causes the input box to bug out below the
+        keyboard")."""
+        def focus(_dt) -> None:
+            if self.manager is not None and \
+                    self.manager.current == "conversation" and \
+                    not self.emoji_panel.is_open:
+                self.entry.input.focus = True
+        Clock.schedule_once(focus, 0.05 if IS_MOBILE else 0)
 
     def open_emoji(self) -> None:
         self.entry.input.focus = False
@@ -36799,7 +41646,12 @@ class ConversationScreen(SwipeGestures, Screen):
 
     def _on_entry_focus(self, _w, focused: bool) -> None:
         if focused and self.emoji_panel.is_open and IS_MOBILE:
+            # A tap on the field with the emoji open: the keyboard was
+            # asked for with the field where the panel holds it. Asked
+            # again once the panel has gone (_focus_entry_settled).
             self.close_emoji()
+            self.entry.input.focus = False
+            self._focus_entry_settled()
 
     # ---- v11: a link's preview, while writing -------------------------------
     # Only with previews turned on in Settings: a moment after a link is
@@ -36917,29 +41769,9 @@ class ConversationScreen(SwipeGestures, Screen):
             ConversationScreen._can_record = desktop_recording_available()
         return ConversationScreen._can_record
 
-    def _refresh_me(self) -> None:
-        """The disc of the identity you are writing as, left of the field."""
-        keys = self.app.keys
-        mine = (keys.address, keys.username, keys.label) \
-            if keys.has_identity else None
-        if mine == getattr(self, "_me_shown", False):
-            return
-        self._me_shown = mine
-        self.me_holder.clear_widgets()
-        if mine is None:
-            return
-        name = keys.username or keys.label
-        me = AvatarButton(keys.address, name, diameter=dp(34),
-                          pos_hint={"center_x": .5, "center_y": .5})
-        me.label = tr("Writing as {name}", name="@" + keys.username
-                      if keys.username else name)
-        me.bind(on_release=lambda _w: IdentitySheet(self.app).open())
-        self.me_holder.add_widget(me)
-
     def _sync_composer(self, animate: bool = True) -> None:
         """Fit the composer to what is in it (see its layout above)."""
         quiet = not self.entry.input.text.strip()
-        fold(self.me_holder, quiet, TOUCH, animate)
         self.entry.show_camera(quiet, animate)
         voice = quiet and self._voice_possible()
         icon = "mic" if voice else "send"
@@ -37030,9 +41862,9 @@ class ConversationScreen(SwipeGestures, Screen):
     def _media_refused(self, what: str) -> bool:
         if self.kind == "self":
             return False
-        why = self.app.group_stop(self.peer, "media") \
-            if self.kind == "group" else ""
-        if why:                                         # 17.4
+        why = (self.app.group_stop(self.peer, "media") or
+               self.app.slow_stop(self.peer)) if self.kind == "group" else ""
+        if why:                                         # 17.4; 20.0: slow
             self.app._set_status(why, T.accent)
             return True
         able = self.app.media_available()
@@ -37043,6 +41875,91 @@ class ConversationScreen(SwipeGestures, Screen):
             tr("{what} need the v9 relay — this one can't carry them yet",
                what=what), T.accent)
         return True
+
+    def attach_menu(self) -> None:
+        """20.0: the paperclip: the attachment sheet (AttachSheet), with
+        what this device and this chat can send."""
+        choices = [("image", tr("Gallery"), self.pick_image),
+                   ("camera", tr("Camera"), self.take_photo)]
+        if not video_note_why_not(False):
+            choices.append(("video", tr("Video message"), self.record_video))
+        choices.append(("file", tr("Document"), self.pick_document))
+        if self.app.store is not None and self.app.store.contacts():
+            choices.append(("person", tr("Contact"), self.pick_contact))
+        if self._voice_possible():
+            choices.append(("mic", tr("Audio"), self.start_recording))
+        choices.append(("place", tr("Location"), self.pick_location))
+        if self.kind != "self":                               # 21.0
+            choices.append(("poll", tr("Poll"), lambda: PollSheet(
+                lambda poll: self.app.send_poll(self.peer, poll)).open()))
+        AttachSheet(choices).open()
+
+    def pick_location(self, asked: bool = False) -> None:
+        """21.0 (MAP29): a place for this chat (LocationSheet); on a
+        phone, once Android's permission is given (an approximate place
+        will do)."""
+        lacking = IS_ANDROID and not any(
+            android_has_permission(p) for p in LOCATION_PERMISSIONS)
+        if lacking and asked:
+            self.app._set_status(tr("Sending your location needs the "
+                                    "location permission"), T.accent)
+        elif lacking:
+            android_request_permissions(
+                list(LOCATION_PERMISSIONS),
+                lambda _p, _g: run_on_ui(self.pick_location, True))
+        else:
+            LocationSheet(self.app, self.peer,
+                          live=self.kind != "self").open()
+
+    def on_poll_choice(self, msg: dict, index: int) -> None:
+        """21.0 (POLL29): a choice of a poll tapped: a vote for it, or
+        (already yours) the vote taken back; where several may be picked,
+        that choice alone changes."""
+        poll, cid = message_ext(msg).get("poll"), msg.get("client_msg_id")
+        if self.selecting or not poll or not cid or self.app.store is None:
+            return
+        mine = set(self.app.store.poll_votes(msg["peer"], cid).get(
+            self.app.keys.address, ()))
+        picks = sorted(mine ^ {index}) if poll["m"] else \
+            ([] if mine == {index} else [index])
+        self.app.vote_poll(msg["peer"], cid, picks)
+
+    def pick_document(self) -> None:
+        """Any file, sent as it is (20.0)."""
+        if self._media_refused(tr("Documents")):
+            return
+        if IS_ANDROID:
+            try:
+                android_open_document(
+                    lambda path, name="": path and self.app.send_file(
+                        path, name, temporary=True), named=True)
+            except Exception:
+                log.exception("document picker failed")
+                self.app._set_status(tr("Couldn't open the file picker"),
+                                     T.alert)
+        else:
+            ImageChooserModal(self.app.send_file, tr("Send a document"),
+                              kinds=["*"]).open()
+
+    def pick_contact(self) -> None:
+        """One of your contacts, handed on as a card (20.0)."""
+        peers = [c["address"] for c in self.app.store.contacts()]
+        ChatPickSheet(self.app, tr("Send a contact"),
+                      lambda a: self.app.send_contact(self.peer, a),
+                      skip=self.peer, peers=peers).open()
+
+    def on_contact_card(self, address: str) -> None:
+        """A tap on a contact's card: their chat if they are a contact
+        already; otherwise they are looked up at the relay and added."""
+        if address == self.app.keys.address:
+            return
+        if self.app.store.get_contact(address) is not None:
+            self.app.open_conversation(address)
+            return
+        sheet = AddContactModal(self.app)
+        sheet.entry.text = address
+        sheet.open()
+        sheet._submit()
 
     def pick_image(self) -> None:
         if self._media_refused(tr("Photos and voice messages")):
@@ -37579,6 +42496,26 @@ class PageScreen(SwipeGestures, Screen):
                        on_tap=(lambda: self.app.choose_timer(peer))
                        if can_set else None)
 
+    def _away_row(self, peer: str, name: str, contact: dict) -> "ListRow":
+        """20.0: the automatic reply this contact gets while Settings ›
+        Away is on: the usual words, or words of their own (optional)."""
+        own = (contact.get("away_text") or "").strip()
+
+        def save(words: str) -> None:
+            self.app.store.set_away_text(
+                peer, "" if words == away_words() else words)
+            self.show(peer)
+        return ListRow(
+            "reply", tr("Away reply"),
+            own or tr("The usual words (Settings › Away)"), chevron=True,
+            on_tap=lambda: TextPromptSheet(
+                tr("Away reply for {name}", name=name),
+                tr("What the reply says"), own,
+                tr("While Settings › Away is on, {name} gets these words "
+                   "in place of the usual ones. Leave it empty for the "
+                   "usual words.", name=name), save, limit=AWAY_MAX,
+                empty_ok=True).open())
+
     def _mute_row(self, peer: str) -> "ListRow":
         """Notifications: on, or muted until when — tap to change."""
         muted, until = self.app.store.mute_state(peer)
@@ -37716,6 +42653,7 @@ class ChatInfoScreen(PageScreen):
                     on_tap=lambda: self.app.start_call(peer)),
             self._mute_row(peer),
             self._timer_row(peer),
+            self._away_row(peer, name, contact),
             ListRow("lock", tr("Verify {name}", name=name),
                     (tr("Verified — you compared codes") if contact.get(
                         "verified") else
@@ -37871,6 +42809,11 @@ class GroupRightsSheet(Sheet):
             self.add(rows_card([ListRow(
                 "pin", tr("Pin messages"), tr("Off: only admins can"),
                 control=self.pin_switch)], inset=0))
+            # 20.0 (GROUPWIDE27): slow mode's pace.
+            self.add(hint(tr("Slow mode: a member writes once in")))
+            self.slow = self.add(Segmented(
+                [(str(s), tr(label)) for s, label in GROUP_SLOW],
+                str(rules.get("slow") or 0)))
             save_buttons(self, self._save)
 
     def _flip(self, right: str, on: bool) -> None:
@@ -37888,7 +42831,8 @@ class GroupRightsSheet(Sheet):
 
     def _save(self) -> None:
         self.app.set_group_permissions(self.gid, self.off(),
-                                       members_pin=self.pin_switch.active)
+                                       members_pin=self.pin_switch.active,
+                                       slow=int(self.slow.value))
         self.dismiss()
         self.on_saved()
 
@@ -37996,12 +42940,16 @@ class GroupInfoScreen(PageScreen):
     """A group's page: its name, photo and timer, what its members may do,
     its topics, its members, notifications, starred messages, and leaving.
     18.0: an admin's rights say which of these they may change; its admins
-    also see the admin log."""
+    also see the admin log. 20.0: what it is about."""
 
     def __init__(self, app: "FextApp", **kw):
         super().__init__(app, "group_info", tr("Group"),
                          lambda: app.close_chat_info(), **kw)
         self.gid: Optional[str] = None
+
+    def _about(self, gid: str, words: str) -> None:
+        self.app.set_group_about(gid, words)
+        self.show(gid)
 
     def show(self, gid: str) -> None:
         self.gid = gid
@@ -38043,12 +42991,30 @@ class GroupInfoScreen(PageScreen):
             rows.append(ListRow("camera", tr("Group photo"),
                                 tr("Every member sees it"), chevron=True,
                                 on_tap=lambda: app.picture_menu(gid)))
-        deny = (group.get("rules") or {}).get("deny") or {}
-        if can("rules") or deny:           # 17.4: what members may do
+        rules = group.get("rules") or {}
+        deny, slow = rules.get("deny") or {}, rules.get("slow") or 0
+        about = rules.get("about") or ""
+        if can("rules") or about:          # 20.0: a few lines on the group
+            rows.insert(0, ListRow(
+                "info", tr("About this group"),
+                about or tr("A few lines every member sees"),
+                chevron=can("rules"),
+                on_tap=(lambda: TextPromptSheet(
+                    tr("About this group"), tr("What it is about"), about,
+                    tr("Every member sees these lines here, and each new "
+                       "member is told them on joining."),
+                    lambda words: self._about(gid, words),
+                    limit=MAX_GROUP_ABOUT, empty_ok=True).open())
+                if can("rules") else None))
+        if can("rules") or deny or slow:   # 17.4: what members may do
+            said = [tr("Off for members: {what}",
+                       what=group_rights_words(deny))] if deny else []
+            if slow:                       # 20.0
+                said.append(tr("Slow mode: once in {time}",
+                               time=slow_words(slow)))
             rows.append(ListRow(
                 "sliders", tr("What members can do"),
-                tr("Off for members: {what}", what=group_rights_words(deny))
-                if deny else tr("Everything"), chevron=can("rules"),
+                " · ".join(said) or tr("Everything"), chevron=can("rules"),
                 on_tap=(lambda: GroupRightsSheet(
                     app, gid, lambda: self.show(gid), deny=deny).open())
                 if can("rules") else None))
@@ -38597,7 +43563,22 @@ class SettingsScreen(PageScreen):
         size.add_widget(InfoLabel(
             tr("“See you at nine?” — this size, 14:05 👍"),
             font_size=fs(17), padding=[0, dp(6)]))
-        self.body.add_widget(rows_card([looks.row, theme.row, size.row]))
+        held = next((k for k, _l, s in HOLD_CHOICES
+                     if abs(s - APPEARANCE.hold) < .01), "default")
+        hold_at = {k: i / (len(HOLD_CHOICES) - 1)
+                   for i, (k, _l, _s) in enumerate(HOLD_CHOICES)}
+        hold = self._picker("clock", tr("Hold to select"), Segmented(
+            [(k, tr(label)) for k, label, _s in HOLD_CHOICES], held,
+            lambda v: chose("hold", lambda: hold.row.glyph, v, hold_at[v])),
+            hold_at[held])
+        hold.add_widget(InfoLabel(tr(
+            "How long a finger stays still on a message or a chat before it "
+            "is selected: {short} s, {medium} s or {long} s",
+            **{k if k != "default" else "medium": f"{s:g}"
+               for k, _l, s in HOLD_CHOICES}),
+            color=T.text_3, italic=True, font_size=fs(14.5)))
+        self.body.add_widget(rows_card([looks.row, theme.row, size.row,
+                                        hold.row]))
         self.body.add_widget(Rule(inset=dp(60)))
         rows = []
         if THEME_SETS[APPEARANCE.theme_set].get("black"):
@@ -38638,6 +43619,23 @@ class SettingsScreen(PageScreen):
                    "are then only notified while Ferritext is open."),
                 control=ToggleSwitch(background_delivery_enabled(),
                                      self._on_delivery))]
+            # 21.0: "Ready for new messages" out of the status bar: Android
+            # raises a running service's notice to a silent one with an
+            # icon, and only its person can lower it (the channel's own
+            # settings, one tap from here). Android 8 and later.
+            if background_delivery_enabled() and (
+                    os.environ.get("FEXT_SHOW_ANDROID_SETTINGS") or
+                    android_sdk() >= 26):
+                hidden = android_service_notice_importance() == NOTICE_MIN
+                rows.append(ListRow(
+                    "bell", tr("Hide its notice from the status bar"),
+                    tr("Done: Android shows it only in the list you pull "
+                       "down") if hidden else tr(
+                       "Android shows every running service's notice. Tap, "
+                       "then choose Minimise (or Silent, and hide it from "
+                       "the status bar): only you can, not Ferritext."),
+                    chevron=True,
+                    on_tap=android_open_service_notice_settings))
             maker = phone_maker()
             if maker in KEEP_RUNNING and background_delivery_enabled():
                 left = len(keep_running_left(maker))
@@ -38677,11 +43675,14 @@ class SettingsScreen(PageScreen):
                        "others do."),
                     control=ToggleSwitch(start_with_windows(),
                                          self._on_startup)))
-            if remote_control_possible():         # 19.0 (REMOTE)
-                rows.append(ListRow(
-                    "screen", tr("Remote access"),
-                    remote_access_summary(self.app.keys.address),
-                    chevron=True, on_tap=self._remote_access))
+            # 19.0 (REMOTE). 20.0: there on every computer; one that
+            # cannot be controlled says why in the row's place.
+            why = remote_control_why_not()
+            rows.append(ListRow(
+                "screen", tr("Remote access"),
+                why or remote_access_summary(self.app.keys.address),
+                chevron=not why,
+                on_tap=None if why else self._remote_access))
             self.body.add_widget(rows_card(rows))
         self.body.add_widget(InfoLabel(
             tr("A muted chat still receives everything and shows it here; "
@@ -38780,8 +43781,10 @@ class SettingsScreen(PageScreen):
                "sees a red mark while it runs; the file is sealed, as a "
                "backup is") if not call_recording_why_not() else
             call_recording_why_not(),
-            control=ToggleSwitch(call_recording_allowed(), lambda on:
-                                 save_pref("call_recording", bool(on)))))
+            # 20.0: no switch where it would switch nothing (a phone).
+            control=None if call_recording_why_not() else
+            ToggleSwitch(call_recording_allowed(), lambda on:
+                         save_pref("call_recording", bool(on)))))
         made = kept_recordings()
         if made:
             rows.append(ListRow(
@@ -39622,6 +44625,10 @@ class MessagingMixin:
         mentions = sanitize_mentions(mentions) if gid_of(peer) else []
         if mentions:
             ext["mn"] = mentions                 # 16.2 (I7): in a group
+        if gid_of(peer) and mention_all(
+                {"ev": True}, body, self.store.group(gid_of(peer)),
+                self.keys.address):
+            ext["ev"] = True                     # 20.0: an admin's @everyone
         if preview and preview.get("u") in links_in(body):
             preview = dict(preview)
             if len(body.encode("utf-8")) > 12000:
@@ -39652,7 +44659,11 @@ class MessagingMixin:
         now, last = time.time(), contact.get("away_at") or 0
         if last >= since and now - last < AWAY_EVERY:
             return None
-        local_id = self.send_text(peer, away_words(), auto=True)
+        # 20.0: this contact's own words, where they were given some
+        # (their chat's info page), in place of the usual ones.
+        words = sanitize_text(contact.get("away_text") or "")[:AWAY_MAX] \
+            .strip() or away_words()
+        local_id = self.send_text(peer, words, auto=True)
         if local_id is not None:
             self.store.set_away_at(peer, now)
         return local_id
@@ -39690,6 +44701,8 @@ class MessagingMixin:
                 return None
             why = self.group_stop(peer, message_rights(
                 dict(x, k="media") if kind in MEDIA_MIME else x), send_at)
+            if not why and send_at is None:
+                why = self.slow_stop(peer)               # 20.0: slow mode
             topic = self.compose_topic(peer, ext)
             if not why and topic and self.topic_closed(peer, topic):
                 why = tr("This topic is closed: only the group's admins "
@@ -40452,6 +45465,20 @@ class MessagingMixin:
         """Why group_rule stops it, in words — or ""."""
         return group_stop_words(self.group_rule(peer, rights, at))
 
+    def slow_stop(self, peer: Optional[str]) -> str:
+        """20.0: why slow mode stops this device's person writing in group
+        `peer` now, in words — or "". Counted from their last message
+        here, by this device's clock."""
+        gid = gid_of(peer)
+        group = self.store.group(gid) if gid and self.store else None
+        if not group or not group["rules"].get("slow"):
+            return ""
+        wait = slow_wait(group["rules"], group_admins(group),
+                         self.keys.address, self.store.last_sent(peer),
+                         time.time())
+        return tr("Slow mode: you can write here again in {time}",
+                  time=_minutes_seconds(wait)) if wait >= 1 else ""
+
     # ---- 17.4: a group's topics ------------------------------------------------
     def compose_topic(self, peer: str, ext: Optional[dict] = None) -> str:
         """The topic a message written now in group `peer` goes to: the one
@@ -40793,9 +45820,17 @@ class RemoteControlMixin:
         self._refresh_call()
 
     def send_remote_input(self, kind: int, fields: tuple) -> None:
+        """An event for the computer this side controls. 20.0: a key it
+        does not know by name is not sent (it says how many it knows in
+        its state; before it has, 19.0's)."""
         call = self.call
-        if call is not None and call.engine is not None:
-            call.engine.send_input(kind, fields)
+        if call is None or call.engine is None:
+            return
+        if kind == INPUT_KEY and fields[0] >= (
+                getattr(call, "rc_state", None) or {}).get(
+                    "k", REMOTE_KEYS_19):
+            return
+        call.engine.send_input(kind, fields)
 
     def _say_control(self, call: "Call") -> None:
         """What this side says of control in its media state."""
@@ -40810,6 +45845,9 @@ class RemoteControlMixin:
         name = self.call_name(call.peer)
         self._remote_ticks(call, on)                         # 19.0.1
         if on:
+            # 21.1: the note's clock; the limit word (Data saver, "pt") at
+            # once, not up to five seconds on.
+            call.rc_began, call.rc_limit_at = time.monotonic(), 0.0
             self._set_status(tr("You are controlling {name}'s computer",
                                 name=name), T.text_2)
         elif call.asks:
@@ -40860,6 +45898,9 @@ class RemoteControlMixin:
                 return
             call.lets, call.control_kind = True, kind
             call.control_since = time.time()
+            remote_log(tr("{name} began a session", name=self.call_name(
+                call.peer)) + (" " + tr("(by the access list)")
+                               if kind == "away" else ""))     # 21.0
             self._say_control(call)
             self._refresh_call()
             # 19.0.1 (REMOTE191): the screen kept on; what the computer is
@@ -40890,6 +45931,10 @@ class RemoteControlMixin:
             self._say_control(call)
             remote_session_kept(call.peer, call.control_kind,
                                 call.control_since, time.time())
+            remote_log(tr("{name}'s session ended after {minutes} min",
+                          name=self.call_name(call.peer),
+                          minutes=max(1, round((time.time() - (
+                              call.control_since or time.time())) / 60))))
             self._remote_ticks(call, False)
             self.apply_keep_awake()                   # 19.0.1: as it was
             self._refresh_call()
@@ -41123,7 +46168,11 @@ class RemoteControlMixin:
             if now - call.__dict__.get("rc_limit_at", 0.0) >= 5.0:
                 call.rc_limit_at = now
                 engine.send_rcmd({"op": "limit", "kbps": REMOTE_SAVER_KBPS
-                                  if remote_saver() else 0})
+                                  if remote_saver() else 0, "pt": 1})
+            overlay = self._call_overlay       # 21.1: waiting, or no longer
+            if overlay is not None and (overlay.waiting or
+                                        overlay.picture.rect() is None):
+                overlay.refresh_note()
             for number, waiting in list(call.rc_waiting.items()):
                 word, tries, sent = waiting
                 if now - sent < 1.5:
@@ -41136,6 +46185,60 @@ class RemoteControlMixin:
                     continue
                 call.rc_waiting[number] = [word, tries + 1, now]
                 engine.send_rcmd(word)
+
+    def _pointer_ticks(self, call: "Call", on: bool) -> None:
+        """21.1 (CURSOR30): while the side controlling this computer draws
+        the pointer itself (its limit word says "pt"), the screen is read
+        without it wherever this computer can tell its pointer
+        (remote_pointer_now; a secure screen's is drawn in all the same),
+        and the pointer's shape, and a move made here (a program, someone
+        at it), are told twenty times a second."""
+        tick = self.__dict__.pop("_pointer_tick_ev", None)
+        if tick is not None:
+            tick.cancel()
+        call.rc_pointer_here, call.rc_pointer_out = on, False
+        call.rc_pointer_said, call.rc_pointer_odd = None, 0
+        video = self.call_video(create=False)
+        if video is not None:
+            video.set_pointer(True)
+        if on and not call.ended:
+            self.__dict__["_pointer_tick_ev"] = Clock.schedule_interval(
+                lambda _dt: self._pointer_tick(call), 0.05)
+
+    def _pointer_tick(self, call: "Call") -> None:
+        engine = call.engine
+        if call.ended or engine is None or not call.lets or \
+                self.call is not call:
+            self._pointer_ticks(call, False)
+            return
+        found = remote_pointer_now()
+        video = self.call_video(create=False)    # each tick: a share
+        out = found is not None and video is not None and \
+            video.set_pointer(False)             # begun again too
+        if not out and video is not None:
+            video.set_pointer(True)
+        if out != call.rc_pointer_out:
+            call.rc_pointer_out = out
+            self._remote_tick(call)         # their pointer's way, told now
+        if not out:
+            return
+        shape, x, y = found
+        taken = engine.input_in
+        put = taken.pointer if taken is not None and taken.done else None
+        # Not where the side controlling put it, twice running (its own
+        # move may be on its way): moved here, so told with where it is.
+        odd = put is None or abs(x - put[0]) > 200 or abs(y - put[1]) > 200
+        call.rc_pointer_odd = call.rc_pointer_odd + 1 if odd else 0
+        said = call.rc_pointer_said or ("", None, 0.0)
+        at = (x, y) if call.rc_pointer_odd >= 2 else None
+        now = time.monotonic()
+        if shape != said[0] or (at is not None and at != said[1]) or \
+                now - said[2] >= 5.0:
+            word = {"op": "cursor", "c": shape}
+            if at is not None:
+                word.update(x=x, y=y)
+            call.rc_pointer_said = (shape, at or said[1], now)
+            engine.send_rcmd(word)
 
     def _remote_state_word(self, call: "Call", now: float) -> dict:
         """What this computer tells the side controlling it: its screen
@@ -41152,8 +46255,17 @@ class RemoteControlMixin:
             known = call.rc_mine = (now, {
                 "n": device_name(), "dev": device_id(), "u": until,
                 "si": windows_signs_in_by_itself() if IS_WINDOWS
-                else None})
-        return dict(known[1], op="state", s=remote_screen_state())
+                else None, "k": len(REMOTE_KEYS)})
+        screen = remote_screen_state()
+        word = dict(known[1], op="state", s=screen, sv=DESK.users > 0,
+                    pt=call.rc_pointer_out and
+                    screen in ("ok", "admin", "hung"))
+        if screen == "hung":                       # 21.0 (NEXT29): End it
+            word["hp"] = remote_hung_program()
+        if screen != call.__dict__.get("rc_logged", "ok"):    # 21.0
+            call.rc_logged = screen
+            remote_log(remote_screen_said(screen, word.get("hp")))
+        return word
 
     def remote_ask(self, word: dict) -> None:
         """The side controlling: a word for their computer (programs, end,
@@ -41201,6 +46313,29 @@ class RemoteControlMixin:
             save_pref("remote_reminded", told)
         return said
 
+    def remote_clip_send(self) -> None:
+        """21.0 (NEXT29): this side's clipboard put in their computer's,
+        when its person asks (never by itself), in pieces that fit."""
+        text = clipboard_text()[:REMOTE_CLIP_MAX]
+        if not text:
+            self._set_status(tr("Your clipboard has no text"), T.alert)
+            return
+        cid, parts = uuid.uuid4().hex[:12], rcmd_text_parts(text)
+        self._set_status(tr("Sending your clipboard…"), T.text_2)
+        for i, part in enumerate(parts):
+            self.remote_ask({"op": "clip", "id": cid, "part": i,
+                             "of": len(parts), "t": part})
+
+    def remote_clip_get(self) -> None:
+        """21.0: their computer's clipboard, copied here."""
+        self._set_status(tr("Asking for their clipboard…"), T.text_2)
+        self.remote_ask({"op": "clipget"})
+
+    def remote_log_ask(self) -> None:
+        """21.0: their computer's log of its sessions (RemoteLogSheet)."""
+        self._set_status(tr("Asking what went wrong there…"), T.text_2)
+        self.remote_ask({"op": "log"})
+
     def remote_programs(self) -> None:
         """Their computer's programs (RemoteProgramsSheet once they come)."""
         self._set_status(tr("Asking for its programs…"), T.text_2)
@@ -41215,13 +46350,22 @@ class RemoteControlMixin:
         for number in reversed(numbers):
             self.send_remote_input(INPUT_KEY, (number, 0))
 
+    def set_remote_touch(self, trackpad: bool) -> None:
+        """21.1: Keys › Trackpad (a phone): its finger's way, kept."""
+        mode = "trackpad" if trackpad else "touch"
+        save_pref("remote_touch", mode)
+        overlay = self._call_overlay
+        if overlay is not None:
+            overlay.remote.set_mode(mode)
+        self._set_status(remote_touch_hint(mode), T.text_2)
+
     def set_remote_saver(self, on: bool) -> None:
         save_pref("remote_saver", bool(on))
         call = self.call
         if call is not None and call.engine is not None and \
                 self.controlling(call):
             call.engine.send_rcmd({"op": "limit", "kbps": REMOTE_SAVER_KBPS
-                                   if on else 0})
+                                   if on else 0, "pt": 1})
 
     def _remote_cmd(self, call: "Call", word: dict) -> None:
         """A word of a controlled screen's (PKT_RCMD, sealed with the
@@ -41229,10 +46373,11 @@ class RemoteControlMixin:
         controller's when this computer is controlled. Each is taken only
         in its own role: nothing is done here for a side not let in."""
         op = word.get("op")
-        if op in ("limit", "list", "end", "restart") and call.lets:
+        if op in ("limit", "list", "end", "restart", "log", "clip",
+                  "clipget") and call.lets:
             self._remote_here(call, op, word)
-        elif op in ("state", "programs", "done") and (
-                self.controlling(call) or call.asks):
+        elif op in ("state", "programs", "done", "logged", "clipped",
+                    "cursor") and (self.controlling(call) or call.asks):
             self._remote_there(call, op, word)
 
     def _remote_here(self, call: "Call", op: str, word: dict) -> None:
@@ -41240,6 +46385,9 @@ class RemoteControlMixin:
         engine = call.engine
         if op == "limit":
             engine.screen_cap = _int(word.get("kbps"), 0, 100000) or 0
+            here = word.get("pt") == 1           # 21.1 (CURSOR30): theirs
+            if here != call.rc_pointer_here:
+                self._pointer_ticks(call, here)
             return
         number = _int(word.get("n"), 1, 2 ** 31)
         if number is None or engine is None:
@@ -41255,14 +46403,34 @@ class RemoteControlMixin:
                 engine.send_rcmd({"op": "programs", "n": number, "part": i,
                                   "of": len(parts), "list": part})
             return
+        name = self.call_name(call.peer)
+        if op in ("log", "clipget"):                      # 21.0 (NEXT29)
+            if op == "log":
+                key = "lines"
+                parts = rcmd_list_parts(remote_log_lines()[-REMOTE_LOG_SENT:])
+            else:
+                text = clipboard_text()[:REMOTE_CLIP_MAX]
+                remote_log(tr("{name} took this computer's clipboard ({count} "
+                              "characters)", name=name, count=len(text)))
+                key, parts = "t", rcmd_text_parts(text)
+            for i, part in enumerate(parts):
+                engine.send_rcmd({"op": "logged" if op == "log" else
+                                  "clipped", "n": number, "part": i,
+                                  "of": len(parts), key: part})
+            return
+        if op == "clip":
+            self._remote_clip_part(call, number, word, name)
+            return
         done = call.__dict__.setdefault("rc_done", {})
         if number in done:                      # asked again: told again
             engine.send_rcmd(done[number])
             return
-        name = self.call_name(call.peer)
         if op == "end":
             ok, why = remote_close_program(_int(word.get("w"), 0, 2 ** 63) or 0,
                                            _int(word.get("p"), 0, 2 ** 31) or 0)
+            remote_log(tr("{name} ended a program from afar", name=name) if ok
+                       else tr("{name} could not end a program: {why}",
+                               name=name, why=why))
         else:                                   # restart
             ok, why = computer_restart(tr(
                 "Ferritext: {name} restarts this computer from afar.",
@@ -41271,12 +46439,50 @@ class RemoteControlMixin:
                 remote_restart_asked(call.peer)
                 self.store.add_event(call.peer, tr(
                     "{name} restarted this computer from afar", name=name))
+            remote_log(tr("{name} restarted this computer from afar",
+                          name=name) if ok else tr(
+                "{name} asked for a restart, which Windows refused: {why}",
+                name=name, why=why))
         done[number] = {"op": "done", "n": number, "of": op, "ok": ok,
                         "why": str(why)[:200]}
         engine.send_rcmd(done[number])
 
+    def _remote_clip_part(self, call: "Call", number: int, word: dict,
+                          name: str) -> None:
+        """21.0 (NEXT29): a piece of the controlling side's clipboard; once
+        all have come, this computer's clipboard holds it. Each piece is
+        answered (sent again until it is)."""
+        cid = _str(word.get("id"), 16) or ""
+        count = _int(word.get("of"), 1, 64) or 1
+        part = _int(word.get("part"), 0, count - 1)
+        pieces = call.__dict__.setdefault("rc_clip", {}).setdefault(cid, {})
+        if part is not None and isinstance(word.get("t"), str):
+            pieces[part] = word["t"][:REMOTE_CLIP_MAX]
+        whole = len(pieces) == count
+        if whole and not call.__dict__.setdefault("rc_clip_done",
+                                                  set()) & {cid}:
+            call.rc_clip_done.add(cid)
+            text = "".join(pieces[i] for i in range(count))[:REMOTE_CLIP_MAX]
+            Clipboard.copy(text)
+            remote_log(tr("{name} put text in this computer's clipboard "
+                          "({count} characters)", name=name,
+                          count=len(text)))
+        call.engine.send_rcmd({"op": "done", "n": number, "of": "clip",
+                               "ok": part is not None, "all": whole,
+                               "why": ""})
+
     def _remote_there(self, call: "Call", op: str, word: dict) -> None:
         """The side controlling: what their computer says."""
+        if op == "cursor":                            # 21.1 (CURSOR30)
+            x, y = _int(word.get("x"), 0, 65535), _int(word.get("y"), 0,
+                                                       65535)
+            call.rc_pointer = (word.get("c") if word.get("c") in
+                               POINTER_SHAPES else "arrow",
+                               None if x is None or y is None else (x, y))
+            overlay = self._call_overlay
+            if overlay is not None:
+                overlay.remote.pointer_said(*call.rc_pointer)
+            return
         if op == "state":
             state = sanitize_remote_state(word)
             call.rc_state = state
@@ -41290,6 +46496,33 @@ class RemoteControlMixin:
         number = _int(word.get("n"), 1, 2 ** 31)
         waiting = call.rc_waiting.get(number) if number else None
         if waiting is None:
+            return
+        if op in ("logged", "clipped"):                   # 21.0 (NEXT29)
+            got = call.__dict__.setdefault("rc_parts", {})
+            count = _int(word.get("of"), 1, 64) or 1
+            part = _int(word.get("part"), 0, count - 1)
+            if part is not None:
+                got.setdefault(number, {})[part] = word.get(
+                    "lines" if op == "logged" else "t")
+            if len(got.get(number, {})) < count:
+                return
+            call.rc_waiting.pop(number, None)
+            parts = got.pop(number)
+            name = self.call_name(call.peer)
+            if op == "logged":
+                RemoteLogSheet(self, sanitize_log_lines(
+                    [line for i in range(count) for line in (
+                        parts[i] if isinstance(parts[i], list) else [])]),
+                    name).open()
+                return
+            text = "".join(parts[i] if isinstance(parts[i], str) else ""
+                           for i in range(count))[:REMOTE_CLIP_MAX]
+            if text:
+                Clipboard.copy(text)
+            self._set_status(tr("{name}'s clipboard is copied here ({count} "
+                                "characters)", name=name, count=len(text))
+                             if text else tr("{name}'s clipboard has no text",
+                                             name=name), T.text_2)
             return
         if op == "programs":
             got = call.__dict__.setdefault("rc_parts", {})
@@ -41319,6 +46552,10 @@ class RemoteControlMixin:
         elif what == "restart":
             self._set_status(tr("{name}'s computer did not restart: {why}",
                                 name=name, why=why), T.alert)
+        elif what == "clip":                              # 21.0 (NEXT29)
+            if word.get("all") is True:
+                self._set_status(tr("Your clipboard is on {name}'s computer: "
+                                    "paste it there", name=name), T.text_2)
         elif what == "end":
             self._set_status(tr("Asked it to close") if ok else why or tr(
                 "It could not be closed"), T.text_2 if ok else T.alert)
@@ -41388,6 +46625,8 @@ class RemoteControlMixin:
     def _told_again(self) -> None:
         """Started again by the watcher (--again): the person at the
         computer is told why, once."""
+        remote_log(tr("Ferritext started again by its watcher: it had "
+                      "closed by itself, or stopped answering"))
         desktop_notify(tr("Ferritext is running again"), tr(
             "Someone can connect to this computer from afar, so Ferritext "
             "keeps running. To close it for good, turn off Keep Ferritext "
@@ -41425,6 +46664,10 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
         # at a found or quoted message); None while it follows the chat.
         self._chat_ceiling: Optional[int] = None
         self._dirty_chat = False               # coalesced refresh flags
+        self._live: dict = {}        # 21.0: this phone's live shares, by cid
+        self._live_clock = None      # their clock while one runs
+        self._live_redraw = None     # the chat drawn again as one ends
+        self._here: tuple = (None, -1e9)      # (point, when read)
         self._dirty_list = False
         self.foreground = True                 # drives reconnect aggressiveness
         self._register_modal: Optional[RegisterModal] = None
@@ -41665,7 +46908,8 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
                        reduce_motion: Optional[bool] = None,
                        black: Optional[bool] = None,
                        theme_set: Optional[str] = None,
-                       edge_fade: Optional[bool] = None) -> None:
+                       edge_fade: Optional[bool] = None,
+                       hold: Optional[str] = None) -> None:
         if theme is not None:
             save_pref("theme", theme)
         if theme_set is not None:
@@ -41678,6 +46922,8 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
             save_pref("reduce_motion", bool(reduce_motion))
         if edge_fade is not None:
             save_pref("edge_fade", bool(edge_fade))
+        if hold is not None:
+            save_pref("hold", hold)
         self.apply_appearance(force=text_size is not None)
         for view in list(_FADED_LISTS):     # 18.1: at once, no rebuild
             view.place_fades()
@@ -41967,11 +47213,22 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
         return False
 
     def _on_keyboard(self, _window, key, *_args) -> bool:
-        """Android/Esc back, innermost first: an open sheet, highlight mode,
-        the emoji panel, a recording, a pending reply, a call's notes, a
-        page — and only then the app."""
+        """Android's Back and Esc: one step back (_step_back). 20.0: taken
+        whatever happens in the step, so that a fault in one page's way
+        back is logged and no more: the key never goes on to anything
+        that would close the app."""
         if key not in (27, 1001):
             return False
+        try:
+            self._step_back()
+        except Exception:
+            log.exception("back: the step back failed")
+        return True
+
+    def _step_back(self) -> bool:
+        """One step back, innermost first: an open sheet, highlight mode,
+        the emoji panel, a recording, a pending reply, a call's notes, a
+        page — and only then the app, left for the home screen."""
         sheets = [v for v in Window.children if isinstance(v, ModalView)]
         if sheets:
             top = sheets[0]
@@ -42035,6 +47292,7 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
         # The outermost page: Android goes to the home screen with the app
         # kept as it is; a computer's Esc does nothing (it used to close
         # the window).
+        log.info("back: the outermost page, so to the home screen")
         android_move_to_back()
         return True
 
@@ -42047,6 +47305,8 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
         if self.worker is not None:
             self.worker.stop_event.set()
             self.worker = None
+        self._live.clear()          # 21.0: its live shares wait (_resume_live)
+        self._live_idle()
         if self.store is not None:
             self.store.close()
             self.store = None
@@ -42055,6 +47315,7 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
         self.api = self._api_for(self.keys)
         self.store = LocalStore(self.keys.store_path())
         self._load_pictures()
+        self._resume_live()
         self.current_peer = None
         self._navigate("chats", None)
         self.chats_screen.refresh_header()
@@ -42397,6 +47658,23 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
             peer, [m.get("client_msg_id") for m in messages])
         for msg in messages:
             msg["reactions"] = reactions.get(msg.get("client_msg_id"), [])
+            poll = message_ext(msg).get("poll") \
+                if '"poll"' in (msg.get("ext") or "") else None
+            if poll and msg.get("client_msg_id"):   # 21.0: what it counts
+                msg["poll_state"] = poll_state(self.store, peer,
+                                               msg["client_msg_id"], poll)
+            loc = message_ext(msg).get("loc") \
+                if '"until"' in (msg.get("ext") or "") else None
+            if loc and "until" in loc:          # 21.0: a live share's point
+                msg["live_state"] = location_shown(self.store, msg, loc)
+        # 21.0: drawn again as the soonest live share shown ends by its time
+        ends = [message_ext(m)["loc"]["until"] for m in messages
+                if (m.get("live_state") or (None, False))[1]]
+        if self._live_redraw is not None:
+            self._live_redraw.cancel()
+        self._live_redraw = Clock.schedule_once(
+            lambda _dt: self.refresh_chat(self.current_peer),
+            min(ends) - time.time() + 1) if ends else None
         self.conversation_screen.has_older = bool(
             self._chat_anchor is not None
             and self.conversation_screen.thread is None       # 18.0
@@ -42518,6 +47796,11 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
         body = sanitize_text(screen.entry.text)
         if not body:
             return
+        why = self.slow_stop(self.current_peer) if screen.editing is None \
+            else ""
+        if why:                 # 20.0: slow mode; what is written is kept
+            self._set_status(why, T.accent)
+            return
         if screen.editing is not None:              # 16.2: an edit
             msg = screen.editing
             screen._draft_before_edit = ""
@@ -42573,6 +47856,9 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
         if not rows:
             return
         peer = rows[0]["peer"]
+        for row in rows:      # 21.0: a live share deleted (either way) stops
+            if row.get("client_msg_id") in self._live:
+                self.stop_live(peer, row["client_msg_id"])
         if not for_everyone:
             for row in self.store.delete_messages([r["id"] for r in rows]):
                 discard_media_file(row.get("media_path"))
@@ -42814,7 +48100,8 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
             return
         snip = single_line_text(message_text(row) or {
             "image": "a photo", "voice": "a voice message",
-            "video": "a video message"}.get(row.get("kind"), "a message"),
+            "video": "a video message",
+            "file": "a document"}.get(row.get("kind"), "a message"),
             40)
         fallback = (f"Reacted {emoji} to \u201c{snip}\u201d" if adding
                     else "Removed a reaction")
@@ -42861,6 +48148,232 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
             self._in_chat_order(peer, lambda: self._send_control(
                 peer, ctl, "Pinned a message" if on else
                 "Unpinned a message"))
+
+    # ---- 21.0 (MAP29): a place, and a live one --------------------------------
+    def send_location(self, peer: Optional[str], point: dict
+                      ) -> Optional[str]:
+        """A place into `peer`'s chat; its cid."""
+        loc = sanitize_location(point)
+        if peer is None or loc is None:
+            return None
+        local = self._queue_message(peer, location_body(loc),
+                                    {"k": "text", "loc": loc}, "text",
+                                    {"loc": loc})
+        self.refresh_chat(self.current_peer)
+        row = self.store.message(local) if local else None
+        return row["client_msg_id"] if row else None
+
+    def share_live(self, peer: Optional[str], point: dict,
+                   minutes: int) -> Optional[str]:
+        """This phone's place shared for `minutes`: its message now, then
+        its next points as it moves (live_due), until then or stop_live."""
+        source = location_source()
+        point = dict(point, until=int(time.time()) + minutes * 60)
+        cid = self.send_location(peer, point) if source else None
+        if cid is None:
+            return None
+        loc = sanitize_location(point)
+        self.store.set_live_point(peer, cid, loc)
+        self._follow_live(peer, cid, loc["until"], (time.time(), loc))
+        return cid
+
+    def here(self) -> Optional[dict]:
+        """Where this phone was last known to be (read again after a
+        minute), for a place's distance from you; None on a computer, or
+        without the permission."""
+        point, read = self._here
+        if time.monotonic() - read > 60:
+            source = location_source()
+            point = source.last() if source is not None and (
+                not IS_ANDROID or any(android_has_permission(p)
+                                      for p in LOCATION_PERMISSIONS)) \
+                else None
+            self._here = (point, time.monotonic())
+        return point
+
+    def open_place(self, point: dict) -> None:
+        """A place in the phone's maps app; where none takes it, its
+        coordinates copied."""
+        if not show_in_maps(point["lat"], point["lon"]):
+            self.copy_text(coordinates_text(point))
+
+    def _follow_live(self, peer: str, cid: str, until: int,
+                     last: Optional[tuple]) -> None:
+        """A share this phone keeps up: its place is read (out of sight
+        too, on Android, while the location service runs) until none is
+        left. `last`: (time, point) of the point sent last, if known."""
+        self._live_check_stop()            # 21.1: a Stop not yet heard
+        self._live[cid] = {"peer": peer, "until": until, "last": last}
+        if self._live_clock is None:
+            if IS_ANDROID:
+                try:                     # in sight, on the UI thread, and
+                    self._live_service.text = self.live_notice_words()
+                    self._live_service.launch()     # not waited for, as
+                except Exception:                   # the camera's
+                    log.exception("location: its service")
+            location_source().follow(self._on_live_point)
+            self._live_clock = Clock.schedule_interval(self._live_tick, 5)
+        elif IS_ANDROID:
+            self._live_service.say(self.live_notice_words())
+
+    @property
+    def _live_service(self) -> "LocationService":
+        service = self.__dict__.get("_live_service_kept")
+        if service is None:
+            service = self.__dict__["_live_service_kept"] = LocationService()
+        return service
+
+    def live_notice_words(self) -> str:
+        """21.1 (LIVENOTICE30): with whom this phone shares its place, and
+        until when: "With Ann until 18:30", "With Ann and 2 more until
+        19:00" (the latest end)."""
+        shares = sorted(self._live.values(), key=lambda s: s["until"])
+        if not shares:
+            return ""
+        names = [conversation_title(self, s["peer"])[0] for s in shares]
+        until = datetime.fromtimestamp(shares[-1]["until"]).strftime("%H:%M")
+        if len(names) == 1:
+            return tr("With {name} until {time}", name=names[0], time=until)
+        return tr("With {name} and {n} more until {time}", name=names[-1],
+                  n=len(names) - 1, time=until)
+
+    def _resume_live(self) -> None:
+        """This identity's own shares that had not ended (the app was
+        closed, or another identity used, while they ran) go on; those
+        past their time, or that this device can no longer keep up (no
+        place of its own, the permission taken back), end."""
+        able = location_source() is not None and (not IS_ANDROID or any(
+            android_has_permission(p) for p in LOCATION_PERMISSIONS))
+        if IS_ANDROID and self._live_service.stopped():   # 21.1: from its
+            able = False                                 # notice, closed
+        for peer, cid, until in self.store.own_live_shares():
+            if able and time.time() < until:
+                self._follow_live(peer, cid, until, None)
+            else:
+                self.stop_live(peer, cid)
+
+    def _stop_live_in(self, peers: list) -> None:
+        """This phone's live shares in these chats stop (a chat deleted,
+        its contact blocked, its group left)."""
+        for cid, share in list(self._live.items()):
+            if share["peer"] in peers:
+                self.stop_live(share["peer"], cid)
+
+    def _live_idle(self) -> None:
+        """Once no share is kept up, the phone's place is not read."""
+        if not self._live and self._live_clock is not None:
+            self._live_clock.cancel()
+            self._live_clock = None
+            location_source().unfollow(self._on_live_point)
+            if IS_ANDROID:
+                self._live_service.stop()
+
+    def _on_live_point(self, point: dict) -> None:
+        if IS_ANDROID and self._live_service.stopped_mark.exists():
+            self._live_check_stop()     # 21.1: Stop on its notice: no more
+            return
+        now = time.time()
+        for cid, share in list(self._live.items()):
+            peer = share["peer"]
+            if now >= share["until"]:
+                self.stop_live(peer, cid)
+                continue
+            group = self.store.group(gid_of(peer)) if gid_of(peer) else None
+            crowd = bool(group) and len(group["members"]) > LIVE_CROWD
+            if not live_due(share["last"], point, now, crowd):
+                continue
+            share["last"] = (now, point)
+            self.store.set_live_point(peer, cid, point)
+            self.ui_queue.put(("message_stored", peer))
+            if self.conversation_kind(peer) != "self":
+                ctl = {"op": "loc", "cid": cid, "p": point}
+                self._in_chat_order(peer, lambda p=peer, c=ctl:
+                                    self._send_control(p, c, "Live location"))
+
+    def _live_tick(self, _dt) -> None:
+        """Ends the shares past their time, and (21.1, every 5 s, not 30)
+        every share once Stop was tapped on the notice."""
+        self._live_check_stop()
+        for cid, share in list(self._live.items()):
+            if time.time() >= share["until"]:
+                self.stop_live(share["peer"], cid)
+
+    def _live_check_stop(self) -> None:
+        """21.1 (LIVENOTICE30): Stop tapped on the location service's
+        notice: every share this phone keeps up ends, said to the chats."""
+        if IS_ANDROID and self._live_service.stopped():
+            for cid, share in list(self._live.items()):
+                self.stop_live(share["peer"], cid)
+
+    def stop_live(self, peer: str, cid: str) -> None:
+        """A live share stopped (or over): said to the others, its point
+        let go on both sides; once none runs, the phone's place is no
+        longer read."""
+        self._live.pop(cid, None)
+        if self.store.end_live(peer, cid) and \
+                self.conversation_kind(peer) != "self":
+            ctl = {"op": "loc", "cid": cid, "stop": True}
+            self._in_chat_order(peer, lambda: self._send_control(
+                peer, ctl, "Stopped sharing live location"))
+        self._live_idle()
+        if self._live and IS_ANDROID:      # 21.1: the others, still shared
+            self._live_service.say(self.live_notice_words())
+        self.ui_queue.put(("message_stored", peer))
+
+    # ---- 21.0 (POLL29): polls ------------------------------------------------
+    def send_poll(self, peer: Optional[str], poll: dict) -> None:
+        """A poll into `peer`'s chat: a message whose words are the poll
+        (poll_body), for apps before 21.0 and previews."""
+        poll = sanitize_poll(poll)
+        if peer is None or poll is None:
+            return
+        self._queue_message(peer, poll_body(poll), {"k": "text",
+                                                    "poll": poll},
+                            "text", {"poll": poll})
+        self.refresh_chat(self.current_peer)
+
+    def _poll_of(self, peer: str, cid: str) -> tuple:
+        """(the poll's message, its poll), or (None, None)."""
+        row = self.store.message_by_cid(peer, cid) if self.store else None
+        poll = message_ext(row).get("poll") if row else None
+        return (row, poll) if poll else (None, None)
+
+    def vote_poll(self, peer: str, cid: str, picks: list) -> None:
+        """This person's vote in a poll of `peer` ([] takes it back): kept
+        here at once, then sealed to the others."""
+        row, poll = self._poll_of(peer, cid)
+        at = now_iso()
+        if poll is None or not poll_open(
+                poll, self.store.poll_ended(peer, cid), at):
+            return
+        picks = poll_picks(picks, poll)
+        if picks is None or not self.store.set_vote(
+                peer, cid, self.keys.address, picks, at):
+            return
+        self.ui_queue.put(("message_stored", peer))
+        if self.conversation_kind(peer) != "self":
+            words = ", ".join(f"\u201c{poll['o'][i]}\u201d" for i in picks)
+            ctl = {"op": "vote", "cid": cid, "v": picks}
+            self._in_chat_order(peer, lambda: self._send_control(
+                peer, ctl, f"Voted {words} in the poll \u201c{poll['q']}"
+                "\u201d" if picks else "Took back a vote in a poll"))
+
+    def can_end_poll(self, peer: str, row: dict) -> bool:
+        group = self.store.group(gid_of(peer)) if gid_of(peer) else None
+        return may_end_poll(row, self.keys.address, self.keys.address, group)
+
+    def end_poll(self, peer: str, cid: str) -> None:
+        """A poll ended for everyone: no more votes count."""
+        row, poll = self._poll_of(peer, cid)
+        if poll is None or not self.can_end_poll(peer, row) or \
+                not self.store.end_poll(peer, cid, self.keys.address,
+                                        now_iso()):
+            return
+        self.ui_queue.put(("message_stored", peer))
+        if self.conversation_kind(peer) != "self":
+            ctl = {"op": "pollend", "cid": cid}
+            self._in_chat_order(peer, lambda: self._send_control(
+                peer, ctl, f"Ended the poll \u201c{poll['q']}\u201d"))
 
     def unpin_all(self, peer: str) -> None:
         if not self.can_pin(peer) or not self.store.unpin_all(
@@ -43041,11 +48554,13 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
         return None
 
     def set_group_permissions(self, gid: str, off,
-                              members_pin: Optional[bool] = None) -> bool:
+                              members_pin: Optional[bool] = None,
+                              slow: Optional[int] = None) -> bool:
         """As an admin with the right to: which rights (GROUP_RIGHTS) are
-        off for every member, and (19.0, `members_pin`) whether members may
-        pin messages. One already off keeps when it went off; each change
-        is said here and goes to every member in the group's state."""
+        off for every member, (19.0, `members_pin`) whether members may
+        pin messages, and (20.0, `slow`) slow mode's pace in seconds, 0 for
+        off. One already off keeps when it went off; each change is said
+        here and goes to every member in the group's state."""
         group = self.store.group(gid)
         if not group_can(group, self.keys.address, "rules") or \
                 group["state"] != "active":
@@ -43055,8 +48570,16 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
         deny = {r: before.get(r, now) for r in GROUP_RIGHTS if r in off}
         pin_was = bool(rules.get("pin"))
         pin = pin_was if members_pin is None else bool(members_pin)
-        if set(deny) == set(before) and pin == pin_was:
+        slow_was = rules.get("slow") or 0
+        slow = slow_was if slow is None or not slow_words(slow) else slow
+        if set(deny) == set(before) and pin == pin_was and slow == slow_was:
             return False
+        if slow != slow_was:
+            self.store.add_event(group_peer(gid), tr(
+                "You turned on slow mode: a member writes once in {time}",
+                time=slow_words(slow)) if slow else
+                tr("You turned off slow mode"))
+            rules["slow"] = slow
         if pin != pin_was:
             self.store.add_event(group_peer(gid), tr(
                 "You let members pin messages" if pin else
@@ -43071,6 +48594,26 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
                     else "You turned {what} back on for members",
                     what=tr(GROUP_RIGHT_WORDS[right])))
         rules["deny"] = deny
+        self._save_rules(gid, group, rules)
+        return True
+
+    def set_group_about(self, gid: str, words: str) -> bool:
+        """20.0: as an admin with the right to set its rules: a few lines
+        on what the group is about ("" takes them away). Kept in its
+        rules, shown in its page, and said in the chat to every member
+        now and to each who joins."""
+        group = self.store.group(gid)
+        if not group_can(group, self.keys.address, "rules") or \
+                group["state"] != "active":
+            return False
+        words = sanitize_text(words)[:MAX_GROUP_ABOUT].strip()
+        rules = dict(group["rules"])
+        if words == (rules.get("about") or ""):
+            return False
+        rules["about"] = words
+        self.store.add_event(group_peer(gid), tr(
+            "You wrote what this group is about: {words}", words=words)
+            if words else tr("You took away what this group is about"))
         self._save_rules(gid, group, rules)
         return True
 
@@ -43167,6 +48710,7 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
         group = self.store.group(gid)
         if not group or group["state"] != "active":
             return
+        self._stop_live_in([group_peer(gid)])                    # 21.0
         recipients = self.group_recipients(gid)
         handover = self._handover(group)
         if handover is not None:
@@ -43579,6 +49123,85 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
         self._send_media(peer, "image", data, "image/jpeg", extra,
                          caption or "Photo", reply, "jpg")
 
+    def send_file(self, path: str, name: str = "",
+                  temporary: bool = False) -> None:
+        """A document (20.0): the file at `path` as it is, under `name`
+        (its own, where none is given). `temporary`: a copy this app made
+        (a phone's picker), deleted once read."""
+        peer = self.current_peer
+        if peer is None:
+            return
+        reply = self.conversation_screen.take_reply()
+        name = file_name(name or Path(path).name) or "file"
+        limit = self.media_limit(peer)
+
+        def work():
+            try:
+                if os.path.getsize(path) > limit - 64:
+                    self.ui_queue.put(("status", tr(
+                        "That's too large to send (the most is {size})",
+                        size=size_text(limit)), COL_DANGER))
+                    return
+                data = Path(path).read_bytes()
+            except OSError as exc:
+                self.ui_queue.put(("status", tr("Could not read that file: "
+                                                "{error}", error=exc),
+                                   COL_DANGER))
+                return
+            finally:
+                if temporary:
+                    discard_cache_file(path)
+            self._send_media(peer, "file", data, MEDIA_MIME["file"][0],
+                             {"name": name}, FILE_BODY + name, reply,
+                             media_suffix("file", None, name))
+        threading.Thread(target=work, daemon=True).start()
+
+    def save_document(self, msg: dict) -> None:
+        """A document that is here, handed to its person: a phone's Save
+        dialog; on a computer a copy in Downloads, its folder opened. The
+        app opens no document itself."""
+        path = msg.get("media_path") or ""
+        name = (message_ext(msg).get("media") or {}).get("name") or "file"
+        if IS_ANDROID:
+            try:
+                android_save_document(path, name, lambda ok: self._set_status(
+                    tr("Saved") if ok else tr("Not saved"), T.text_2))
+            except Exception:
+                log.exception("could not ask where to save")
+                self._set_status(tr("Couldn't save that document"), T.alert)
+            return
+        folder = Path.home() / "Downloads"
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            target = folder / name
+            stem, dot, ending = name.rpartition(".")
+            for n in range(1, 200):               # a name not taken
+                if not target.exists():
+                    break
+                target = folder / (f"{stem} ({n}).{ending}" if dot
+                                   else f"{name} ({n})")
+            shutil.copyfile(path, target)
+        except OSError as exc:
+            self._set_status(tr("Couldn't save that document: {error}",
+                                error=exc), T.alert)
+            return
+        open_folder_in_explorer(folder)
+        self._set_status(tr("Saved to {path}", path=str(target)), T.text_2)
+
+    def send_contact(self, peer: Optional[str], address: str) -> None:
+        """One of your contacts handed on to `peer` as a card (20.0): their
+        name and address. The reader's app looks them up at the relay
+        before adding them."""
+        contact = self.store.get_contact(address) if self.store else None
+        if peer is None or contact is None:
+            return
+        name = contact.get("username") or ""
+        body = "Contact: " + (f"@{name} " if name else "") + address
+        self._queue_message(peer, body, {"k": "text", "card": {
+            "a": address, "u": name}}, "text",
+            {"card": {"a": address, "u": name}})
+        self.refresh_chat(self.current_peer)
+
     def send_voice(self, path: str, duration_ms: int, wave: str = "") -> None:
         peer = self.current_peer
         if peer is None:
@@ -43726,7 +49349,8 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
                         self.ui_queue.put(("message_stored", peer))
                         return
                 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
-                suffix = media_suffix(row["kind"], media.get("mime"))
+                suffix = media_suffix(row["kind"], media.get("mime"),
+                                      media.get("name") or "")
                 target = MEDIA_DIR / f"{row.get('client_msg_id') or uuid.uuid4().hex}.{suffix}"
                 target.write_bytes(data)
                 self.store.set_media(local_id, path=str(target),
@@ -43755,8 +49379,8 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
         if not row or not row.get("client_msg_id"):
             return
         peer = row["peer"]
-        what = {"voice": "voice message",
-                "video": "video message"}.get(row["kind"], "photo")
+        what = {"voice": "voice message", "video": "video message",
+                "file": "document"}.get(row["kind"], "photo")
         self.store.set_media(local_id, state="requested")
         self.refresh_chat(self.current_peer)
         gid = gid_of(peer)
@@ -44340,7 +49964,9 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
                               on_key=lambda *a: run_on_ui(
                                   self._video_lost, *a),
                               on_failed=self._video_failed,
-                              who_of=self._video_who)
+                              who_of=self._video_who,
+                              on_strain=lambda: run_on_ui(
+                                  self.call_media_changed))
             self.__dict__["_call_video"] = video
         return video
 
@@ -44348,6 +49974,21 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
         video = self.__dict__.pop("_call_video", None)
         if video is not None:
             video.close()
+        self._camera_service(False)
+
+    def _camera_service(self, on: bool) -> None:
+        """20.0: a phone's camera service (CameraService), running while
+        a call's camera is on: started here, in sight, as Android wants."""
+        if not IS_ANDROID:
+            return
+        try:
+            service = CameraService()
+            if on and not service.on:
+                service.start(0)           # not waited for: no one needs it yet
+            elif not on and service.on:
+                service.stop()
+        except Exception:
+            log.exception("video: the camera's service")
 
     def _video_who(self, user: str):
         """A person as the call's engine names them: a room's member index
@@ -44378,7 +50019,14 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
 
         def go():
             off_ui(probe_video_encoders)   # HEVC, AV1 in hardware, once
-            then(self.call_video().start(track))
+            # 21.0: a remote session's screen through the service's helper
+            # (the lock screen, permission prompts), where it answers.
+            remote = track == "s" and bool(getattr(self.call, "remote",
+                                                   False))
+            why = self.call_video().start(track, helper=remote)
+            if track == "v" and not why:
+                self._camera_service(True)
+            then(why)
             self._video_plan(track)
         if IS_ANDROID and track == "s":           # 18.0: Android's yes first
             def asked(grant: Optional[tuple]) -> None:
@@ -44408,6 +50056,8 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
         video = self.call_video(create=False)
         if video is not None:
             video.stop(track)
+        if track == "v":
+            self._camera_service(False)
 
     def call_view(self, tiles: dict) -> None:
         """What the call's screen shows now ({(user, track): tile}): drawn
@@ -44569,6 +50219,13 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
             overlay.call is call and overlay.parent is not None else (
                 self._call_pill.shows() if self._call_pill is not None
                 else {})
+        # 20.0: a device that cannot keep up with their picture asks for
+        # a smaller one (VideoReceiver.ease).
+        video = self.call_video(create=False)
+        ease = video.receiver.ease if video is not None else 1
+        if ease > 1:
+            shows = {track: (w / ease, h / ease)
+                     for track, (w, h) in shows.items()}
         call.engine.set_media(not call.muted, me.camera, me.screen,
                               me.recording, shows)
         self._say_control(call)               # 19.0: can be controlled
@@ -44983,7 +50640,8 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
             # 19.0 (REMOTE): a remote session, without sound (CallAudio:
             # no device opened) and through the relay only.
             hidden=call.remote, audio_factory=CallAudio if call.remote
-            else None)
+            else None,
+            drop_after=REMOTE_DROP_SECONDS if call.remote else 0.0)
         engine.muted = call.muted          # 16.1: off until turned on
         call.engine = engine
         # 17.0: the pictures, both ways (the lobby's camera goes on).
@@ -45077,7 +50735,12 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
         android_find_call_classes()      # before _prepare_incoming's thread
         if remote and call_offer_age(sig, self.api) > CALL_OFFER_MAX_AGE:
             return              # tried while this computer was off: no card
-        if call_offer_age(sig, self.api) > CALL_OFFER_MAX_AGE:
+        # 20.0: Answer pressed on its notification, and the app had to
+        # start first (many seconds on an older phone): taken for as long
+        # as the caller rings, not only while a new ring would be worth it.
+        answered = self._answer_on_ring == sig["id"]
+        if call_offer_age(sig, self.api) > (
+                CALL_RING_SECONDS if answered else CALL_OFFER_MAX_AGE):
             self._missed_offer(sender, sig)
             # The caller may be waiting on it still: it rings no more there.
             self._send_call_end(sender, sig["id"], "timeout")
@@ -45289,6 +50952,8 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
                 video.ask_key(value)
         elif kind == "bye":
             self._finish_call("hangup", local=False)
+        elif kind == "renew":                                  # 20.0
+            self._renew_call_pass(call)
         elif kind == "lost":
             self._set_status(tr("The call dropped"), T.alert)
             self._finish_call("failed", local=True)
@@ -45300,6 +50965,22 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
             self._finish_call("failed", local=True)
         self._refresh_call()
 
+    def _renew_call_pass(self, call: "Call") -> None:
+        """20.0: a call that hears nothing asks for a new pass to the
+        relay's call port ("renew"): fetched off the UI thread, and handed
+        to its engine, which goes on trying to reconnect with it."""
+        engine = call.engine
+
+        def work() -> None:
+            try:
+                relay, ticket = self._call_relay()
+            except Exception as exc:       # no network yet: asked again
+                log.info("call: no new pass yet: %s", exc)
+                return
+            if engine is not None and not call.ended:
+                engine.renew(relay, ticket)
+        threading.Thread(target=work, daemon=True).start()
+
     def answer_call(self) -> None:
         """Accepting an incoming 1-to-1 call — its screen's Answer, its
         toast, its card, its notification (16.1): the lobby first, where
@@ -45309,7 +50990,13 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
         if call is None or call.ended or call.outgoing or \
                 call.state != "incoming":
             return
-        if call.session is None or self.preview_call(call.session) is None:
+        lobby = None
+        if call.session is not None:
+            try:
+                lobby = self.preview_call(call.session)
+            except Exception:      # 20.0: a lobby that cannot be drawn
+                log.exception("call: no lobby; answered without it")
+        if lobby is None:
             self._answer_now()
 
     def _answer_now(self) -> None:
@@ -45845,6 +51532,8 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
         if call is None or call.ended:
             return
         call.muted = not call.muted
+        if call.session is not None:        # 20.0: its tile's mark too
+            call.session.me.mic = not call.muted
         if call.engine is not None:
             call.engine.set_mic(not call.muted)
         self.call_media_changed()
@@ -46612,6 +52301,11 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
                         on_restore=lambda *_a: self._came_back())
             if STARTUP_FLAG in sys.argv[1:]:    # 18.2: opened by Windows
                 Clock.schedule_once(lambda _dt: Window.minimize(), 0.5)
+            # 21.0 (SERVICE29): signed in by itself after a restart (a power
+            # cut, an update): locked at once, and reachable from afar
+            # through the service.
+            if lock_after_sign_in_due():
+                Clock.schedule_once(lambda _dt: windows_lock(), 2)
             Clock.schedule_once(lambda _dt: self.apply_keep_awake(), 3)
             # 19.0.1 (KEEPUP): the watcher looked after once a minute, told
             # this UI answers; a restart asked from afar timed as it ends.
@@ -46721,11 +52415,17 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
         return True
 
     def _pause_call_camera(self) -> None:
-        """Out of sight, a phone has no camera (Android allows none in the
-        background): a call's camera is turned off, as the others see, and
-        said on return (17.0)."""
+        """Out of sight, a phone's camera stays on in a call while its
+        service runs (20.0, CameraService). Without it Android allows
+        none: the camera is turned off, as the others see, and said on
+        return (17.0). The lobby's, which no one sees yet, goes off too."""
         video = self.call_video(create=False)
         if not IS_ANDROID or video is None or "v" not in video.coders:
+            return
+        in_call = self.__dict__.get("_room_screen") is not None or (
+            self.call is not None and not self.call.ended and
+            self.call.state in ("active", "connecting"))
+        if in_call and CameraService().on:
             return
         screen = self.__dict__.get("_room_screen")
         if screen is not None:
@@ -47180,6 +52880,8 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
         their calls are refused. Unblock: what was held arrives, in order
         (v11; it used to be thrown away)."""
         peers = [p for p in peers if self.conversation_kind(p) == "dm"]
+        if blocked:
+            self._stop_live_in(peers)                             # 21.0
         self.store.set_chat_flag(peers, "blocked", 1 if blocked else 0)
         if blocked and IS_ANDROID:
             for peer in peers:
@@ -47239,6 +52941,7 @@ class FextApp(RemoteControlMixin, MessagingMixin, App):
     def delete_chats(self, peers: list, verb: str = "") -> None:
         """Remove chats from this device (a group is left first) and from
         the list, until something new arrives in them."""
+        self._stop_live_in(peers)                                 # 21.0
         for peer in peers:
             if peer.startswith(GROUP_PREFIX):
                 group = self.store.group(gid_of(peer))
@@ -47399,13 +53102,17 @@ def notification_text(store: "LocalStore", peer: str, body: str, kind: str,
     return (person_name(contact, peer, 12), preview, muted)
 
 
-def keep_call_offer(address: str, sender: str, sig: dict) -> bool:
+def keep_call_offer(address: str, sender: str, sig: dict,
+                    age: Optional[float] = None) -> bool:
     """A call's offer kept for the app, for identity `address`: rung by
     the background service while the app was closed, or (17.2, IDCALLS)
-    answered for an identity the app switches to (take_call_offer)."""
+    answered for an identity the app switches to (take_call_offer).
+    20.0: with its `age` now, as whoever keeps it knows it (call_offer_age:
+    the app that takes it counts on from there)."""
     try:
         (DATA_DIR / f"call_offer_{address}.json").write_text(json.dumps(
-            {"from": sender, "sig": sig, "at": time.time()}), "utf-8")
+            {"from": sender, "sig": sig, "at": time.time(),
+             "age": age}), "utf-8")
         return True
     except OSError:
         log.exception("could not keep a call's offer")
@@ -47429,6 +53136,10 @@ def take_call_offer(address: str) -> Optional[tuple]:
         return None
     if isinstance(kept.get("relay_at"), (int, float)):
         sig["relay_at"] = float(kept["relay_at"])
+    age, at = pending.get("age"), pending.get("at")
+    if all(isinstance(n, (int, float)) and not isinstance(n, bool)
+           for n in (age, at)):
+        sig["aged"] = (max(0.0, float(age)), float(at))
     return sender, sig
 
 
@@ -47451,7 +53162,8 @@ def _service_call_signal(app: HeadlessApp, sender: str, sig: dict) -> None:
                 "op": "end", "id": sig["id"], "why": "timeout"}, "Voice call"))
             return
         if app.store.get_contact(sender) is None or \
-                not keep_call_offer(app.keys.address, sender, sig):
+                not keep_call_offer(app.keys.address, sender, sig,
+                                    call_offer_age(sig, app.api)):
             return
         kind = tr("Incoming video call" if sig.get("v") else
                   "Incoming voice call")
@@ -47471,7 +53183,8 @@ def _service_call_signal(app: HeadlessApp, sender: str, sig: dict) -> None:
         rang = False
         if IS_ANDROID:
             try:
-                rang = android_call_notification(app, sender, sig["id"], name)
+                rang = android_call_notification(app, sender, sig["id"], name,
+                                                 sig.get("v") is True)
             except Exception:
                 log.exception("could not ring for a call")
             if not rang:
@@ -47613,6 +53326,524 @@ def run_background_service(max_cycles: Optional[int] = None,
 
 
 # =============================================================================
+#  What this build can do (--check)
+# =============================================================================
+CHECK_FLAG = "--check"
+
+
+def build_check() -> dict:
+    """What this build can do on this computer, each part tried for real:
+    {part: "" or why not}, with "version", "compiled" and "python" beside
+    them. `Ferritext --check FILE` writes it as JSON and ends, without a
+    window.
+
+    A build by Nuitka lacks whatever its build did not see, and the app
+    then does without, silently (each part is optional). 20.0: the EXE had
+    shipped without PyAV, so without video, screen sharing or remote
+    control. CI now holds each EXE against plain Python on the same
+    machine (desktop/smoke_exe.py): the EXE never has less."""
+    def tried(what: Callable[[], object]) -> str:
+        try:
+            got = what()
+        except Exception as exc:
+            return f"{type(exc).__name__}: {exc}"[:300]
+        return "" if got is None or got else "missing"
+
+    def video() -> bool:
+        """A picture coded in H.264 and decoded again, as a call's is."""
+        av = _pyav()
+        if av is None:
+            import av                           # raises, saying why
+        picture = av.VideoFrame(320, 240, "yuv420p")
+        for plane in picture.planes:
+            plane.update(bytes([128]) * plane.buffer_size)
+        coder, decoder = FfmpegEncoder("h264", 320, 240, 15, 300), \
+            FfmpegDecoder("h264")
+        try:
+            return any(decoder.decode(data, (320, 240), False)
+                       for data, _key in coder.encode(picture, True) +
+                       [(bytes(p), False) for p in coder.ctx.encode(None)])
+        finally:
+            coder.close()
+
+    def screen() -> bool:
+        """The screen read once, as a shared screen is."""
+        sources = video_sources("screen")
+        if not sources:
+            raise RuntimeError(call_video_why_not("s") or "no screen")
+        capture = VideoCapture(sources[0])
+        capture.start()
+        try:
+            if capture.next_frame(0, 15.0) is None:
+                raise RuntimeError(capture.error or "no picture in 15 s")
+            return True
+        finally:
+            capture.stop()
+
+    def control() -> bool:
+        injector = remote_injector()
+        if injector is not None:
+            injector.close()
+        return injector is not None and remote_control_possible()
+
+    def certificates() -> bool:
+        import certifi
+        return Path(certifi.where()).is_file()
+
+    parts = {
+        "fonts and icons": lambda: (ASSET_DIR / "fonts").is_dir() and
+        DESKTOP_ICON.is_file(),
+        "secure connections (certifi)": certificates,
+        "instant delivery (websocket-client)": lambda: _websocket_mod,
+        "fast signatures (coincurve)": lambda: HAVE_NATIVE_SECP256K1,
+        "calls in Opus (PyOgg's library)": opus_library,
+        "microphone and speaker (sounddevice)":
+        lambda: __import__("sounddevice"),
+        "voice notes at 1.5x and 2x (numpy)": lambda: __import__("numpy"),
+        "QR codes read (pyzbar)":
+        lambda: __import__("pyzbar.pyzbar", fromlist=["decode"]).decode,
+        "QR codes drawn (qrcode)": lambda: qrcode.make("fext"),
+        "video (PyAV)": video,
+        "screen sharing": screen,
+        "remote control": control,
+    }
+    report = {name: tried(what) for name, what in parts.items()}
+    report.update(version=APP_VERSION, compiled="__compiled__" in globals(),
+                  python="%d.%d.%d" % sys.version_info[:3])
+    return report
+
+
+# =============================================================================
+#  21.0 (SERVICE29): the service set up, updated and removed, as
+#  administrator (Windows' own permission prompt, from Settings)
+# =============================================================================
+#: Windows' policy that lets a service press Ctrl+Alt+Del (SendSAS): 1,
+#: services; 3, services and ease-of-access programs.
+#: In the service's copy of Ferritext: what says the folder is Ferritext's
+#: own (nothing else there is replaced or removed).
+SERVICE_MARK = "ferritext-service.txt"
+SAS_POLICY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+
+
+def service_folder() -> Path:
+    """The service's copy of Ferritext: Program Files, which only
+    administrators can change (a service must never run a file the
+    person's own programs could replace)."""
+    return Path(os.environ.get("ProgramFiles") or
+                "C:\\Program Files") / APP_NAME
+
+
+def service_state(reg=None) -> Optional[dict]:
+    """The service as Windows keeps it: {"version": of its copy, "prompts":
+    whether a session may answer a permission prompt}; None when it is not
+    set up. `reg` stands in for winreg in the tests."""
+    if reg is None:
+        if not IS_WINDOWS:
+            return None
+        import winreg as reg
+    try:
+        with reg.OpenKey(reg.HKEY_LOCAL_MACHINE, DESK_PARAMETERS) as key:
+            def value(name, default):
+                try:
+                    return reg.QueryValueEx(key, name)[0]
+                except OSError:
+                    return default
+            return {"version": str(value("Version", "")),
+                    "prompts": value("AnswerPrompts", 0) == 1}
+    except OSError:
+        return None
+
+
+def service_why_not() -> str:
+    """'' when this Ferritext can set up the service; else why not."""
+    if not IS_WINDOWS:
+        return tr("Only on Windows")
+    if built_exe() is None:
+        return tr("Only the Windows program (the EXE) sets it up: the "
+                  "Python file's folders can be changed by any program of "
+                  "yours, and a service must never run what they can "
+                  "change.")
+    return ""
+
+
+def _scm():
+    """advapi32's service functions, with their prototypes."""
+    import ctypes
+    from ctypes import wintypes as w
+    a = ctypes.WinDLL("advapi32", use_last_error=True)
+    H, D, S = ctypes.c_void_p, w.DWORD, w.LPCWSTR
+    for name, res, args in (
+            ("OpenSCManagerW", H, (S, S, D)),
+            ("OpenServiceW", H, (H, S, D)),
+            ("CreateServiceW", H, (H, S, S, D, D, D, D, S, S, H, S, S, S)),
+            ("ChangeServiceConfigW", w.BOOL, (H, D, D, D, S, S, H, S, S, S,
+                                              S)),
+            ("ChangeServiceConfig2W", w.BOOL, (H, D, H)),
+            ("StartServiceW", w.BOOL, (H, D, H)),
+            ("ControlService", w.BOOL, (H, D, H)),
+            ("DeleteService", w.BOOL, (H,)),
+            ("QueryServiceStatus", w.BOOL, (H, H)),
+            ("CloseServiceHandle", w.BOOL, (H,))):
+        getattr(a, name).restype, getattr(a, name).argtypes = res, list(args)
+    return a
+
+
+def _service_status(a, service) -> int:
+    """The service's state (1 stopped, 2 starting, 3 stopping, 4 running)."""
+    import ctypes
+    status = (ctypes.c_uint32 * 7)()
+    if not a.QueryServiceStatus(service, ctypes.byref(status)):
+        return 0
+    return status[1]
+
+
+def _service_wait(a, service, state: int, seconds: float) -> bool:
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if _service_status(a, service) == state:
+            return True
+        time.sleep(0.25)
+    return _service_status(a, service) == state
+
+
+def _service_stop(a, service) -> None:
+    import ctypes
+    status = (ctypes.c_uint32 * 7)()
+    if _service_status(a, service) not in (0, 1):
+        a.ControlService(service, 1, ctypes.byref(status))      # STOP
+        _service_wait(a, service, 1, 30.0)
+
+
+def _copy_program(source: Path, target: Path) -> None:
+    """The program's folder copied in whole beside `target`, then put in
+    its place (the old one removed, or left to Windows to remove at the
+    next restart where a file of it is still open)."""
+    if target.exists() and not (target / SERVICE_MARK).exists():
+        raise OSError(tr("{folder} holds files Ferritext did not put there: "
+                         "move them elsewhere first", folder=target))
+    fresh = target.with_name(target.name + ".new")
+    old = target.with_name(target.name + ".old")
+    for leftover in (fresh, old):
+        shutil.rmtree(leftover, ignore_errors=True)
+    shutil.copytree(source, fresh)
+    (fresh / SERVICE_MARK).write_text(
+        "Ferritext's service runs this copy. Settings › Remote access "
+        "removes it.\n", "utf-8")
+    if target.exists():
+        for _try in range(20):           # the service's files let go of
+            try:
+                replace_file(target, old)
+                break
+            except OSError:
+                time.sleep(0.5)
+        else:
+            raise OSError(f"{target} is in use")
+    replace_file(fresh, target)
+    shutil.rmtree(old, ignore_errors=True)
+
+
+def _sas_policy() -> Optional[int]:
+    """SoftwareSASGeneration set so that a service may press
+    Ctrl+Alt+Del; what it was before (None: absent), to be put back on
+    removal."""
+    import winreg
+    with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, SAS_POLICY, 0,
+                            winreg.KEY_READ | winreg.KEY_WRITE) as key:
+        try:
+            was = winreg.QueryValueEx(key, "SoftwareSASGeneration")[0]
+        except OSError:
+            was = None
+        if was not in (1, 3):
+            winreg.SetValueEx(key, "SoftwareSASGeneration", 0,
+                              winreg.REG_DWORD, 3 if was == 2 else 1)
+    return was
+
+
+def service_install(command: Optional[list] = None) -> str:
+    """SERVICE_INSTALL, run as administrator: the program copied to
+    Program Files, the service made (or pointed at the new copy) and
+    started; '' when done, else why not. `command` (the tests' Python
+    build on GitHub's Windows): what the service runs, in place of the
+    copy."""
+    import ctypes
+    import winreg
+    if command is None:
+        if "__compiled__" not in globals():
+            return service_why_not()
+        target = service_folder()
+        command = [str(target / Path(program_file()).name)]
+    a = _scm()
+    manager = a.OpenSCManagerW(None, None, 0x000F003F)  # SC_MANAGER_ALL_ACCESS
+    if not manager:
+        return tr("Windows did not let Ferritext set up a service "
+                  "({code})", code=ctypes.get_last_error())
+    service = None
+    try:
+        service = a.OpenServiceW(manager, WIN_SERVICE, 0x000F01FF)
+        if service:
+            _service_stop(a, service)
+        if "__compiled__" in globals() and command[0].startswith(
+                str(service_folder())):
+            _copy_program(Path(program_file()).parent, service_folder())
+        line = subprocess.list2cmdline(command + [SERVICE_FLAG])
+        if service:
+            ok = a.ChangeServiceConfigW(service, 0xFFFFFFFF, 2, 0xFFFFFFFF,
+                                        line, None, None, None, None, None,
+                                        WIN_SERVICE_SHOWN)  # AUTO_START
+        else:
+            service = a.CreateServiceW(
+                manager, WIN_SERVICE, WIN_SERVICE_SHOWN, 0x000F01FF, 0x10, 2,
+                1, line, None, None, None, None, None)   # OWN_PROCESS, AUTO
+            ok = bool(service)
+        if not ok:
+            return tr("Windows did not take the service ({code})",
+                      code=ctypes.get_last_error())
+
+        class SC_ACTION(ctypes.Structure):
+            _fields_ = [("Type", ctypes.c_int), ("Delay", ctypes.c_uint32)]
+
+        class FAILURE_ACTIONS(ctypes.Structure):
+            _fields_ = [("dwResetPeriod", ctypes.c_uint32),
+                        ("lpRebootMsg", ctypes.c_wchar_p),
+                        ("lpCommand", ctypes.c_wchar_p),
+                        ("cActions", ctypes.c_uint32),
+                        ("lpsaActions", ctypes.POINTER(SC_ACTION))]
+        again = (SC_ACTION * 3)(SC_ACTION(1, 5000), SC_ACTION(1, 30000),
+                                SC_ACTION(1, 60000))        # RESTART
+        failure = FAILURE_ACTIONS(86400, None, None, 3, again)
+        a.ChangeServiceConfig2W(service, 2, ctypes.byref(failure))
+        description = ctypes.c_wchar_p(
+            "Lets a remote session of Ferritext see and use the lock and "
+            "sign-in screens and Windows' permission prompts.")
+        a.ChangeServiceConfig2W(service, 1, ctypes.byref(description))
+        with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, DESK_PARAMETERS,
+                                0, winreg.KEY_READ | winreg.KEY_WRITE) as key:
+            try:              # set at the first set-up, kept by updates
+                winreg.QueryValueEx(key, "PrevSAS")
+                _sas_policy()
+            except OSError:
+                was = _sas_policy()
+                winreg.SetValueEx(key, "PrevSAS", 0, winreg.REG_DWORD,
+                                  0xFFFFFFFF if was is None else was)
+            winreg.SetValueEx(key, "Version", 0, winreg.REG_SZ, APP_VERSION)
+            try:
+                winreg.QueryValueEx(key, "AnswerPrompts")
+            except OSError:
+                winreg.SetValueEx(key, "AnswerPrompts", 0,
+                                  winreg.REG_DWORD, 0)
+        if not a.StartServiceW(service, 0, None) and \
+                ctypes.get_last_error() != 1056:     # ALREADY_RUNNING
+            return tr("The service did not start ({code})",
+                      code=ctypes.get_last_error())
+        if not _service_wait(a, service, 4, 20.0):
+            return tr("The service did not start")
+        return ""
+    except OSError as exc:
+        return str(exc)
+    finally:
+        if service:
+            a.CloseServiceHandle(service)
+        a.CloseServiceHandle(manager)
+
+
+def service_remove() -> str:
+    """SERVICE_REMOVE, run as administrator: the service stopped and
+    removed, Ctrl+Alt+Del's policy as it was, the copy in Program Files
+    gone. '' when done, else why not."""
+    import ctypes
+    import winreg
+    previous = None
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            DESK_PARAMETERS) as key:
+            previous = winreg.QueryValueEx(key, "PrevSAS")[0]
+    except OSError:
+        pass
+    a = _scm()
+    manager = a.OpenSCManagerW(None, None, 0x000F003F)
+    if not manager:
+        return tr("Windows did not let Ferritext remove the service "
+                  "({code})", code=ctypes.get_last_error())
+    try:
+        service = a.OpenServiceW(manager, WIN_SERVICE, 0x000F01FF)
+        if service:
+            _service_stop(a, service)
+            ok = a.DeleteService(service)
+            a.CloseServiceHandle(service)
+            if not ok:
+                return tr("Windows did not remove the service ({code})",
+                          code=ctypes.get_last_error())
+    finally:
+        a.CloseServiceHandle(manager)
+    if previous is not None:
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, SAS_POLICY, 0,
+                                winreg.KEY_WRITE) as key:
+                if previous == 0xFFFFFFFF:
+                    winreg.DeleteValue(key, "SoftwareSASGeneration")
+                else:
+                    winreg.SetValueEx(key, "SoftwareSASGeneration", 0,
+                                      winreg.REG_DWORD, previous)
+        except OSError:
+            pass
+    folder = service_folder()
+    if (folder / SERVICE_MARK).exists():
+        shutil.rmtree(folder, ignore_errors=True)
+        if folder.exists():        # a file still open: gone at the restart
+            for path in sorted(folder.rglob("*"), reverse=True) + [folder]:
+                ctypes.windll.kernel32.MoveFileExW(str(path), None, 4)
+    return ""
+
+
+def service_set(prompts: bool) -> str:
+    """SERVICE_SET, run as administrator: whether a session may answer a
+    permission prompt."""
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, DESK_PARAMETERS, 0,
+                            winreg.KEY_WRITE) as key:
+            winreg.SetValueEx(key, "AnswerPrompts", 0, winreg.REG_DWORD,
+                              int(prompts))
+        return ""
+    except OSError as exc:
+        return str(exc)
+
+
+def run_as_administrator(arguments: list) -> Optional[int]:
+    """This EXE run again, as administrator, with `arguments`: Windows asks
+    its person first (its permission prompt). Its exit code once it ends;
+    None when the person said no or Windows could not ask."""
+    import ctypes
+    from ctypes import wintypes
+
+    class SHELLEXECUTEINFOW(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("fMask", ctypes.c_ulong),
+                    ("hwnd", ctypes.c_void_p), ("lpVerb", wintypes.LPCWSTR),
+                    ("lpFile", wintypes.LPCWSTR),
+                    ("lpParameters", wintypes.LPCWSTR),
+                    ("lpDirectory", wintypes.LPCWSTR),
+                    ("nShow", ctypes.c_int), ("hInstApp", ctypes.c_void_p),
+                    ("lpIDList", ctypes.c_void_p),
+                    ("lpClass", wintypes.LPCWSTR),
+                    ("hkeyClass", ctypes.c_void_p),
+                    ("dwHotKey", wintypes.DWORD),
+                    ("hIcon", ctypes.c_void_p),
+                    ("hProcess", ctypes.c_void_p)]
+    exe = built_exe()
+    if exe is None:
+        return None
+    shell = ctypes.WinDLL("shell32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    shell.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p,
+                                             wintypes.DWORD]
+    kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p,
+                                            ctypes.POINTER(wintypes.DWORD)]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    info = SHELLEXECUTEINFOW(cbSize=ctypes.sizeof(SHELLEXECUTEINFOW),
+                             fMask=0x00000040,   # SEE_MASK_NOCLOSEPROCESS
+                             lpVerb="runas", lpFile=exe,
+                             lpParameters=subprocess.list2cmdline(arguments),
+                             nShow=0)
+    if not shell.ShellExecuteExW(ctypes.byref(info)) or not info.hProcess:
+        return None                  # 1223: its person said no
+    try:
+        kernel32.WaitForSingleObject(info.hProcess, 0xFFFFFFFF)
+        code = wintypes.DWORD()
+        kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(code))
+        return code.value
+    finally:
+        kernel32.CloseHandle(info.hProcess)
+
+
+def service_ask(flag: str, then: Callable[[str], None],
+                value: str = "") -> None:
+    """The service set up, updated or removed, or its setting changed, by
+    this EXE run again as administrator; `then(why not)` on the UI thread
+    ('' when done)."""
+    why = service_why_not()
+    if why:
+        then(why)
+        return
+    result = DATA_DIR / "service-result.json"
+
+    def work() -> None:
+        try:
+            result.unlink()
+        except OSError:
+            pass
+        code = run_as_administrator([flag, str(result)] +
+                                    ([value] if value else []))
+        if code is None:
+            why = tr("Windows' permission was not given")
+        else:
+            try:
+                why = json.loads(result.read_text("utf-8")).get("why", "")
+            except (OSError, ValueError):
+                why = tr("It ended without saying how it went ({code})",
+                         code=code)
+        DESK.forget()                 # asked afresh: it may answer now
+        run_on_ui(lambda: then(str(why)))
+    off_ui(work)
+
+
+def service_run(argv: list) -> None:
+    """SERVICE_INSTALL / SERVICE_REMOVE / SERVICE_SET FILE [value]: done
+    here (this process runs as administrator), the outcome written to FILE
+    for the Ferritext that asked."""
+    flag = next(f for f in (SERVICE_INSTALL, SERVICE_REMOVE, SERVICE_SET)
+                if f in argv)
+    at = argv.index(flag)
+    out = argv[at + 1] if len(argv) > at + 1 else ""
+    try:
+        if flag == SERVICE_INSTALL:
+            why = service_install()
+        elif flag == SERVICE_REMOVE:
+            why = service_remove()
+        else:
+            why = service_set(len(argv) > at + 2 and argv[at + 2] == "1")
+    except Exception as exc:
+        why = f"{type(exc).__name__}: {exc}"
+    if out:
+        try:
+            Path(out).write_text(json.dumps({"why": why}), "utf-8")
+        except OSError:
+            pass
+
+
+# ---- 21.0: a computer that signs in by itself locks at once ---------------------
+def lock_after_sign_in_due() -> bool:
+    """Whether Ferritext, started as Windows signed its person in by itself
+    (after a restart: a power cut, an update), locks the screen at once:
+    its setting is on, the service is set up (the lock screen can then be
+    unlocked from afar), Windows signs in by itself, and the computer
+    started within the last ten minutes (a sign-in by hand later is left
+    alone). Not when the watcher started Ferritext again."""
+    if not IS_WINDOWS or STARTUP_FLAG not in sys.argv[1:] or \
+            GUARD_AGAIN in sys.argv[1:] or \
+            not load_prefs().get("desk_lock_after_sign_in"):
+        return False
+    if service_state() is None or not windows_signs_in_by_itself():
+        return False
+    try:
+        import ctypes
+        uptime = ctypes.WinDLL("kernel32").GetTickCount64
+        uptime.restype = ctypes.c_uint64
+        return uptime() < 10 * 60 * 1000
+    except (OSError, AttributeError):
+        return False
+
+
+def windows_lock() -> None:
+    """The screen locked, as Windows+L does."""
+    try:
+        import ctypes
+        ctypes.WinDLL("user32").LockWorkStation()
+    except (OSError, AttributeError):
+        log.exception("could not lock the screen")
+
+
+# =============================================================================
 #  Entrypoint
 # =============================================================================
 def main() -> None:
@@ -47633,5 +53864,21 @@ def main() -> None:
 if __name__ == "__main__":
     if ANDROID_SERVICE == SERVICE_NAME:
         run_background_service()
+    elif IS_WINDOWS and any(flag in sys.argv[1:] for flag in (
+            SERVICE_INSTALL, SERVICE_REMOVE, SERVICE_SET)):
+        service_run(sys.argv)      # 21.0: as administrator, from Settings
+        os._exit(0)
+    elif CHECK_FLAG in sys.argv[1:] and not IS_MOBILE:
+        _report = json.dumps(build_check(), indent=1, ensure_ascii=False)
+        _at = sys.argv.index(CHECK_FLAG) + 1
+        if _at < len(sys.argv):         # the EXE has no console to print to
+            Path(sys.argv[_at]).write_text(_report, encoding="utf-8")
+        else:
+            print(_report, flush=True)
+        # Ended at once, as the app itself ends: nothing is left to put
+        # away, and a window, a screen's reader and their threads taken
+        # down one by one at exit can end in Windows' fault dialog, which
+        # then sits in front of everything.
+        os._exit(0)
     else:
         main()

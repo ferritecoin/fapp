@@ -165,6 +165,10 @@ jobs:
           python desktop/test_backup.py main.py
           xvfb-run -a python3.13 desktop/test_video.py main.py
           xvfb-run -a python3.13 desktop/test_videomsg.py main.py
+          # 20.0: a remote session end to end, the program itself as the
+          # computer left behind (its screen read, its input injected, a
+          # crash and a restart played, the session regained).
+          xvfb-run -a -s "-screen 0 1280x800x24" python3.13 desktop/e2e_remote.py main.py
 
   build-windows:
     name: Nuitka (Windows EXE)
@@ -213,7 +217,7 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ${{ runner.temp }}/nuitka-cache
-          key: nuitka-windows-py313-${{ hashFiles('main.py', 'desktop/build_desktop.sh', 'desktop/nuitka-package.config.yml', 'desktop/requirements*.txt') }}
+          key: nuitka-windows-py313-${{ hashFiles('main.py', 'desktop/build_desktop.py', 'desktop/nuitka-package.config.yml', 'desktop/requirements*.txt') }}
           restore-keys: nuitka-windows-py313-
 
       - name: Build the Windows executable
@@ -225,8 +229,9 @@ jobs:
           VER="$(grep -E '^version' buildozer.spec | head -1 | sed -E 's/.*=[[:space:]]*//')"
           TITLE="$(grep -E '^title' buildozer.spec | head -1 | sed -E 's/.*=[[:space:]]*//')"
           EXE="${TITLE}-${VER}-windows.exe"
-          ONEFILE=1 PY=python OUT="$PWD/release" NAME="$EXE" \
-            bash desktop/build_desktop.sh
+          # The file a person builds with on Windows (PY: this Python,
+          # which has the packages, in place of an environment of its own).
+          PY=python cmd //c "desktop\\build_exe.bat --out release --name $EXE"
           ls -la release/
           echo "exe=release/$EXE" >> "$GITHUB_OUTPUT"
 
@@ -245,6 +250,22 @@ jobs:
           # (Direct3D, which Windows renders in software) instead of OpenGL.
           KIVY_GL_BACKEND: angle_sdl2
         run: python desktop/smoke_exe.py "${{ steps.exe.outputs.exe }}" smoke_exe
+
+      # 20.0: the executable as the computer left behind, a session with it
+      # end to end (desktop/e2e_remote.py): what most people run is what is
+      # tried.
+      - name: A remote session with it, end to end
+        env:
+          KIVY_GL_BACKEND: angle_sdl2
+          FEXT_E2E_OUT: smoke_exe/e2e
+          PYTHONIOENCODING: utf-8
+        run: python desktop/e2e_remote.py "${{ steps.exe.outputs.exe }}"
+
+      # 21.0 (SERVICE29): its Windows service set up, running and removed,
+      # as Settings › Remote access asks Windows (desktop/smoke_service.py;
+      # the runner's account is an administrator).
+      - name: Its Windows service, set up and removed
+        run: python desktop/smoke_service.py "${{ steps.exe.outputs.exe }}"
 
       - name: Keep the screenshots and logs of those starts
         if: always()

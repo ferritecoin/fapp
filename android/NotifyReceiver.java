@@ -27,6 +27,10 @@ public class NotifyReceiver extends BroadcastReceiver {
     @Override
     public void onReceive(Context ctx, Intent intent) {
         String action = intent.getAction();
+        if (Notifier.ACTION_STOP_LIVE.equals(action)) {
+            stopLive(ctx, intent.getStringExtra("flag"));
+            return;
+        }
         String peer = intent.getStringExtra("peer");
         int id = intent.getIntExtra("id", 0);
         if (action == null || peer == null) {
@@ -62,6 +66,35 @@ public class NotifyReceiver extends BroadcastReceiver {
         }
         Notifier.cancel(ctx, id);
         startSync(ctx);
+    }
+
+    /**
+     * 21.1 (LIVENOTICE30): Stop on a live location's notice. The location
+     * service runs while its flag file is there: "flag.stopped" is left
+     * for the app (which tells the chats the share ended, now or when it
+     * next starts), then the flag goes, and the service ends within a
+     * second. Only a file in the app's own folder, named as the service's.
+     */
+    private static void stopLive(Context ctx, String flag) {
+        File file;
+        try {
+            file = new File(flag).getCanonicalFile();
+            String own = ctx.getFilesDir().getCanonicalPath() + File.separator;
+            if (!file.getPath().startsWith(own)
+                    || !file.getName().equals(".location_active")) {
+                return;
+            }
+        } catch (Exception e) {            // no flag named, or no such path
+            return;
+        }
+        try {
+            new FileOutputStream(file.getPath() + ".stopped").close();
+        } catch (Exception e) {
+            Log.w(TAG, "could not say the live location was stopped", e);
+        }
+        if (!file.delete()) {
+            Log.w(TAG, "the live location's flag was not there");
+        }
     }
 
     /** Written whole, then renamed into place: never read half-written. */
